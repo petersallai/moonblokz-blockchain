@@ -1,0 +1,14 @@
+[package]
+name = "moonblokz-blockchain"
+version = "0.1.0"
+edition = "2024"
+description = "MoonBlokz blockchain interpretation crate (no_std, no-alloc"
+license = "MIT"
+repository = "https://github.com/petersallai/moonblokz-blockchain"
+keywords = ["embedded", "no-std", "blockchain", "moonblokz"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
+moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["schnorr", "backend-memory"] }
+moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false, features = ["schnorr-crypto-bigint"] }
