@@ -16,10 +16,13 @@
 //! so the same construction inputs + the same event sequence yield identical
 //! state (FR62 / FR63 precondition).
 
-use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE};
+use moonblokz_chain_types::{
+    Block, BlockBuilder, BlockHeader, NodeTransfer, PAYLOAD_TYPE_TRANSACTION, Registration,
+};
+use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
 
-use crate::chain_config::ChainConfigTrait;
+use crate::chain_config::{ChainConfigError, ChainConfigTrait};
 use crate::prng::Prng;
 
 /// Next-call deadline carried alongside every state-changing outcome.
@@ -41,6 +44,46 @@ pub enum NextCall {
 
 /// `(outcome, scheduling)` pair returned by every state-changing API call.
 pub type CallResult<T> = (T, NextCall);
+
+/// Reasons the FR54 genesis bootstrap can be refused.
+///
+/// Story 1.4 surfaces `LocalNodeIdNotZero` (the FR54 caller-side
+/// precondition), initial chain-config retention errors, and storage
+/// persistence failure. Additional reasons
+/// (`StorageNotEmpty`, broader `InvalidConfig`) arrive when Story 5.6+
+/// enforces the full precondition set.
+pub enum GenesisRejectReason {
+    /// `local_node_id` was not `0`. Genesis is a node-zero-only operation
+    /// (FR54).
+    LocalNodeIdNotZero,
+    /// `initial_chain_config_bytes` would not fit in the future Block #1
+    /// chain-config payload.
+    InitialChainConfigTooLarge,
+    /// The initial chain-config payload has already been retained and must
+    /// not be overwritten.
+    InitialChainConfigAlreadyStored,
+    /// Block #0 could not be persisted through the storage seam, so genesis
+    /// must not report success.
+    StorageSaveFailed,
+}
+
+/// Outcome of `Blockchain::initialize_genesis`.
+///
+/// Walking-skeleton (Story 1.4) scope: returns an **owned** [`Block`] for
+/// Block #0. The architectural `BlockView<'a>` borrow form arrives once
+/// `EmitScratch` exists (Story 4.3 / 8.3 per architecture §6.2).
+pub enum InitGenesisOutcome {
+    /// Genesis Block #0 was created and persisted. Caller should broadcast
+    /// it; the next `on_tick(...)` will emit Block #1 (chain-config) per
+    /// AR6 / decisions log #19.
+    Created(Block),
+    /// Genesis was refused; no `Blockchain` instance exists on this path.
+    /// Currently unreachable from the success-path return — kept for
+    /// forward-compatibility with Story 5.6+ when the precondition set
+    /// expands. The `Result::Err` carries the actual refusal.
+    #[allow(dead_code)]
+    Rejected(GenesisRejectReason),
+}
 
 /// Authoritative-interpretation lifecycle phase (FR1–FR4).
 ///
@@ -101,6 +144,10 @@ pub struct Blockchain<
     local_node_id: u32,
     node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
     prng: Prng,
+
+    // FR1–FR4 lifecycle state. Default `Collecting`; transitions to
+    // `Processing` then `Ready` land in Story 5.1–5.4.
+    lifecycle_phase: LifecyclePhase,
 
     // Const-sized placeholders for future real bounded tables (Story 1.2).
     // `()` is zero-sized until the owning story replaces it with the real
@@ -174,6 +221,7 @@ impl<
             local_node_id,
             node_zero_public_key,
             prng: Prng::new(prng_seed),
+            lifecycle_phase: LifecyclePhase::Collecting,
             _blocks: [(); MAX_BLOCKS],
             _chain_heads: [(); MAX_BRANCH_COUNT],
             _node_info: [(); MAX_NODES],
@@ -181,43 +229,376 @@ impl<
             _snake_chain_tail_idx: 0,
         }
     }
+
+    /// FR54 genesis bootstrap. Constructs the `Blockchain`, builds genesis
+    /// Block #0 (node-zero registration + initial self-transfer), persists
+    /// it through the storage seam, and returns the immediate-callback
+    /// `NextCall::At(now)` so the bridge will call `on_tick(...)` to emit
+    /// Block #1 (chain-config) per AR6.
+    ///
+    /// Refusal: returns `Err(GenesisRejectReason::LocalNodeIdNotZero)` if
+    /// `local_node_id != 0` (FR54 caller-side precondition). No
+    /// `Blockchain` instance is constructed on the refusal path.
+    ///
+    /// **Walking-skeleton scope (Story 1.4).** The Block #0 layout is
+    /// minimum-buildable: registration + self-transfer per FR54. The block
+    /// and bootstrap transactions are finalized through chain-types signed
+    /// builders; full canonical validation still lands in Stories 4.2 / 5.4 /
+    /// 5.6. The `initial_chain_config_bytes` parameter is retained by the
+    /// `chain_config` seam for the later Block #1 emission; validation and
+    /// durable-lock semantics land in Story 5.6.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_genesis(
+        crypto: Crypto,
+        storage: Storage,
+        mut chain_config: Config,
+        local_node_id: u32,
+        initial_total_network_currency: u64,
+        initial_chain_config_bytes: &[u8],
+        prng_seed: u64,
+        now: u64,
+    ) -> Result<(Self, InitGenesisOutcome, NextCall), GenesisRejectReason> {
+        if local_node_id != 0 {
+            return Err(GenesisRejectReason::LocalNodeIdNotZero);
+        }
+        let node_zero_public_key = *crypto.public_key().serialize();
+        chain_config
+            .store_initial_chain_config_bytes(initial_chain_config_bytes)
+            .map_err(|err| match err {
+                ChainConfigError::InitialChainConfigTooLarge => {
+                    GenesisRejectReason::InitialChainConfigTooLarge
+                }
+                ChainConfigError::InitialChainConfigAlreadyStored => {
+                    GenesisRejectReason::InitialChainConfigAlreadyStored
+                }
+            })?;
+
+        // Assemble signed Block #0: registration of node #0 + a self-transfer
+        // of the initial total network currency.
+        let registration = Registration::new_signed(
+            0, // vote
+            0, // initializer (node #0)
+            0, // new_node_id (node #0)
+            0, // registration_price
+            0, // fee
+            &node_zero_public_key,
+            &crypto,
+        );
+        let self_transfer = NodeTransfer::new_signed(
+            0, // vote
+            0, // anchor_sequence
+            0, // initializer (node #0)
+            0, // receiver (self)
+            initial_total_network_currency,
+            0, // fee
+            0, // comment
+            &crypto,
+        );
+
+        let header = BlockHeader {
+            version: 1,
+            sequence: 0,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: [0u8; 32],
+            // Ignored by `BlockBuilder::build_signed`; the builder signs the
+            // full canonical block bytes with this field zero-filled, then
+            // stores the generated signature here.
+            signature: [0u8; 64],
+        };
+
+        // The chain-types builder errors only on payload-type mismatch or
+        // capacity overflow — neither applies to two small bootstrap
+        // transactions. The walking-skeleton uses `unreachable!` to make the
+        // invariant explicit; Story 5.6+ may surface BlockError through a
+        // new InitGenesisOutcome::Rejected variant when the assembly grows.
+        let mut builder = BlockBuilder::new().header(header);
+        if builder.add_registration(&registration).is_err() {
+            unreachable!("Block #0 registration is fixed-size and cannot overflow payload");
+        }
+        if builder.add_node_transfer(&self_transfer).is_err() {
+            unreachable!("Block #0 self-transfer is fixed-size and cannot overflow payload");
+        }
+        let block_0 = match builder.build_signed(&crypto) {
+            Ok(b) => b,
+            Err(_) => unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
+        };
+
+        let mut bc = Self::new(
+            crypto,
+            storage,
+            chain_config,
+            local_node_id,
+            node_zero_public_key,
+            prng_seed,
+        );
+
+        // Exercise the storage seam end-to-end. If persistence fails, do not
+        // return a `Created` outcome: the caller must not broadcast a Block #0
+        // that this node failed to retain locally.
+        bc.storage
+            .save_block(0, &block_0)
+            .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+
+        Ok((bc, InitGenesisOutcome::Created(block_0), NextCall::At(now)))
+    }
+
+    /// Read-only query — returns the current lifecycle phase (FR1–FR4).
+    ///
+    /// Carries no `NextCall` per AR4 (read-only queries do not change
+    /// scheduling).
+    pub fn current_phase(&self) -> LifecyclePhase {
+        match self.lifecycle_phase {
+            LifecyclePhase::Collecting => LifecyclePhase::Collecting,
+            LifecyclePhase::Processing => LifecyclePhase::Processing,
+            LifecyclePhase::Ready => LifecyclePhase::Ready,
+        }
+    }
+
+    /// Read-only query — returns the local node id (FR67).
+    pub fn local_node_id(&self) -> u32 {
+        self.local_node_id
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_config::FixedChainConfig;
+    use crate::chain_config::{
+        ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
+    };
     use moonblokz_chain_types::MAX_BLOCK_SIZE;
     use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE};
     use moonblokz_storage::backend_memory::MemoryBackend;
 
-    /// End-to-end integration smoke: constructs a real `Blockchain` with a
-    /// real Schnorr (crypto-bigint) backend, a real `MemoryBackend`, and the
-    /// AR14 `FixedChainConfig` stub. Proves the trait-bound seam compiles
-    /// and constructs without panic or allocation.
-    #[test]
-    fn blockchain_new_constructs_a_real_instance() {
+    fn any_nonzero(bytes: &[u8]) -> bool {
+        bytes.iter().any(|value| *value != 0)
+    }
+
+    /// Helper: construct a (Crypto, MemoryBackend, FixedChainConfig) triple
+    /// for the walking-skeleton tests. Uses real backends so the trait-bound
+    /// seam is exercised end-to-end.
+    fn test_backends() -> (
+        Crypto,
+        MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        FixedChainConfig,
+    ) {
         let private_key = [1u8; PRIVATE_KEY_SIZE];
-        // `Result::expect` requires `Debug` on the error, but `moonblokz-crypto`
-        // intentionally omits derives on `CryptoError` (embedded code-size). Use
-        // `.ok().expect(...)` to side-step the Debug bound while still panicking
-        // cleanly on failure.
         let crypto = Crypto::new(private_key)
             .ok()
             .expect("test private key should be accepted by the backend");
-
-        // Small in-memory storage capacity for the smoke test.
         let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
         let chain_config = FixedChainConfig::new();
-        let node_zero_public_key = [0u8; PUBLIC_KEY_SIZE];
+        (crypto, storage, chain_config)
+    }
 
-        let _bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::new(
+    /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
+    /// yields Block #0 + `NextCall::At(now)` (immediate callback for the
+    /// later Block #1 step), no embassy deps anywhere in the harness.
+    #[test]
+    fn walking_skeleton_genesis_success() {
+        let (crypto, storage, chain_config) = test_backends();
+        let expected_node_zero_public_key = *crypto.public_key().serialize();
+        let now: u64 = 12_345;
+        let initial_chain_config_bytes = [0xC0, 0xA5, 0xF6, 0x01];
+
+        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
             crypto,
             storage,
             chain_config,
-            42,
-            node_zero_public_key,
+            0,                           // local_node_id
+            1_000_000_000,               // initial_total_network_currency
+            &initial_chain_config_bytes, // retained for the later Block #1 emit
             0xDEAD_BEEF_CAFE_F00D,
+            now,
         );
+
+        match result {
+            Ok((bc, InitGenesisOutcome::Created(block), NextCall::At(t))) => {
+                assert_eq!(block.sequence(), 0);
+                assert_eq!(block.creator(), 0);
+                assert_eq!(block.version(), 1);
+                assert_eq!(block.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+                assert!(any_nonzero(block.signature()), "Block #0 must be signed");
+                let mut transactions = block
+                    .transactions()
+                    .expect("genesis Block #0 should contain transaction payload")
+                    .iter();
+                let registration = transactions
+                    .next()
+                    .expect("first genesis transaction should register node #0")
+                    .as_registration()
+                    .expect("first genesis transaction should be Registration");
+                assert_eq!(
+                    registration.new_public_key(),
+                    &expected_node_zero_public_key
+                );
+                assert!(any_nonzero(registration.new_key_signature()));
+                assert!(any_nonzero(registration.signature()));
+                let self_transfer = transactions
+                    .next()
+                    .expect("second genesis transaction should seed node #0 balance")
+                    .as_node_transfer()
+                    .expect("second genesis transaction should be NodeTransfer");
+                assert!(any_nonzero(self_transfer.signature()));
+                assert!(transactions.next().is_none());
+                assert_eq!(t, now, "Block #1 needs an immediate-callback tick (AR6)");
+                assert_eq!(
+                    bc.chain_config.initial_chain_config_bytes(),
+                    Some(&initial_chain_config_bytes[..])
+                );
+                assert!(bc.current_phase() == LifecyclePhase::Collecting);
+                assert_eq!(bc.local_node_id(), 0);
+            }
+            Ok((_, InitGenesisOutcome::Rejected(_), _)) => {
+                panic!("walking-skeleton success path should not return Rejected outcome");
+            }
+            Ok((_, _, NextCall::Idle)) => {
+                panic!("genesis must schedule the Block #1 callback (AR6)");
+            }
+            Err(_) => panic!("genesis with local_node_id == 0 must succeed (FR54)"),
+        }
+    }
+
+    /// AC2 — `local_node_id != 0` refuses genesis; no `Blockchain` is
+    /// constructed. The `Err(_)` arm is forward-compat for the additional
+    /// `GenesisRejectReason` variants Story 5.6+ introduces.
+    #[allow(unreachable_patterns)]
+    #[test]
+    fn walking_skeleton_refuses_non_zero_local_node_id() {
+        let (crypto, storage, chain_config) = test_backends();
+
+        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
+            crypto,
+            storage,
+            chain_config,
+            1, // local_node_id != 0 → refusal
+            1_000_000_000,
+            &[],
+            0,
+            0,
+        );
+
+        match result {
+            Err(GenesisRejectReason::LocalNodeIdNotZero) => {}
+            Err(_) => panic!("expected LocalNodeIdNotZero refusal"),
+            Ok(_) => panic!("FR54 precondition must refuse local_node_id != 0"),
+        }
+    }
+
+    /// Oversized genesis chain-config bytes are rejected before a `Blockchain`
+    /// instance is constructed; the bounded retention lives in `chain_config.rs`.
+    #[test]
+    fn walking_skeleton_rejects_oversized_initial_chain_config() {
+        let (crypto, storage, chain_config) = test_backends();
+        let oversized = [0u8; INITIAL_CHAIN_CONFIG_BYTES_CAPACITY + 1];
+
+        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
+            crypto,
+            storage,
+            chain_config,
+            0,
+            1_000_000_000,
+            &oversized,
+            0,
+            0,
+        );
+
+        match result {
+            Err(GenesisRejectReason::InitialChainConfigTooLarge) => {}
+            Err(_) => panic!("expected InitialChainConfigTooLarge refusal"),
+            Ok(_) => panic!("oversized initial chain-config bytes must be refused"),
+        }
+    }
+
+    /// Already-retained initial chain-config bytes are not overwritten during
+    /// genesis setup.
+    #[test]
+    fn walking_skeleton_rejects_already_stored_initial_chain_config() {
+        let (crypto, storage, mut chain_config) = test_backends();
+        chain_config
+            .store_initial_chain_config_bytes(&[0x01, 0x02])
+            .unwrap();
+
+        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
+            crypto,
+            storage,
+            chain_config,
+            0,
+            1_000_000_000,
+            &[0x03, 0x04],
+            0,
+            0,
+        );
+
+        match result {
+            Err(GenesisRejectReason::InitialChainConfigAlreadyStored) => {}
+            Err(_) => panic!("expected InitialChainConfigAlreadyStored refusal"),
+            Ok(_) => panic!("genesis must not overwrite retained chain-config bytes"),
+        }
+    }
+
+    /// Storage persistence failure refuses genesis; no `Created` outcome is
+    /// returned when Block #0 cannot be retained locally.
+    #[test]
+    fn walking_skeleton_refuses_storage_save_failure() {
+        let private_key = [1u8; PRIVATE_KEY_SIZE];
+        let crypto = Crypto::new(private_key)
+            .ok()
+            .expect("test private key should be accepted by the backend");
+        let storage = MemoryBackend::<0>::new();
+        let chain_config = FixedChainConfig::new();
+
+        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
+            crypto,
+            storage,
+            chain_config,
+            0,
+            1_000_000_000,
+            &[],
+            0,
+            0,
+        );
+
+        match result {
+            Err(GenesisRejectReason::StorageSaveFailed) => {}
+            Err(_) => panic!("expected StorageSaveFailed refusal"),
+            Ok(_) => panic!("genesis must not succeed when Block #0 cannot be persisted"),
+        }
+    }
+
+    /// AC3 — read-only queries are typed to **not** carry `NextCall`.
+    /// This is a compile-time guarantee: `current_phase` returns
+    /// `LifecyclePhase` directly (not `CallResult<LifecyclePhase>`), and
+    /// `local_node_id` returns `u32` directly.
+    #[test]
+    fn walking_skeleton_query_carries_no_next_call() {
+        let (crypto, storage, chain_config) = test_backends();
+
+        let (bc, _, _) = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
+            crypto,
+            storage,
+            chain_config,
+            0,
+            1_000_000_000,
+            &[],
+            0,
+            0,
+        )
+        .ok()
+        .expect("genesis must succeed for local_node_id == 0");
+
+        // Type-level assertion: the query result is `LifecyclePhase`,
+        // not `(LifecyclePhase, NextCall)`. If the signature ever drifts
+        // back to `CallResult`, this annotation will fail to compile.
+        let phase: LifecyclePhase = bc.current_phase();
+        assert!(phase == LifecyclePhase::Collecting);
+
+        let node_id: u32 = bc.local_node_id();
+        assert_eq!(node_id, 0);
     }
 }

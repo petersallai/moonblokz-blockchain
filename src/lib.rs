@@ -39,8 +39,12 @@ pub(crate) mod snake_chain;
 pub(crate) mod spent_bits;
 pub(crate) mod staged_validation;
 
-pub use api::{Blockchain, CallResult, LifecyclePhase, NextCall};
-pub use chain_config::{ChainConfigTrait, FixedChainConfig};
+pub use api::{
+    Blockchain, CallResult, GenesisRejectReason, InitGenesisOutcome, LifecyclePhase, NextCall,
+};
+pub use chain_config::{
+    ChainConfigError, ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
+};
 
 #[cfg(test)]
 mod tests {
