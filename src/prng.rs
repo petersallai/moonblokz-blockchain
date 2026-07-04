@@ -3,17 +3,16 @@
 //! [`Prng`] wraps `rand_xoshiro::Xoshiro256PlusPlus` (256-bit state, no_std,
 //! PractRand >2 TB) as the root PRNG seeded from the caller-supplied
 //! `prng_seed`. The blockchain hands `derive_subseed`-derived sub-seeds
-//! (`"mempool"`, `"vote"`, `"replay"`) to downstream crates
-//! (`moonblokz-mempool`, `moonblokz-vote`, the FR50 seed-source selector)
-//! during their own initialization.
+//! (`"mempool"`, `"replay"`) to downstream consumers (`moonblokz-mempool`,
+//! the FR50 seed-source selector) during their own initialization.
+//! (`moonblokz-vote` is fully deterministic and takes no sub-seed.)
 //!
 //! **Algorithm choice:** Story 1.3 originally framed the root PRNG as WyRand
 //! u64. The revised architecture §2.3 uses Xoshiro256PlusPlus instead — the
 //! statistical quality difference (~32 GB vs >2 TB PractRand) is significant
 //! enough for a long-running deterministic system where seeded PRNG outputs
-//! feed mempool eviction, creator-order tie-breaking, and seed-source
-//! selection. Memory/CPU difference is negligible (~72 B / RP2040 SRAM, both
-//! ~30-50 cycles per `next_u64`).
+//! feed mempool eviction and seed-source selection. Memory/CPU difference is
+//! negligible (~72 B / RP2040 SRAM, both ~30-50 cycles per `next_u64`).
 //!
 //! Replay-determinism guarantee (AR11): `derive_subseed` is a **pure**
 //! function of `(seed, label)` — it does not observe or mutate the inner
@@ -55,7 +54,7 @@ impl Prng {
     /// Pure: depends only on `(self.seed, label)` and never observes or
     /// mutates `self.inner`. Two calls with the same label return identical
     /// sub-seeds for the lifetime of the `Prng` (AR11 stability guarantee).
-    #[allow(dead_code)] // consumed by Story 2.1 / 3.1 sub-crate initialization
+    #[allow(dead_code)] // consumed by mempool initialization and FR50 seed-source selection
     pub(crate) fn derive_subseed(&self, label: &[u8]) -> u64 {
         // FNV-1a 64-bit hash of the label, XOR'd with the cached seed.
         const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
@@ -100,10 +99,10 @@ mod tests {
     fn different_labels_produce_different_subseeds() {
         let p = Prng::new(0xFEED_FACE_DEAD_BEEF);
         let m = p.derive_subseed(b"mempool");
-        let v = p.derive_subseed(b"vote");
+        let i = p.derive_subseed(b"intake");
         let r = p.derive_subseed(b"replay");
-        assert_ne!(m, v);
-        assert_ne!(v, r);
+        assert_ne!(m, i);
+        assert_ne!(i, r);
         assert_ne!(m, r);
     }
 

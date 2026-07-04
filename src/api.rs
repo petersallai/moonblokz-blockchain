@@ -22,6 +22,7 @@ use moonblokz_chain_types::{
 use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
 
+use crate::blocks::BlockTable;
 use crate::chain_config::{ChainConfigError, ChainConfigTrait};
 use crate::prng::Prng;
 
@@ -149,10 +150,12 @@ pub struct Blockchain<
     // `Processing` then `Ready` land in Story 5.1–5.4.
     lifecycle_phase: LifecyclePhase,
 
+    // FR18 bounded block-tree — data layer landed in Story 4.1.
+    blocks: BlockTable<MAX_BLOCKS>,
+
     // Const-sized placeholders for future real bounded tables (Story 1.2).
     // `()` is zero-sized until the owning story replaces it with the real
-    // entry layout (Story 4.1 / 4.4 / 7.1).
-    _blocks: [(); MAX_BLOCKS],
+    // entry layout (Story 4.4 / 7.1).
     _chain_heads: [(); MAX_BRANCH_COUNT],
     _node_info: [(); MAX_NODES],
 
@@ -164,7 +167,12 @@ pub struct Blockchain<
     //
     // Deliberately no standalone placeholders for:
     // - `VERIFICATION_HORIZON`: cheap/deep-zone algorithm boundary only.
-    // - `MAX_BLOCK_UTXO_OUTPUT`: later consumed inside `BlockEntry.spent_bits`.
+    // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.spent_bits` sizing
+    //   (Story 4.1 fixes that field at a 32-byte constant — see
+    //   `blocks::SPENT_BITS_BYTES` — because deriving an array length from a
+    //   generic const parameter via division requires the unstable
+    //   `generic_const_exprs` feature). Epic 7 resolves this when it gives
+    //   `spent_bits` real semantics.
 }
 
 impl<
@@ -222,7 +230,7 @@ impl<
             node_zero_public_key,
             prng: Prng::new(prng_seed),
             lifecycle_phase: LifecyclePhase::Collecting,
-            _blocks: [(); MAX_BLOCKS],
+            blocks: BlockTable::new(),
             _chain_heads: [(); MAX_BRANCH_COUNT],
             _node_info: [(); MAX_NODES],
             _active_chain_head_idx: 0,
