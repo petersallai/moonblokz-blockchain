@@ -26,9 +26,7 @@ use moonblokz_storage::StorageTrait;
 use crate::blocks::{BlockEntry, BlockTable, BlockTableError, NONE_REF};
 use crate::chain_config::{ChainConfigError, ChainConfigTrait};
 use crate::prng::Prng;
-use crate::staged_validation::{
-    BlockStatus, SIG_VERIFY_CACHE_CAPACITY, SignatureVerificationCache, Tier1Failure, tier1_gate,
-};
+use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate};
 
 /// Next-call deadline carried alongside every state-changing outcome.
 ///
@@ -180,12 +178,6 @@ pub struct Blockchain<
     // FR18 bounded block-tree — data layer landed in Story 4.1.
     blocks: BlockTable<MAX_BLOCKS>,
 
-    // FR9 signature-verification cache — Story 4.2. Non-durable (empty on
-    // construction / restart per FR59); a pure optimization aid over
-    // `crypto.verify_signature`. Fixed module-const capacity (not a const
-    // generic; see `staged_validation::SIG_VERIFY_CACHE_CAPACITY`).
-    sig_verify_cache: SignatureVerificationCache<SIG_VERIFY_CACHE_CAPACITY>,
-
     // Const-sized placeholders for future real bounded tables (Story 1.2).
     // `()` is zero-sized until the owning story replaces it with the real
     // entry layout (Story 4.4 / 7.1).
@@ -264,7 +256,6 @@ impl<
             prng: Prng::new(prng_seed),
             lifecycle_phase: LifecyclePhase::Collecting,
             blocks: BlockTable::new(),
-            sig_verify_cache: SignatureVerificationCache::new(),
             _chain_heads: [(); MAX_BRANCH_COUNT],
             _node_info: [(); MAX_NODES],
             _active_chain_head_idx: 0,
@@ -338,11 +329,6 @@ impl<
             core::ptr::addr_of_mut!((*dst).lifecycle_phase).write(LifecyclePhase::Collecting);
             let blocks_ptr = core::ptr::addr_of_mut!((*dst).blocks);
             BlockTable::init_in_place(blocks_ptr);
-            // The signature cache is small (~2.6 KB at the Schnorr-pinned
-            // `PUBLIC_KEY_SIZE == 32`, capacity 32) — well under the
-            // `init_in_place` motivation threshold (the 45.6 KB block table) —
-            // so writing an empty value directly is fine; no element-wise fill.
-            core::ptr::addr_of_mut!((*dst).sig_verify_cache).write(SignatureVerificationCache::new());
             core::ptr::addr_of_mut!((*dst)._chain_heads).write([(); MAX_BRANCH_COUNT]);
             core::ptr::addr_of_mut!((*dst)._node_info).write([(); MAX_NODES]);
             core::ptr::addr_of_mut!((*dst)._active_chain_head_idx).write(0);
@@ -510,17 +496,9 @@ impl<
     /// index (and FR19 parent-recovery for a missing parent) is Story 4.4's
     /// `chain_heads` work — this crate has no find-by-hash yet.
     #[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
-    pub(crate) fn tier1_admit(&mut self, block: &BlockView, now: u64) -> Result<u32, AdmitError> {
+    pub(crate) fn tier1_admit(&mut self, block: &BlockView) -> Result<u32, AdmitError> {
         let block_size_limit = self.chain_config.current_block_size_limit();
-        tier1_gate(
-            block,
-            &self.node_zero_public_key,
-            block_size_limit,
-            &self.crypto,
-            &mut self.sig_verify_cache,
-            now,
-        )
-        .map_err(AdmitError::Rejected)?;
+        tier1_gate(block, &self.node_zero_public_key, block_size_limit, &self.crypto).map_err(AdmitError::Rejected)?;
 
         // FR11 defensive duplicate guard (Story 4.3 is the authoritative
         // duplicate classifier and calls this only for non-duplicates; the
@@ -629,10 +607,6 @@ mod tests {
         assert_eq!(a.blocks.len(), b.blocks.len());
         assert_eq!(a.blocks.len(), 0);
         assert_eq!(a.node_zero_public_key, b.node_zero_public_key);
-        // Story 4.2: the signature cache is constructed empty (FR59) identically
-        // via both new() and the unsafe init_in_place() field write.
-        assert_eq!(a.sig_verify_cache.occupied_count(), 0);
-        assert_eq!(b.sig_verify_cache.occupied_count(), 0);
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
@@ -888,7 +862,7 @@ mod tests {
     fn tier1_admit_inserts_at_stored() {
         let mut bc = new_test_chain();
         let block = node_transfer_block(5, 3, 4, 7);
-        let idx = bc.tier1_admit(&block.view(), 0).expect("well-formed block is admitted");
+        let idx = bc.tier1_admit(&block.view()).expect("well-formed block is admitted");
         assert_eq!(bc.blocks.len(), 1);
         assert_eq!(
             bc.blocks.get(idx).expect("entry present").status(),
@@ -905,7 +879,7 @@ mod tests {
         let mut bc = new_test_chain();
         // initializer == vote == 7 → FR6 self-vote.
         let block = node_transfer_block(5, 7, 4, 7);
-        let result = bc.tier1_admit(&block.view(), 0);
+        let result = bc.tier1_admit(&block.view());
         assert_eq!(result, Err(AdmitError::Rejected(Tier1Failure::SelfVote)));
         assert_eq!(bc.blocks.len(), 0, "a rejected block must not be stored");
     }
@@ -916,8 +890,8 @@ mod tests {
     fn tier1_admit_duplicate_is_already_present() {
         let mut bc = new_test_chain();
         let block = node_transfer_block(5, 3, 4, 7);
-        bc.tier1_admit(&block.view(), 0).expect("first admission");
-        let second = bc.tier1_admit(&block.view(), 0);
+        bc.tier1_admit(&block.view()).expect("first admission");
+        let second = bc.tier1_admit(&block.view());
         assert_eq!(second, Err(AdmitError::AlreadyPresent));
         assert_eq!(bc.blocks.len(), 1, "duplicate must not be re-stored");
     }

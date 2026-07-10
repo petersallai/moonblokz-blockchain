@@ -1,7 +1,7 @@
 //! `staged_validation.rs` — FR9 three-status / three-tier staged validation.
 //!
-//! Story 4.2 scope: the **FR9 status model**, the **Tier 1 intake gating**
-//! check set, and the **signature-verification cache**. Tier 2 (Connected
+//! Story 4.2 scope: the **FR9 status model** and the **Tier 1 intake gating**
+//! check set. Tier 2 (Connected
 //! promotion) and Tier 3 (Active promotion) are *declared* here — their
 //! predicates are documented and the status-transition map is a concrete
 //! function ([`is_legal_transition`]) — but their **drivers are tagged
@@ -11,12 +11,12 @@
 //! the same paths plus transaction/balance/UTXO validation (Epic 7).
 //!
 //! **Statelessness.** Architecture §4.2 characterizes this module as
-//! "stateless tier 1/2/3 checks." The one piece of *state* the FR9 tiers
-//! need — the signature-verification cache — is an owned value on
-//! [`crate::api::Blockchain`], passed into the (still-stateless) check
-//! functions by `&mut`. The check functions own no state themselves, so the
-//! §4.2 characterization holds: the cache is a caller-provided optimization
-//! aid, not module-internal state.
+//! "stateless tier 1/2/3 checks." The check functions here hold that property
+//! literally: they operate purely over passed-in references (block bytes, the
+//! node-zero trust anchor, the durable-locked chain-config, and a `crypto`
+//! handle) and own no mutable state. (Story 4.2 originally carried a
+//! signature-verification cache as `Blockchain` state passed in by `&mut`; it
+//! was removed by design — see [`verify_signature_bytes`].)
 //!
 //! **FR16 "store unless exact evidence."** Tier 1 rejects a block *only* on
 //! evidence derivable from the block bytes alone (plus the durable-locked
@@ -30,7 +30,7 @@
 
 use moonblokz_chain_types::{
     BlockView, ComplexTransactionView, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
-    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, calculate_hash,
+    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
 };
 use moonblokz_crypto::{
     CryptoTrait, PUBLIC_KEY_SIZE, PublicKey, PublicKeyTrait, Signature, SignatureTrait,
@@ -44,19 +44,6 @@ const SUPPORTED_VERSION: u8 = 1;
 /// Node #0's canonical id — the FR69 trust-anchor subject and the FR6 /
 /// FR54 permanent self-vote exception's node.
 const NODE_ZERO_ID: u32 = 0;
-
-/// Signature-verification cache capacity (FR9: "capacity is a build-time
-/// compile-constant"). A module const, not a 10th `Blockchain` const generic —
-/// same rationale as Story 4.1's `SPENT_BITS_BYTES` (avoid churning the public
-/// API + every instantiation site). At 32 entries the cache is
-/// `32 × size_of::<SigCacheEntry>()`; see the RAM note in the Story 4.2 file
-/// (this structure is not budgeted in architecture §6/§7 — a flagged
-/// discrepancy). Because `moonblokz-chain-types` pins the Schnorr backend
-/// (`PUBLIC_KEY_SIZE == 32`), this crate is effectively Schnorr-only, so an
-/// entry is ~112 B (two 32-byte hashes + a 32-byte key + result/timestamp/flag,
-/// padded) and the cache ~3.6 KB — the BLS 96-byte-key case is not reachable
-/// through chain-types.
-pub(crate) const SIG_VERIFY_CACHE_CAPACITY: usize = 32;
 
 /// FR9 stored-status of a block in the retained block-tree. **`Invalid` is
 /// deliberately not a variant** — it is a *terminal classification*, never a
@@ -156,140 +143,26 @@ pub(crate) enum Tier1Failure {
 }
 
 // ---------------------------------------------------------------------------
-// Signature-verification cache (FR9 cache contract, AC6)
+// Signature verification (FR9 Tier 1)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-struct SigCacheEntry {
-    /// Hash of the signed content (the preimage / message the signature is
-    /// computed over) — *not* a hash of the public key.
-    content_hash: [u8; 32],
-    sig_hash: [u8; 32],
-    public_key: [u8; PUBLIC_KEY_SIZE],
-    result: bool,
-    inserted_at: u64,
-    occupied: bool,
-}
-
-impl SigCacheEntry {
-    const fn empty() -> Self {
-        Self {
-            content_hash: [0; 32],
-            sig_hash: [0; 32],
-            public_key: [0; PUBLIC_KEY_SIZE],
-            result: false,
-            inserted_at: 0,
-            occupied: false,
-        }
-    }
-}
-
-/// Fixed-capacity, in-memory, non-durable signature-verification cache
-/// (FR9 / FR59 / FR63). Keyed by `(canonical-signed-bytes-hash,
-/// signature-hash, public-key)` with a Boolean result and a per-entry
-/// insertion timestamp (from the FR46 `now: u64` time base — the module reads
-/// no wall clock). On overflow the oldest-inserted entry is evicted
-/// (deterministic lowest-index tie-break, so replay stays byte-identical). The
-/// cache is a pure memoization of the deterministic
-/// `verify_signature(message, signature, public_key)`: a cold or emptied cache
-/// yields the same Boolean on a miss, so it changes only cost, never
-/// classification.
+/// Verify `signature_bytes` over `preimage` against `public_key_bytes` by
+/// converting the wire bytes to the concrete crypto types and calling
+/// `crypto.verify_signature`. Malformed signature or key bytes cannot form a
+/// valid signature, so they resolve to `false` (exact evidence at the call
+/// site). `verify_signature` is deterministic in `(message, signature,
+/// public_key)`, so this call is itself replay-deterministic (FR63).
 ///
-/// **The key includes the signature hash — deliberately beyond FR9's literal
-/// `(canonical-signed-bytes-hash, public-key)` wording.** `verify_signature`'s
-/// result depends on all three of `(message, signature, public_key)`, so
-/// keying on only `(message-hash, public-key)` would let a *second* claim
-/// presenting a *different* signature over the same `(message, public_key)`
-/// pair inherit the first claim's cached Boolean. That is a real
-/// false-accept/false-reject: e.g. a valid registration for public key `P`
-/// caches `true`, then a forged registration reusing `P` with a garbage
-/// `new_key_signature` would hit the cache and be admitted — and the outcome
-/// would depend on cache warmth (cold rejects, warm accepts), breaking FR9's
-/// own "empty cache changes only cost, never classification" guarantee and
-/// FR63 replay determinism. Including `sig_hash` makes the cache a faithful
-/// memoization of the full verification function. (Flagged as an FR9-wording
-/// discrepancy in the Story 4.2 file / deferred-work.md.)
-#[allow(dead_code)] // `new`/`verify_cached` consumed via `Blockchain`; tests exercise directly.
-pub(crate) struct SignatureVerificationCache<const CAP: usize> {
-    entries: [SigCacheEntry; CAP],
-}
-
-#[allow(dead_code)]
-impl<const CAP: usize> SignatureVerificationCache<CAP> {
-    /// A compile-time-empty cache (FR59: empty on restart / construction).
-    pub(crate) const fn new() -> Self {
-        Self {
-            entries: [SigCacheEntry::empty(); CAP],
-        }
-    }
-
-    /// Number of occupied entries. Used by the `init_in_place` equivalence
-    /// test to confirm the cache is constructed empty (FR59) identically via
-    /// both `new()` and `init_in_place()`.
-    pub(crate) fn occupied_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.occupied).count()
-    }
-
-    fn lookup(&self, content_hash: &[u8; 32], sig_hash: &[u8; 32], public_key: &[u8; PUBLIC_KEY_SIZE]) -> Option<bool> {
-        self.entries
-            .iter()
-            .find(|e| e.occupied && &e.content_hash == content_hash && &e.sig_hash == sig_hash && &e.public_key == public_key)
-            .map(|e| e.result)
-    }
-
-    fn store(&mut self, content_hash: [u8; 32], sig_hash: [u8; 32], public_key: [u8; PUBLIC_KEY_SIZE], result: bool, now: u64) {
-        let new_entry = SigCacheEntry {
-            content_hash,
-            sig_hash,
-            public_key,
-            result,
-            inserted_at: now,
-            occupied: true,
-        };
-        // First empty slot, if any.
-        if let Some(slot) = self.entries.iter_mut().find(|e| !e.occupied) {
-            *slot = new_entry;
-            return;
-        }
-        if CAP == 0 {
-            return; // zero-capacity cache: pure pass-through, nothing to store.
-        }
-        // Oldest-first eviction: smallest `inserted_at`, lowest index on ties.
-        let mut victim = 0usize;
-        for i in 1..CAP {
-            if self.entries[i].inserted_at < self.entries[victim].inserted_at {
-                victim = i;
-            }
-        }
-        self.entries[victim] = new_entry;
-    }
-
-    /// Verify `signature_bytes` over `preimage` against `public_key_bytes`,
-    /// consulting the cache first. On a miss, converts the wire bytes to the
-    /// concrete crypto types and calls `crypto.verify_signature`; malformed
-    /// signature or key bytes cannot be a valid signature, so they resolve to
-    /// `false` (exact evidence at the call site). The result is cached under
-    /// `(hash(preimage), hash(signature_bytes), public_key)` — see the type
-    /// doc for why the signature hash is part of the key.
-    pub(crate) fn verify_cached<C: CryptoTrait>(
-        &mut self,
-        crypto: &C,
-        preimage: &[u8],
-        signature_bytes: &[u8],
-        public_key_bytes: &[u8; PUBLIC_KEY_SIZE],
-        now: u64,
-    ) -> bool {
-        let content_hash = calculate_hash(preimage);
-        let sig_hash = calculate_hash(signature_bytes);
-        if let Some(cached) = self.lookup(&content_hash, &sig_hash, public_key_bytes) {
-            return cached;
-        }
-        let result = match (Signature::new(signature_bytes), PublicKey::new(public_key_bytes)) {
-            (Ok(sig), Ok(pk)) => crypto.verify_signature(preimage, &sig, &pk),
-            _ => false,
-        };
-        self.store(content_hash, sig_hash, *public_key_bytes, result, now);
-        result
+/// (Story 4.2 originally memoized this behind a signature-verification cache;
+/// the cache was removed by design — block-tree `(sequence, hash)` dedup
+/// already prevents duplicate-arrival re-verification before Tier 1 runs, and
+/// the residual same-object Tier 1 → Tier 3 / chain-switch re-verification is
+/// expected-rare given deterministic creator selection, so a ~3.6 KB
+/// content-addressed cache did not earn its keep against the RAM budget.)
+fn verify_signature_bytes<C: CryptoTrait>(crypto: &C, preimage: &[u8], signature_bytes: &[u8], public_key_bytes: &[u8]) -> bool {
+    match (Signature::new(signature_bytes), PublicKey::new(public_key_bytes)) {
+        (Ok(sig), Ok(pk)) => crypto.verify_signature(preimage, &sig, &pk),
+        _ => false,
     }
 }
 
@@ -302,16 +175,13 @@ impl<const CAP: usize> SignatureVerificationCache<CAP> {
 /// Returns `Ok(())` when no exact evidence of invalidity exists (the block is
 /// admissible at `Stored`), or the first exact-evidence [`Tier1Failure`].
 ///
-/// Stateless over passed-in references — the only mutated argument is the
-/// signature cache (`&mut`), an optimization aid that never changes the verdict.
+/// Stateless over passed-in references — no argument is mutated.
 #[allow(dead_code)] // consumed by `Blockchain::tier1_admit` (api.rs).
-pub(crate) fn tier1_gate<C: CryptoTrait, const CAP: usize>(
+pub(crate) fn tier1_gate<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
     block_size_limit: u16,
     crypto: &C,
-    sig_cache: &mut SignatureVerificationCache<CAP>,
-    now: u64,
 ) -> Result<(), Tier1Failure> {
     // Header-level checks (payload-independent).
     if block.version() != SUPPORTED_VERSION {
@@ -335,7 +205,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait, const CAP: usize>(
 
     match block.payload_type() {
         PAYLOAD_TYPE_TRANSACTION => {
-            tier1_transaction_block(block, node_zero_public_key, crypto, sig_cache, now, is_genesis_block_zero)?;
+            tier1_transaction_block(block, node_zero_public_key, crypto, is_genesis_block_zero)?;
         }
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
         PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key)?,
@@ -350,12 +220,10 @@ pub(crate) fn tier1_gate<C: CryptoTrait, const CAP: usize>(
     Ok(())
 }
 
-fn tier1_transaction_block<C: CryptoTrait, const CAP: usize>(
+fn tier1_transaction_block<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
     crypto: &C,
-    sig_cache: &mut SignatureVerificationCache<CAP>,
-    now: u64,
     is_genesis_block_zero: bool,
 ) -> Result<(), Tier1Failure> {
     let payload = block.transactions().ok_or(Tier1Failure::MalformedPayload)?;
@@ -383,9 +251,8 @@ fn tier1_transaction_block<C: CryptoTrait, const CAP: usize>(
                 return Err(Tier1Failure::NodeZeroRegistrationKeyMismatch);
             }
             // new_key_signature proves possession: the new key signs its own
-            // public-key bytes. Verified via the cache.
-            let new_pk = to_pubkey_array(reg.new_public_key()).ok_or(Tier1Failure::InvalidNewKeySignature)?;
-            if !sig_cache.verify_cached(crypto, reg.new_public_key(), reg.new_key_signature(), &new_pk, now) {
+            // public-key bytes.
+            if !verify_signature_bytes(crypto, reg.new_public_key(), reg.new_key_signature(), reg.new_public_key()) {
                 return Err(Tier1Failure::InvalidNewKeySignature);
             }
         } else if let Some(cx) = tx.as_complex() {
@@ -541,15 +408,6 @@ fn check_no_self_vote(initializer: u32, vote: u32, is_genesis_block_zero: bool) 
     Ok(())
 }
 
-fn to_pubkey_array(bytes: &[u8]) -> Option<[u8; PUBLIC_KEY_SIZE]> {
-    if bytes.len() != PUBLIC_KEY_SIZE {
-        return None;
-    }
-    let mut arr = [0u8; PUBLIC_KEY_SIZE];
-    arr.copy_from_slice(bytes);
-    Some(arr)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,10 +452,6 @@ mod tests {
         builder.build_signed(signer).ok().expect("build signed")
     }
 
-    fn empty_cache() -> SignatureVerificationCache<SIG_VERIFY_CACHE_CAPACITY> {
-        SignatureVerificationCache::new()
-    }
-
     /// Raw header-only block bytes for header-level malformation tests
     /// (`BlockView::from_bytes` only checks `len ∈ [122,2016]` and `version != 0`).
     fn raw_block(version: u8, sequence: u32, payload_type: u8) -> [u8; HEADER_SIZE] {
@@ -623,110 +477,6 @@ mod tests {
         assert!(!is_legal_transition(Connected, Stored));
     }
 
-    // --- AC6: signature-verification cache ----------------------------------
-
-    #[test]
-    fn cache_starts_empty() {
-        let cache = SignatureVerificationCache::<4>::new();
-        assert!(cache.lookup(&[0u8; 32], &[0u8; 32], &[0u8; PUBLIC_KEY_SIZE]).is_none());
-    }
-
-    #[test]
-    fn cache_hit_returns_same_bool_as_verify() {
-        let c = crypto(1);
-        let pk = pubkey_bytes(&c);
-        let msg = b"cache hit message";
-        let sig = c.sign(msg);
-        let sig_bytes = sig.serialize();
-        let mut cache = SignatureVerificationCache::<4>::new();
-        assert!(cache.verify_cached(&c, msg, sig_bytes, &pk, 1));
-        // Second call is a cache hit and returns the same boolean.
-        assert!(cache.verify_cached(&c, msg, sig_bytes, &pk, 2));
-        assert_eq!(cache.lookup(&calculate_hash(msg), &calculate_hash(sig_bytes), &pk), Some(true));
-    }
-
-    #[test]
-    fn empty_cache_same_outcome_as_warm() {
-        // FR63: a zero-capacity (never-caching) cache and a warm cache produce
-        // identical booleans — only the crypto-call count differs.
-        let c = crypto(1);
-        let pk = pubkey_bytes(&c);
-        let msg = b"determinism message";
-        let sig = c.sign(msg);
-        let sig_bytes = sig.serialize();
-
-        let mut warm = SignatureVerificationCache::<4>::new();
-        let w1 = warm.verify_cached(&c, msg, sig_bytes, &pk, 1);
-        let w2 = warm.verify_cached(&c, msg, sig_bytes, &pk, 2);
-
-        let mut cold = SignatureVerificationCache::<0>::new();
-        let c1 = cold.verify_cached(&c, msg, sig_bytes, &pk, 1);
-        let c2 = cold.verify_cached(&c, msg, sig_bytes, &pk, 2);
-
-        assert_eq!(w1, c1);
-        assert_eq!(w2, c2);
-        assert_eq!(w1, w2);
-    }
-
-    #[test]
-    fn cache_result_is_false_for_bad_signature() {
-        // A signature by key A over a message, verified against key B, is false;
-        // the false result is cached and returned identically on the hit.
-        let a = crypto(1);
-        let b = crypto(2);
-        let pk_b = pubkey_bytes(&b);
-        let msg = b"wrong signer";
-        let sig = a.sign(msg); // signed by A
-        let sig_bytes = sig.serialize();
-        let mut cache = SignatureVerificationCache::<4>::new();
-        assert!(!cache.verify_cached(&a, msg, sig_bytes, &pk_b, 1));
-        assert_eq!(cache.lookup(&calculate_hash(msg), &calculate_hash(sig_bytes), &pk_b), Some(false));
-    }
-
-    #[test]
-    fn oldest_first_eviction() {
-        let c = crypto(1);
-        let pk = pubkey_bytes(&c);
-        let mut cache = SignatureVerificationCache::<2>::new();
-        let (s1, s2, s3) = (c.sign(b"m1"), c.sign(b"m2"), c.sign(b"m3"));
-        cache.verify_cached(&c, b"m1", s1.serialize(), &pk, 1);
-        cache.verify_cached(&c, b"m2", s2.serialize(), &pk, 2);
-        // Third insert overflows capacity 2 → evicts the oldest (m1, t=1).
-        cache.verify_cached(&c, b"m3", s3.serialize(), &pk, 3);
-        assert!(
-            cache.lookup(&calculate_hash(b"m1"), &calculate_hash(s1.serialize()), &pk).is_none(),
-            "oldest entry must be evicted"
-        );
-        assert!(cache.lookup(&calculate_hash(b"m2"), &calculate_hash(s2.serialize()), &pk).is_some());
-        assert!(cache.lookup(&calculate_hash(b"m3"), &calculate_hash(s3.serialize()), &pk).is_some());
-    }
-
-    #[test]
-    fn cache_key_includes_signature_no_cross_signature_reuse() {
-        // Regression (code-review finding, 2026-07-10): a *valid* signature over
-        // (message M, key P) must NOT let a *different* (e.g. forged/garbage)
-        // signature over the same (M, P) inherit the cached `true`. Otherwise a
-        // forged registration reusing a public key would be admitted, and the
-        // outcome would depend on cache warmth (breaking FR63).
-        let c = crypto(1);
-        let pk = pubkey_bytes(&c);
-        let msg = b"reused message and key";
-        let good = c.sign(msg);
-        let good_bytes = good.serialize();
-
-        let mut cache = SignatureVerificationCache::<4>::new();
-        assert!(cache.verify_cached(&c, msg, good_bytes, &pk, 1), "valid signature verifies");
-
-        // A garbage signature over the SAME (message, public key): must be false,
-        // and identically false whether the cache is warm (above) or cold.
-        let garbage = [0u8; 64];
-        let warm = cache.verify_cached(&c, msg, &garbage, &pk, 2);
-        let mut cold_cache = SignatureVerificationCache::<4>::new();
-        let cold = cold_cache.verify_cached(&c, msg, &garbage, &pk, 2);
-        assert!(!warm, "forged signature must not inherit the valid one's cached true");
-        assert_eq!(warm, cold, "cold and warm caches must classify identically (FR63)");
-    }
-
     // --- AC2: header-level Tier 1 checks (raw bytes) ------------------------
 
     #[test]
@@ -734,9 +484,8 @@ mod tests {
         let bytes = raw_block(2, 5, PAYLOAD_TYPE_APPROVAL);
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
             Err(Tier1Failure::UnsupportedVersion)
         );
     }
@@ -746,9 +495,8 @@ mod tests {
         let bytes = raw_block(1, 5, 9);
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
             Err(Tier1Failure::UnknownPayloadType)
         );
     }
@@ -759,9 +507,8 @@ mod tests {
         let bytes = raw_block(1, u32::MAX, PAYLOAD_TYPE_APPROVAL);
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
             Err(Tier1Failure::SequenceCeiling)
         );
     }
@@ -772,9 +519,8 @@ mod tests {
         let bytes = raw_block(1, 5, PAYLOAD_TYPE_APPROVAL); // len == HEADER_SIZE == 122
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), 100 /* < 122 */, &c, &mut cache, 0),
+            tier1_gate(&block, &pubkey_bytes(&c), 100 /* < 122 */, &c),
             Err(Tier1Failure::BlockTooLarge)
         );
     }
@@ -786,8 +532,7 @@ mod tests {
         let bytes = raw_block(1, 5, PAYLOAD_TYPE_CHAIN_CONFIG);
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
-        let mut cache = empty_cache();
-        assert_eq!(tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c, &mut cache, 0), Ok(()));
+        assert_eq!(tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c), Ok(()));
     }
 
     // --- AC2/AC3: transaction-payload checks --------------------------------
@@ -796,9 +541,8 @@ mod tests {
     fn tier1_accepts_wellformed_node_transfer() {
         let c = crypto(1);
         let block = node_transfer_block(5, 3 /*vote*/, 4 /*anchor*/, 7 /*initializer*/, &c);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
         );
     }
@@ -808,9 +552,8 @@ mod tests {
         let c = crypto(1);
         // initializer == vote == 7 (both non-zero) → self-vote.
         let block = node_transfer_block(5, 7, 4, 7, &c);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Err(Tier1Failure::SelfVote)
         );
     }
@@ -820,9 +563,8 @@ mod tests {
         // Permanent node-#0 exception: initializer 0, vote 0 is always allowed.
         let c = crypto(1);
         let block = node_transfer_block(5, 0, 4, 0, &c);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
         );
     }
@@ -833,9 +575,8 @@ mod tests {
         // monotonicity rule (genesis self-transfer: initializer==vote, anchor==0==seq).
         let c = crypto(1);
         let block = node_transfer_block(0, 7, 0, 7, &c);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
         );
     }
@@ -845,9 +586,8 @@ mod tests {
         let c = crypto(1);
         // anchor 10 ≥ block sequence 5.
         let block = node_transfer_block(5, 3, 10, 7, &c);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Err(Tier1Failure::AnchorSequenceNotBeforeBlock)
         );
     }
@@ -865,8 +605,7 @@ mod tests {
         let pk_a = pubkey_bytes(&a);
         // new_node_id == 0 → FR69 (i) requires new_public_key == node_zero. Pass pk_a as both.
         let block = registration_block(5, 0, &pk_a, &a);
-        let mut cache = empty_cache();
-        assert_eq!(tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a, &mut cache, 0), Ok(()));
+        assert_eq!(tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a), Ok(()));
     }
 
     #[test]
@@ -875,9 +614,8 @@ mod tests {
         let a = crypto(1);
         let b = crypto(2);
         let block = registration_block(5, 0, &pubkey_bytes(&a), &a);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&b), NORMAL_LIMIT, &a, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&b), NORMAL_LIMIT, &a),
             Err(Tier1Failure::NodeZeroRegistrationKeyMismatch)
         );
     }
@@ -890,9 +628,8 @@ mod tests {
         let a = crypto(1);
         let b = crypto(2);
         let block = registration_block(5, 9, &pubkey_bytes(&b), &a);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(3)), NORMAL_LIMIT, &a, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(3)), NORMAL_LIMIT, &a),
             Err(Tier1Failure::InvalidNewKeySignature)
         );
     }
@@ -909,9 +646,8 @@ mod tests {
         builder.add_registration(&reg).ok().expect("add reg");
         builder.add_complex_transaction(&cx).ok().expect("add complex");
         let block = builder.build_signed(&a).ok().expect("build");
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a, &mut cache, 0),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a),
             Err(Tier1Failure::RegistrationComplexMutualExclusion)
         );
     }
@@ -932,9 +668,8 @@ mod tests {
             cx.add_balance_input(4, 8, 30, 0, &DUMMY_SIG).ok().unwrap();
             cx.add_balance_output(9, 50).ok().unwrap();
         });
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Err(Tier1Failure::InputsLessThanOutputs)
         );
     }
@@ -948,9 +683,8 @@ mod tests {
             cx.add_utxo_input(&[7u8; 32], 0, &DUMMY_SIG).ok().unwrap();
             cx.add_balance_output(9, 50).ok().unwrap();
         });
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
         );
     }
@@ -963,9 +697,8 @@ mod tests {
             cx.add_balance_input(4, 8, 50, 0, &DUMMY_SIG).ok().unwrap();
             cx.add_balance_output(9, 40).ok().unwrap();
         });
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Err(Tier1Failure::SelfVote)
         );
     }
@@ -984,8 +717,7 @@ mod tests {
         let a = crypto(1);
         let pk_a = pubkey_bytes(&a);
         let block = balance_block(5, 0, &pk_a, &a);
-        let mut cache = empty_cache();
-        assert_eq!(tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a, &mut cache, 0), Ok(()));
+        assert_eq!(tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a), Ok(()));
     }
 
     #[test]
@@ -994,9 +726,8 @@ mod tests {
         let a = crypto(1);
         let b = crypto(2);
         let block = balance_block(5, 0, &pubkey_bytes(&a), &a);
-        let mut cache = empty_cache();
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&b), NORMAL_LIMIT, &a, &mut cache, 0),
+            tier1_gate(&block.view(), &pubkey_bytes(&b), NORMAL_LIMIT, &a),
             Err(Tier1Failure::NodeZeroBalanceKeyMismatch)
         );
     }
