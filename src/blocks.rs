@@ -37,9 +37,13 @@
 //! head-scoped, not per-block, Story 4.1 does not add the field at all;
 //! Story 4.4 adds it to `ChainHeadEntry` instead.
 
+use crate::staged_validation::BlockStatus;
+
 /// Sentinel value for an unresolved parent reference and for an empty
-/// slot's `sequence` (architecture §6.2).
-const NONE_REF: u32 = u32::MAX;
+/// slot's `sequence` (architecture §6.2). `pub(crate)` so the admission path
+/// (`api::Blockchain::tier1_admit`) can insert a block with an as-yet-
+/// unresolved parent (parent linking / recovery is Story 4.4).
+pub(crate) const NONE_REF: u32 = u32::MAX;
 
 /// ADR-016 spent-bit vector size in bytes, for the architecture §5 default
 /// `MAX_BLOCK_UTXO_OUTPUT = 256` (256 / 8 = 32).
@@ -53,10 +57,21 @@ const NONE_REF: u32 = u32::MAX;
 /// generic sizing question when it gives the field real semantics.
 const SPENT_BITS_BYTES: usize = 32;
 
-/// `flags` bit assignment: bit 0 is live in Story 4.1; bits 1-2 are reserved
-/// for Story 4.2's FR9 status placeholder and are neither set nor
-/// interpreted here; bits 3-7 are unused.
+/// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2
+/// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
+/// bits 3-7 are unused.
 const FLAG_ON_ACTIVE_CHAIN: u8 = 0b0000_0001;
+
+/// FR9 status bits (bits 1-2 of `flags`). Story 4.1 reserved these; Story 4.2
+/// gives them meaning. Encoding: `Stored = 0b00`, `Connected = 0b01`,
+/// `Active = 0b10` (`0b11` unused). Default `flags == 0` therefore decodes to
+/// `Stored`, which is exactly the collecting-state default (FR9 / AC4) — no
+/// change to `new()` / `new_empty()` is needed. `is_on_active_chain` (bit 0)
+/// and the `Active` status (bits 1-2) are deliberately distinct: bit 0 is
+/// tree-membership on the active-chain path (FR18/FR19 ancestry), the status
+/// is the FR9 validation tier. Never conflate them.
+const FLAG_STATUS_SHIFT: u8 = 1;
+const FLAG_STATUS_MASK: u8 = 0b0000_0110;
 
 /// Per-block ancestry and status metadata (FR18).
 ///
@@ -126,6 +141,40 @@ impl BlockEntry {
         } else {
             self.flags &= !FLAG_ON_ACTIVE_CHAIN;
         }
+    }
+
+    /// FR9 stored status (bits 1-2 of `flags`). A brand-new entry decodes to
+    /// [`BlockStatus::Stored`] (the collecting-state default, AC4).
+    pub(crate) fn status(&self) -> BlockStatus {
+        match (self.flags & FLAG_STATUS_MASK) >> FLAG_STATUS_SHIFT {
+            0b01 => BlockStatus::Connected,
+            0b10 => BlockStatus::Active,
+            // 0b00 (Stored) and the unused 0b11 both decode to Stored — the
+            // module never writes 0b11, and treating a stray bit pattern as
+            // the least-promoted status fails safe.
+            _ => BlockStatus::Stored,
+        }
+    }
+
+    /// Writes the FR9 status into bits 1-2 without disturbing bit 0
+    /// (`is_on_active_chain`) or the unused high bits.
+    ///
+    /// **Reserved for the Epic 5/6/7 promotion drivers; not exercised in
+    /// Epic 4.** Within Epic 4 the only status ever assigned is `Stored`,
+    /// which is already the `new()` default — so in practice this is only
+    /// called (if at all) to set `Stored` explicitly at admission. A future
+    /// promotion story that must change an *already-inserted* entry's status
+    /// does so through the delete-then-`insert` discipline of Story 4.1 (no
+    /// `get_mut` on `BlockTable`), not by mutating a stored entry in place;
+    /// this setter is for stamping the status onto a `BlockEntry` value
+    /// *before* it is inserted.
+    pub(crate) fn set_status(&mut self, status: BlockStatus) {
+        let bits: u8 = match status {
+            BlockStatus::Stored => 0b00,
+            BlockStatus::Connected => 0b01,
+            BlockStatus::Active => 0b10,
+        };
+        self.flags = (self.flags & !FLAG_STATUS_MASK) | ((bits << FLAG_STATUS_SHIFT) & FLAG_STATUS_MASK);
     }
 }
 
@@ -318,6 +367,23 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         false
     }
 
+    /// Index of the first empty slot, or `None` if the table is full.
+    ///
+    /// Story 4.2's admission path uses this to write durable storage
+    /// *before* mutating the tree: it persists the block at the slot
+    /// [`Self::insert`] is about to choose, so a storage-save failure leaves
+    /// the tree untouched (no leaked slot, which matters because there is no
+    /// deletion path until Story 4.4). Because the module is single-threaded
+    /// and nothing mutates the table between the two calls, `next_free_index`
+    /// and the subsequent `insert` agree on the same slot.
+    pub(crate) fn next_free_index(&self) -> Option<u32> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.is_empty_slot())
+            .map(|(idx, _)| idx as u32)
+    }
+
     /// Number of occupied slots. Used by the AC7 footprint invariant test;
     /// the `MAX_BLOCKS` ceiling is already structural (array-bounded), so
     /// this exists to catch a leaked slot (never freed) rather than an
@@ -454,6 +520,42 @@ mod tests {
         assert!(table.find(1, &hash_of(1)).is_some());
         assert!(table.find(1, &hash_of(2)).is_some());
         assert_eq!(table.len(), 3);
+    }
+
+    #[test]
+    fn status_default_is_stored() {
+        // AC1 / AC4: a brand-new entry (and an empty slot) decodes to Stored,
+        // the collecting-state default — no explicit set_status needed.
+        assert_eq!(BlockEntry::new(hash_of(1), NONE_REF, 0).status(), BlockStatus::Stored);
+        assert_eq!(BlockEntry::new_empty().status(), BlockStatus::Stored);
+    }
+
+    #[test]
+    fn status_round_trips_through_flags() {
+        for status in [BlockStatus::Stored, BlockStatus::Connected, BlockStatus::Active] {
+            let mut entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
+            entry.set_status(status);
+            assert_eq!(entry.status(), status);
+        }
+    }
+
+    #[test]
+    fn status_and_active_chain_bit_are_independent() {
+        // The FR9 status (bits 1-2) and is_on_active_chain (bit 0) must not
+        // clobber each other — distinct concepts (architecture §6.2).
+        let mut entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
+        entry.set_on_active_chain(true);
+        entry.set_status(BlockStatus::Active);
+        assert!(entry.is_on_active_chain());
+        assert_eq!(entry.status(), BlockStatus::Active);
+
+        entry.set_status(BlockStatus::Stored);
+        assert!(entry.is_on_active_chain(), "flipping status must not clear the active-chain bit");
+
+        entry.set_status(BlockStatus::Connected);
+        entry.set_on_active_chain(false);
+        assert_eq!(entry.status(), BlockStatus::Connected, "clearing the active-chain bit must not disturb status");
+        assert!(!entry.is_on_active_chain());
     }
 
     #[test]

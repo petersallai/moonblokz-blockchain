@@ -17,14 +17,16 @@
 //! state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    Block, BlockBuilder, BlockHeader, NodeTransfer, PAYLOAD_TYPE_TRANSACTION, Registration,
+    Block, BlockBuilder, BlockHeader, BlockView, NodeTransfer, PAYLOAD_TYPE_TRANSACTION,
+    Registration,
 };
 use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
 
-use crate::blocks::BlockTable;
+use crate::blocks::{BlockEntry, BlockTable, BlockTableError, NONE_REF};
 use crate::chain_config::{ChainConfigError, ChainConfigTrait};
 use crate::prng::Prng;
+use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate};
 
 /// Next-call deadline carried alongside every state-changing outcome.
 ///
@@ -101,6 +103,29 @@ pub enum LifecyclePhase {
     Collecting,
     Processing,
     Ready,
+}
+
+/// Outcome of the internal FR9 Tier 1 admission entry point
+/// [`Blockchain::tier1_admit`]. Story 4.3's `receive_block` intake surface
+/// maps each variant to the single-outcome `ReceiveBlockOutcome`:
+/// `Rejected(Tier1Failure)` → `Rejected(RejectReason)`, `AlreadyPresent` →
+/// `DuplicateKnown`, success → `AcceptedSilently`. `TableFull` /
+/// `StorageSaveFailed` are capacity/IO failures, not FR16 exact evidence —
+/// their outcome mapping is Story 4.3/4.4's concern.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+#[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
+pub(crate) enum AdmitError {
+    /// FR16 exact evidence of invalidity — the block is not stored.
+    Rejected(Tier1Failure),
+    /// `(sequence, hash)` already in the block-tree (FR11). Not re-stored.
+    AlreadyPresent,
+    /// The bounded block-tree is at capacity (`MAX_BLOCKS`); no eviction path
+    /// exists until Story 4.4 (FR19 chain_heads-eviction).
+    TableFull,
+    /// The block passed Tier 1 but could not be persisted through the storage
+    /// seam — it is not inserted into the tree (storage-first admission).
+    StorageSaveFailed,
 }
 
 /// Authoritative blockchain state for a MoonBlokz node.
@@ -444,6 +469,87 @@ impl<
     pub fn local_node_id(&self) -> u32 {
         self.local_node_id
     }
+
+    /// FR9 Tier 1 admission (Story 4.2). Rejects a block whose `(sequence, hash)`
+    /// is already in the tree as `AlreadyPresent` first, then runs the full
+    /// Tier 1 gating check set over `block`; on pass, persists the block through
+    /// the storage seam and inserts it into the block-tree at
+    /// [`BlockStatus::Stored`], returning its storage/tree index. On any
+    /// exact-evidence failure the block is neither persisted nor inserted, and
+    /// the failing [`Tier1Failure`] is returned.
+    ///
+    /// This is the internal entry point Story 4.3's `receive_block` intake
+    /// surface will call; it deliberately stops at "Tier 1 verdict + Stored
+    /// admission." The single-outcome `ReceiveBlockOutcome` mapping, the
+    /// collecting-vs-ready FR60 window logic, the FR11 duplicate-classification
+    /// *outcome*, and the FR17 chain-config silent-discard are Story 4.3.
+    ///
+    /// **Collecting-state invariant (AC4):** every admitted block is `Stored`
+    /// — no Connected/Active is assigned, because no active chain exists and no
+    /// promotion driver runs in Epic 4.
+    ///
+    /// **Duplicate-first ordering (FR11 / FR10):** the `(sequence, hash)` guard
+    /// runs *before* Tier 1, so a re-arriving already-stored block is rejected
+    /// as `AlreadyPresent` without re-running signature verification — a purely
+    /// structural check (a stored block already passed Tier 1, and an identical
+    /// hash means identical bytes, so the verdict cannot differ). This — not a
+    /// signature-verification cache — is what keeps the dominant mesh-rebroadcast
+    /// re-arrival case off the crypto path. (Story 4.3's `receive_block` is the
+    /// authoritative FR11 duplicate classifier; this guard makes `tier1_admit`
+    /// cheap and robust on its own, independent of the caller.)
+    ///
+    /// **Storage-first ordering:** the block is saved to durable storage at the
+    /// slot [`BlockTable::insert`] will choose *before* the tree is mutated, so
+    /// a storage failure leaves the tree untouched (there is no deletion path
+    /// to roll back a tree insert until Story 4.4).
+    ///
+    /// **Parent linkage is deferred to Story 4.4:** the entry is inserted with
+    /// an unresolved parent (`NONE_REF`). Resolving `previous_hash` to a parent
+    /// index (and FR19 parent-recovery for a missing parent) is Story 4.4's
+    /// `chain_heads` work — this crate has no find-by-hash yet.
+    #[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
+    pub(crate) fn tier1_admit(&mut self, block: &BlockView) -> Result<u32, AdmitError> {
+        // Duplicate-first (FR11 / FR10): reject an already-stored (sequence, hash)
+        // before any Tier 1 crypto. A stored block already passed Tier 1, and an
+        // identical hash means identical bytes, so re-verification could only
+        // reach the same verdict — skipping it is safe and keeps mesh-rebroadcast
+        // re-arrivals off the signature-verification path (the reason this story
+        // needs no signature-verification cache).
+        let hash = block.hash();
+        if self.blocks.find(block.sequence(), &hash).is_some() {
+            return Err(AdmitError::AlreadyPresent);
+        }
+
+        let block_size_limit = self.chain_config.current_block_size_limit();
+        tier1_gate(block, &self.node_zero_public_key, block_size_limit, &self.crypto).map_err(AdmitError::Rejected)?;
+
+        // Storage-first: reserve the slot `insert` will pick, persist there,
+        // then insert. Reconstruct an owned `Block` for the storage seam
+        // (`save_block` takes `&Block`); this copy happens only on the success
+        // path, after Tier 1 passed.
+        let idx = self.blocks.next_free_index().ok_or(AdmitError::TableFull)?;
+        let owned = Block::from_bytes(block.serialized_bytes())
+            .map_err(|_| AdmitError::Rejected(Tier1Failure::MalformedPayload))?;
+        self.storage
+            .save_block(idx, &owned)
+            .map_err(|_| AdmitError::StorageSaveFailed)?;
+
+        let mut entry = BlockEntry::new(hash, NONE_REF, block.sequence());
+        entry.set_status(BlockStatus::Stored);
+        match self.blocks.insert(entry) {
+            Ok(inserted) => {
+                debug_assert_eq!(inserted, idx, "storage-first slot must match insert slot");
+                Ok(inserted)
+            }
+            Err(BlockTableError::Full) => Err(AdmitError::TableFull),
+            Err(BlockTableError::DuplicateEntry) => Err(AdmitError::AlreadyPresent),
+            Err(BlockTableError::ReservedSequence) => {
+                // Unreachable: `tier1_gate` already rejects sequence == u32::MAX
+                // (FR53 (ii)) before we get here.
+                Err(AdmitError::Rejected(Tier1Failure::SequenceCeiling))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -722,5 +828,86 @@ mod tests {
 
         let node_id: u32 = bc.local_node_id();
         assert_eq!(node_id, 0);
+    }
+
+    // --- Story 4.2: FR9 Tier 1 admission entry point ------------------------
+
+    type TestChain = Blockchain<
+        Crypto,
+        MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        FixedChainConfig,
+        16,
+        16,
+        4,
+        16,
+        4,
+        16,
+    >;
+
+    fn new_test_chain() -> TestChain {
+        let (crypto, storage, chain_config) = test_backends();
+        let node_zero = *crypto.public_key().serialize();
+        Blockchain::new(crypto, storage, chain_config, 5, node_zero, 0)
+    }
+
+    fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer: u32) -> Block {
+        // The block-creator signature is not a Tier 1 gate in Epic 4
+        // (opportunistic / ready-state), so any signer works for these tests.
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(vote, anchor, initializer, 9, 100, 1, 0, &signer);
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        builder.add_node_transfer(&nt).ok().expect("add node transfer");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// AC4: a Tier 1-passing block is admitted at `Stored` and persisted.
+    #[test]
+    fn tier1_admit_inserts_at_stored() {
+        let mut bc = new_test_chain();
+        let block = node_transfer_block(5, 3, 4, 7);
+        let idx = bc.tier1_admit(&block.view()).expect("well-formed block is admitted");
+        assert_eq!(bc.blocks.len(), 1);
+        assert_eq!(
+            bc.blocks.get(idx).expect("entry present").status(),
+            BlockStatus::Stored,
+            "collecting-state admission is always Stored (AC4)"
+        );
+        // Durable storage received the block (storage-first admission).
+        assert!(bc.storage.read_block(idx).is_ok());
+    }
+
+    /// AC5: a Tier 1 failure returns the exact-evidence form and stores nothing.
+    #[test]
+    fn tier1_admit_rejects_and_does_not_store() {
+        let mut bc = new_test_chain();
+        // initializer == vote == 7 → FR6 self-vote.
+        let block = node_transfer_block(5, 7, 4, 7);
+        let result = bc.tier1_admit(&block.view());
+        assert_eq!(result, Err(AdmitError::Rejected(Tier1Failure::SelfVote)));
+        assert_eq!(bc.blocks.len(), 0, "a rejected block must not be stored");
+    }
+
+    /// FR11 defensive guard: re-admitting an identical block reports it as
+    /// already present rather than double-storing it.
+    #[test]
+    fn tier1_admit_duplicate_is_already_present() {
+        let mut bc = new_test_chain();
+        let block = node_transfer_block(5, 3, 4, 7);
+        bc.tier1_admit(&block.view()).expect("first admission");
+        let second = bc.tier1_admit(&block.view());
+        assert_eq!(second, Err(AdmitError::AlreadyPresent));
+        assert_eq!(bc.blocks.len(), 1, "duplicate must not be re-stored");
     }
 }
