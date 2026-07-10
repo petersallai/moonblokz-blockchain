@@ -238,6 +238,79 @@ impl<
         }
     }
 
+    /// In-place construction for embedded/task use: writes directly into
+    /// caller-provided `dst` instead of returning `Self` by value.
+    ///
+    /// `Self` is large (dominated by `blocks: BlockTable<MAX_BLOCKS>`, e.g.
+    /// ~45.6 KB at the default `MAX_BLOCKS = 600`) — large enough that no
+    /// construction technique *inside* a function that returns `Self` by
+    /// value can avoid needing a full `size_of::<Self>()`-sized stack
+    /// allocation somewhere (measured across several approaches: a
+    /// struct-literal, and `MaybeUninit` + per-field pointer writes with
+    /// and without an element-by-element large-array fill — all landed at
+    /// the same floor). [`Self::new`] is fine for the desktop simulator
+    /// (architecture §10 / FR62 — plain owned value, no `'static`/global
+    /// state, and no tight stack budget there) and for tests.
+    ///
+    /// For embedded firmware, use this instead, from *inside* a
+    /// `#[embassy_executor::task]` fn:
+    ///
+    /// ```ignore
+    /// #[embassy_executor::task]
+    /// async fn blockchain_task(/* ... */) {
+    ///     let mut storage = core::mem::MaybeUninit::<BlockchainT>::uninit();
+    ///     unsafe { BlockchainT::init_in_place(storage.as_mut_ptr(), /* ... */); }
+    ///
+    ///     // Load-bearing: `storage` must be referenced again after an
+    ///     // `.await`, or the compiler has no reason to place it in the
+    ///     // task's Future state rather than a transient local within
+    ///     // this poll segment — measured to make the difference between
+    ///     // ~66.6 KiB in the shared poll-time call stack and ~66.6 KiB in
+    ///     // the task's own statically-sized `TaskStorage` instead
+    ///     // (moonblokz-node round-7 stack investigation, Story 4.1
+    ///     // deferred-work follow-up).
+    ///     embassy_futures::yield_now().await;
+    ///
+    ///     let bc = unsafe { storage.assume_init_mut() };
+    ///     // ... use `bc` ...
+    /// }
+    /// ```
+    ///
+    /// Declaring `storage` as a plain local of a synchronous function (or
+    /// never crossing an `.await` while it's live) gets none of this
+    /// benefit — the ~66.6 KB then sits in that function's own transient
+    /// stack frame regardless of how carefully it's written.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `Self` and not yet initialized.
+    /// Every field is written exactly once; no field is read before its
+    /// write; no panic can occur between the first write and the last.
+    pub unsafe fn init_in_place(
+        dst: *mut Self,
+        crypto: Crypto,
+        storage: Storage,
+        chain_config: Config,
+        local_node_id: u32,
+        node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
+        prng_seed: u64,
+    ) {
+        unsafe {
+            core::ptr::addr_of_mut!((*dst).crypto).write(crypto);
+            core::ptr::addr_of_mut!((*dst).storage).write(storage);
+            core::ptr::addr_of_mut!((*dst).chain_config).write(chain_config);
+            core::ptr::addr_of_mut!((*dst).local_node_id).write(local_node_id);
+            core::ptr::addr_of_mut!((*dst).node_zero_public_key).write(node_zero_public_key);
+            core::ptr::addr_of_mut!((*dst).prng).write(Prng::new(prng_seed));
+            core::ptr::addr_of_mut!((*dst).lifecycle_phase).write(LifecyclePhase::Collecting);
+            let blocks_ptr = core::ptr::addr_of_mut!((*dst).blocks);
+            BlockTable::init_in_place(blocks_ptr);
+            core::ptr::addr_of_mut!((*dst)._chain_heads).write([(); MAX_BRANCH_COUNT]);
+            core::ptr::addr_of_mut!((*dst)._node_info).write([(); MAX_NODES]);
+            core::ptr::addr_of_mut!((*dst)._active_chain_head_idx).write(0);
+            core::ptr::addr_of_mut!((*dst)._snake_chain_tail_idx).write(0);
+        }
+    }
+
     /// FR54 genesis bootstrap. Constructs the `Blockchain`, builds genesis
     /// Block #0 (node-zero registration + initial self-transfer), persists
     /// it through the storage seam, and returns the immediate-callback
@@ -402,6 +475,47 @@ mod tests {
         let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
         let chain_config = FixedChainConfig::new();
         (crypto, storage, chain_config)
+    }
+
+    /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
+    /// `blocks` filled element-by-element via `BlockTable::init_in_place`)
+    /// must produce a struct indistinguishable from `new()`'s — a wrong
+    /// field order, a skipped field, or an off-by-one in the `unsafe`
+    /// block would silently corrupt memory rather than panic, so this is
+    /// verified directly rather than trusted by construction.
+    #[test]
+    fn init_in_place_matches_new() {
+        let (crypto_a, storage_a, chain_config_a) = test_backends();
+        let a = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::new(
+            crypto_a,
+            storage_a,
+            chain_config_a,
+            7,
+            [3u8; PUBLIC_KEY_SIZE],
+            0xDEAD_BEEF,
+        );
+
+        let (crypto_b, storage_b, chain_config_b) = test_backends();
+        let mut result = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let b = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
+                result.as_mut_ptr(),
+                crypto_b,
+                storage_b,
+                chain_config_b,
+                7,
+                [3u8; PUBLIC_KEY_SIZE],
+                0xDEAD_BEEF,
+            );
+            result.assume_init()
+        };
+
+        assert_eq!(a.local_node_id(), b.local_node_id());
+        assert!(a.current_phase() == LifecyclePhase::Collecting);
+        assert!(b.current_phase() == LifecyclePhase::Collecting);
+        assert_eq!(a.blocks.len(), b.blocks.len());
+        assert_eq!(a.blocks.len(), 0);
+        assert_eq!(a.node_zero_public_key, b.node_zero_public_key);
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`

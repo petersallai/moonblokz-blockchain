@@ -182,12 +182,61 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// run many independent instances in one process; an associated `const`
     /// keeps that per-instance ownership while still moving the expensive
     /// part of construction to compile time.
+    ///
+    /// **Measured, not assumed (2026-07-04).** An alternative — zero-fill
+    /// the array at runtime, then patch only the two non-zero sentinel
+    /// fields per slot in a loop — was built and measured head-to-head on
+    /// the real `thumbv6m-none-eabi` target under the project's actual
+    /// release profile (`opt-level = "z"`, `lto = true`,
+    /// `codegen-units = 1`). It costs ~0 flash bytes as predicted (no
+    /// stored template), but needs **66% *more* stack** than this `const`
+    /// (111 KiB vs. 66.6 KiB through `Blockchain::new()`'s real
+    /// whole-struct-literal shape) — mutating a named local in a loop
+    /// forces the compiler to materialize it as a real, non-elidable stack
+    /// value, which is worse than this constant's single unconditional
+    /// copy. Given architecture §2 states RAM, not flash, is the binding
+    /// constraint, `const EMPTY` is the right choice on the metric that
+    /// matters. Full numbers: Story 4.1 code-review discussion /
+    /// `deferred-work.md`.
+    ///
+    /// **Neither approach makes `Blockchain::new()` stack-safe on its
+    /// own.** Both measured figures are 11-18× the blockchain task's 6 KiB
+    /// stack budget (architecture §8) — `Blockchain::new()`'s overall
+    /// return-by-value pattern is the real driver, not this one field's
+    /// construction strategy. That is a separate, larger architectural
+    /// question, tracked in `deferred-work.md`, not resolved by this
+    /// constant.
     const EMPTY: Self = Self {
         blocks: [BlockEntry::new_empty(); MAX_BLOCKS],
     };
 
     pub(crate) const fn new() -> Self {
         Self::EMPTY
+    }
+
+    /// Initializes `*dst` in place for embedded/task use: writes each
+    /// `BlockEntry` directly to its final address through a raw pointer,
+    /// one at a time, so no value the size of the whole `[BlockEntry;
+    /// MAX_BLOCKS]` array (~45.6 KB at the default `MAX_BLOCKS = 600`)
+    /// ever exists anywhere in this function — unlike `Self::EMPTY` (a
+    /// `const`: cheap for [`Self::new`]'s by-value return, but still one
+    /// addressable unit that has to be copied in bulk once it becomes a
+    /// field of a larger owned value, e.g. `Blockchain`). Used by
+    /// [`crate::api::Blockchain::init_in_place`]; see that method's doc
+    /// comment for why and how to call it from a task.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `Self` and non-overlapping with
+    /// any other live reference. Writes over possibly-uninitialized memory
+    /// without reading or dropping the old value, which is correct only
+    /// because `dst` is not yet initialized.
+    pub(crate) unsafe fn init_in_place(dst: *mut Self) {
+        let blocks_ptr = unsafe { core::ptr::addr_of_mut!((*dst).blocks) } as *mut BlockEntry;
+        for i in 0..MAX_BLOCKS {
+            unsafe {
+                blocks_ptr.add(i).write(BlockEntry::new_empty());
+            }
+        }
     }
 
     /// FR11 single authoritative duplicate-detection index: a bounded
