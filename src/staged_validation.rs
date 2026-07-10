@@ -161,7 +161,9 @@ pub(crate) enum Tier1Failure {
 
 #[derive(Clone, Copy)]
 struct SigCacheEntry {
-    key_hash: [u8; 32],
+    /// Hash of the signed content (the preimage / message the signature is
+    /// computed over) — *not* a hash of the public key.
+    content_hash: [u8; 32],
     sig_hash: [u8; 32],
     public_key: [u8; PUBLIC_KEY_SIZE],
     result: bool,
@@ -172,7 +174,7 @@ struct SigCacheEntry {
 impl SigCacheEntry {
     const fn empty() -> Self {
         Self {
-            key_hash: [0; 32],
+            content_hash: [0; 32],
             sig_hash: [0; 32],
             public_key: [0; PUBLIC_KEY_SIZE],
             result: false,
@@ -228,16 +230,16 @@ impl<const CAP: usize> SignatureVerificationCache<CAP> {
         self.entries.iter().filter(|e| e.occupied).count()
     }
 
-    fn lookup(&self, key_hash: &[u8; 32], sig_hash: &[u8; 32], public_key: &[u8; PUBLIC_KEY_SIZE]) -> Option<bool> {
+    fn lookup(&self, content_hash: &[u8; 32], sig_hash: &[u8; 32], public_key: &[u8; PUBLIC_KEY_SIZE]) -> Option<bool> {
         self.entries
             .iter()
-            .find(|e| e.occupied && &e.key_hash == key_hash && &e.sig_hash == sig_hash && &e.public_key == public_key)
+            .find(|e| e.occupied && &e.content_hash == content_hash && &e.sig_hash == sig_hash && &e.public_key == public_key)
             .map(|e| e.result)
     }
 
-    fn store(&mut self, key_hash: [u8; 32], sig_hash: [u8; 32], public_key: [u8; PUBLIC_KEY_SIZE], result: bool, now: u64) {
+    fn store(&mut self, content_hash: [u8; 32], sig_hash: [u8; 32], public_key: [u8; PUBLIC_KEY_SIZE], result: bool, now: u64) {
         let new_entry = SigCacheEntry {
-            key_hash,
+            content_hash,
             sig_hash,
             public_key,
             result,
@@ -277,16 +279,16 @@ impl<const CAP: usize> SignatureVerificationCache<CAP> {
         public_key_bytes: &[u8; PUBLIC_KEY_SIZE],
         now: u64,
     ) -> bool {
-        let key_hash = calculate_hash(preimage);
+        let content_hash = calculate_hash(preimage);
         let sig_hash = calculate_hash(signature_bytes);
-        if let Some(cached) = self.lookup(&key_hash, &sig_hash, public_key_bytes) {
+        if let Some(cached) = self.lookup(&content_hash, &sig_hash, public_key_bytes) {
             return cached;
         }
         let result = match (Signature::new(signature_bytes), PublicKey::new(public_key_bytes)) {
             (Ok(sig), Ok(pk)) => crypto.verify_signature(preimage, &sig, &pk),
             _ => false,
         };
-        self.store(key_hash, sig_hash, *public_key_bytes, result, now);
+        self.store(content_hash, sig_hash, *public_key_bytes, result, now);
         result
     }
 }
