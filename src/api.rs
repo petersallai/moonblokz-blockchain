@@ -470,11 +470,13 @@ impl<
         self.local_node_id
     }
 
-    /// FR9 Tier 1 admission (Story 4.2). Runs the full Tier 1 gating check set
-    /// over `block`; on pass, persists the block through the storage seam and
-    /// inserts it into the block-tree at [`BlockStatus::Stored`], returning its
-    /// storage/tree index. On any exact-evidence failure the block is neither
-    /// persisted nor inserted, and the failing [`Tier1Failure`] is returned.
+    /// FR9 Tier 1 admission (Story 4.2). Rejects a block whose `(sequence, hash)`
+    /// is already in the tree as `AlreadyPresent` first, then runs the full
+    /// Tier 1 gating check set over `block`; on pass, persists the block through
+    /// the storage seam and inserts it into the block-tree at
+    /// [`BlockStatus::Stored`], returning its storage/tree index. On any
+    /// exact-evidence failure the block is neither persisted nor inserted, and
+    /// the failing [`Tier1Failure`] is returned.
     ///
     /// This is the internal entry point Story 4.3's `receive_block` intake
     /// surface will call; it deliberately stops at "Tier 1 verdict + Stored
@@ -485,6 +487,16 @@ impl<
     /// **Collecting-state invariant (AC4):** every admitted block is `Stored`
     /// — no Connected/Active is assigned, because no active chain exists and no
     /// promotion driver runs in Epic 4.
+    ///
+    /// **Duplicate-first ordering (FR11 / FR10):** the `(sequence, hash)` guard
+    /// runs *before* Tier 1, so a re-arriving already-stored block is rejected
+    /// as `AlreadyPresent` without re-running signature verification — a purely
+    /// structural check (a stored block already passed Tier 1, and an identical
+    /// hash means identical bytes, so the verdict cannot differ). This — not a
+    /// signature-verification cache — is what keeps the dominant mesh-rebroadcast
+    /// re-arrival case off the crypto path. (Story 4.3's `receive_block` is the
+    /// authoritative FR11 duplicate classifier; this guard makes `tier1_admit`
+    /// cheap and robust on its own, independent of the caller.)
     ///
     /// **Storage-first ordering:** the block is saved to durable storage at the
     /// slot [`BlockTable::insert`] will choose *before* the tree is mutated, so
@@ -497,16 +509,19 @@ impl<
     /// `chain_heads` work — this crate has no find-by-hash yet.
     #[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
     pub(crate) fn tier1_admit(&mut self, block: &BlockView) -> Result<u32, AdmitError> {
-        let block_size_limit = self.chain_config.current_block_size_limit();
-        tier1_gate(block, &self.node_zero_public_key, block_size_limit, &self.crypto).map_err(AdmitError::Rejected)?;
-
-        // FR11 defensive duplicate guard (Story 4.3 is the authoritative
-        // duplicate classifier and calls this only for non-duplicates; the
-        // guard here keeps the storage-first write from persisting a dup).
+        // Duplicate-first (FR11 / FR10): reject an already-stored (sequence, hash)
+        // before any Tier 1 crypto. A stored block already passed Tier 1, and an
+        // identical hash means identical bytes, so re-verification could only
+        // reach the same verdict — skipping it is safe and keeps mesh-rebroadcast
+        // re-arrivals off the signature-verification path (the reason this story
+        // needs no signature-verification cache).
         let hash = block.hash();
         if self.blocks.find(block.sequence(), &hash).is_some() {
             return Err(AdmitError::AlreadyPresent);
         }
+
+        let block_size_limit = self.chain_config.current_block_size_limit();
+        tier1_gate(block, &self.node_zero_public_key, block_size_limit, &self.crypto).map_err(AdmitError::Rejected)?;
 
         // Storage-first: reserve the slot `insert` will pick, persist there,
         // then insert. Reconstruct an owned `Block` for the storage seam
