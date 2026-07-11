@@ -25,6 +25,7 @@ use moonblokz_storage::StorageTrait;
 
 use crate::blocks::{BlockEntry, BlockTable, BlockTableError, NONE_REF};
 use crate::chain_config::{ChainConfigError, ChainConfigTrait};
+use crate::intake::classify_block;
 use crate::prng::Prng;
 use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate};
 
@@ -114,7 +115,6 @@ pub enum LifecyclePhase {
 /// their outcome mapping is Story 4.3/4.4's concern.
 #[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Eq)]
-#[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
 pub(crate) enum AdmitError {
     /// FR16 exact evidence of invalidity — the block is not stored.
     Rejected(Tier1Failure),
@@ -126,6 +126,58 @@ pub(crate) enum AdmitError {
     /// The block passed Tier 1 but could not be persisted through the storage
     /// seam — it is not inserted into the tree (storage-first admission).
     StorageSaveFailed,
+}
+
+/// Single-outcome classification returned by [`Blockchain::receive_block`]
+/// (FR10; single-outcome scheduling-pull pattern, AR4). Exactly one variant is
+/// produced per submitted block, and the response carries no descriptive
+/// payload beyond the [`RejectReason`] discriminant (FR10 minimal-response
+/// convention). Classification is deterministic in the block bytes + current
+/// authoritative state and is independent of transport origin.
+///
+/// Epic 4 realizes the three terminal variants below. The `AcceptedAndSend*`
+/// addendum variants of architecture §3.2 are a forward-tagged extension, each
+/// added **with its payload type by its owning story**:
+/// `AcceptedAndSendParentRecoveryRequest(ParentRecoveryRequest)` by Story 4.4
+/// (FR19 missing parent), `AcceptedAndSendBlock(BlockView<'_>)` by Epic 8
+/// (FR26 relay), and `AcceptedAndSendSupport(SupportView<'_>)` by Epic 6
+/// (FR12 deviance support). The `ParentRecoveryRequest` variant is
+/// non-borrowing (Story 4.4 adds it without a lifetime); the two borrowing
+/// variants introduce the `<'a>` lifetime when they land.
+// Same derive discipline as `AdmitError`/`LifecyclePhase`: no `Copy`/`Clone` in
+// production (binary-size cost on embedded targets); `Debug` only under test.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum ReceiveBlockOutcome {
+    /// FR11 — the block's `(sequence, block_hash)` is already in the retained
+    /// block-tree; it is not re-stored and not re-advanced through FR9.
+    DuplicateKnown,
+    /// FR16 — the block passed Tier 1 and was stored at [`BlockStatus::Stored`];
+    /// no addendum effect is produced in Epic 4.
+    AcceptedSilently,
+    /// FR16 / FR60 — the block was refused; see [`RejectReason`].
+    Rejected(RejectReason),
+}
+
+/// Why a block was refused at intake. Per the FR10 minimal-response convention
+/// the caller observes only this discriminant, never the granular
+/// [`Tier1Failure`].
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum RejectReason {
+    /// FR60 — outside the active `snake_chain` window (`S_new >= S_head + W` or
+    /// `S_new < S_tail`). Ready-state only; never produced in collecting state.
+    OutOfWindow,
+    /// FR16 exact evidence of invalidity — any Story 4.2 Tier 1 gating failure,
+    /// or the FR17 chain-config content mismatch. Not stored, not added to the
+    /// tree, not advanced through FR9.
+    InvalidEvidence,
+    /// Operational refusal — the block could not be persisted or retained
+    /// (`AdmitError::TableFull` before Story 4.4 eviction, or a storage-save
+    /// failure). This is **not** an FR10 block-validity classification: the
+    /// block may be perfectly valid but could not be stored. `TableFull`
+    /// becomes unreachable once Story 4.4 `chain_heads` eviction lands.
+    Unstorable,
 }
 
 /// Authoritative blockchain state for a MoonBlokz node.
@@ -507,7 +559,6 @@ impl<
     /// an unresolved parent (`NONE_REF`). Resolving `previous_hash` to a parent
     /// index (and FR19 parent-recovery for a missing parent) is Story 4.4's
     /// `chain_heads` work — this crate has no find-by-hash yet.
-    #[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
     pub(crate) fn tier1_admit(&mut self, block: &BlockView) -> Result<u32, AdmitError> {
         // Duplicate-first (FR11 / FR10): reject an already-stored (sequence, hash)
         // before any Tier 1 crypto. A stored block already passed Tier 1, and an
@@ -521,7 +572,13 @@ impl<
         }
 
         let block_size_limit = self.chain_config.current_block_size_limit();
-        tier1_gate(block, &self.node_zero_public_key, block_size_limit, &self.crypto).map_err(AdmitError::Rejected)?;
+        tier1_gate(
+            block,
+            &self.node_zero_public_key,
+            block_size_limit,
+            &self.crypto,
+        )
+        .map_err(AdmitError::Rejected)?;
 
         // Storage-first: reserve the slot `insert` will pick, persist there,
         // then insert. Reconstruct an owned `Block` for the storage seam
@@ -549,6 +606,65 @@ impl<
                 Err(AdmitError::Rejected(Tier1Failure::SequenceCeiling))
             }
         }
+    }
+
+    /// FR10 block-intake surface (Story 4.3). Classifies a submitted block into
+    /// exactly one [`ReceiveBlockOutcome`] (single-outcome scheduling-pull, AR4)
+    /// and pairs it with a [`NextCall`]. Classification is deterministic in the
+    /// block bytes + current authoritative state and independent of transport
+    /// origin (there is no origin parameter). Delegates to the stateless
+    /// [`crate::intake::classify_block`] dispatcher (FR11 dedup → FR60 window →
+    /// FR17 chain-config → Story 4.2 Tier 1).
+    ///
+    /// Epic 4 always returns [`NextCall::Idle`] — no follow-up work is queued.
+    /// Story 4.4 returns `NextCall::At(now)` when the classification queues an
+    /// FR19 parent-recovery request. `now` is threaded for that forward use.
+    pub fn receive_block(
+        &mut self,
+        block: BlockView<'_>,
+        now: u64,
+    ) -> CallResult<ReceiveBlockOutcome> {
+        let window = self.active_snake_chain_window();
+        let outcome = classify_block(self, &block, window, now);
+        (outcome, NextCall::Idle)
+    }
+
+    /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
+    /// in collecting state (which suppresses the FR60 window check + its
+    /// `long-disconnect-detected` log per AC7).
+    ///
+    /// Epic 4 is collecting-only: there is no lifecycle machine (Epic 5) and no
+    /// snake-chain head/tail state (Epic 9), so this returns `None`
+    /// unconditionally. Epic 5 will gate it on `lifecycle_phase == Ready`; Epic 9
+    /// (`snake_chain.rs`) will derive `(S_tail, S_head)` from the
+    /// `_snake_chain_tail_idx` / `_active_chain_head_idx` block-table indices.
+    fn active_snake_chain_window(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// FR11 duplicate-index probe used by the intake dispatcher: `true` iff a
+    /// block with this `(sequence, hash)` is already in the block-tree.
+    pub(crate) fn block_tree_contains(&self, sequence: u32, hash: &[u8; 32]) -> bool {
+        self.blocks.find(sequence, hash).is_some()
+    }
+
+    /// Number of blocks currently retained in the block-tree. Test-only
+    /// accessor for the `intake.rs` tests (a separate module cannot reach the
+    /// private `blocks` field); `api.rs`'s own tests read `self.blocks.len()`.
+    #[cfg(test)]
+    pub(crate) fn block_tree_len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// FR8 durable-lock state of the chain-config (via the FR56 seam).
+    pub(crate) fn is_chain_config_durable_locked(&self) -> bool {
+        self.chain_config.is_durable_locked()
+    }
+
+    /// The durable-locked chain-config payload bytes, if any have been retained
+    /// (the FR17 content-mismatch comparand). `None` before genesis retention.
+    pub(crate) fn locked_chain_config_bytes(&self) -> Option<&[u8]> {
+        self.chain_config.initial_chain_config_bytes()
     }
 }
 
@@ -602,7 +718,8 @@ mod tests {
         );
 
         let (crypto_b, storage_b, chain_config_b) = test_backends();
-        let mut result = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let mut result =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
         let b = unsafe {
             Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
                 result.as_mut_ptr(),
@@ -868,7 +985,10 @@ mod tests {
             signature: [0u8; 64],
         };
         let mut builder = BlockBuilder::new().header(header);
-        builder.add_node_transfer(&nt).ok().expect("add node transfer");
+        builder
+            .add_node_transfer(&nt)
+            .ok()
+            .expect("add node transfer");
         builder.build_signed(&signer).ok().expect("build signed")
     }
 
@@ -877,7 +997,9 @@ mod tests {
     fn tier1_admit_inserts_at_stored() {
         let mut bc = new_test_chain();
         let block = node_transfer_block(5, 3, 4, 7);
-        let idx = bc.tier1_admit(&block.view()).expect("well-formed block is admitted");
+        let idx = bc
+            .tier1_admit(&block.view())
+            .expect("well-formed block is admitted");
         assert_eq!(bc.blocks.len(), 1);
         assert_eq!(
             bc.blocks.get(idx).expect("entry present").status(),
