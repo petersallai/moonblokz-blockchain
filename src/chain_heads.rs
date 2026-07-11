@@ -336,10 +336,31 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     }
 
     /// Event (ii): the just-admitted block `x_idx` may be the missing parent a
-    /// Stored head has been waiting for. For each such head, resolve the
-    /// tail-point's parent link, bump the junction ref-count, and recompute the
-    /// head's caches (Stored→Connected when the branch now reaches the active
-    /// chain, else a deeper tail-point / merge onto a shared branch).
+    /// Stored head `H` has been waiting for. For each such head, link its
+    /// tail-point `T` to X and recompute `H`'s caches (Stored→Connected when the
+    /// branch now reaches the active chain, else a deeper tail-point).
+    ///
+    /// **Reverse-arrival merge (the parent-recovery common case — child `T`
+    /// arrived before parent `X`).** When X was admitted, event (i) already made
+    /// X a tip (`head_idx == x_idx` in some slot). Attaching `T` as X's child
+    /// makes X interior, so:
+    /// - the **first** tail to attach to X *merges*: X's own head entry is
+    ///   removed (X is no longer a tip; `H`'s head is the surviving tip) and X's
+    ///   ref-count is **unchanged** (its single tip attachment becomes its single
+    ///   child attachment — the branch-count out-degree is still 1);
+    /// - a **subsequent** tail attaching to X (a fork *below* X) genuinely adds a
+    ///   new child branch, so X's ref-count is bumped +1 (fork-point semantics).
+    ///
+    /// Getting this wrong would leave a stale head pointing at an interior block
+    /// and double-count X (breaking eviction). See the module's branch-count note.
+    ///
+    /// **Two phases** so that *several heads sharing one tail-point* `T` (a fork
+    /// *above* `T`) are all handled: phase 1 resolves each distinct unresolved
+    /// tail that names X as parent (exactly once per tail) and does the X
+    /// merge/fork accounting; phase 2 recomputes **every** Stored head that was
+    /// waiting for X — including the shared-tail siblings that phase 1's
+    /// resolve-once left with an already-linked tail — so none is stranded as a
+    /// zombie still emitting recovery requests for a block now in the tree.
     fn resolve_pending_tails<const MAX_BLOCKS: usize>(
         &mut self,
         blocks: &mut BlockTable<MAX_BLOCKS>,
@@ -352,6 +373,12 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         let x_hash = *x_entry.hash();
         let x_seq = x_entry.sequence();
 
+        // Phase 1 — resolve each *distinct* unresolved tail that names X as its
+        // parent (a tail with `parent_ref == NONE_REF`, sequence `x_seq + 1`, and
+        // a head whose cached `missing_parent_hash == x_hash`). A tail shared by
+        // several heads is resolved on the first head that reaches it; the shared
+        // siblings then fail the `parent_ref == NONE_REF` test and are handled in
+        // phase 2.
         for slot in 0..MAX_BRANCH_COUNT {
             let (is_empty, is_conn, tail_idx, mph) = {
                 let h = &self.heads[slot];
@@ -365,17 +392,34 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
             if is_empty || is_conn || tail_idx == x_idx || mph != x_hash {
                 continue;
             }
-            // Confirm the tail is genuinely waiting for X one sequence above it.
-            let matches = blocks
+            let unresolved_child = blocks
                 .get(tail_idx)
                 .is_some_and(|t| t.parent_ref() == NONE_REF && t.sequence() == x_seq + 1);
-            if !matches {
+            if !unresolved_child {
                 continue;
             }
-            // X is this head's missing parent: link the tail to X and register the
-            // reconnected child at the junction (branch-count +1 on X).
             blocks.resolve_parent_ref(tail_idx, x_idx);
-            blocks.adjust_head_ref_count(x_idx, 1);
+            // Merge vs. fork-below-X accounting (see the doc above): the first
+            // child attaching to X merges away X's transient own-head (ref-count
+            // unchanged); each further distinct child is a genuine fork at X (+1).
+            if let Some(x_own_slot) = self.slot_of_head(x_idx) {
+                self.heads[x_own_slot] = ChainHeadEntry::new_empty();
+            } else {
+                blocks.adjust_head_ref_count(x_idx, 1);
+            }
+        }
+
+        // Phase 2 — recompute every Stored head that was waiting for X. After
+        // phase 1 each such head's tail resolves through X, so `recompute_caches`
+        // migrates it to the new (deeper) tail-point or reclassifies it Connected.
+        for slot in 0..MAX_BRANCH_COUNT {
+            let (is_empty, is_conn, mph) = {
+                let h = &self.heads[slot];
+                (h.is_empty(), h.is_connected(), h.missing_parent_hash)
+            };
+            if is_empty || is_conn || mph != x_hash {
+                continue;
+            }
             self.recompute_caches(slot, blocks, x_idx, x_prev_hash);
         }
     }
@@ -397,10 +441,22 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         };
         let mut current = self.heads[victim_slot].head_idx;
         for _ in 0..MAX_BLOCKS {
-            let parent = match blocks.get(current) {
-                Some(entry) => entry.parent_ref(),
+            let (parent, on_active) = match blocks.get(current) {
+                Some(entry) => (entry.parent_ref(), entry.is_on_active_chain()),
                 None => break,
             };
+            if on_active {
+                // The active chain (and, contiguously, everything below it) is
+                // **never** deleted by eviction — even when this head's branch
+                // telescopes an active block's ref-count to 0. Drop this head's
+                // edge but keep the block and stop the walk. This is the robust
+                // guard: victim exclusion only protects the exact `active_head_idx`,
+                // but a Connected head that *extends* the active root leaves the
+                // root without a matching head entry (its head advanced), so the
+                // root must be protected structurally here, not by exclusion alone.
+                blocks.adjust_head_ref_count(current, -1);
+                break;
+            }
             match blocks.adjust_head_ref_count(current, -1) {
                 Some(0) => {
                     blocks.delete(current); // releases storage_index == current
@@ -719,18 +775,119 @@ mod tests {
         ch.on_block_admitted(&mut blocks, t, None, hash_of(5), 1, NONE_REF);
         assert_eq!(ch.head_at(0).tail_or_connection_idx, t);
         // X arrives: hash 5 (== H.missing_parent_hash), seq 5 (== tail.seq - 1),
-        // its own parent (hash 4) still missing.
+        // its own parent (hash 4) still missing. Reverse arrival (child before
+        // parent) → X merges into H's branch, X's transient own-head is dropped.
         let x = put(&mut blocks, 5, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, x, None, hash_of(4), 2, NONE_REF);
-        assert_eq!(ch.count(), 2, "X itself is also a new Stored head");
+        assert_eq!(
+            ch.count(),
+            1,
+            "X's transient head merges into H (one branch)"
+        );
         // H's tail migrated to X; H still Stored, now waiting for X's parent.
         let h_slot = (0..4).find(|&s| ch.head_at(s).head_idx == t).unwrap();
         assert!(ch.head_at(h_slot).is_stored());
         assert_eq!(ch.head_at(h_slot).tail_or_connection_idx, x);
         assert_eq!(ch.head_at(h_slot).missing_parent_hash, hash_of(4));
         assert_eq!(blocks.get(t).unwrap().parent_ref(), x, "tail linked to X");
-        // X now carries H's reconnected child (branch-count bumped).
-        assert_eq!(blocks.head_ref_count(x), Some(2));
+        // Branch-count: X has exactly one child (T) — out-degree 1, not 2.
+        assert_eq!(blocks.head_ref_count(x), Some(1));
+        // And the merged branch is evictable cleanly: evicting H deletes T then X.
+        ch.evict_one(&mut blocks, NONE_REF);
+        assert_eq!(ch.count(), 0);
+        assert!(blocks.get(t).is_none());
+        assert!(
+            blocks.get(x).is_none(),
+            "no leaked block after merge + eviction"
+        );
+    }
+
+    #[test]
+    fn eviction_never_deletes_active_chain_root_after_extend() {
+        // Review Finding A: genesis G is the active root; extending it advances
+        // the head (head_idx G→B) while `active_chain_head_idx` stays G, so no
+        // head entry matches the exact active-head exclusion. Eviction must still
+        // never delete an `is_on_active_chain` block — the walk stops at it.
+        let mut blocks = BlockTable::<8>::new();
+        let mut ch = ChainHeadsTable::<4>::new();
+        let mut ge = BlockEntry::new(hash_of(1), NONE_REF, 0);
+        ge.set_on_active_chain(true);
+        let g = blocks.insert(ge).unwrap();
+        ch.on_block_admitted(&mut blocks, g, None, [0; 32], 1, g);
+        // Extend the active root: head advances G→B; active_chain_head_idx stays G.
+        let b = put(&mut blocks, 2, g, 1);
+        ch.on_block_admitted(&mut blocks, b, Some(g), hash_of(1), 2, g);
+        assert_eq!(ch.count(), 1);
+        assert_eq!(
+            ch.head_at(0).head_idx,
+            b,
+            "head advanced off the active root"
+        );
+        // Fill to capacity with higher-sequence orphan heads (seq 5,6,7).
+        for (byte, seq) in [(20u8, 5u32), (30, 6), (40, 7)] {
+            let o = put(&mut blocks, byte, NONE_REF, seq);
+            ch.on_block_admitted(&mut blocks, o, None, hash_of(byte), 3, g);
+        }
+        assert_eq!(ch.count(), 4);
+        // One more orphan head forces eviction; the smallest-seq victim is B
+        // (seq 1), whose back-walk reaches G. G must survive.
+        let extra = put(&mut blocks, 50, NONE_REF, 9);
+        ch.on_block_admitted(&mut blocks, extra, None, hash_of(50), 4, g);
+        assert!(
+            blocks.get(g).is_some(),
+            "genesis / active root is never evicted"
+        );
+        assert!(
+            blocks.get(b).is_none(),
+            "the Connected extension B was the victim"
+        );
+        assert_eq!(ch.count(), 4, "capacity held");
+    }
+
+    #[test]
+    fn event_ii_shared_tail_resolves_all_heads_no_zombie() {
+        // Review Finding B: two heads U and V share tail-point T (a fork *above*
+        // T). Admitting T's missing parent X must migrate BOTH — not leave V a
+        // zombie still requesting X's hash.
+        let mut blocks = BlockTable::<8>::new();
+        let mut ch = ChainHeadsTable::<4>::new();
+        let t = put(&mut blocks, 6, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, t, None, hash_of(4), 1, NONE_REF);
+        let u = put(&mut blocks, 7, t, 6); // extend T
+        ch.on_block_admitted(&mut blocks, u, Some(t), hash_of(6), 2, NONE_REF);
+        let v = put(&mut blocks, 8, t, 6); // fork at T
+        ch.on_block_admitted(&mut blocks, v, Some(t), hash_of(6), 3, NONE_REF);
+        assert_eq!(ch.count(), 2, "two heads U and V share tail T");
+        // Admit X = T's missing parent (hash 4, seq 4).
+        let x = put(&mut blocks, 4, NONE_REF, 4);
+        ch.on_block_admitted(&mut blocks, x, None, hash_of(3), 4, NONE_REF);
+        // Neither head is a zombie: none still points its missing-parent cache at
+        // X's hash; both migrated to X's own missing parent (hash 3).
+        for slot in 0..4 {
+            let h = ch.head_at(slot);
+            if !h.is_empty() && !h.is_connected() {
+                assert_ne!(
+                    h.missing_parent_hash,
+                    hash_of(4),
+                    "no head still requests the now-present block X"
+                );
+                assert_eq!(
+                    h.tail_or_connection_idx, x,
+                    "both heads' tails migrated to X"
+                );
+                assert_eq!(h.missing_parent_hash, hash_of(3));
+            }
+        }
+        assert_eq!(ch.count(), 2, "U and V both survive as heads");
+        assert_eq!(blocks.head_ref_count(x), Some(1), "X has one child (T)");
+        assert_eq!(blocks.head_ref_count(t), Some(2), "T forks to U and V");
+        // The scheduler no longer selects anything for X (no zombie request).
+        let (_, req) = ch.select_parent_recovery(&blocks, 1_000_000, 1).unwrap();
+        assert_eq!(
+            req.missing_parent_hash(),
+            &hash_of(3),
+            "requests X's parent, not X"
+        );
     }
 
     #[test]
