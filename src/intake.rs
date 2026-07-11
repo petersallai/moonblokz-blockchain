@@ -128,6 +128,17 @@ where
     S: StorageTrait,
     Cfg: ChainConfigTrait,
 {
+    // FR60 window width: a zero-width window (`SNAKE_CHAIN_LENGTH == 0`) would
+    // set the upper bound to `s_head` and misclassify the head sequence itself
+    // as `TooFarAhead`. No real config uses 0 (architecture §5 default is 500),
+    // so reject it at compile time — evaluated once per monomorphization.
+    const {
+        assert!(
+            SNAKE_CHAIN_LENGTH >= 1,
+            "SNAKE_CHAIN_LENGTH (FR60 window width) must be >= 1"
+        )
+    };
+
     // 1. FR11 duplicate detection — authoritative, ahead of the window/config
     //    gates so an already-known block is `DuplicateKnown` even if the active
     //    window has since advanced past its sequence (nothing prunes the tree by
@@ -265,19 +276,40 @@ mod tests {
         builder.build_signed(&signer).ok().expect("build signed")
     }
 
-    /// Raw `payload_type=3` chain-config block bytes: header (version=1,
-    /// sequence, `payload_type=3` at byte 13 — matching `staged_validation`'s
-    /// `raw_block` offsets) followed by the given payload. `from_bytes` infers
-    /// the payload as everything after `HEADER_SIZE`, so no declared-length
-    /// field needs setting. Creator stays 0 (only read by the deferred FR64 log).
+    /// A `payload_type=3` chain-config block: a canonical header built via
+    /// `BlockBuilder` (so the wire-field offsets live in the library, not in
+    /// this test — the header stays correct if `BlockHeader`'s layout changes)
+    /// followed by the given raw payload appended at `HEADER_SIZE`, the one
+    /// structural fact (`block == [header | payload]`) that
+    /// `chain_config_content_matches` itself relies on. `from_bytes` infers the
+    /// payload as everything after `HEADER_SIZE`. The block signature is
+    /// irrelevant — the FR17 discard fires before any signature check, and
+    /// `from_bytes` validates only `len ∈ [122, 2016]` and `version != 0`.
+    /// Creator stays 0 (only read by the deferred FR64 log).
     // Fixed buffer + used length (const-generic `HEADER_SIZE + P` array sizing
     // would need the unstable `generic_const_exprs`). Callers parse `&buf[..len]`.
     const CFG_BUF: usize = HEADER_SIZE + 16;
     fn chain_config_block_bytes(seq: u32, payload: &[u8]) -> ([u8; CFG_BUF], usize) {
+        // Header-only block (no payload added) → a canonical HEADER_SIZE-byte
+        // header laid out by `build_signed`'s named-offset code.
+        let header_only = BlockBuilder::new()
+            .header(BlockHeader {
+                version: 1,
+                sequence: seq,
+                creator: 0,
+                mined_amount: 0,
+                payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+                consumed_votes: 0,
+                first_voted_node: 0,
+                consumed_votes_from_first_voted_node: 0,
+                previous_hash: [0u8; 32],
+                signature: [0u8; 64],
+            })
+            .build_signed(&crypto())
+            .ok()
+            .expect("build header-only chain-config block");
         let mut b = [0u8; CFG_BUF];
-        b[0] = 1; // version
-        b[1..5].copy_from_slice(&seq.to_le_bytes());
-        b[13] = PAYLOAD_TYPE_CHAIN_CONFIG;
+        b[..HEADER_SIZE].copy_from_slice(&header_only.view().serialized_bytes()[..HEADER_SIZE]);
         b[HEADER_SIZE..HEADER_SIZE + payload.len()].copy_from_slice(payload);
         (b, HEADER_SIZE + payload.len())
     }
