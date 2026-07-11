@@ -186,11 +186,6 @@ pub(crate) enum BlockTableError {
     /// No empty slot remains. Capacity-pressure eviction (FR19
     /// chain_heads-eviction) is Story 4.4's concern, not this table's.
     Full,
-    /// An entry with the same `(sequence, hash)` is already present
-    /// (FR11). `insert` checks this defensively even though the intended
-    /// caller (Story 4.3's intake surface) is expected to call
-    /// [`BlockTable::find`] first.
-    DuplicateEntry,
     /// `entry.sequence == NONE_REF` (`u32::MAX`) — the same sentinel value
     /// [`BlockEntry::is_empty_slot`] uses to mean "this slot is empty".
     /// Inserting such an entry would make an *occupied* slot indistinguishable
@@ -199,8 +194,10 @@ pub(crate) enum BlockTableError {
     /// (data loss) — violating FR20's no-silent-collapse guarantee. FR53
     /// ("rejects u32::MAX-based chain extension in MVP", architecture §6.2)
     /// is expected to keep a real sequence from ever reaching `u32::MAX`
-    /// before it gets this far; `insert` still checks defensively, matching
-    /// this table's other defensive checks.
+    /// before it gets this far; `insert` still checks it at runtime because it
+    /// protects the table's empty-slot *representation*, not business logic.
+    /// (FR11 de-duplication, by contrast, is now the caller's job — a
+    /// debug-only assertion, not a runtime `BlockTableError`.)
     ReservedSequence,
 }
 
@@ -304,21 +301,42 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
 
     /// Inserts `entry` into the first empty slot. Never evicts or
     /// overwrites a non-empty slot (FR20 — full retention; no silent
-    /// collapse of side branches).
+    /// collapse of side branches). Convenience wrapper over
+    /// [`Self::next_free_index`] + [`Self::insert_at`] for callers (mainly
+    /// tests) that do not run the storage-first two-step; the admission path
+    /// uses `next_free_index` + `insert_at` directly to avoid the second scan.
     pub(crate) fn insert(&mut self, entry: BlockEntry) -> Result<u32, BlockTableError> {
         if entry.sequence == NONE_REF {
             return Err(BlockTableError::ReservedSequence);
         }
-        if self.find(entry.sequence, &entry.hash).is_some() {
-            return Err(BlockTableError::DuplicateEntry);
-        }
-        match self.blocks.iter_mut().enumerate().find(|(_, slot)| slot.is_empty_slot()) {
-            Some((idx, slot)) => {
-                *slot = entry;
-                Ok(idx as u32)
+        match self.next_free_index() {
+            Some(idx) => {
+                self.insert_at(idx, entry);
+                Ok(idx)
             }
             None => Err(BlockTableError::Full),
         }
+    }
+
+    /// Writes `entry` at a known-free `idx` (obtained from
+    /// [`Self::next_free_index`]), skipping the free-slot re-scan `insert`
+    /// performs. Used by the storage-first admission path, which has already
+    /// peeked `idx` to persist the block there before mutating the tree.
+    ///
+    /// **The caller owns FR11 de-duplication.** The intake dispatcher's
+    /// authoritative `(sequence, hash)` check runs before admission, so a
+    /// duplicate reaching here is a caller bug — asserted in debug, not
+    /// re-checked in release (embedded thrift: the public `receive_block`
+    /// path establishes the not-a-duplicate invariant exactly once).
+    pub(crate) fn insert_at(&mut self, idx: u32, entry: BlockEntry) {
+        debug_assert!(entry.sequence != NONE_REF, "insert_at: reserved sentinel sequence");
+        debug_assert!(
+            self.find(entry.sequence, &entry.hash).is_none(),
+            "insert_at: caller must FR11-dedup before admission"
+        );
+        let slot = &mut self.blocks[idx as usize];
+        debug_assert!(slot.is_empty_slot(), "insert_at: target slot must be free");
+        *slot = entry;
     }
 
     /// Returns the entry at `idx`, or `None` if `idx` is out of bounds or
@@ -438,13 +456,19 @@ mod tests {
         assert_eq!(table.find(0, &hash_of(2)), None);
     }
 
+    /// FR11 de-duplication is the caller's responsibility (the intake
+    /// dispatcher's authoritative `(sequence, hash)` check). `insert`/
+    /// `insert_at` no longer re-check it in release; a duplicate is a caller
+    /// bug, caught by a debug assertion. This documents that contract (debug
+    /// builds only — the assertion is compiled out under `--release`).
+    #[cfg(debug_assertions)]
     #[test]
-    fn insert_rejects_duplicate_sequence_hash() {
+    #[should_panic(expected = "FR11-dedup")]
+    fn insert_at_debug_asserts_caller_deduplicates() {
         let mut table = BlockTable::<4>::new();
         table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0)).unwrap();
-        let result = table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0));
-        assert_eq!(result, Err(BlockTableError::DuplicateEntry));
-        assert_eq!(table.len(), 1);
+        // A second insert of the same (sequence, hash) trips the debug assert.
+        let _ = table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0));
     }
 
     #[test]

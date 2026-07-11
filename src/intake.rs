@@ -184,16 +184,14 @@ where
         }
     }
 
-    // 4. Story 4.2 Tier 1 admission (dedup re-checked internally, then
-    //    storage-first insert at `Stored`).
-    match bc.tier1_admit(block) {
+    // 4. Story 4.2 Tier 1 admission. `hash` (computed once in step 1) is
+    //    threaded in; admission trusts this dispatcher's FR11 dedup and does
+    //    not re-check it, then does the storage-first insert at `Stored`.
+    match bc.tier1_admit(block, &hash) {
         Ok(_) => ReceiveBlockOutcome::AcceptedSilently,
         Err(AdmitError::Rejected(_)) => {
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
         }
-        // Defensive: step 1 already returned for a known block, so this arm is
-        // unreachable in practice — kept for a total, honest mapping.
-        Err(AdmitError::AlreadyPresent) => ReceiveBlockOutcome::DuplicateKnown,
         // Operational (capacity/persistence) refusal — NOT an FR10 validity
         // classification. `TableFull` becomes unreachable once Story 4.4
         // `chain_heads` eviction lands.
