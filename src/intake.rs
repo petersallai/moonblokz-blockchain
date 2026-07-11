@@ -121,7 +121,7 @@ pub(crate) fn classify_block<
     >,
     block: &BlockView<'_>,
     window: Option<(u32, u32)>,
-    _now: u64,
+    now: u64,
 ) -> ReceiveBlockOutcome
 where
     C: CryptoTrait,
@@ -186,8 +186,10 @@ where
 
     // 4. Story 4.2 Tier 1 admission. `hash` (computed once in step 1) is
     //    threaded in; admission trusts this dispatcher's FR11 dedup and does
-    //    not re-check it, then does the storage-first insert at `Stored`.
-    match bc.tier1_admit(block, &hash) {
+    //    not re-check it, then does the storage-first insert at `Stored` and
+    //    runs the Story 4.4 FR19 chain_heads mutation events (`now` stamps the
+    //    head arrival timestamp / bootstrap scheduling).
+    match bc.tier1_admit(block, &hash, now) {
         Ok(_) => ReceiveBlockOutcome::AcceptedSilently,
         Err(AdmitError::Rejected(_)) => {
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
@@ -410,7 +412,13 @@ mod tests {
         let block = node_transfer_block(5, 3, 4, 7);
         let (outcome, next) = bc.receive_block(block.view(), 1_000);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert!(matches!(next, NextCall::Idle));
+        // Story 4.4: a non-genesis block with an unresolved parent (its
+        // `previous_hash` is zero-filled here) becomes a Stored `chain_heads`
+        // head, so `receive_block` schedules the FR19 parent-recovery tick.
+        assert!(
+            matches!(next, NextCall::At(_)),
+            "an orphan block schedules parent recovery"
+        );
         assert_eq!(bc.block_tree_len(), 1, "accepted block is stored");
     }
 
@@ -449,40 +457,35 @@ mod tests {
     #[test]
     fn receive_block_operational_refusal_is_unstorable() {
         // The `Unstorable` arm maps the operational refusals
-        // `AdmitError::{TableFull, StorageSaveFailed}` — a valid block that
-        // could not be persisted/retained, distinct from an `InvalidEvidence`
-        // validity verdict. In this fixture the `MemoryBackend<8 * MAX_BLOCK_SIZE
-        // + 8000>` storage seam binds before the 16-slot block-table, so a run of
-        // distinct Tier-1-valid blocks (seq > anchor, no self-vote) eventually
-        // hits `StorageSaveFailed → Unstorable`; the `TableFull → Unstorable`
-        // arm shares the same mapping (and becomes unreachable once Story 4.4
-        // eviction lands). Assert the first refusal is `Unstorable` and the
-        // refused block is not stored.
-        let mut bc = new_test_chain();
-        let mut stored = 0usize;
-        let mut refusal = None;
-        for i in 0..40u32 {
-            let block = node_transfer_block(i + 5, 3, i + 4, 7);
-            match bc.receive_block(block.view(), 0).0 {
-                ReceiveBlockOutcome::AcceptedSilently => stored += 1,
-                other => {
-                    refusal = Some(other);
-                    break;
-                }
-            }
-        }
-        assert!(
-            stored > 0,
-            "some blocks are admitted before the limit binds"
+        // `AdmitError::{TableFull, StorageSaveFailed}` — a valid block that could
+        // not be persisted/retained, distinct from an `InvalidEvidence` validity
+        // verdict. Story 4.4 `chain_heads` eviction makes the `TableFull` path
+        // effectively unreachable (a full block-table is relieved by evicting the
+        // smallest non-active head), so this exercises the surviving
+        // `StorageSaveFailed → Unstorable` path directly with a zero-capacity
+        // storage seam: the very first admission fails to persist and must
+        // classify `Unstorable`, not `InvalidEvidence` (the block is valid).
+        let c = crypto();
+        let node_zero = *c.public_key().serialize();
+        let storage = MemoryBackend::<0>::new();
+        let mut bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::new(
+            c,
+            storage,
+            FixedChainConfig::new(),
+            5,
+            node_zero,
+            0,
         );
+        let block = node_transfer_block(5, 3, 4, 7);
+        let (outcome, _) = bc.receive_block(block.view(), 0);
         assert_eq!(
-            refusal,
-            Some(ReceiveBlockOutcome::Rejected(RejectReason::Unstorable)),
-            "an operational storage/table limit yields Unstorable, not InvalidEvidence"
+            outcome,
+            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable),
+            "an unpersistable-but-valid block yields Unstorable, not InvalidEvidence"
         );
         assert_eq!(
             bc.block_tree_len(),
-            stored,
+            0,
             "the unstorable block is not added to the tree"
         );
     }

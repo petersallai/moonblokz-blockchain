@@ -143,6 +143,39 @@ impl BlockEntry {
         }
     }
 
+    /// Canonical block identity (FR11 key). Read by `chain_heads.rs` (Story 4.4)
+    /// for tip tie-breaks (`head_block_id`) and event (ii) parent matching.
+    pub(crate) fn hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
+    /// Block sequence. Read by `chain_heads.rs` for the FR19/FR63 `head_sequence`
+    /// tie-break (architecture §6.3: no cached `head_sequence` — derived here).
+    pub(crate) fn sequence(&self) -> u32 {
+        self.sequence
+    }
+
+    /// Resolved parent index into `blocks`, or [`NONE_REF`] if unresolved
+    /// (genesis, or an as-yet-unrecovered ancestor). Read by the FR19
+    /// ancestry/eviction back-walks.
+    pub(crate) fn parent_ref(&self) -> u32 {
+        self.parent_ref
+    }
+
+    /// FR19 shared-ancestry reference count (number of `chain_heads` entries
+    /// whose ancestry path includes this block).
+    pub(crate) fn head_ref_count(&self) -> u8 {
+        self.head_ref_count
+    }
+
+    /// Stamps the FR19 `head_ref_count` onto a `BlockEntry` value **before** it
+    /// is inserted (event (i) — a new block's initial count, typically 1).
+    /// In-place adjustment of an already-inserted block goes through
+    /// [`BlockTable::adjust_head_ref_count`].
+    pub(crate) fn set_head_ref_count(&mut self, count: u8) {
+        self.head_ref_count = count;
+    }
+
     /// FR9 stored status (bits 1-2 of `flags`). A brand-new entry decodes to
     /// [`BlockStatus::Stored`] (the collecting-state default, AC4).
     pub(crate) fn status(&self) -> BlockStatus {
@@ -174,7 +207,8 @@ impl BlockEntry {
             BlockStatus::Connected => 0b01,
             BlockStatus::Active => 0b10,
         };
-        self.flags = (self.flags & !FLAG_STATUS_MASK) | ((bits << FLAG_STATUS_SHIFT) & FLAG_STATUS_MASK);
+        self.flags =
+            (self.flags & !FLAG_STATUS_MASK) | ((bits << FLAG_STATUS_SHIFT) & FLAG_STATUS_MASK);
     }
 }
 
@@ -295,7 +329,9 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         self.blocks
             .iter()
             .enumerate()
-            .find(|(_, entry)| !entry.is_empty_slot() && entry.sequence == sequence && &entry.hash == hash)
+            .find(|(_, entry)| {
+                !entry.is_empty_slot() && entry.sequence == sequence && &entry.hash == hash
+            })
             .map(|(idx, _)| idx as u32)
     }
 
@@ -329,7 +365,10 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// re-checked in release (embedded thrift: the public `receive_block`
     /// path establishes the not-a-duplicate invariant exactly once).
     pub(crate) fn insert_at(&mut self, idx: u32, entry: BlockEntry) {
-        debug_assert!(entry.sequence != NONE_REF, "insert_at: reserved sentinel sequence");
+        debug_assert!(
+            entry.sequence != NONE_REF,
+            "insert_at: reserved sentinel sequence"
+        );
         debug_assert!(
             self.find(entry.sequence, &entry.hash).is_none(),
             "insert_at: caller must FR11-dedup before admission"
@@ -342,7 +381,9 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// Returns the entry at `idx`, or `None` if `idx` is out of bounds or
     /// names an empty slot.
     pub(crate) fn get(&self, idx: u32) -> Option<&BlockEntry> {
-        self.blocks.get(idx as usize).filter(|entry| !entry.is_empty_slot())
+        self.blocks
+            .get(idx as usize)
+            .filter(|entry| !entry.is_empty_slot())
     }
 
     /// FR18/FR19 ancestry recovery: walks `parent_ref` from `start_idx`
@@ -407,7 +448,103 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// this exists to catch a leaked slot (never freed) rather than an
     /// out-of-bounds write.
     pub(crate) fn len(&self) -> usize {
-        self.blocks.iter().filter(|entry| !entry.is_empty_slot()).count()
+        self.blocks
+            .iter()
+            .filter(|entry| !entry.is_empty_slot())
+            .count()
+    }
+
+    // -- Story 4.4 (FR19) chain_heads support: parent resolution, structural
+    //    ref-count mutation, and the table's first deletion path. ------------
+
+    /// FR19 event (i) parent resolution. A block's parent has a *known*
+    /// sequence — `child_sequence − 1` — and a known hash (`previous_hash`), so
+    /// this reuses the `(sequence, hash)` index without needing a
+    /// find-by-hash-alone. Returns `None` for `child_sequence == 0` (genesis has
+    /// no parent) or when the parent is not (yet) in the tree.
+    pub(crate) fn find_parent(&self, previous_hash: &[u8; 32], child_sequence: u32) -> Option<u32> {
+        let parent_sequence = child_sequence.checked_sub(1)?;
+        self.find(parent_sequence, previous_hash)
+    }
+
+    /// FR19 shared-ancestry reference count of the block at `idx`, or `None` for
+    /// an empty/out-of-bounds slot. Read by `chain_heads.rs` assertions + the
+    /// eviction walk's post-conditions.
+    pub(crate) fn head_ref_count(&self, idx: u32) -> Option<u8> {
+        self.get(idx).map(|entry| entry.head_ref_count())
+    }
+
+    /// FR19 structural `head_ref_count` mutation on an **already-inserted**
+    /// block (event (ii) back-walk increment; eviction back-walk decrement).
+    /// Returns the new count, or `None` for an empty/out-of-bounds slot.
+    ///
+    /// **This is a deliberate, narrow exception to this module's "no in-place
+    /// mutation — delete-then-`insert`" rule.** That rule is scoped to
+    /// *ancestry-identity and status* bits (e.g. flipping `is_on_active_chain`
+    /// during an FR23 chain-switch). `head_ref_count` is *structural
+    /// bookkeeping* — FR19 defines it as "derived from the block-tree graph" and
+    /// mutates it in place on blocks that have children; delete-then-reinsert
+    /// would assign a new index and orphan every child's `parent_ref`. So the
+    /// count is adjusted in place here, while identity/ancestry remain immutable.
+    pub(crate) fn adjust_head_ref_count(&mut self, idx: u32, delta: i8) -> Option<u8> {
+        let entry = self.blocks.get_mut(idx as usize)?;
+        if entry.is_empty_slot() {
+            return None;
+        }
+        let new_count = if delta >= 0 {
+            let inc = delta as u8;
+            debug_assert!(
+                entry.head_ref_count.checked_add(inc).is_some(),
+                "adjust_head_ref_count: head_ref_count overflow"
+            );
+            entry.head_ref_count.saturating_add(inc)
+        } else {
+            let dec = delta.unsigned_abs();
+            debug_assert!(
+                entry.head_ref_count >= dec,
+                "adjust_head_ref_count: head_ref_count underflow"
+            );
+            entry.head_ref_count.saturating_sub(dec)
+        };
+        entry.head_ref_count = new_count;
+        Some(new_count)
+    }
+
+    /// FR19 event (ii): resolve a tail-point's previously-missing parent link,
+    /// setting `parent_ref` from [`NONE_REF`] to the now-present parent index.
+    ///
+    /// Same structural-not-identity rationale as [`Self::adjust_head_ref_count`]:
+    /// a parent is only ever *resolved* (`NONE_REF → idx`), never *re-pointed*
+    /// to a different block (that would be an identity change and is forbidden).
+    /// Debug-asserts the current value is `NONE_REF`.
+    pub(crate) fn resolve_parent_ref(&mut self, idx: u32, parent_idx: u32) {
+        if let Some(entry) = self.blocks.get_mut(idx as usize) {
+            debug_assert!(!entry.is_empty_slot(), "resolve_parent_ref: empty slot");
+            debug_assert!(
+                entry.parent_ref == NONE_REF,
+                "resolve_parent_ref: only an unresolved parent may be resolved, never re-pointed"
+            );
+            entry.parent_ref = parent_idx;
+        }
+    }
+
+    /// FR19 eviction: free the slot at `idx` (reset to the empty-slot sentinel),
+    /// returning whether an occupied block was removed. This is the block-tree's
+    /// **first** deletion path (Story 4.1 deferred it here) — an authorized
+    /// removal complementing FR16/FR17 (FR5/FR57 later). Because
+    /// `blocks[i] ⟷ storage_index = i`, freeing the slot releases `storage_index
+    /// = idx` for reuse; the durable bytes are overwritten by the next
+    /// `save_block(idx, …)` (no eager flash erase — `StorageTrait` exposes no
+    /// delete, and lazy overwrite-on-reuse is the sane embedded pattern; see the
+    /// Story 4.4 "Eviction walk" Dev Note).
+    pub(crate) fn delete(&mut self, idx: u32) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                *entry = BlockEntry::new_empty();
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -451,7 +588,9 @@ mod tests {
     #[test]
     fn find_returns_none_for_unknown_sequence_hash() {
         let mut table = BlockTable::<4>::new();
-        table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0)).unwrap();
+        table
+            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
+            .unwrap();
         assert_eq!(table.find(1, &hash_of(1)), None);
         assert_eq!(table.find(0, &hash_of(2)), None);
     }
@@ -466,7 +605,9 @@ mod tests {
     #[should_panic(expected = "FR11-dedup")]
     fn insert_at_debug_asserts_caller_deduplicates() {
         let mut table = BlockTable::<4>::new();
-        table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0)).unwrap();
+        table
+            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
+            .unwrap();
         // A second insert of the same (sequence, hash) trips the debug assert.
         let _ = table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0));
     }
@@ -485,8 +626,12 @@ mod tests {
     #[test]
     fn insert_rejects_when_table_full() {
         let mut table = BlockTable::<2>::new();
-        table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0)).unwrap();
-        table.insert(BlockEntry::new(hash_of(2), NONE_REF, 1)).unwrap();
+        table
+            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
+            .unwrap();
+        table
+            .insert(BlockEntry::new(hash_of(2), NONE_REF, 1))
+            .unwrap();
         let result = table.insert(BlockEntry::new(hash_of(3), NONE_REF, 2));
         assert_eq!(result, Err(BlockTableError::Full));
         assert_eq!(table.len(), 2);
@@ -498,15 +643,21 @@ mod tests {
     #[test]
     fn ancestry_walk_finds_active_chain_through_multiple_hops() {
         let mut table = BlockTable::<8>::new();
-        let root = table.insert(BlockEntry::new(hash_of(0), NONE_REF, 0)).unwrap();
+        let root = table
+            .insert(BlockEntry::new(hash_of(0), NONE_REF, 0))
+            .unwrap();
         // Mark the root on the active chain.
         let mut active_root = table.blocks[root as usize];
         active_root.set_on_active_chain(true);
         table.blocks[root as usize] = active_root;
 
         let child1 = table.insert(BlockEntry::new(hash_of(1), root, 1)).unwrap();
-        let child2 = table.insert(BlockEntry::new(hash_of(2), child1, 2)).unwrap();
-        let tip = table.insert(BlockEntry::new(hash_of(3), child2, 3)).unwrap();
+        let child2 = table
+            .insert(BlockEntry::new(hash_of(2), child1, 2))
+            .unwrap();
+        let tip = table
+            .insert(BlockEntry::new(hash_of(3), child2, 3))
+            .unwrap();
 
         assert!(table.walks_to_active_chain(tip));
     }
@@ -514,14 +665,18 @@ mod tests {
     #[test]
     fn ancestry_walk_returns_false_on_unresolved_parent() {
         let mut table = BlockTable::<4>::new();
-        let orphan = table.insert(BlockEntry::new(hash_of(1), NONE_REF, 5)).unwrap();
+        let orphan = table
+            .insert(BlockEntry::new(hash_of(1), NONE_REF, 5))
+            .unwrap();
         assert!(!table.walks_to_active_chain(orphan));
     }
 
     #[test]
     fn ancestry_walk_is_bounded() {
         let mut table = BlockTable::<4>::new();
-        let a = table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0)).unwrap();
+        let a = table
+            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
+            .unwrap();
         let b = table.insert(BlockEntry::new(hash_of(2), a, 1)).unwrap();
         // Introduce a malformed 2-cycle: a's parent_ref now points to b.
         let mut cyclic_a = table.blocks[a as usize];
@@ -536,7 +691,9 @@ mod tests {
     #[test]
     fn multiple_branches_all_retained() {
         let mut table = BlockTable::<8>::new();
-        let root = table.insert(BlockEntry::new(hash_of(0), NONE_REF, 0)).unwrap();
+        let root = table
+            .insert(BlockEntry::new(hash_of(0), NONE_REF, 0))
+            .unwrap();
         let branch_a = table.insert(BlockEntry::new(hash_of(1), root, 1)).unwrap();
         let branch_b = table.insert(BlockEntry::new(hash_of(2), root, 1)).unwrap();
 
@@ -550,13 +707,20 @@ mod tests {
     fn status_default_is_stored() {
         // AC1 / AC4: a brand-new entry (and an empty slot) decodes to Stored,
         // the collecting-state default — no explicit set_status needed.
-        assert_eq!(BlockEntry::new(hash_of(1), NONE_REF, 0).status(), BlockStatus::Stored);
+        assert_eq!(
+            BlockEntry::new(hash_of(1), NONE_REF, 0).status(),
+            BlockStatus::Stored
+        );
         assert_eq!(BlockEntry::new_empty().status(), BlockStatus::Stored);
     }
 
     #[test]
     fn status_round_trips_through_flags() {
-        for status in [BlockStatus::Stored, BlockStatus::Connected, BlockStatus::Active] {
+        for status in [
+            BlockStatus::Stored,
+            BlockStatus::Connected,
+            BlockStatus::Active,
+        ] {
             let mut entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
             entry.set_status(status);
             assert_eq!(entry.status(), status);
@@ -574,11 +738,18 @@ mod tests {
         assert_eq!(entry.status(), BlockStatus::Active);
 
         entry.set_status(BlockStatus::Stored);
-        assert!(entry.is_on_active_chain(), "flipping status must not clear the active-chain bit");
+        assert!(
+            entry.is_on_active_chain(),
+            "flipping status must not clear the active-chain bit"
+        );
 
         entry.set_status(BlockStatus::Connected);
         entry.set_on_active_chain(false);
-        assert_eq!(entry.status(), BlockStatus::Connected, "clearing the active-chain bit must not disturb status");
+        assert_eq!(
+            entry.status(),
+            BlockStatus::Connected,
+            "clearing the active-chain bit must not disturb status"
+        );
         assert!(!entry.is_on_active_chain());
     }
 
@@ -586,12 +757,17 @@ mod tests {
     fn block_table_footprint_invariant() {
         let mut table = BlockTable::<4>::new();
         for i in 0..4u32 {
-            table.insert(BlockEntry::new(hash_of(i as u8), NONE_REF, i)).unwrap();
+            table
+                .insert(BlockEntry::new(hash_of(i as u8), NONE_REF, i))
+                .unwrap();
             assert!(table.len() <= 4);
         }
         for entry in table.blocks.iter() {
             assert!(!entry.is_empty_slot());
         }
-        assert_eq!(table.insert(BlockEntry::new(hash_of(99), NONE_REF, 99)), Err(BlockTableError::Full));
+        assert_eq!(
+            table.insert(BlockEntry::new(hash_of(99), NONE_REF, 99)),
+            Err(BlockTableError::Full)
+        );
     }
 }
