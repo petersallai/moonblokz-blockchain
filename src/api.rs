@@ -207,7 +207,7 @@ pub struct Blockchain<
     Storage: StorageTrait,
     Config: ChainConfigTrait,
     const MAX_NODES: usize,
-    const SNAKE_CHAIN_LENGTH: usize,
+    const SNAKE_CHAIN_LENGTH: u32,
     const VERIFICATION_HORIZON: usize,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
@@ -238,7 +238,10 @@ pub struct Blockchain<
 
     // Real snake-chain state is two block-table indices, not a W-sized
     // window. `SNAKE_CHAIN_LENGTH` remains an algorithmic bound for
-    // maintaining the tail index relative to the active head.
+    // maintaining the tail index relative to the active head. It is a `u32`
+    // (not the array-sizing `usize` the other const generics use) because it
+    // is a window *width* compared directly against `u32` block sequences —
+    // never an array length — so it needs no cast at the FR60 comparison site.
     _active_chain_head_idx: u32,
     _snake_chain_tail_idx: u32,
     //
@@ -257,7 +260,7 @@ impl<
     Storage: StorageTrait,
     Config: ChainConfigTrait,
     const MAX_NODES: usize,
-    const SNAKE_CHAIN_LENGTH: usize,
+    const SNAKE_CHAIN_LENGTH: u32,
     const VERIFICATION_HORIZON: usize,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,

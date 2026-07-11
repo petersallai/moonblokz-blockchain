@@ -102,7 +102,7 @@ pub(crate) fn classify_block<
     S,
     Cfg,
     const MAX_NODES: usize,
-    const SNAKE_CHAIN_LENGTH: usize,
+    const SNAKE_CHAIN_LENGTH: u32,
     const VERIFICATION_HORIZON: usize,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
@@ -141,12 +141,7 @@ where
     //    (collecting) suppresses both the check and the `long-disconnect-detected`
     //    log (AC7).
     if let Some((s_tail, s_head)) = window {
-        match snake_chain_window_verdict(
-            block.sequence(),
-            s_tail,
-            s_head,
-            SNAKE_CHAIN_LENGTH as u32,
-        ) {
+        match snake_chain_window_verdict(block.sequence(), s_tail, s_head, SNAKE_CHAIN_LENGTH) {
             WindowVerdict::TooFarAhead => {
                 // FR64 (Epic 11 `LogSink`): emit `long-disconnect-detected`
                 // carrying S_new = block.sequence(), the incoming block hash,
@@ -417,6 +412,49 @@ mod tests {
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
         );
         assert_eq!(bc.block_tree_len(), 0, "rejected block is not stored");
+    }
+
+    // --- Unstorable: operational refusal, NOT an FR10 validity verdict ------
+
+    #[test]
+    fn receive_block_operational_refusal_is_unstorable() {
+        // The `Unstorable` arm maps the operational refusals
+        // `AdmitError::{TableFull, StorageSaveFailed}` — a valid block that
+        // could not be persisted/retained, distinct from an `InvalidEvidence`
+        // validity verdict. In this fixture the `MemoryBackend<8 * MAX_BLOCK_SIZE
+        // + 8000>` storage seam binds before the 16-slot block-table, so a run of
+        // distinct Tier-1-valid blocks (seq > anchor, no self-vote) eventually
+        // hits `StorageSaveFailed → Unstorable`; the `TableFull → Unstorable`
+        // arm shares the same mapping (and becomes unreachable once Story 4.4
+        // eviction lands). Assert the first refusal is `Unstorable` and the
+        // refused block is not stored.
+        let mut bc = new_test_chain();
+        let mut stored = 0usize;
+        let mut refusal = None;
+        for i in 0..40u32 {
+            let block = node_transfer_block(i + 5, 3, i + 4, 7);
+            match bc.receive_block(block.view(), 0).0 {
+                ReceiveBlockOutcome::AcceptedSilently => stored += 1,
+                other => {
+                    refusal = Some(other);
+                    break;
+                }
+            }
+        }
+        assert!(
+            stored > 0,
+            "some blocks are admitted before the limit binds"
+        );
+        assert_eq!(
+            refusal,
+            Some(ReceiveBlockOutcome::Rejected(RejectReason::Unstorable)),
+            "an operational storage/table limit yields Unstorable, not InvalidEvidence"
+        );
+        assert_eq!(
+            bc.block_tree_len(),
+            stored,
+            "the unstorable block is not added to the tree"
+        );
     }
 
     // --- AC3 precedence: dedup beats window ---------------------------------
