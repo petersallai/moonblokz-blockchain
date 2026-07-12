@@ -36,8 +36,11 @@
 //!   child gets +1.
 //! - **eviction**: decrement along the evicted branch, delete at 0, stop at > 0.
 //!
-//! This reconciliation of FR19's per-event wording to its own eviction rule is
-//! the story's #2 review item (see the Story 4.4 Dev Notes).
+//! This reconciliation of FR19's per-event wording to its own eviction rule was
+//! **ratified 2026-07-12**: PRD FR19 + the `moonblokz-info` KB (prd / algorithm)
+//! were corrected to define `head_ref_count` as this branch-count and to
+//! increment the fork-point on a fork (the original "fork-point … retain"
+//! wording was eviction-unsafe). This module is the reference implementation.
 
 use crate::api::ParentRecoveryRequest;
 use crate::blocks::{BlockTable, NONE_REF};
