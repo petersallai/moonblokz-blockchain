@@ -111,14 +111,15 @@ pub trait ChainConfigTrait {
     /// FR8 durable-lock status. The MVP stub returns `true` (FR56*).
     fn is_durable_locked(&self) -> bool;
 
-    /// FR19 / FR46 — wall-clock period (ms) at which the parent-recovery
-    /// scheduler ticks (the FR46 "missing-parent re-query" deadline cadence).
-    fn parent_recovery_global_tick_interval_ms(&self) -> u64;
-
     /// FR19 / FR46 — minimum wall-clock period (ms) between two consecutive
     /// parent-recovery requests emitted **for the same head** (per-head retry
     /// window; a head is eligible once `last_request_timestamp + this ≤ now()`,
-    /// including the never-requested `last_request_timestamp == 0` case).
+    /// or immediately when `last_request_timestamp == 0` — never requested).
+    ///
+    /// There is deliberately **no** `parent_recovery_global_tick_interval`: under
+    /// the AR4 scheduling-pull contract the module returns the *exact* next
+    /// instant a request can be emitted (via `NextCall::At`), so a fixed periodic
+    /// tick cadence is unnecessary — the bridge wakes only when there is work.
     fn parent_recovery_per_head_retry_interval_ms(&self) -> u64;
 
     /// FR46 — module-scope global emit cooldown (ms): no parent-recovery
@@ -181,14 +182,9 @@ impl ChainConfigTrait for FixedChainConfig {
     }
 
     // FR19/FR46 parent-recovery timing (tunable stub values; a real
-    // `moonblokz-configuration` supplies chain-governed values). The chosen
-    // relation `per_head_retry ≥ min_emit ≥ global_tick` keeps the per-head
-    // window the coarsest limit and the global cooldown between it and the tick
-    // cadence, but the scheduler is correct for any positive values.
-    fn parent_recovery_global_tick_interval_ms(&self) -> u64 {
-        15_000
-    }
-
+    // `moonblokz-configuration` supplies chain-governed values). `per_head_retry`
+    // is the coarser per-head limit; `min_emit` the finer global cross-head
+    // cooldown. The scheduler is correct for any positive values.
     fn parent_recovery_per_head_retry_interval_ms(&self) -> u64 {
         120_000
     }
@@ -219,7 +215,6 @@ mod tests {
         assert_eq!(cfg.current_max_utxo_outputs(), 255);
         assert_eq!(cfg.current_max_aggregated_signatures(), 50);
         assert!(cfg.is_durable_locked());
-        assert_eq!(cfg.parent_recovery_global_tick_interval_ms(), 15_000);
         assert_eq!(cfg.parent_recovery_per_head_retry_interval_ms(), 120_000);
         assert_eq!(cfg.parent_recovery_min_emit_interval_ms(), 10_000);
     }

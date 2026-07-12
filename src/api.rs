@@ -706,11 +706,11 @@ impl<
     /// [`crate::intake::classify_block`] dispatcher (FR11 dedup → FR60 window →
     /// FR17 chain-config → Story 4.2 Tier 1).
     ///
-    /// After admission (Story 4.4), returns `NextCall::At(now + global tick)` when
-    /// the tree holds ≥1 Stored head — so the bridge calls [`Self::on_tick`] to
-    /// run the FR19 parent-recovery scheduler — else `NextCall::Idle`. The
-    /// request itself is emitted from the tick (never inline here), gated by the
-    /// FR46 global cooldown; see [`TickOutcome`].
+    /// After admission (Story 4.4), returns `NextCall::At(exact next-eligible
+    /// instant)` when the tree holds ≥1 Stored head — so the bridge calls
+    /// [`Self::on_tick`] exactly when the FR19 parent-recovery scheduler can emit
+    /// — else `NextCall::Idle`. The request itself is emitted from the tick
+    /// (never inline here), gated by the FR46 global cooldown; see [`TickOutcome`].
     pub fn receive_block(
         &mut self,
         block: BlockView<'_>,
@@ -718,7 +718,7 @@ impl<
     ) -> CallResult<ReceiveBlockOutcome> {
         let window = self.active_snake_chain_window();
         let outcome = classify_block(self, &block, window, now);
-        (outcome, self.next_parent_recovery_call(now))
+        (outcome, self.next_parent_recovery_call())
     }
 
     /// FR19/FR46 tick: run the parent-recovery scheduler. First evaluates the
@@ -727,9 +727,9 @@ impl<
     /// select the most-overdue Stored head (deterministic FR63 tie-breaks) and
     /// emit **exactly one** [`ParentRecoveryRequest`], updating both the head's
     /// `last_request_timestamp` and the module-scope emit timestamp to `now`.
-    /// Reports `NextCall::At(now + global tick)` while Stored heads remain
-    /// (`NextCall::Idle` when none do). Story 8.4 extends this into the full
-    /// multi-deadline scheduler.
+    /// Reports `NextCall::At(exact next-eligible instant)` while Stored heads
+    /// remain (`NextCall::Idle` when none do). Story 8.4 extends this into the
+    /// full multi-deadline scheduler.
     pub fn on_tick(&mut self, now: u64) -> CallResult<TickOutcome> {
         let min_emit = self.chain_config.parent_recovery_min_emit_interval_ms();
         let per_head_retry = self
@@ -755,18 +755,28 @@ impl<
         } else {
             TickOutcome::Idle
         };
-        (outcome, self.next_parent_recovery_call(now))
+        (outcome, self.next_parent_recovery_call())
     }
 
-    /// The next parent-recovery scheduler wake-up: `NextCall::At(now + global
-    /// tick)` while any Stored head awaits its missing parent (FR46 "deadline not
-    /// scheduled when no Stored heads present"), else `NextCall::Idle`.
-    fn next_parent_recovery_call(&self, now: u64) -> NextCall {
-        if self.chain_heads.has_stored_head() {
-            let tick = self.chain_config.parent_recovery_global_tick_interval_ms();
-            NextCall::At(now.saturating_add(tick))
-        } else {
-            NextCall::Idle
+    /// The next parent-recovery wake-up as the **exact** instant a request can
+    /// next be emitted (AR4 scheduling-pull — no fixed periodic tick): the later
+    /// of the earliest Stored-head per-head eligibility and the FR46 global emit
+    /// cooldown clearing. `NextCall::Idle` when no Stored head awaits a parent
+    /// (FR46 "deadline not scheduled when no Stored heads present"). An instant
+    /// already in the past means "call back ASAP" (a request is due now).
+    fn next_parent_recovery_call(&self) -> NextCall {
+        let per_head_retry = self
+            .chain_config
+            .parent_recovery_per_head_retry_interval_ms();
+        match self.chain_heads.earliest_recovery_deadline(per_head_retry) {
+            Some(head_ready) => {
+                let min_emit = self.chain_config.parent_recovery_min_emit_interval_ms();
+                let cooldown_clear = self
+                    .last_parent_request_emit_timestamp
+                    .saturating_add(min_emit);
+                NextCall::At(head_ready.max(cooldown_clear))
+            }
+            None => NextCall::Idle,
         }
     }
 
@@ -1289,6 +1299,30 @@ mod tests {
         // Past the cooldown, emission resumes.
         let (third, _) = bc.on_tick(t + 10_000);
         assert!(matches!(third, TickOutcome::SendParentRecoveryRequest(_)));
+    }
+
+    /// The `NextCall` is the **exact** next-eligible instant (AR4 pull model),
+    /// not `now + a fixed periodic tick`. A fresh orphan (`lrt == 0`, module
+    /// never emitted) is gated only by the FR46 boot-time global cooldown, so the
+    /// deadline is `min_emit` regardless of `now`; after an emission it is the
+    /// per-head window end.
+    #[test]
+    fn parent_recovery_nextcall_is_exact_deadline() {
+        let mut bc = new_test_chain();
+        let orphan = node_transfer_block(5, 3, 4, 7);
+        // min_emit (stub) = 10_000; last_emit = 0 → deadline = max(0, 10_000).
+        let (_, next) = bc.receive_block(orphan.view(), 5_000);
+        assert!(
+            matches!(next, NextCall::At(10_000)),
+            "exact cooldown deadline, independent of now (5_000)"
+        );
+        // Emit at a large now; the next deadline is the per-head window end
+        // (lrt 1_000_000 + per_head_retry 120_000), not now + a fixed interval.
+        let (_, next2) = bc.on_tick(1_000_000);
+        assert!(
+            matches!(next2, NextCall::At(1_120_000)),
+            "exact per-head window end after emission"
+        );
     }
 
     /// AC3 — a fresh chain (no Stored heads) ticks Idle with no wake-up.

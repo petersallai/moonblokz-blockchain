@@ -167,9 +167,12 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         self.heads.iter().filter(|h| !h.is_empty()).count()
     }
 
-    /// `true` iff at least one Stored head exists (drives the FR46 "deadline not
-    /// scheduled when no Stored heads present" rule and `receive_block`'s
-    /// `NextCall`).
+    /// `true` iff at least one Stored head exists. The scheduler's `NextCall`
+    /// derivation uses [`Self::earliest_recovery_deadline`] (which returns `None`
+    /// on the same condition) instead; this predicate is kept for the Epic 5
+    /// collecting-state lifecycle gating (a node stays a pure receiver while any
+    /// Stored head still awaits its parent) and is exercised by the tests.
+    #[allow(dead_code)] // consumed by the Epic 5 lifecycle gating; tests use it now.
     pub(crate) fn has_stored_head(&self) -> bool {
         self.heads
             .iter()
@@ -524,7 +527,7 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
             if head.is_empty() || head.is_connected() {
                 continue;
             }
-            if head.last_request_timestamp.saturating_add(per_head_retry) > now {
+            if Self::head_eligible_at(head.last_request_timestamp, per_head_retry) > now {
                 continue;
             }
             let Some(entry) = blocks.get(head.head_idx) else {
@@ -554,6 +557,37 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         let claimed = tail_seq.saturating_sub(1);
         let req = ParentRecoveryRequest::new(self.heads[slot].missing_parent_hash, claimed);
         Some((slot, req))
+    }
+
+    /// The per-head eligibility instant: a never-requested head
+    /// (`last_request_timestamp == 0`) is eligible from time 0 (FR46 "immediately
+    /// eligible"); otherwise it is eligible at `last_request_timestamp +
+    /// per_head_retry`. Used both by selection and by the exact-deadline
+    /// computation so the two never disagree.
+    fn head_eligible_at(last_request_timestamp: u64, per_head_retry: u64) -> u64 {
+        if last_request_timestamp == 0 {
+            0
+        } else {
+            last_request_timestamp.saturating_add(per_head_retry)
+        }
+    }
+
+    /// The earliest instant at which *some* Stored head becomes per-head eligible
+    /// for a parent-recovery request, or `None` when no Stored head exists. The
+    /// caller combines this with the FR46 global emit cooldown to compute the
+    /// exact next `NextCall::At` — so the bridge wakes precisely when a request
+    /// can fire, never on a fixed periodic tick (there is no
+    /// `parent_recovery_global_tick_interval` in the AR4 scheduling-pull model).
+    pub(crate) fn earliest_recovery_deadline(&self, per_head_retry: u64) -> Option<u64> {
+        let mut earliest: Option<u64> = None;
+        for head in self.heads.iter() {
+            if head.is_empty() || head.is_connected() {
+                continue;
+            }
+            let eligible_at = Self::head_eligible_at(head.last_request_timestamp, per_head_retry);
+            earliest = Some(earliest.map_or(eligible_at, |e| e.min(eligible_at)));
+        }
+        earliest
     }
 
     /// Mark the winning head as requested at `now` (the only scheduler mutation).
@@ -748,6 +782,34 @@ mod tests {
             ch.select_parent_recovery(&blocks, 1_500, 500).is_some(),
             "retry window elapsed at now == lrt + retry"
         );
+    }
+
+    #[test]
+    fn scheduler_never_requested_head_is_immediately_eligible() {
+        // FR46: a never-requested head (`last_request_timestamp == 0`) is
+        // eligible immediately — even at a `now` smaller than `per_head_retry`
+        // (a freshly booted node must not wait a full retry window for its first
+        // request).
+        let mut blocks = BlockTable::<8>::new();
+        let mut ch = ChainHeadsTable::<4>::new();
+        let h = put(&mut blocks, 20, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, h, None, hash_of(20), 1, NONE_REF);
+        assert!(
+            ch.select_parent_recovery(&blocks, 5, 120_000).is_some(),
+            "lrt == 0 is eligible even at now (5) << per_head_retry (120000)"
+        );
+        assert_eq!(ch.earliest_recovery_deadline(120_000), Some(0));
+        // After a request, the head's next eligibility is lrt + per_head_retry.
+        let (slot, _) = ch.select_parent_recovery(&blocks, 5, 120_000).unwrap();
+        ch.mark_requested(slot, 1_000);
+        assert_eq!(ch.earliest_recovery_deadline(120_000), Some(121_000));
+        assert!(ch.select_parent_recovery(&blocks, 5, 120_000).is_none());
+    }
+
+    #[test]
+    fn earliest_recovery_deadline_none_without_stored_heads() {
+        let ch = ChainHeadsTable::<4>::new();
+        assert_eq!(ch.earliest_recovery_deadline(120_000), None);
     }
 
     #[test]
