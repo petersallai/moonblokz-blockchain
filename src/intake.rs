@@ -236,7 +236,19 @@ mod tests {
         let c = crypto();
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
-        Blockchain::new(c, storage, FixedChainConfig::new(), 5, node_zero, 0)
+        let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+        unsafe {
+            TestChain::init_in_place(
+                bc_slot.as_mut_ptr(),
+                c,
+                storage,
+                FixedChainConfig::new(),
+                5,
+                node_zero,
+                0,
+            );
+            bc_slot.assume_init()
+        }
     }
 
     /// A durably-locked chain with `initial_chain_config_bytes == payload`.
@@ -248,7 +260,19 @@ mod tests {
         chain_config
             .store_initial_chain_config_bytes(config_payload)
             .expect("store initial chain config");
-        Blockchain::new(c, storage, chain_config, 5, node_zero, 0)
+        let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+        unsafe {
+            TestChain::init_in_place(
+                bc_slot.as_mut_ptr(),
+                c,
+                storage,
+                chain_config,
+                5,
+                node_zero,
+                0,
+            );
+            bc_slot.assume_init()
+        }
     }
 
     /// A well-formed Tier-1-passing transaction block (`seq > anchor`, no
@@ -468,14 +492,20 @@ mod tests {
         let c = crypto();
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<0>::new();
-        let mut bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::new(
-            c,
-            storage,
-            FixedChainConfig::new(),
-            5,
-            node_zero,
-            0,
-        );
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let mut bc = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
+                bc_slot.as_mut_ptr(),
+                c,
+                storage,
+                FixedChainConfig::new(),
+                5,
+                node_zero,
+                0,
+            );
+            bc_slot.assume_init()
+        };
         let block = node_transfer_block(5, 3, 4, 7);
         let (outcome, _) = bc.receive_block(block.view(), 0);
         assert_eq!(

@@ -75,18 +75,14 @@ const FLAG_STATUS_MASK: u8 = 0b0000_0110;
 
 /// Per-block ancestry and status metadata (FR18).
 ///
-/// `Copy`/`Clone` are derived solely so [`BlockTable::new`] can populate its
-/// array with `[BlockEntry::new_empty(); MAX_BLOCKS]` (same rationale as
-/// `moonblokz-mempool`'s `IndexEntry`). Fields are private; module-local
-/// code (including tests) uses direct field access rather than an
-/// accessor surface, keeping the embedded API surface small — the same
-/// discipline `moonblokz-mempool`'s `IndexEntry` follows.
+/// Fields are private; module-local code (including tests) uses direct
+/// field access rather than an accessor surface, keeping the embedded API
+/// surface small — the same discipline `moonblokz-mempool`'s `IndexEntry`
+/// follows.
 // No caller reads `head_ref_count`/`spent_bits` yet (Story 4.2/4.4/Epic 7
 // consume them); silencing dead_code keeps the struct clean until those
-// callers land, matching Story 1.2's scaffold convention. Rust's dead-code
-// lint ignores derived-`Clone` "uses".
+// callers land, matching Story 1.2's scaffold convention.
 #[allow(dead_code)]
-#[derive(Clone, Copy)]
 pub(crate) struct BlockEntry {
     hash: [u8; 32],
     parent_ref: u32,
@@ -245,65 +241,32 @@ pub(crate) struct BlockTable<const MAX_BLOCKS: usize> {
 }
 
 // `find`/`insert`/`get`/`walks_to_active_chain` are consumed starting with
-// Story 4.2/4.3/4.4; `new` is already called from `api.rs`. Story 4.1's
-// tests exercise every method directly.
+// Story 4.2/4.3/4.4; `init_in_place` is already called from `api.rs`.
+// Story 4.1's tests exercise every method directly.
 #[allow(dead_code)]
 impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
-    /// Compile-time-constant empty table — one instance per `MAX_BLOCKS`
-    /// monomorphization, evaluated by `rustc` at compile time rather than
-    /// assembled element-by-element at runtime. `new()` copies this constant
-    /// instead of evaluating `[BlockEntry::new_empty(); MAX_BLOCKS]` itself,
-    /// so the ~45.6 KB initial value (`MAX_BLOCKS = 600`) is baked into the
-    /// binary's read-only data and reproduced via a bulk copy — not built up
-    /// as a live stack temporary on every call. Plain `static` was
-    /// considered and rejected: architecture §10 (FR62 simulator
-    /// compatibility) requires `Blockchain` to stay a plain owned value with
-    /// no `'static`/global state, specifically so the desktop simulator can
-    /// run many independent instances in one process; an associated `const`
-    /// keeps that per-instance ownership while still moving the expensive
-    /// part of construction to compile time.
-    ///
-    /// **Measured, not assumed (2026-07-04).** An alternative — zero-fill
-    /// the array at runtime, then patch only the two non-zero sentinel
-    /// fields per slot in a loop — was built and measured head-to-head on
-    /// the real `thumbv6m-none-eabi` target under the project's actual
-    /// release profile (`opt-level = "z"`, `lto = true`,
-    /// `codegen-units = 1`). It costs ~0 flash bytes as predicted (no
-    /// stored template), but needs **66% *more* stack** than this `const`
-    /// (111 KiB vs. 66.6 KiB through `Blockchain::new()`'s real
-    /// whole-struct-literal shape) — mutating a named local in a loop
-    /// forces the compiler to materialize it as a real, non-elidable stack
-    /// value, which is worse than this constant's single unconditional
-    /// copy. Given architecture §2 states RAM, not flash, is the binding
-    /// constraint, `const EMPTY` is the right choice on the metric that
-    /// matters. Full numbers: Story 4.1 code-review discussion /
-    /// `deferred-work.md`.
-    ///
-    /// **Neither approach makes `Blockchain::new()` stack-safe on its
-    /// own.** Both measured figures are 11-18× the blockchain task's 6 KiB
-    /// stack budget (architecture §8) — `Blockchain::new()`'s overall
-    /// return-by-value pattern is the real driver, not this one field's
-    /// construction strategy. That is a separate, larger architectural
-    /// question, tracked in `deferred-work.md`, not resolved by this
-    /// constant.
-    const EMPTY: Self = Self {
-        blocks: [BlockEntry::new_empty(); MAX_BLOCKS],
-    };
-
-    pub(crate) const fn new() -> Self {
-        Self::EMPTY
-    }
-
     /// Initializes `*dst` in place for embedded/task use: writes each
     /// `BlockEntry` directly to its final address through a raw pointer,
     /// one at a time, so no value the size of the whole `[BlockEntry;
     /// MAX_BLOCKS]` array (~45.6 KB at the default `MAX_BLOCKS = 600`)
-    /// ever exists anywhere in this function — unlike `Self::EMPTY` (a
-    /// `const`: cheap for [`Self::new`]'s by-value return, but still one
-    /// addressable unit that has to be copied in bulk once it becomes a
-    /// field of a larger owned value, e.g. `Blockchain`). Used by
-    /// [`crate::api::Blockchain::init_in_place`]; see that method's doc
-    /// comment for why and how to call it from a task.
+    /// ever exists anywhere in this function. This is the table's only
+    /// constructor.
+    ///
+    /// **An earlier by-value `new()` existed**, backed by a compile-time
+    /// `const EMPTY: Self = Self { blocks: [BlockEntry::new_empty(); MAX_BLOCKS] }`.
+    /// It was removed once every caller was confirmed able to use this
+    /// constructor instead — see [`crate::api::Blockchain::init_in_place`]'s
+    /// doc comment for why returning `Self` by value can't be made
+    /// stack-cheap no matter how it's assembled internally. The
+    /// const-bake-vs-runtime-loop stack measurement that justified `EMPTY`'s
+    /// design while it existed (111 KiB for a mutated-local loop vs. 66.6 KiB
+    /// for the const bulk-copy, both still 11-18× the 6 KiB task stack
+    /// budget) is preserved in Story 4.1's code-review discussion /
+    /// `deferred-work.md` for reference; it no longer applies to any code
+    /// path here, since this function never materializes the whole array at
+    /// all — each iteration writes one 76 B `BlockEntry` directly to its
+    /// final address. Used by [`crate::api::Blockchain::init_in_place`]; see
+    /// that method's doc comment for why and how to call it from a task.
     ///
     /// # Safety
     /// `dst` must be valid for writes of `Self` and non-overlapping with
@@ -556,6 +519,17 @@ mod tests {
         [byte; 32]
     }
 
+    /// Test-only stand-in for the deleted by-value `BlockTable::new()`:
+    /// wraps the `MaybeUninit` + `init_in_place` + `assume_init()` calling
+    /// convention once so individual tests don't each repeat `unsafe` code.
+    fn empty_table<const N: usize>() -> BlockTable<N> {
+        let mut table = core::mem::MaybeUninit::<BlockTable<N>>::uninit();
+        unsafe {
+            BlockTable::init_in_place(table.as_mut_ptr());
+            table.assume_init()
+        }
+    }
+
     #[test]
     fn block_entry_size_is_within_budget() {
         // 32 hash + 4 parent_ref + 4 sequence + 32 spent_bits +
@@ -569,7 +543,7 @@ mod tests {
 
     #[test]
     fn block_table_empty_slot_sentinel() {
-        let table = BlockTable::<4>::new();
+        let table = empty_table::<4>();
         for i in 0..4 {
             assert!(table.get(i).is_none());
         }
@@ -578,7 +552,7 @@ mod tests {
 
     #[test]
     fn insert_assigns_index_and_is_findable() {
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         let entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
         let idx = table.insert(entry).unwrap();
         assert_eq!(table.find(0, &hash_of(1)), Some(idx));
@@ -587,7 +561,7 @@ mod tests {
 
     #[test]
     fn find_returns_none_for_unknown_sequence_hash() {
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         table
             .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
             .unwrap();
@@ -604,7 +578,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "FR11-dedup")]
     fn insert_at_debug_asserts_caller_deduplicates() {
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         table
             .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
             .unwrap();
@@ -617,7 +591,7 @@ mod tests {
         // sequence == NONE_REF (u32::MAX) would be indistinguishable from an
         // empty slot once stored — insert must refuse it up front rather
         // than silently creating an unreadable/overwritable occupied slot.
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         let result = table.insert(BlockEntry::new(hash_of(1), NONE_REF, NONE_REF));
         assert_eq!(result, Err(BlockTableError::ReservedSequence));
         assert_eq!(table.len(), 0);
@@ -625,7 +599,7 @@ mod tests {
 
     #[test]
     fn insert_rejects_when_table_full() {
-        let mut table = BlockTable::<2>::new();
+        let mut table = empty_table::<2>();
         table
             .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
             .unwrap();
@@ -642,14 +616,12 @@ mod tests {
 
     #[test]
     fn ancestry_walk_finds_active_chain_through_multiple_hops() {
-        let mut table = BlockTable::<8>::new();
+        let mut table = empty_table::<8>();
         let root = table
             .insert(BlockEntry::new(hash_of(0), NONE_REF, 0))
             .unwrap();
         // Mark the root on the active chain.
-        let mut active_root = table.blocks[root as usize];
-        active_root.set_on_active_chain(true);
-        table.blocks[root as usize] = active_root;
+        table.blocks[root as usize].set_on_active_chain(true);
 
         let child1 = table.insert(BlockEntry::new(hash_of(1), root, 1)).unwrap();
         let child2 = table
@@ -664,7 +636,7 @@ mod tests {
 
     #[test]
     fn ancestry_walk_returns_false_on_unresolved_parent() {
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         let orphan = table
             .insert(BlockEntry::new(hash_of(1), NONE_REF, 5))
             .unwrap();
@@ -673,15 +645,13 @@ mod tests {
 
     #[test]
     fn ancestry_walk_is_bounded() {
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         let a = table
             .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
             .unwrap();
         let b = table.insert(BlockEntry::new(hash_of(2), a, 1)).unwrap();
         // Introduce a malformed 2-cycle: a's parent_ref now points to b.
-        let mut cyclic_a = table.blocks[a as usize];
-        cyclic_a.parent_ref = b;
-        table.blocks[a as usize] = cyclic_a;
+        table.blocks[a as usize].parent_ref = b;
 
         // Neither node is on the active chain; an unbounded walk would loop
         // forever. The bounded walk must terminate and report false.
@@ -690,7 +660,7 @@ mod tests {
 
     #[test]
     fn multiple_branches_all_retained() {
-        let mut table = BlockTable::<8>::new();
+        let mut table = empty_table::<8>();
         let root = table
             .insert(BlockEntry::new(hash_of(0), NONE_REF, 0))
             .unwrap();
@@ -755,7 +725,7 @@ mod tests {
 
     #[test]
     fn block_table_footprint_invariant() {
-        let mut table = BlockTable::<4>::new();
+        let mut table = empty_table::<4>();
         for i in 0..4u32 {
             table
                 .insert(BlockEntry::new(hash_of(i as u8), NONE_REF, i))

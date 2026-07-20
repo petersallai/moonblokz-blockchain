@@ -58,7 +58,6 @@ const FLAG_CONNECTED: u8 = 0b0000_0001;
 ///
 /// Empty-slot sentinel: `head_idx == u32::MAX` ([`NONE_REF`]).
 #[allow(dead_code)] // `arrival_timestamp`/`branch_value` are Epic-8/Epic-6 consumers.
-#[derive(Clone, Copy)]
 pub(crate) struct ChainHeadEntry {
     /// Index into `blocks` of the head (tip) block. `head_sequence` /
     /// `head_block_id` (the FR63 tie-break keys) are read from `blocks[head_idx]`
@@ -133,20 +132,14 @@ enum Anchor {
 }
 
 impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
-    /// Compile-time-constant empty table (one per monomorphization), copied by
-    /// [`Self::new`] — same rationale as `BlockTable::EMPTY` (architecture §6.2):
-    /// keeps the by-value construction cheap without a `static`.
-    const EMPTY: Self = Self {
-        heads: [ChainHeadEntry::new_empty(); MAX_BRANCH_COUNT],
-    };
-
-    pub(crate) const fn new() -> Self {
-        Self::EMPTY
-    }
-
     /// In-place construction for embedded/task use (mirrors
-    /// [`BlockTable::init_in_place`]): each `ChainHeadEntry` is written directly
-    /// to its final address, so no whole-array temporary is materialized.
+    /// [`BlockTable::init_in_place`]), and this type's only constructor: each
+    /// `ChainHeadEntry` is written directly to its final address, so no
+    /// whole-array temporary is materialized. An earlier by-value `new()`
+    /// (backed by a compile-time `const EMPTY`, same rationale as
+    /// `BlockTable::EMPTY` used to have) was removed once every caller was
+    /// confirmed able to use this constructor instead — see
+    /// `Blockchain::init_in_place`'s doc comment for why.
     ///
     /// # Safety
     /// `dst` must be valid for writes of `Self` and non-overlapping with any
@@ -633,17 +626,38 @@ mod tests {
             .unwrap()
     }
 
+    /// Test-only stand-in for the deleted by-value `BlockTable::new()`: wraps
+    /// the `MaybeUninit` + `init_in_place` + `assume_init()` calling
+    /// convention once so individual tests don't each repeat `unsafe` code.
+    fn empty_blocks<const N: usize>() -> BlockTable<N> {
+        let mut table = core::mem::MaybeUninit::<BlockTable<N>>::uninit();
+        unsafe {
+            BlockTable::init_in_place(table.as_mut_ptr());
+            table.assume_init()
+        }
+    }
+
+    /// Test-only stand-in for the deleted by-value `ChainHeadsTable::new()`:
+    /// same rationale as [`empty_blocks`].
+    fn empty_chain_heads<const N: usize>() -> ChainHeadsTable<N> {
+        let mut table = core::mem::MaybeUninit::<ChainHeadsTable<N>>::uninit();
+        unsafe {
+            ChainHeadsTable::init_in_place(table.as_mut_ptr());
+            table.assume_init()
+        }
+    }
+
     #[test]
     fn empty_table_has_no_heads() {
-        let ch = ChainHeadsTable::<4>::new();
+        let ch = empty_chain_heads::<4>();
         assert_eq!(ch.count(), 0);
         assert!(!ch.has_stored_head());
     }
 
     #[test]
     fn new_stored_head_on_unresolved_parent() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let b = put(&mut blocks, 5, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, b, None, hash_of(9), 1_000, NONE_REF);
         assert_eq!(ch.count(), 1);
@@ -657,8 +671,8 @@ mod tests {
 
     #[test]
     fn extend_advances_single_head() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let a = put(&mut blocks, 1, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
         let b = put(&mut blocks, 2, a, 6);
@@ -675,8 +689,8 @@ mod tests {
 
     #[test]
     fn fork_creates_second_head_and_bumps_fork_point() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let a = put(&mut blocks, 1, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
         let b = put(&mut blocks, 2, a, 6);
@@ -695,8 +709,8 @@ mod tests {
 
     #[test]
     fn eviction_deletes_exclusive_blocks_and_protects_shared() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let a = put(&mut blocks, 1, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
         let b = put(&mut blocks, 2, a, 6);
@@ -718,8 +732,8 @@ mod tests {
 
     #[test]
     fn eviction_full_branch_when_unshared() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let a = put(&mut blocks, 1, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
         let b = put(&mut blocks, 2, a, 6);
@@ -732,8 +746,8 @@ mod tests {
 
     #[test]
     fn eviction_never_evicts_active_head() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let a = put(&mut blocks, 1, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
         let b = put(&mut blocks, 2, NONE_REF, 4);
@@ -748,8 +762,8 @@ mod tests {
 
     #[test]
     fn scheduler_selects_most_overdue_then_tie_breaks() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let lo = put(&mut blocks, 20, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, lo, None, hash_of(20), 1, NONE_REF);
         let hi = put(&mut blocks, 30, NONE_REF, 9);
@@ -768,8 +782,8 @@ mod tests {
 
     #[test]
     fn scheduler_per_head_retry_window_gates() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let h = put(&mut blocks, 20, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, h, None, hash_of(20), 1, NONE_REF);
         let (slot, _) = ch.select_parent_recovery(&blocks, 1_000, 500).unwrap();
@@ -790,8 +804,8 @@ mod tests {
         // eligible immediately — even at a `now` smaller than `per_head_retry`
         // (a freshly booted node must not wait a full retry window for its first
         // request).
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let h = put(&mut blocks, 20, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, h, None, hash_of(20), 1, NONE_REF);
         assert!(
@@ -808,14 +822,14 @@ mod tests {
 
     #[test]
     fn earliest_recovery_deadline_none_without_stored_heads() {
-        let ch = ChainHeadsTable::<4>::new();
+        let ch = empty_chain_heads::<4>();
         assert_eq!(ch.earliest_recovery_deadline(120_000), None);
     }
 
     #[test]
     fn scheduler_ignores_connected_heads() {
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         // Active genesis block (is_on_active_chain set) at seq 0.
         let mut e = BlockEntry::new(hash_of(1), NONE_REF, 0);
         e.set_on_active_chain(true);
@@ -834,8 +848,8 @@ mod tests {
         // Stored head H = block T (seq 6, parent missing, waiting for hash 5).
         // Admit X (seq 5, hash 5, parent still missing) → T links to X, tail
         // migrates to X, head stays Stored with X's missing parent.
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let t = put(&mut blocks, 6, NONE_REF, 6);
         ch.on_block_admitted(&mut blocks, t, None, hash_of(5), 1, NONE_REF);
         assert_eq!(ch.head_at(0).tail_or_connection_idx, t);
@@ -873,8 +887,8 @@ mod tests {
         // the head (head_idx G→B) while `active_chain_head_idx` stays G, so no
         // head entry matches the exact active-head exclusion. Eviction must still
         // never delete an `is_on_active_chain` block — the walk stops at it.
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let mut ge = BlockEntry::new(hash_of(1), NONE_REF, 0);
         ge.set_on_active_chain(true);
         let g = blocks.insert(ge).unwrap();
@@ -914,8 +928,8 @@ mod tests {
         // Review Finding B: two heads U and V share tail-point T (a fork *above*
         // T). Admitting T's missing parent X must migrate BOTH — not leave V a
         // zombie still requesting X's hash.
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let t = put(&mut blocks, 6, NONE_REF, 5);
         ch.on_block_admitted(&mut blocks, t, None, hash_of(4), 1, NONE_REF);
         let u = put(&mut blocks, 7, t, 6); // extend T
@@ -958,8 +972,8 @@ mod tests {
     #[test]
     fn event_ii_connects_to_active_chain() {
         // Active genesis G (seq 0). Stored head H = T (seq 1, waiting for G).
-        let mut blocks = BlockTable::<8>::new();
-        let mut ch = ChainHeadsTable::<4>::new();
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
         let mut ge = BlockEntry::new(hash_of(7), NONE_REF, 0);
         ge.set_on_active_chain(true);
         let g = blocks.insert(ge).unwrap();
