@@ -70,7 +70,7 @@ pub enum GenesisRejectReason {
     StorageSaveFailed,
 }
 
-/// Outcome of `Blockchain::initialize_genesis`.
+/// Outcome of `Blockchain::initialize_genesis_in_place`.
 ///
 /// Walking-skeleton (Story 1.4) scope: returns an **owned** [`Block`] for
 /// Block #0. The architectural `BlockView<'a>` borrow form arrives once
@@ -223,48 +223,9 @@ impl<
         MAX_BLOCK_UTXO_OUTPUT,
     >
 {
-    /// Constructs a `Blockchain` with adjacent-component handles and
-    /// construction-time init parameters (FR67, FR69, AR11).
-    ///
-    /// Parameters:
-    /// - `crypto`/`storage`/`chain_config`: adjacent-component seam handles.
-    ///   The module never receives raw signing-key bytes — only the `crypto`
-    ///   handle (FR68 / AR13).
-    /// - `local_node_id`: this node's canonical id on the active chain (FR67).
-    /// - `node_zero_public_key`: node-zero trust anchor (FR69), sized via
-    ///   `moonblokz_crypto::PUBLIC_KEY_SIZE` (backend-derived).
-    /// - `prng_seed`: deterministic-replay PRNG root (AR11 / FR62 precondition).
-    ///
-    /// All init parameters are stored as immutable construction inputs; the
-    /// module performs no internal wall-clock reads and no internal entropy
-    /// source — callers must supply `now: u64` to every state-changing
-    /// method (forthcoming in Story 1.4+).
-    pub fn new(
-        crypto: Crypto,
-        storage: Storage,
-        chain_config: Config,
-        local_node_id: u32,
-        node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
-        prng_seed: u64,
-    ) -> Self {
-        Self {
-            crypto,
-            storage,
-            chain_config,
-            local_node_id,
-            node_zero_public_key,
-            prng: Prng::new(prng_seed),
-            lifecycle_phase: LifecyclePhase::Collecting,
-            blocks: BlockTable::new(),
-            _chain_heads: [(); MAX_BRANCH_COUNT],
-            _node_info: [(); MAX_NODES],
-            _active_chain_head_idx: 0,
-            _snake_chain_tail_idx: 0,
-        }
-    }
-
-    /// In-place construction for embedded/task use: writes directly into
-    /// caller-provided `dst` instead of returning `Self` by value.
+    /// In-place construction for embedded/task use, and this type's **only**
+    /// constructor: writes directly into caller-provided `dst` instead of
+    /// returning `Self` by value.
     ///
     /// `Self` is large (dominated by `blocks: BlockTable<MAX_BLOCKS>`, e.g.
     /// ~45.6 KB at the default `MAX_BLOCKS = 600`) — large enough that no
@@ -273,11 +234,18 @@ impl<
     /// allocation somewhere (measured across several approaches: a
     /// struct-literal, and `MaybeUninit` + per-field pointer writes with
     /// and without an element-by-element large-array fill — all landed at
-    /// the same floor). [`Self::new`] is fine for the desktop simulator
-    /// (architecture §10 / FR62 — plain owned value, no `'static`/global
-    /// state, and no tight stack budget there) and for tests.
+    /// the same floor). A by-value `new()` existed earlier and was fine for
+    /// the desktop simulator (architecture §10 / FR62 — plain owned value,
+    /// no `'static`/global state, and no tight stack budget there) and for
+    /// tests, but it was removed once every caller was confirmed able to use
+    /// this constructor instead: a plain owned `Blockchain` is still
+    /// reachable anywhere it's needed via a local `MaybeUninit` +
+    /// `assume_init()` (exactly as this crate's own tests do), it just
+    /// always goes through an in-place write rather than a by-value return.
+    /// See [`Self::initialize_genesis_in_place`] for the one production
+    /// constructor path (FR54).
     ///
-    /// For embedded firmware, use this instead, from *inside* a
+    /// For embedded firmware, use this from *inside* a
     /// `#[embassy_executor::task]` fn:
     ///
     /// ```ignore
@@ -336,15 +304,25 @@ impl<
         }
     }
 
-    /// FR54 genesis bootstrap. Constructs the `Blockchain`, builds genesis
-    /// Block #0 (node-zero registration + initial self-transfer), persists
-    /// it through the storage seam, and returns the immediate-callback
-    /// `NextCall::At(now)` so the bridge will call `on_tick(...)` to emit
-    /// Block #1 (chain-config) per AR6.
+    /// FR54 genesis bootstrap: builds genesis Block #0 (node-zero
+    /// registration + initial self-transfer), persists it through the
+    /// storage seam, and initializes `*dst` in place — writing every field
+    /// through [`Self::init_in_place`] instead of returning `Self` by value,
+    /// for the same reason [`Self::init_in_place`]'s doc comment gives: this
+    /// is the one production path that constructs a `Blockchain`, so it must
+    /// not reintroduce the by-value-return stack cost `init_in_place` exists
+    /// to avoid. On success, returns the immediate-callback `NextCall::At(now)`
+    /// so the bridge will call `on_tick(...)` to emit Block #1 (chain-config)
+    /// per AR6.
     ///
-    /// Refusal: returns `Err(GenesisRejectReason::LocalNodeIdNotZero)` if
-    /// `local_node_id != 0` (FR54 caller-side precondition). No
-    /// `Blockchain` instance is constructed on the refusal path.
+    /// Refusal: returns `Err(GenesisRejectReason::_)` if `local_node_id != 0`,
+    /// if `initial_chain_config_bytes` doesn't fit or was already retained, or
+    /// if Block #0 cannot be persisted (FR54 caller-side preconditions). Every
+    /// fallible step — including the storage save — runs on the standalone
+    /// `crypto` / `storage` / `chain_config` values *before*
+    /// [`Self::init_in_place`] is called, so `*dst` is left **entirely
+    /// untouched** on every `Err` path; there is no case where `Err` is
+    /// returned after `*dst` was already written.
     ///
     /// **Walking-skeleton scope (Story 1.4).** The Block #0 layout is
     /// minimum-buildable: registration + self-transfer per FR54. The block
@@ -353,17 +331,24 @@ impl<
     /// 5.6. The `initial_chain_config_bytes` parameter is retained by the
     /// `chain_config` seam for the later Block #1 emission; validation and
     /// durable-lock semantics land in Story 5.6.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `Self` and not yet initialized. On
+    /// `Ok`, `*dst` is fully initialized exactly like [`Self::init_in_place`].
+    /// On `Err`, `*dst` is not written at all — do not call `assume_init`/
+    /// `assume_init_mut` on it.
     #[allow(clippy::too_many_arguments)]
-    pub fn initialize_genesis(
+    pub unsafe fn initialize_genesis_in_place(
+        dst: *mut Self,
         crypto: Crypto,
-        storage: Storage,
+        mut storage: Storage,
         mut chain_config: Config,
         local_node_id: u32,
         initial_total_network_currency: u64,
         initial_chain_config_bytes: &[u8],
         prng_seed: u64,
         now: u64,
-    ) -> Result<(Self, InitGenesisOutcome, NextCall), GenesisRejectReason> {
+    ) -> Result<(InitGenesisOutcome, NextCall), GenesisRejectReason> {
         if local_node_id != 0 {
             return Err(GenesisRejectReason::LocalNodeIdNotZero);
         }
@@ -434,23 +419,27 @@ impl<
             Err(_) => unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
         };
 
-        let mut bc = Self::new(
-            crypto,
-            storage,
-            chain_config,
-            local_node_id,
-            node_zero_public_key,
-            prng_seed,
-        );
-
-        // Exercise the storage seam end-to-end. If persistence fails, do not
-        // return a `Created` outcome: the caller must not broadcast a Block #0
-        // that this node failed to retain locally.
-        bc.storage
+        // Exercise the storage seam end-to-end *before* `*dst` is touched at
+        // all: if persistence fails, the caller must not receive a `Created`
+        // outcome, and this ordering means `*dst` stays uninitialized on
+        // this path exactly like every other refusal above.
+        storage
             .save_block(0, &block_0)
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
 
-        Ok((bc, InitGenesisOutcome::Created(block_0), NextCall::At(now)))
+        unsafe {
+            Self::init_in_place(
+                dst,
+                crypto,
+                storage,
+                chain_config,
+                local_node_id,
+                node_zero_public_key,
+                prng_seed,
+            );
+        }
+
+        Ok((InitGenesisOutcome::Created(block_0), NextCall::At(now)))
     }
 
     /// Read-only query — returns the current lifecycle phase (FR1–FR4).
@@ -585,43 +574,32 @@ mod tests {
 
     /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
     /// `blocks` filled element-by-element via `BlockTable::init_in_place`)
-    /// must produce a struct indistinguishable from `new()`'s — a wrong
-    /// field order, a skipped field, or an off-by-one in the `unsafe`
-    /// block would silently corrupt memory rather than panic, so this is
-    /// verified directly rather than trusted by construction.
+    /// must land every field in its correct default state — a wrong field
+    /// order, a skipped field, or an off-by-one in the `unsafe` block would
+    /// silently corrupt memory rather than panic, so this is verified
+    /// directly rather than trusted by construction.
     #[test]
-    fn init_in_place_matches_new() {
-        let (crypto_a, storage_a, chain_config_a) = test_backends();
-        let a = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::new(
-            crypto_a,
-            storage_a,
-            chain_config_a,
-            7,
-            [3u8; PUBLIC_KEY_SIZE],
-            0xDEAD_BEEF,
-        );
-
-        let (crypto_b, storage_b, chain_config_b) = test_backends();
-        let mut result = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let b = unsafe {
+    fn init_in_place_sets_expected_defaults() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let bc = unsafe {
             Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
-                result.as_mut_ptr(),
-                crypto_b,
-                storage_b,
-                chain_config_b,
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
                 7,
                 [3u8; PUBLIC_KEY_SIZE],
                 0xDEAD_BEEF,
             );
-            result.assume_init()
+            bc_slot.assume_init()
         };
 
-        assert_eq!(a.local_node_id(), b.local_node_id());
-        assert!(a.current_phase() == LifecyclePhase::Collecting);
-        assert!(b.current_phase() == LifecyclePhase::Collecting);
-        assert_eq!(a.blocks.len(), b.blocks.len());
-        assert_eq!(a.blocks.len(), 0);
-        assert_eq!(a.node_zero_public_key, b.node_zero_public_key);
+        assert_eq!(bc.local_node_id(), 7);
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        assert_eq!(bc.blocks.len(), 0);
+        assert_eq!(bc.node_zero_public_key, [3u8; PUBLIC_KEY_SIZE]);
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
@@ -634,19 +612,24 @@ mod tests {
         let now: u64 = 12_345;
         let initial_chain_config_bytes = [0xC0, 0xA5, 0xF6, 0x01];
 
-        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
-            crypto,
-            storage,
-            chain_config,
-            0,                           // local_node_id
-            1_000_000_000,               // initial_total_network_currency
-            &initial_chain_config_bytes, // retained for the later Block #1 emit
-            0xDEAD_BEEF_CAFE_F00D,
-            now,
-        );
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let outcome = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                0,                           // local_node_id
+                1_000_000_000,               // initial_total_network_currency
+                &initial_chain_config_bytes, // retained for the later Block #1 emit
+                0xDEAD_BEEF_CAFE_F00D,
+                now,
+            )
+        };
 
-        match result {
-            Ok((bc, InitGenesisOutcome::Created(block), NextCall::At(t))) => {
+        match outcome {
+            Ok((InitGenesisOutcome::Created(block), NextCall::At(t))) => {
                 assert_eq!(block.sequence(), 0);
                 assert_eq!(block.creator(), 0);
                 assert_eq!(block.version(), 1);
@@ -675,6 +658,8 @@ mod tests {
                 assert!(any_nonzero(self_transfer.signature()));
                 assert!(transactions.next().is_none());
                 assert_eq!(t, now, "Block #1 needs an immediate-callback tick (AR6)");
+
+                let bc = unsafe { bc_slot.assume_init() };
                 assert_eq!(
                     bc.chain_config.initial_chain_config_bytes(),
                     Some(&initial_chain_config_bytes[..])
@@ -682,10 +667,10 @@ mod tests {
                 assert!(bc.current_phase() == LifecyclePhase::Collecting);
                 assert_eq!(bc.local_node_id(), 0);
             }
-            Ok((_, InitGenesisOutcome::Rejected(_), _)) => {
+            Ok((InitGenesisOutcome::Rejected(_), _)) => {
                 panic!("walking-skeleton success path should not return Rejected outcome");
             }
-            Ok((_, _, NextCall::Idle)) => {
+            Ok((_, NextCall::Idle)) => {
                 panic!("genesis must schedule the Block #1 callback (AR6)");
             }
             Err(_) => panic!("genesis with local_node_id == 0 must succeed (FR54)"),
@@ -700,18 +685,23 @@ mod tests {
     fn walking_skeleton_refuses_non_zero_local_node_id() {
         let (crypto, storage, chain_config) = test_backends();
 
-        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
-            crypto,
-            storage,
-            chain_config,
-            1, // local_node_id != 0 → refusal
-            1_000_000_000,
-            &[],
-            0,
-            0,
-        );
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let outcome = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                1, // local_node_id != 0 → refusal
+                1_000_000_000,
+                &[],
+                0,
+                0,
+            )
+        };
 
-        match result {
+        match outcome {
             Err(GenesisRejectReason::LocalNodeIdNotZero) => {}
             Err(_) => panic!("expected LocalNodeIdNotZero refusal"),
             Ok(_) => panic!("FR54 precondition must refuse local_node_id != 0"),
@@ -725,18 +715,23 @@ mod tests {
         let (crypto, storage, chain_config) = test_backends();
         let oversized = [0u8; INITIAL_CHAIN_CONFIG_BYTES_CAPACITY + 1];
 
-        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
-            crypto,
-            storage,
-            chain_config,
-            0,
-            1_000_000_000,
-            &oversized,
-            0,
-            0,
-        );
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let outcome = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                0,
+                1_000_000_000,
+                &oversized,
+                0,
+                0,
+            )
+        };
 
-        match result {
+        match outcome {
             Err(GenesisRejectReason::InitialChainConfigTooLarge) => {}
             Err(_) => panic!("expected InitialChainConfigTooLarge refusal"),
             Ok(_) => panic!("oversized initial chain-config bytes must be refused"),
@@ -752,18 +747,23 @@ mod tests {
             .store_initial_chain_config_bytes(&[0x01, 0x02])
             .unwrap();
 
-        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
-            crypto,
-            storage,
-            chain_config,
-            0,
-            1_000_000_000,
-            &[0x03, 0x04],
-            0,
-            0,
-        );
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let outcome = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                0,
+                1_000_000_000,
+                &[0x03, 0x04],
+                0,
+                0,
+            )
+        };
 
-        match result {
+        match outcome {
             Err(GenesisRejectReason::InitialChainConfigAlreadyStored) => {}
             Err(_) => panic!("expected InitialChainConfigAlreadyStored refusal"),
             Ok(_) => panic!("genesis must not overwrite retained chain-config bytes"),
@@ -781,18 +781,23 @@ mod tests {
         let storage = MemoryBackend::<0>::new();
         let chain_config = FixedChainConfig::new();
 
-        let result = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
-            crypto,
-            storage,
-            chain_config,
-            0,
-            1_000_000_000,
-            &[],
-            0,
-            0,
-        );
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let outcome = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                0,
+                1_000_000_000,
+                &[],
+                0,
+                0,
+            )
+        };
 
-        match result {
+        match outcome {
             Err(GenesisRejectReason::StorageSaveFailed) => {}
             Err(_) => panic!("expected StorageSaveFailed refusal"),
             Ok(_) => panic!("genesis must not succeed when Block #0 cannot be persisted"),
@@ -807,18 +812,24 @@ mod tests {
     fn walking_skeleton_query_carries_no_next_call() {
         let (crypto, storage, chain_config) = test_backends();
 
-        let (bc, _, _) = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis(
-            crypto,
-            storage,
-            chain_config,
-            0,
-            1_000_000_000,
-            &[],
-            0,
-            0,
-        )
+        let mut bc_slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                0,
+                1_000_000_000,
+                &[],
+                0,
+                0,
+            )
+        }
         .ok()
         .expect("genesis must succeed for local_node_id == 0");
+        let bc = unsafe { bc_slot.assume_init() };
 
         // Type-level assertion: the query result is `LifecyclePhase`,
         // not `(LifecyclePhase, NextCall)`. If the signature ever drifts
@@ -847,7 +858,19 @@ mod tests {
     fn new_test_chain() -> TestChain {
         let (crypto, storage, chain_config) = test_backends();
         let node_zero = *crypto.public_key().serialize();
-        Blockchain::new(crypto, storage, chain_config, 5, node_zero, 0)
+        let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+        unsafe {
+            TestChain::init_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                5,
+                node_zero,
+                0,
+            );
+            bc_slot.assume_init()
+        }
     }
 
     fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer: u32) -> Block {
