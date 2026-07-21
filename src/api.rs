@@ -19,7 +19,7 @@
 
 use moonblokz_chain_types::{
     Block, BlockBuilder, BlockHeader, BlockView, NodeTransfer, PAYLOAD_TYPE_CHAIN_CONFIG,
-    PAYLOAD_TYPE_TRANSACTION, Registration,
+    PAYLOAD_TYPE_TRANSACTION, Registration, TransactionView,
 };
 use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
@@ -28,8 +28,15 @@ use crate::blocks::{BlockEntry, BlockTable, NONE_REF};
 use crate::chain_config::{ChainConfigError, ChainConfigTrait};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
+use crate::lifecycle::is_legal_transition;
 use crate::prng::Prng;
 use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate};
+
+// `LifecyclePhase` is owned by `lifecycle.rs` (architecture §4.2) and
+// re-exported here so the crate's public surface (`api::LifecyclePhase`, and in
+// turn `moonblokz_blockchain::LifecyclePhase`) is unchanged after Story 5.1
+// relocated the enum out of this module.
+pub use crate::lifecycle::LifecyclePhase;
 
 /// Next-call deadline carried alongside every state-changing outcome.
 ///
@@ -100,21 +107,80 @@ pub struct GenesisBlocks {
     pub block_one: Block,
 }
 
-/// Authoritative-interpretation lifecycle phase (FR1–FR4).
+/// Outcome of the join/restart init follow-up [`Blockchain::initialize_from_storage`].
 ///
-/// - `Collecting`: empty chain or accumulating tree; query surfaces return
-///   not-ready (FR1, FR14, FR42).
-/// - `Processing`: full-chain reconstruction in progress (FR3).
-/// - `Ready`: validated active chain; full intake/query surface available
-///   (FR4, FR9 fully active).
-// `PartialEq`/`Eq` are needed for lifecycle gate checks and phase-transition
-// assertions in the planned state machine. Avoid Copy/Clone until a concrete
-// later story needs value duplication beyond borrowing/matching.
+/// A node is constructed once via the single `unsafe` [`Blockchain::init_in_place`]
+/// (which lands it in `Collecting` with an empty tree) and then reads durable
+/// storage through this **safe** follow-up — the split keeps the `unsafe`
+/// raw-pointer construction isolated from the safe storage-reading business
+/// logic (architecture §3.6 "in-place constructor + role-specific follow-up").
+///
+/// Story 5.1 realizes only the empty-storage (fresh-join) outcome
+/// `StartedCollecting`. The restart-from-durable-blocks path — read the retained
+/// blocks, rebuild the tree, evaluate FR2, run the FR3 pass — and its
+/// `ResumedProcessing` / `ResumedReady` / `Rejected(_)` outcomes land in
+/// **Story 5.7 (FR59)**, which fills the non-empty branch and adds those arms.
+/// (Minimal now, extended then: no dead arm ships early — the crate's
+/// declare-and-tag-forward discipline.)
+#[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Eq)]
-pub enum LifecyclePhase {
-    Collecting,
-    Processing,
-    Ready,
+pub enum InitOutcome {
+    /// Storage held no blocks (fresh join): the node stays in `Collecting` as a
+    /// pure receiver and acquires the chain from the mesh (FR1).
+    StartedCollecting,
+}
+
+/// Not-ready result of the FR14/FR10 transaction-intake entry point
+/// [`Blockchain::receive_transaction`] while the node is not `Ready`.
+///
+/// Story 5.1 builds only the not-ready gate (FR1: transaction intake is
+/// ready-only). The ready-state classification set (`AcceptedToMempool`,
+/// `AlreadyConfirmed`, `DuplicateInMempool`, `Deferred`, `Rejected`) is added by
+/// **Epic 7** when it builds the body (FR14).
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum ReceiveTransactionOutcome {
+    /// FR1 — the module is not in `Ready`; no classification is performed.
+    NotReady,
+}
+
+/// Not-ready result of the FR55 local transaction-creation surface
+/// [`Blockchain::submit_local_transaction`] while the node is not `Ready`.
+///
+/// Story 5.1 builds only the not-ready gate. FR55's `Created` / `Held(reason)` /
+/// `Rejected(reason)` outcomes are added by **Epic 10** when it builds the body
+/// (`NotReady` is FR55's mandated `Rejected(not-ready)` case).
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum LocalTransactionOutcome {
+    /// FR1/FR55 — the module is not in `Ready`; the transaction is not created.
+    NotReady,
+}
+
+/// Why a value/balance query [`Blockchain::query_balance`] returned no value.
+///
+/// A `Result` (not `Option`) so `NotReady` stays distinct from the domain
+/// "absent" case: **Epic 10** adds `UnknownNode` (node not in the roster) when
+/// it builds the ready-state body — neither may be conflated with a legitimate
+/// zero balance (FR41).
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum BalanceQueryError {
+    /// FR1 — the module is not in `Ready`; value state does not exist yet.
+    NotReady,
+}
+
+/// Why a block-retrieval query ([`Blockchain::serve_block_by_hash`] /
+/// [`Blockchain::serve_block_by_sequence`]) returned no block.
+///
+/// A `Result` (not `Option`) so `NotReady` (FR42: block-retrieval is ready-only)
+/// stays distinct from the domain "absent" case: **Epic 10** adds `NotFound`
+/// when it builds the ready-state body.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum BlockQueryError {
+    /// FR1/FR42 — the module is not in `Ready`; block-retrieval is not served.
+    NotReady,
 }
 
 /// Outcome of the internal FR9 Tier 1 admission entry point
@@ -640,6 +706,10 @@ impl<
         // Node #0 authored a complete, valid chain, so it is immediately Ready:
         // there is no FR2 dominant-chain acquisition or FR3 reconstruction to do
         // for the author (join/restart nodes still go through Collecting).
+        // This is an **init-time** establishment of the initial phase, NOT a
+        // runtime `Collecting→Ready` transition (which is illegal, Story 5.1) —
+        // genesis therefore writes the field directly rather than through the
+        // guarded `set_lifecycle_phase`.
         self.lifecycle_phase = LifecyclePhase::Ready;
 
         Ok(GenesisBlocks {
@@ -658,6 +728,64 @@ impl<
             LifecyclePhase::Processing => LifecyclePhase::Processing,
             LifecyclePhase::Ready => LifecyclePhase::Ready,
         }
+    }
+
+    /// Guarded runtime lifecycle transition (FR1/FR4). Debug-asserts the edge is
+    /// legal per [`crate::lifecycle::is_legal_transition`] (`Collecting→Processing`,
+    /// `Processing→Ready`, `Processing→Collecting`; never `Collecting→Ready`),
+    /// then writes the new phase. The assert compiles out in release, where the
+    /// transition is trusted (the same debug-assert-invariant discipline the
+    /// intake/admission path uses). The FR2/FR6/FR5 drivers in Stories 5.2/5.4/5.5
+    /// are the only callers. **Genesis does not use this** — it establishes the
+    /// initial `Ready` phase directly at bootstrap (initialization, not a runtime
+    /// transition; see [`Self::process_genesis`]).
+    // First caller lands in Story 5.2 (Collecting→Processing); declared-and-tagged-
+    // forward, so allow dead_code until then.
+    #[allow(dead_code)]
+    pub(crate) fn set_lifecycle_phase(&mut self, to: LifecyclePhase) {
+        debug_assert!(
+            is_legal_transition(&self.lifecycle_phase, &to),
+            "illegal lifecycle transition"
+        );
+        self.lifecycle_phase = to;
+    }
+
+    /// The single readiness gate (FR1). `true` iff the node is in `Ready`; every
+    /// ready-only surface consults this before operating. In `Collecting` /
+    /// `Processing` it is `false`, so those surfaces return their uniform
+    /// not-ready indication.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.lifecycle_phase == LifecyclePhase::Ready
+    }
+
+    /// Join/restart init follow-up (FR1/FR59): the **safe** counterpart to the
+    /// `unsafe` [`Self::init_in_place`] constructor. Construction writes raw
+    /// fields (unsafe) and lands the node in `Collecting`; this method then reads
+    /// durable storage (safe) — the deliberate unsafe/safe split (architecture
+    /// §3.6 "in-place constructor + role-specific follow-up"), so the raw-pointer
+    /// memory init stays isolated from safe storage-reading business logic.
+    ///
+    /// **Story 5.1 scope:** the empty-storage (fresh-join) path — no durable
+    /// blocks → the node stays `Collecting` and returns `StartedCollecting`
+    /// (FR1). The **restart** path (durable blocks present → rebuild the
+    /// block-tree / `chain_heads`, evaluate FR2, run the FR3 pass, transition to
+    /// Ready-or-Collecting, returning `ResumedReady` / `ResumedProcessing`) is
+    /// **Story 5.7 (FR59)**; the non-empty branch is a `todo!()` forward-tag until
+    /// then (reachable only by a restart test — genesis uses
+    /// [`Self::process_genesis`], fresh join uses the empty path here).
+    ///
+    /// Carries a `NextCall` per AR4 (a state-changing init step). The emptiness
+    /// probe reads durable block index 0; Story 5.7 replaces it with the FR59
+    /// control-data-driven rebuild.
+    pub fn initialize_from_storage(&mut self, _now: u64) -> CallResult<InitOutcome> {
+        let has_durable_blocks = self.storage.read_block(0).is_ok();
+        if has_durable_blocks {
+            // FR59 restart rebuild — Story 5.7 reads the retained durable blocks,
+            // rebuilds the tree, and runs the FR2/FR3 spine. Not built here.
+            todo!("FR59 restart rebuild from durable storage — Story 5.7");
+        }
+        // Fresh join: empty durable storage → remain a pure receiver (FR1).
+        (InitOutcome::StartedCollecting, NextCall::Idle)
     }
 
     /// Read-only query — returns the local node id (FR67).
@@ -739,7 +867,17 @@ impl<
         // FR19 bootstrap (AC7): a genesis block (sequence 0, no parent) anchors
         // the active chain — mark it on-chain and record it as the active head so
         // event (i) classifies its head Connected.
-        let is_genesis = block.sequence() == 0 && parent.is_none();
+        //
+        // Single-genesis guard (Story 5.1, deferred from the Story-4.4 review):
+        // only anchor when the active chain is **not already anchored**
+        // (`active_chain_head_idx == NONE_REF`). A second distinct `sequence == 0`
+        // block (trust-anchor equivocation — only node #0 can validly sign one)
+        // must NOT silently reseat the active chain; with this guard it is instead
+        // admitted as an ordinary Stored orphan head (its spurious parent-recovery
+        // request for a `sequence == 0` parent is harmless — the scheduler's
+        // `claimed_parent_sequence` saturates at 0).
+        let is_genesis =
+            block.sequence() == 0 && parent.is_none() && self.active_chain_head_idx == NONE_REF;
 
         let mut entry = BlockEntry::new(*hash, parent.unwrap_or(NONE_REF), block.sequence());
         entry.set_status(BlockStatus::Stored);
@@ -857,16 +995,95 @@ impl<
             .map(|entry| entry.sequence())
     }
 
+    // ---------------------------------------------------------------------
+    // Ready-only entry points — not-ready-gated in Story 5.1 (FR1).
+    //
+    // Each checks `is_ready()` and returns its uniform not-ready value while the
+    // node is Collecting/Processing; the ready-state body (beyond the gate) is
+    // built by the owning epic (`todo!()` forward-tag), reachable only by a
+    // genesis(Ready) node in tests until then. Queries return `Result<_, E>`
+    // (a `Result`, not `Option`, so `NotReady` ≠ the domain "absent" case).
+    // ---------------------------------------------------------------------
+
+    /// FR14/FR10 transaction intake (ready-only). While not `Ready` the module
+    /// returns [`ReceiveTransactionOutcome::NotReady`] with `NextCall::Idle`
+    /// (FR1: FR14's classification inputs — anchor-sequence window, already-
+    /// confirmed detection, deferred evaluation — are defined against the active
+    /// chain, which does not exist while collecting). Ready-state classification
+    /// is **Epic 7** (FR14); Story 5.1 builds only the gate.
+    pub fn receive_transaction(
+        &mut self,
+        _tx: TransactionView<'_>,
+        _now: u64,
+    ) -> CallResult<ReceiveTransactionOutcome> {
+        if !self.is_ready() {
+            return (ReceiveTransactionOutcome::NotReady, NextCall::Idle);
+        }
+        todo!("FR14 ready-state transaction classification — Epic 7")
+    }
+
+    /// FR55 local transaction-creation surface (ready-only). While not `Ready`
+    /// returns [`LocalTransactionOutcome::NotReady`] (FR55's mandated
+    /// `Rejected(not-ready)`). The `Created` / `Held` / `Rejected` body is
+    /// **Epic 10**; Story 5.1 builds only the gate.
+    pub fn submit_local_transaction(
+        &mut self,
+        _tx: TransactionView<'_>,
+        _now: u64,
+    ) -> CallResult<LocalTransactionOutcome> {
+        if !self.is_ready() {
+            return (LocalTransactionOutcome::NotReady, NextCall::Idle);
+        }
+        todo!("FR55 ready-state local transaction creation — Epic 10")
+    }
+
+    /// FR41 node-balance query (ready-only). `Err(BalanceQueryError::NotReady)`
+    /// while not `Ready`; the ready-state lookup (and the `UnknownNode` arm) is
+    /// **Epic 10**. A `Result`, not `Option`, so not-ready stays distinct from a
+    /// missing node and from a legitimate zero balance.
+    pub fn query_balance(&self, _node_id: u32) -> Result<u64, BalanceQueryError> {
+        if !self.is_ready() {
+            return Err(BalanceQueryError::NotReady);
+        }
+        todo!("FR41 ready-state balance lookup — Epic 10")
+    }
+
+    /// FR42 block-retrieval by hash (ready-only). `Err(BlockQueryError::NotReady)`
+    /// while not `Ready` — a collecting node does not serve blocks, including
+    /// radio-forwarded peer requests (FR1). Ready-state lookup (and the
+    /// `NotFound` arm) is **Epic 10**.
+    pub fn serve_block_by_hash(&self, _hash: &[u8; 32]) -> Result<BlockView<'_>, BlockQueryError> {
+        if !self.is_ready() {
+            return Err(BlockQueryError::NotReady);
+        }
+        todo!("FR42 ready-state block retrieval by hash — Epic 10")
+    }
+
+    /// FR42 block-retrieval by sequence (ready-only). `Err(BlockQueryError::NotReady)`
+    /// while not `Ready`. Ready-state lookup is **Epic 10**.
+    pub fn serve_block_by_sequence(&self, _seq: u32) -> Result<BlockView<'_>, BlockQueryError> {
+        if !self.is_ready() {
+            return Err(BlockQueryError::NotReady);
+        }
+        todo!("FR42 ready-state block retrieval by sequence — Epic 10")
+    }
+
     /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
     /// in collecting state (which suppresses the FR60 window check + its
     /// `long-disconnect-detected` log per AC7).
     ///
-    /// Epic 4 is collecting-only: there is no lifecycle machine (Epic 5) and no
-    /// snake-chain head/tail state (Epic 9), so this returns `None`
-    /// unconditionally. Epic 5 will gate it on `lifecycle_phase == Ready`; Epic 9
-    /// (`snake_chain.rs`) will derive `(S_tail, S_head)` from the
-    /// `_snake_chain_tail_idx` / `_active_chain_head_idx` block-table indices.
+    /// Gated on `Ready` (Story 5.1): while the node is not `Ready` (Collecting /
+    /// Processing) there is no active chain, so this returns `None` and the FR60
+    /// window check stays inactive — every admitted block is `Stored` (FR9/AC6).
+    /// The decision is now phase-driven, not a hardcoded `None`. Epic 9
+    /// (`snake_chain.rs`) supplies the real `(S_tail, S_head)` from the
+    /// `_snake_chain_tail_idx` / `active_chain_head_idx` block-table indices once
+    /// Ready; until it lands, the Ready branch also yields `None`.
     fn active_snake_chain_window(&self) -> Option<(u32, u32)> {
+        if !self.is_ready() {
+            return None;
+        }
+        // Epic 9 derives the real (S_tail, S_head) here.
         None
     }
 
@@ -1035,7 +1252,10 @@ mod tests {
             .expect("first genesis transaction should register node #0")
             .as_registration()
             .expect("first genesis transaction should be Registration");
-        assert_eq!(registration.new_public_key(), &expected_node_zero_public_key);
+        assert_eq!(
+            registration.new_public_key(),
+            &expected_node_zero_public_key
+        );
         assert!(any_nonzero(registration.new_key_signature()));
         assert!(any_nonzero(registration.signature()));
         let self_transfer = transactions
@@ -1060,7 +1280,10 @@ mod tests {
             &initial_chain_config_bytes[..],
             "Block #1 payload is the initial chain-config verbatim"
         );
-        assert!(any_nonzero(block_one.signature()), "Block #1 must be signed");
+        assert!(
+            any_nonzero(block_one.signature()),
+            "Block #1 must be signed"
+        );
 
         assert_eq!(
             bc.chain_config.initial_chain_config_bytes(),
@@ -1527,5 +1750,148 @@ mod tests {
         );
         // Deterministic selection: smallest head_sequence (5) first → claimed 4.
         assert_eq!(claims_a[0], Some(4));
+    }
+
+    // --- Story 5.1: lifecycle state machine, init paths, not-ready gating -----
+
+    /// AC1/AC3 — a freshly constructed node (join path via `init_in_place`) is in
+    /// `Collecting` and not ready.
+    #[test]
+    fn fresh_node_is_collecting_and_not_ready() {
+        let bc = new_test_chain();
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        assert!(!bc.is_ready());
+    }
+
+    /// AC2 — a node that authored genesis is `Ready` (init-time direct-set, not a
+    /// runtime transition).
+    #[test]
+    fn genesis_node_is_ready() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 1);
+        bc.process_genesis(1_000_000_000, &[0xAB])
+            .ok()
+            .expect("genesis must succeed");
+        assert!(bc.current_phase() == LifecyclePhase::Ready);
+        assert!(bc.is_ready());
+    }
+
+    /// AC1 — the guarded mutator accepts every legal runtime edge.
+    #[test]
+    fn set_lifecycle_phase_accepts_legal_edges() {
+        // Collecting → Processing → Ready.
+        let mut bc = new_test_chain();
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        assert!(bc.current_phase() == LifecyclePhase::Processing);
+        bc.set_lifecycle_phase(LifecyclePhase::Ready);
+        assert!(bc.current_phase() == LifecyclePhase::Ready);
+
+        // Processing → Collecting (FR5 recovery edge).
+        let mut bc2 = new_test_chain();
+        bc2.set_lifecycle_phase(LifecyclePhase::Processing);
+        bc2.set_lifecycle_phase(LifecyclePhase::Collecting);
+        assert!(bc2.current_phase() == LifecyclePhase::Collecting);
+    }
+
+    /// AC1 — the guarded mutator rejects the illegal direct `Collecting → Ready`
+    /// edge (debug-assert; `cargo test` runs debug).
+    #[test]
+    #[should_panic(expected = "illegal lifecycle transition")]
+    fn set_lifecycle_phase_rejects_collecting_to_ready() {
+        let mut bc = new_test_chain();
+        bc.set_lifecycle_phase(LifecyclePhase::Ready);
+    }
+
+    /// AC5 — the snake-chain window seam is phase-gated: `None` while not Ready
+    /// (so FR60 stays inactive and every admitted block is Stored, AC6).
+    #[test]
+    fn snake_chain_window_none_while_collecting() {
+        let bc = new_test_chain();
+        assert!(bc.active_snake_chain_window().is_none());
+    }
+
+    /// AC3 — the join follow-up on empty durable storage keeps the node
+    /// Collecting and reports `StartedCollecting`.
+    #[test]
+    fn initialize_from_storage_empty_starts_collecting() {
+        let mut bc = new_test_chain();
+        let (outcome, next) = bc.initialize_from_storage(0);
+        assert_eq!(outcome, InitOutcome::StartedCollecting);
+        assert!(matches!(next, NextCall::Idle));
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+    }
+
+    /// AC4 — read-only ready-only queries return `Err(NotReady)` while Collecting
+    /// (a `Result`, so not-ready is a distinct signal, not `None`).
+    #[test]
+    fn collecting_gates_ready_only_queries() {
+        let bc = new_test_chain();
+        assert_eq!(bc.query_balance(1), Err(BalanceQueryError::NotReady));
+        assert!(matches!(
+            bc.serve_block_by_hash(&[0u8; 32]),
+            Err(BlockQueryError::NotReady)
+        ));
+        assert!(matches!(
+            bc.serve_block_by_sequence(0),
+            Err(BlockQueryError::NotReady)
+        ));
+    }
+
+    /// AC4 — state-changing ready-only intake surfaces return `NotReady` with
+    /// `NextCall::Idle` while Collecting.
+    #[test]
+    fn collecting_gates_transaction_intake() {
+        let mut bc = new_test_chain();
+        let block = node_transfer_block(5, 3, 4, 7);
+        let bv = block.view();
+        let payload = bv.transactions().expect("transaction payload");
+
+        let tx1 = payload.iter().next().expect("one transaction");
+        let (o1, n1) = bc.receive_transaction(tx1, 1_000);
+        assert_eq!(o1, ReceiveTransactionOutcome::NotReady);
+        assert!(matches!(n1, NextCall::Idle));
+
+        let tx2 = payload.iter().next().expect("one transaction");
+        let (o2, n2) = bc.submit_local_transaction(tx2, 1_000);
+        assert_eq!(o2, LocalTransactionOutcome::NotReady);
+        assert!(matches!(n2, NextCall::Idle));
+    }
+
+    /// AC5 — the single-genesis guard: a second distinct `sequence == 0` block
+    /// does not reseat the active chain (it is admitted as a Stored orphan).
+    #[test]
+    fn single_genesis_guard_second_seq0_does_not_reseat() {
+        let mut bc = new_test_chain();
+
+        // First genesis (seq 0) anchors the active chain at slot 0.
+        let g1 = node_transfer_block(0, 7, 0, 7);
+        let (o1, _) = bc.receive_block(g1.view(), 100);
+        assert_eq!(o1, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(bc.active_chain_head_idx, 0);
+        assert_eq!(bc.current_active_head(), Some(0));
+
+        // A second, distinct seq-0 block (different vote/initializer → different
+        // hash) must NOT reseat the active chain.
+        let g2 = node_transfer_block(0, 3, 0, 3);
+        assert_ne!(
+            g1.view().hash(),
+            g2.view().hash(),
+            "distinct genesis blocks"
+        );
+        let (o2, _) = bc.receive_block(g2.view(), 200);
+        assert_eq!(o2, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            bc.active_chain_head_idx, 0,
+            "second genesis must not reseat the active chain"
+        );
+        assert_eq!(
+            bc.blocks.len(),
+            2,
+            "second genesis is admitted as an orphan"
+        );
+        assert!(
+            !bc.blocks.get(1).expect("orphan entry").is_on_active_chain(),
+            "the second seq-0 block is not on the active chain"
+        );
     }
 }
