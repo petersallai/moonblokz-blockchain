@@ -238,14 +238,11 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
                 self.heads[slot].last_request_timestamp = 0; // scheduling removed
                 self.heads[slot].missing_parent_hash = [0; 32];
             }
-            Anchor::Tail(tail_idx) => {
-                self.heads[slot].flags &= !FLAG_CONNECTED;
-                self.heads[slot].tail_or_connection_idx = tail_idx;
                 let hash = if tail_idx == anchor_block_idx {
                     *anchor_block_prev_hash
                 } else {
                     self.cached_missing_hash_for_tail(tail_idx)
-                        .unwrap_or(*anchor_block_prev_hash)
+                        .unwrap_or(self.heads[slot].missing_parent_hash)
                 };
                 self.heads[slot].missing_parent_hash = hash;
             }
