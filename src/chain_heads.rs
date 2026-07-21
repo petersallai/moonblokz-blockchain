@@ -203,11 +203,10 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
             if entry.parent_ref() == NONE_REF {
                 return Anchor::Tail(current);
             }
-            last_valid = current;
-            current = entry.parent_ref();
-        }
-        Anchor::Tail(current)
+        last_valid = current;
+        current = entry.parent_ref();
     }
+    Anchor::Tail(last_valid)
 
     /// The cached missing-parent hash for a Stored head whose tail-point is
     /// `tail_idx` (copied when a new head shares an existing branch's tail).
