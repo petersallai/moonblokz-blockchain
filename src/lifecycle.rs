@@ -16,7 +16,7 @@
 //!
 //! ## Not-ready gating contract (FR1)
 //!
-//! While the node is not [`LifecyclePhase::Ready`], every ready-only behavior
+//! While the node is not [`LifecyclePhase::Ready`], every Ready-state-only behavior
 //! returns a uniform not-ready indication, consulting the single
 //! `Blockchain::is_ready()` gate. All follow one shape: read-only queries
 //! return `Result<T, E>` with an `E::NotReady` arm (a `Result`, **not**
@@ -44,7 +44,7 @@
 
 /// Authoritative-interpretation lifecycle phase (FR1–FR4).
 ///
-/// - `Collecting`: empty chain or accumulating tree; ready-only surfaces
+/// - `Collecting`: empty chain or accumulating tree; Ready-state-only surfaces
 ///   return not-ready (FR1). Block intake + FR19 parent-recovery stay active.
 /// - `Processing`: full-chain reconstruction in progress (FR3).
 /// - `Ready`: validated active chain; full intake/query surface available

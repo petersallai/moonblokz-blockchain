@@ -134,7 +134,7 @@ pub enum InitOutcome {
 /// [`Blockchain::receive_transaction`] while the node is not `Ready`.
 ///
 /// Story 5.1 builds only the not-ready gate (FR1: transaction intake is
-/// ready-only). The ready-state classification set (`AcceptedToMempool`,
+/// Ready-state-only). The ready-state classification set (`AcceptedToMempool`,
 /// `AlreadyConfirmed`, `DuplicateInMempool`, `Deferred`, `Rejected`) is added by
 /// **Epic 7** when it builds the body (FR14).
 #[cfg_attr(test, derive(Debug))]
@@ -173,7 +173,7 @@ pub enum BalanceQueryError {
 /// Why a block-retrieval query ([`Blockchain::serve_block_by_hash`] /
 /// [`Blockchain::serve_block_by_sequence`]) returned no block.
 ///
-/// A `Result` (not `Option`) so `NotReady` (FR42: block-retrieval is ready-only)
+/// A `Result` (not `Option`) so `NotReady` (FR42: block-retrieval is Ready-state-only)
 /// stays distinct from the domain "absent" case: **Epic 10** adds `NotFound`
 /// when it builds the ready-state body.
 #[cfg_attr(test, derive(Debug))]
@@ -795,7 +795,7 @@ impl<
     }
 
     /// The single readiness gate (FR1). `true` iff the node is in `Ready`; every
-    /// ready-only surface consults this before operating. In `Collecting` /
+    /// Ready-state-only surface consults this before operating. In `Collecting` /
     /// `Processing` it is `false`, so those surfaces return their uniform
     /// not-ready indication.
     pub(crate) fn is_ready(&self) -> bool {
@@ -1016,7 +1016,7 @@ impl<
         (outcome, self.next_parent_recovery_call())
     }
 
-    // --- State-changing ready-only intake entry points (FR14 / FR55) ---------
+    // --- State-changing Ready-state-only intake entry points (FR14 / FR55) ---------
     // Not-ready-gated in Story 5.1 (FR1). These are **state-changing** (`&mut
     // self`) and carry a `NextCall` (AR4) — grouped here with the other
     // state-changing methods (`receive_block`, `on_tick`), NOT with the read-only
@@ -1024,7 +1024,7 @@ impl<
     // `NextCall::Idle`; the ready-state body is built by the owning epic
     // (`todo!()` forward-tag, reachable only by a genesis(Ready) node in tests).
 
-    /// FR14/FR10 transaction intake (ready-only). While not `Ready` the module
+    /// FR14/FR10 transaction intake (Ready-state-only). While not `Ready` the module
     /// returns [`ReceiveTransactionOutcome::NotReady`] with `NextCall::Idle`
     /// (FR1: FR14's classification inputs — anchor-sequence window, already-
     /// confirmed detection, deferred evaluation — are defined against the active
@@ -1041,7 +1041,7 @@ impl<
         todo!("FR14 ready-state transaction classification — Epic 7")
     }
 
-    /// FR55 local transaction-creation surface (ready-only). While not `Ready`
+    /// FR55 local transaction-creation surface (Ready-state-only). While not `Ready`
     /// returns [`LocalTransactionOutcome::NotReady`] (FR55's mandated
     /// `Rejected(not-ready)`). The `Created` / `Held` / `Rejected` body is
     /// **Epic 10**; Story 5.1 builds only the gate.
@@ -1089,7 +1089,7 @@ impl<
             .map(|entry| entry.sequence())
     }
 
-    // --- Read-only ready-only queries (FR40–FR44) ----------------------------
+    // --- Read-only queries, served only in Ready (FR40-FR44) -----------------
     // Not-ready-gated in Story 5.1 (FR1). Read-only (no `NextCall`, AR4) and
     // served only in `Ready`: while Collecting/Processing each returns
     // `Err(E::NotReady)`. `Result<T, E>` (not `Option`) so `NotReady` ≠ the
@@ -1099,7 +1099,7 @@ impl<
     // `submit_local_transaction` are grouped above with the state-changing
     // methods, not here — they carry a `NextCall`.)
 
-    /// FR41 node-balance query (ready-only). `Err(BalanceQueryError::NotReady)`
+    /// FR41 node-balance query (Ready-state-only). `Err(BalanceQueryError::NotReady)`
     /// while not `Ready`; the ready-state lookup (and the `UnknownNode` arm) is
     /// **Epic 10**. A `Result`, not `Option`, so not-ready stays distinct from a
     /// missing node and from a legitimate zero balance.
@@ -1110,7 +1110,7 @@ impl<
         todo!("FR41 ready-state balance lookup — Epic 10")
     }
 
-    /// FR42 block-retrieval by hash (ready-only). `Err(BlockQueryError::NotReady)`
+    /// FR42 block-retrieval by hash (Ready-state-only). `Err(BlockQueryError::NotReady)`
     /// while not `Ready` — a collecting node does not serve blocks, including
     /// radio-forwarded peer requests (FR1). Ready-state lookup (and the
     /// `NotFound` arm) is **Epic 10**.
@@ -1121,7 +1121,7 @@ impl<
         todo!("FR42 ready-state block retrieval by hash — Epic 10")
     }
 
-    /// FR42 block-retrieval by sequence (ready-only). `Err(BlockQueryError::NotReady)`
+    /// FR42 block-retrieval by sequence (Ready-state-only). `Err(BlockQueryError::NotReady)`
     /// while not `Ready`. Ready-state lookup is **Epic 10**.
     pub fn serve_block_by_sequence(&self, _seq: u32) -> Result<BlockView<'_>, BlockQueryError> {
         if !self.is_ready() {
@@ -1130,7 +1130,7 @@ impl<
         todo!("FR42 ready-state block retrieval by sequence — Epic 10")
     }
 
-    /// FR40 transaction-state query (ready-only). `Err(TxStateQueryError::NotReady)`
+    /// FR40 transaction-state query (Ready-state-only). `Err(TxStateQueryError::NotReady)`
     /// while not `Ready`; the `Unknown`/`InMempool`/`Confirmed` lookup against the
     /// mempool + active chain is **Epic 10**.
     pub fn query_transaction_state(
@@ -1143,7 +1143,7 @@ impl<
         todo!("FR40 ready-state transaction-state query — Epic 10")
     }
 
-    /// FR44 creator-role determination (ready-only) — gates FR45 block creation.
+    /// FR44 creator-role determination (Ready-state-only) — gates FR45 block creation.
     /// `Err(CreatorQueryError::NotReady)` while not `Ready`; the binary comparison
     /// of the local node id against the top of the FR38 creator-order projection
     /// is **Epic 8**.
@@ -1928,7 +1928,7 @@ mod tests {
         assert_eq!(bc.creator_role(), Err(CreatorQueryError::NotReady));
     }
 
-    /// AC4 — state-changing ready-only intake surfaces return `NotReady` with
+    /// AC4 — state-changing Ready-state-only intake surfaces return `NotReady` with
     /// `NextCall::Idle` while Collecting.
     #[test]
     fn collecting_gates_transaction_intake() {
