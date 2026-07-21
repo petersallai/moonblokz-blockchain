@@ -12,8 +12,9 @@
 //!
 //! The module performs **no internal wall-clock reads and no internal entropy
 //! source**. Callers supply `prng_seed: u64` at construction (rooting the
-//! Xoshiro256PlusPlus PRNG hierarchy, AR11) and `now: u64` to every state-changing
-//! method. Identical construction inputs + identical event sequence yield
+//! Xoshiro256PlusPlus PRNG hierarchy, AR11) and `now: u64` to every
+//! time-dependent state-changing method (the one-shot `process_genesis`
+//! bootstrap needs none). Identical construction inputs + identical event sequence yield
 //! identical state and outcomes across runs and across nodes (when seeded
 //! identically) — the seam every later replay/simulator story (Epic 11)
 //! builds on.
@@ -40,7 +41,7 @@ pub(crate) mod spent_bits;
 pub(crate) mod staged_validation;
 
 pub use api::{
-    Blockchain, CallResult, GenesisRejectReason, InitGenesisOutcome, LifecyclePhase, NextCall,
+    Blockchain, CallResult, GenesisBlocks, GenesisRejectReason, LifecyclePhase, NextCall,
     ParentRecoveryRequest, ReceiveBlockOutcome, RejectReason, TickOutcome,
 };
 pub use chain_config::{

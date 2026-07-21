@@ -12,9 +12,10 @@
 //!
 //! Replay determinism — the module performs **no internal wall-clock reads
 //! and no internal entropy source**. Callers supply `prng_seed: u64` at
-//! construction and `now: u64` to every state-changing method (forthcoming),
-//! so the same construction inputs + the same event sequence yield identical
-//! state (FR62 / FR63 precondition).
+//! construction and `now: u64` to every time-dependent state-changing method
+//! (forthcoming); the one-shot `process_genesis` bootstrap schedules nothing and
+//! takes no timestamp. The same construction inputs + the same event sequence
+//! therefore yield identical state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
     Block, BlockBuilder, BlockHeader, BlockView, NodeTransfer, PAYLOAD_TYPE_CHAIN_CONFIG,
@@ -79,23 +80,24 @@ pub enum GenesisRejectReason {
     StorageSaveFailed,
 }
 
-/// Outcome of [`Blockchain::process_genesis`].
+/// The two genesis blocks produced by [`Blockchain::process_genesis`], created
+/// and persisted in a single call. The caller broadcasts both over the radio,
+/// lowest-sequence first.
 ///
-/// Walking-skeleton (Story 1.4) scope: returns both genesis blocks as **owned**
-/// [`Block`] values. The architectural `BlockView<'a>` borrow form arrives once
-/// `EmitScratch` exists (Story 4.3 / 8.3 per architecture §6.2).
-pub enum InitGenesisOutcome {
-    /// Both genesis blocks were created and persisted in a single call:
-    /// `block_zero` (node-#0 registration + initial self-transfer, FR54) and
-    /// `block_one` (the chain-config block carrying `initial_chain_config_bytes`,
-    /// `previous_hash` chained to `block_zero`). The caller broadcasts both over
-    /// the radio, lowest-sequence first.
-    Created { block_zero: Block, block_one: Block },
-    /// Genesis was refused. Currently unreachable from the success-path return —
-    /// kept for forward-compatibility with Story 5.6+ when the precondition set
-    /// expands. The `Result::Err` carries the actual refusal.
-    #[allow(dead_code)]
-    Rejected(GenesisRejectReason),
+/// - `block_zero` — node-#0 registration + initial self-transfer (FR54).
+/// - `block_one` — the chain-config block carrying `initial_chain_config_bytes`,
+///   `previous_hash` chained to `block_zero`.
+///
+/// Refusal is carried by the `Err(GenesisRejectReason)` half of
+/// `process_genesis`'s `Result`, so there is no `Rejected` variant here — this
+/// is a plain product of the two success blocks, not a single-outcome enum.
+///
+/// Walking-skeleton (Story 1.4) scope: **owned** [`Block`] values. The
+/// architectural `BlockView<'a>` borrow form arrives once `EmitScratch` exists
+/// (Story 4.3 / 8.3 per architecture §6.2).
+pub struct GenesisBlocks {
+    pub block_zero: Block,
+    pub block_one: Block,
 }
 
 /// Authoritative-interpretation lifecycle phase (FR1–FR4).
@@ -467,9 +469,14 @@ impl<
     /// built before either is saved, so a refusal never leaves a half-written
     /// chain from *this* call.
     ///
-    /// On success, returns `NextCall::At(now)` — an immediate follow-up tick so
-    /// the scheduler proceeds to normal operation. (Block #1 is no longer emitted
-    /// from `on_tick`; both blocks are produced here.)
+    /// Unlike the other state-changing methods, genesis carries **no
+    /// `NextCall`** (the return is a plain `Result<GenesisBlocks, _>`, not a
+    /// `CallResult`). Genesis is a one-per-chain bootstrap with no follow-up work
+    /// scheduled immediately after it, so it is deliberately kept out of the AR4
+    /// single-outcome scheduling-pull contract that the recurring methods share —
+    /// there is never a real deadline to return here. Normal scheduling begins
+    /// with the caller's regular `on_tick` cadence. (No `now` parameter is needed
+    /// for the same reason.)
     ///
     /// **Walking-skeleton scope (Story 1.4).** Block layouts are
     /// minimum-buildable per FR54; blocks are finalized through chain-types signed
@@ -481,8 +488,7 @@ impl<
         &mut self,
         initial_total_network_currency: u64,
         initial_chain_config_bytes: &[u8],
-        now: u64,
-    ) -> Result<CallResult<InitGenesisOutcome>, GenesisRejectReason> {
+    ) -> Result<GenesisBlocks, GenesisRejectReason> {
         if self.local_node_id != 0 {
             return Err(GenesisRejectReason::LocalNodeIdNotZero);
         }
@@ -546,7 +552,7 @@ impl<
         // capacity overflow — neither applies to these fixed-size bootstrap
         // payloads. The walking-skeleton uses `unreachable!` to make the
         // invariant explicit; Story 5.6+ may surface BlockError through a
-        // new InitGenesisOutcome::Rejected variant when the assembly grows.
+        // new GenesisRejectReason variant when the assembly grows.
         let mut builder = BlockBuilder::new().header(block_0_header);
         if builder.add_registration(&registration).is_err() {
             unreachable!("Block #0 registration is fixed-size and cannot overflow payload");
@@ -598,13 +604,10 @@ impl<
             .save_block(1, &block_1)
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
 
-        Ok((
-            InitGenesisOutcome::Created {
-                block_zero: block_0,
-                block_one: block_1,
-            },
-            NextCall::At(now),
-        ))
+        Ok(GenesisBlocks {
+            block_zero: block_0,
+            block_one: block_1,
+        })
     }
 
     /// Read-only query — returns the current lifecycle phase (FR1–FR4).
@@ -960,98 +963,73 @@ mod tests {
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
     /// yields **both** Block #0 and Block #1 in a single `process_genesis`
-    /// call, plus `NextCall::At(now)`, with no embassy deps anywhere in the
-    /// harness.
+    /// call (no `NextCall`), with no embassy deps anywhere in the harness.
     #[test]
     fn walking_skeleton_genesis_success() {
         let (crypto, storage, chain_config) = test_backends();
         let expected_node_zero_public_key = *crypto.public_key().serialize();
-        let now: u64 = 12_345;
         let initial_chain_config_bytes = [0xC0, 0xA5, 0xF6, 0x01];
 
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0xDEAD_BEEF_CAFE_F00D);
-        let outcome = bc.process_genesis(
-            1_000_000_000, // initial_total_network_currency
-            &initial_chain_config_bytes,
-            now,
+        let GenesisBlocks {
+            block_zero,
+            block_one,
+        } = bc
+            .process_genesis(1_000_000_000, &initial_chain_config_bytes)
+            .ok()
+            .expect("genesis with local_node_id == 0 must succeed (FR54)");
+
+        // --- Block #0: registration + self-transfer ---
+        assert_eq!(block_zero.sequence(), 0);
+        assert_eq!(block_zero.creator(), 0);
+        assert_eq!(block_zero.version(), 1);
+        assert_eq!(block_zero.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+        assert!(
+            any_nonzero(block_zero.signature()),
+            "Block #0 must be signed"
         );
+        let mut transactions = block_zero
+            .transactions()
+            .expect("genesis Block #0 should contain transaction payload")
+            .iter();
+        let registration = transactions
+            .next()
+            .expect("first genesis transaction should register node #0")
+            .as_registration()
+            .expect("first genesis transaction should be Registration");
+        assert_eq!(registration.new_public_key(), &expected_node_zero_public_key);
+        assert!(any_nonzero(registration.new_key_signature()));
+        assert!(any_nonzero(registration.signature()));
+        let self_transfer = transactions
+            .next()
+            .expect("second genesis transaction should seed node #0 balance")
+            .as_node_transfer()
+            .expect("second genesis transaction should be NodeTransfer");
+        assert!(any_nonzero(self_transfer.signature()));
+        assert!(transactions.next().is_none());
 
-        match outcome {
-            Ok((
-                InitGenesisOutcome::Created {
-                    block_zero,
-                    block_one,
-                },
-                NextCall::At(t),
-            )) => {
-                // --- Block #0: registration + self-transfer ---
-                assert_eq!(block_zero.sequence(), 0);
-                assert_eq!(block_zero.creator(), 0);
-                assert_eq!(block_zero.version(), 1);
-                assert_eq!(block_zero.payload_type(), PAYLOAD_TYPE_TRANSACTION);
-                assert!(
-                    any_nonzero(block_zero.signature()),
-                    "Block #0 must be signed"
-                );
-                let mut transactions = block_zero
-                    .transactions()
-                    .expect("genesis Block #0 should contain transaction payload")
-                    .iter();
-                let registration = transactions
-                    .next()
-                    .expect("first genesis transaction should register node #0")
-                    .as_registration()
-                    .expect("first genesis transaction should be Registration");
-                assert_eq!(
-                    registration.new_public_key(),
-                    &expected_node_zero_public_key
-                );
-                assert!(any_nonzero(registration.new_key_signature()));
-                assert!(any_nonzero(registration.signature()));
-                let self_transfer = transactions
-                    .next()
-                    .expect("second genesis transaction should seed node #0 balance")
-                    .as_node_transfer()
-                    .expect("second genesis transaction should be NodeTransfer");
-                assert!(any_nonzero(self_transfer.signature()));
-                assert!(transactions.next().is_none());
+        // --- Block #1: chain-config, chained to Block #0 ---
+        assert_eq!(block_one.sequence(), 1);
+        assert_eq!(block_one.version(), 1);
+        assert_eq!(block_one.payload_type(), PAYLOAD_TYPE_CHAIN_CONFIG);
+        assert_eq!(
+            block_one.previous_hash(),
+            &block_zero.hash()[..],
+            "Block #1 must chain to Block #0"
+        );
+        assert_eq!(
+            block_one.payload(),
+            &initial_chain_config_bytes[..],
+            "Block #1 payload is the initial chain-config verbatim"
+        );
+        assert!(any_nonzero(block_one.signature()), "Block #1 must be signed");
 
-                // --- Block #1: chain-config, chained to Block #0 ---
-                assert_eq!(block_one.sequence(), 1);
-                assert_eq!(block_one.version(), 1);
-                assert_eq!(block_one.payload_type(), PAYLOAD_TYPE_CHAIN_CONFIG);
-                assert_eq!(
-                    block_one.previous_hash(),
-                    &block_zero.hash()[..],
-                    "Block #1 must chain to Block #0"
-                );
-                assert_eq!(
-                    block_one.payload(),
-                    &initial_chain_config_bytes[..],
-                    "Block #1 payload is the initial chain-config verbatim"
-                );
-                assert!(
-                    any_nonzero(block_one.signature()),
-                    "Block #1 must be signed"
-                );
-
-                assert_eq!(t, now, "genesis schedules an immediate follow-up tick");
-
-                assert_eq!(
-                    bc.chain_config.initial_chain_config_bytes(),
-                    Some(&initial_chain_config_bytes[..])
-                );
-                assert!(bc.current_phase() == LifecyclePhase::Collecting);
-                assert_eq!(bc.local_node_id(), 0);
-            }
-            Ok((InitGenesisOutcome::Rejected(_), _)) => {
-                panic!("walking-skeleton success path should not return Rejected outcome");
-            }
-            Ok((_, NextCall::Idle)) => {
-                panic!("genesis must schedule the immediate follow-up tick");
-            }
-            Err(_) => panic!("genesis with local_node_id == 0 must succeed (FR54)"),
-        }
+        assert_eq!(
+            bc.chain_config.initial_chain_config_bytes(),
+            Some(&initial_chain_config_bytes[..])
+        );
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        assert_eq!(bc.local_node_id(), 0);
     }
 
     /// AC2 — `local_node_id != 0` refuses genesis and leaves the chain empty.
@@ -1063,7 +1041,7 @@ mod tests {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 1, 0);
 
-        let outcome = bc.process_genesis(1_000_000_000, &[], 0);
+        let outcome = bc.process_genesis(1_000_000_000, &[]);
 
         match outcome {
             Err(GenesisRejectReason::LocalNodeIdNotZero) => {}
@@ -1082,7 +1060,7 @@ mod tests {
         let oversized = [0u8; INITIAL_CHAIN_CONFIG_BYTES_CAPACITY + 1];
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let outcome = bc.process_genesis(1_000_000_000, &oversized, 0);
+        let outcome = bc.process_genesis(1_000_000_000, &oversized);
 
         match outcome {
             Err(GenesisRejectReason::InitialChainConfigTooLarge) => {}
@@ -1101,7 +1079,7 @@ mod tests {
             .unwrap();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let outcome = bc.process_genesis(1_000_000_000, &[0x03, 0x04], 0);
+        let outcome = bc.process_genesis(1_000_000_000, &[0x03, 0x04]);
 
         match outcome {
             Err(GenesisRejectReason::StorageNotEmpty) => {}
@@ -1122,10 +1100,10 @@ mod tests {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let first = bc.process_genesis(1_000_000_000, &[0xAA], 1);
+        let first = bc.process_genesis(1_000_000_000, &[0xAA]);
         assert!(first.is_ok(), "first genesis must succeed");
 
-        let second = bc.process_genesis(1_000_000_000, &[0xBB], 2);
+        let second = bc.process_genesis(1_000_000_000, &[0xBB]);
         match second {
             Err(GenesisRejectReason::StorageNotEmpty) => {}
             Err(_) => panic!("expected StorageNotEmpty on the second genesis"),
@@ -1160,7 +1138,7 @@ mod tests {
             bc_slot.assume_init()
         };
 
-        let outcome = bc.process_genesis(1_000_000_000, &[], 0);
+        let outcome = bc.process_genesis(1_000_000_000, &[]);
 
         match outcome {
             Err(GenesisRejectReason::StorageSaveFailed) => {}
@@ -1177,7 +1155,7 @@ mod tests {
     fn walking_skeleton_query_carries_no_next_call() {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
-        bc.process_genesis(1_000_000_000, &[], 0)
+        bc.process_genesis(1_000_000_000, &[])
             .ok()
             .expect("genesis must succeed for local_node_id == 0");
 
