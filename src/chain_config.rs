@@ -111,6 +111,25 @@ pub trait ChainConfigTrait {
     /// FR8 durable-lock status. The MVP stub returns `true` (FR56*).
     fn is_durable_locked(&self) -> bool;
 
+    /// FR19 / FR46 — minimum wall-clock period (ms) between two consecutive
+    /// parent-recovery requests emitted **for the same head** (per-head retry
+    /// window; a head is eligible once `last_request_timestamp + this ≤ now()`,
+    /// or immediately when `last_request_timestamp == 0` — never requested).
+    ///
+    /// There is deliberately **no** `parent_recovery_global_tick_interval`: under
+    /// the AR4 scheduling-pull contract the module returns the *exact* next
+    /// instant a request can be emitted (via `NextCall::At`), so a fixed periodic
+    /// tick cadence is unnecessary — the bridge wakes only when there is work.
+    fn parent_recovery_per_head_retry_interval_ms(&self) -> u64;
+
+    /// FR46 — module-scope global emit cooldown (ms): no parent-recovery
+    /// request is emitted while `last_parent_request_emit_timestamp + this >
+    /// now()`, independent of any per-head retry window. Bounds the cross-tick
+    /// emission rate to at most one request per this window, even when the tick
+    /// interval is shorter. (Named in PRD FR46; not in the epics Story 4.4 AC —
+    /// see the story's "FR46 global cooldown" Dev Note.)
+    fn parent_recovery_min_emit_interval_ms(&self) -> u64;
+
     /// Retains the genesis chain-config payload bytes for the later Block #1
     /// emit.
     fn store_initial_chain_config_bytes(&mut self, bytes: &[u8]) -> Result<(), ChainConfigError>;
@@ -162,6 +181,18 @@ impl ChainConfigTrait for FixedChainConfig {
         true
     }
 
+    // FR19/FR46 parent-recovery timing (tunable stub values; a real
+    // `moonblokz-configuration` supplies chain-governed values). `per_head_retry`
+    // is the coarser per-head limit; `min_emit` the finer global cross-head
+    // cooldown. The scheduler is correct for any positive values.
+    fn parent_recovery_per_head_retry_interval_ms(&self) -> u64 {
+        120_000
+    }
+
+    fn parent_recovery_min_emit_interval_ms(&self) -> u64 {
+        10_000
+    }
+
     fn store_initial_chain_config_bytes(&mut self, bytes: &[u8]) -> Result<(), ChainConfigError> {
         self.initial_chain_config.store(bytes)
     }
@@ -184,6 +215,8 @@ mod tests {
         assert_eq!(cfg.current_max_utxo_outputs(), 255);
         assert_eq!(cfg.current_max_aggregated_signatures(), 50);
         assert!(cfg.is_durable_locked());
+        assert_eq!(cfg.parent_recovery_per_head_retry_interval_ms(), 120_000);
+        assert_eq!(cfg.parent_recovery_min_emit_interval_ms(), 10_000);
     }
 
     #[test]

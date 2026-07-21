@@ -41,6 +41,7 @@ pub(crate) mod staged_validation;
 
 pub use api::{
     Blockchain, CallResult, GenesisRejectReason, InitGenesisOutcome, LifecyclePhase, NextCall,
+    ParentRecoveryRequest, ReceiveBlockOutcome, RejectReason, TickOutcome,
 };
 pub use chain_config::{
     ChainConfigError, ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,

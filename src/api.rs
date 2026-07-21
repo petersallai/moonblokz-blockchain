@@ -23,8 +23,10 @@ use moonblokz_chain_types::{
 use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
 
-use crate::blocks::{BlockEntry, BlockTable, BlockTableError, NONE_REF};
+use crate::blocks::{BlockEntry, BlockTable, NONE_REF};
 use crate::chain_config::{ChainConfigError, ChainConfigTrait};
+use crate::chain_heads::ChainHeadsTable;
+use crate::intake::classify_block;
 use crate::prng::Prng;
 use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate};
 
@@ -108,24 +110,134 @@ pub enum LifecyclePhase {
 /// Outcome of the internal FR9 Tier 1 admission entry point
 /// [`Blockchain::tier1_admit`]. Story 4.3's `receive_block` intake surface
 /// maps each variant to the single-outcome `ReceiveBlockOutcome`:
-/// `Rejected(Tier1Failure)` → `Rejected(RejectReason)`, `AlreadyPresent` →
-/// `DuplicateKnown`, success → `AcceptedSilently`. `TableFull` /
-/// `StorageSaveFailed` are capacity/IO failures, not FR16 exact evidence —
-/// their outcome mapping is Story 4.3/4.4's concern.
+/// `Rejected(Tier1Failure)` → `Rejected(RejectReason)`, success →
+/// `AcceptedSilently`. `TableFull` / `StorageSaveFailed` are capacity/IO
+/// failures, not FR16 exact evidence — mapped to `Rejected(Unstorable)`.
+/// There is no `AlreadyPresent`: FR11 de-duplication is owned by the intake
+/// dispatcher (`classify_block`) which classifies a known block as
+/// `DuplicateKnown` *before* calling `tier1_admit`, so admission never sees a
+/// duplicate.
 #[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Eq)]
-#[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
 pub(crate) enum AdmitError {
     /// FR16 exact evidence of invalidity — the block is not stored.
     Rejected(Tier1Failure),
-    /// `(sequence, hash)` already in the block-tree (FR11). Not re-stored.
-    AlreadyPresent,
     /// The bounded block-tree is at capacity (`MAX_BLOCKS`); no eviction path
     /// exists until Story 4.4 (FR19 chain_heads-eviction).
     TableFull,
     /// The block passed Tier 1 but could not be persisted through the storage
     /// seam — it is not inserted into the tree (storage-first admission).
     StorageSaveFailed,
+}
+
+/// Single-outcome classification returned by [`Blockchain::receive_block`]
+/// (FR10; single-outcome scheduling-pull pattern, AR4). Exactly one variant is
+/// produced per submitted block, and the response carries no descriptive
+/// payload beyond the [`RejectReason`] discriminant (FR10 minimal-response
+/// convention). Classification is deterministic in the block bytes + current
+/// authoritative state and is independent of transport origin.
+///
+/// Epic 4 realizes the three terminal variants below. The `AcceptedAndSend*`
+/// addendum variants of architecture §3.2 are a forward-tagged extension, each
+/// added **with its payload type by its owning story**:
+/// `AcceptedAndSendBlock(BlockView<'_>)` by Epic 8 (FR26 relay) and
+/// `AcceptedAndSendSupport(SupportView<'_>)` by Epic 6 (FR12 deviance support);
+/// these borrowing variants introduce the `<'a>` lifetime when they land.
+///
+/// **FR19 parent recovery is emitted from the tick, not here.** The architecture
+/// §3.2 sketch also lists `AcceptedAndSendParentRecoveryRequest`, and Story 4.3
+/// forward-tagged it to Story 4.4 — but per FR19/FR46 a parent-recovery request
+/// is a *scheduler* effect gated by the FR46 global emit cooldown, so Story 4.4
+/// emits it from [`Blockchain::on_tick`] as [`TickOutcome::SendParentRecoveryRequest`],
+/// and `receive_block` that creates/retains a Stored head returns
+/// `(AcceptedSilently, NextCall::At(next tick))` instead. This variant is
+/// therefore **not** added to `ReceiveBlockOutcome` (it would never be emitted).
+/// See the Story 4.4 "Emission surface" Dev Note.
+// Same derive discipline as `AdmitError`/`LifecyclePhase`: no `Copy`/`Clone` in
+// production (binary-size cost on embedded targets); `Debug` only under test.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum ReceiveBlockOutcome {
+    /// FR11 — the block's `(sequence, block_hash)` is already in the retained
+    /// block-tree; it is not re-stored and not re-advanced through FR9.
+    DuplicateKnown,
+    /// FR16 — the block passed Tier 1 and was stored at [`BlockStatus::Stored`];
+    /// no addendum effect is produced in Epic 4.
+    AcceptedSilently,
+    /// FR16 / FR60 — the block was refused; see [`RejectReason`].
+    Rejected(RejectReason),
+}
+
+/// Why a block was refused at intake. Per the FR10 minimal-response convention
+/// the caller observes only this discriminant, never the granular
+/// [`Tier1Failure`].
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum RejectReason {
+    /// FR60 — outside the active `snake_chain` window (`S_new >= S_head + W` or
+    /// `S_new < S_tail`). Ready-state only; never produced in collecting state.
+    OutOfWindow,
+    /// FR16 exact evidence of invalidity — any Story 4.2 Tier 1 gating failure,
+    /// or the FR17 chain-config content mismatch. Not stored, not added to the
+    /// tree, not advanced through FR9.
+    InvalidEvidence,
+    /// Operational refusal — the block could not be persisted or retained
+    /// (`AdmitError::TableFull` before Story 4.4 eviction, or a storage-save
+    /// failure). This is **not** an FR10 block-validity classification: the
+    /// block may be perfectly valid but could not be stored. `TableFull`
+    /// becomes unreachable once Story 4.4 `chain_heads` eviction lands.
+    Unstorable,
+}
+
+/// FR19 parent-recovery request payload — the outbound message the module asks
+/// the radio layer to send when a Stored head's tail-point parent is missing.
+///
+/// Non-borrowing owned struct (architecture §3.2): it carries the missing
+/// parent's hash and the *claimed* parent sequence (`tail_point.sequence − 1`),
+/// so the radio layer / peers can locate and return the block. Emitted by
+/// [`Blockchain::on_tick`] as [`TickOutcome::SendParentRecoveryRequest`] — the
+/// FR46 scheduler surface, **not** inline from `receive_block` (the FR46 global
+/// emit cooldown is a tick concept; see the Story 4.4 "Emission surface" note).
+// Same derive discipline as the outcome enums: no `Copy`/`Clone` in production;
+// `Debug` only under test.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub struct ParentRecoveryRequest {
+    missing_parent_hash: [u8; 32],
+    claimed_parent_sequence: u32,
+}
+
+impl ParentRecoveryRequest {
+    pub(crate) fn new(missing_parent_hash: [u8; 32], claimed_parent_sequence: u32) -> Self {
+        Self {
+            missing_parent_hash,
+            claimed_parent_sequence,
+        }
+    }
+
+    /// The hash of the missing parent block (the tail-point's `previous_hash`).
+    pub fn missing_parent_hash(&self) -> &[u8; 32] {
+        &self.missing_parent_hash
+    }
+
+    /// The claimed sequence of the missing parent (`tail_point.sequence − 1`).
+    pub fn claimed_parent_sequence(&self) -> u32 {
+        self.claimed_parent_sequence
+    }
+}
+
+/// Single-outcome result of [`Blockchain::on_tick`] (AR4). Epic 4 realizes the
+/// FR19/FR46 parent-recovery slice of the scheduler; Story 8.4 extends this enum
+/// with the block-creation (FR45), grace-period (FR47), and mempool-replenishment
+/// (FR43) tick effects, folding the module-scope `last_parent_request_emit_timestamp`
+/// and the tick deadline into the full `SchedulerState` (architecture §6.7).
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum TickOutcome {
+    /// No time-driven behavior fired this tick.
+    Idle,
+    /// FR19 — emit a single parent-recovery request for the selected Stored head.
+    SendParentRecoveryRequest(ParentRecoveryRequest),
 }
 
 /// Authoritative blockchain state for a MoonBlokz node.
@@ -155,7 +267,7 @@ pub struct Blockchain<
     Storage: StorageTrait,
     Config: ChainConfigTrait,
     const MAX_NODES: usize,
-    const SNAKE_CHAIN_LENGTH: usize,
+    const SNAKE_CHAIN_LENGTH: u32,
     const VERIFICATION_HORIZON: usize,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
@@ -178,16 +290,30 @@ pub struct Blockchain<
     // FR18 bounded block-tree — data layer landed in Story 4.1.
     blocks: BlockTable<MAX_BLOCKS>,
 
-    // Const-sized placeholders for future real bounded tables (Story 1.2).
-    // `()` is zero-sized until the owning story replaces it with the real
-    // entry layout (Story 4.4 / 7.1).
-    _chain_heads: [(); MAX_BRANCH_COUNT],
+    // FR19 chain_heads tip table — landed in Story 4.4.
+    chain_heads: ChainHeadsTable<MAX_BRANCH_COUNT>,
+
+    // Const-sized placeholder for the future real bounded table (Story 1.2).
+    // `()` is zero-sized until the owning story replaces it (Story 7.1).
     _node_info: [(); MAX_NODES],
+
+    // FR19/FR46 module-scope global emit cooldown: wall-clock time of the most
+    // recent parent-recovery request emitted across all heads (`0` = never).
+    // Story 8.4 folds this (and the tick deadline) into the full `SchedulerState`
+    // (architecture §6.7).
+    last_parent_request_emit_timestamp: u64,
+
+    // FR19/§6.4: the active-chain head as a block-table index (`NONE_REF` = no
+    // active head yet). Genesis admission (Story 4.4 event (i)) sets it; the
+    // full FR2/FR4 lifecycle drivers (Epic 5) refine it.
+    active_chain_head_idx: u32,
 
     // Real snake-chain state is two block-table indices, not a W-sized
     // window. `SNAKE_CHAIN_LENGTH` remains an algorithmic bound for
-    // maintaining the tail index relative to the active head.
-    _active_chain_head_idx: u32,
+    // maintaining the tail index relative to the active head. It is a `u32`
+    // (not the array-sizing `usize` the other const generics use) because it
+    // is a window *width* compared directly against `u32` block sequences —
+    // never an array length — so it needs no cast at the FR60 comparison site.
     _snake_chain_tail_idx: u32,
     //
     // Deliberately no standalone placeholders for:
@@ -205,7 +331,7 @@ impl<
     Storage: StorageTrait,
     Config: ChainConfigTrait,
     const MAX_NODES: usize,
-    const SNAKE_CHAIN_LENGTH: usize,
+    const SNAKE_CHAIN_LENGTH: u32,
     const VERIFICATION_HORIZON: usize,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
@@ -297,9 +423,11 @@ impl<
             core::ptr::addr_of_mut!((*dst).lifecycle_phase).write(LifecyclePhase::Collecting);
             let blocks_ptr = core::ptr::addr_of_mut!((*dst).blocks);
             BlockTable::init_in_place(blocks_ptr);
-            core::ptr::addr_of_mut!((*dst)._chain_heads).write([(); MAX_BRANCH_COUNT]);
+            let chain_heads_ptr = core::ptr::addr_of_mut!((*dst).chain_heads);
+            ChainHeadsTable::init_in_place(chain_heads_ptr);
             core::ptr::addr_of_mut!((*dst)._node_info).write([(); MAX_NODES]);
-            core::ptr::addr_of_mut!((*dst)._active_chain_head_idx).write(0);
+            core::ptr::addr_of_mut!((*dst).last_parent_request_emit_timestamp).write(0);
+            core::ptr::addr_of_mut!((*dst).active_chain_head_idx).write(NONE_REF);
             core::ptr::addr_of_mut!((*dst)._snake_chain_tail_idx).write(0);
         }
     }
@@ -459,61 +587,63 @@ impl<
         self.local_node_id
     }
 
-    /// FR9 Tier 1 admission (Story 4.2). Rejects a block whose `(sequence, hash)`
-    /// is already in the tree as `AlreadyPresent` first, then runs the full
-    /// Tier 1 gating check set over `block`; on pass, persists the block through
-    /// the storage seam and inserts it into the block-tree at
-    /// [`BlockStatus::Stored`], returning its storage/tree index. On any
-    /// exact-evidence failure the block is neither persisted nor inserted, and
-    /// the failing [`Tier1Failure`] is returned.
+    /// FR9 Tier 1 admission (Story 4.2). Runs the full Tier 1 gating check set
+    /// over `block`; on pass, persists the block through the storage seam and
+    /// inserts it into the block-tree at [`BlockStatus::Stored`], returning its
+    /// storage/tree index. On any exact-evidence failure the block is neither
+    /// persisted nor inserted, and the failing [`Tier1Failure`] is returned.
     ///
     /// This is the internal entry point Story 4.3's `receive_block` intake
-    /// surface will call; it deliberately stops at "Tier 1 verdict + Stored
+    /// surface calls; it deliberately stops at "Tier 1 verdict + Stored
     /// admission." The single-outcome `ReceiveBlockOutcome` mapping, the
     /// collecting-vs-ready FR60 window logic, the FR11 duplicate-classification
     /// *outcome*, and the FR17 chain-config silent-discard are Story 4.3.
+    ///
+    /// **The caller owns FR11 de-duplication.** `classify_block` runs the
+    /// authoritative `(sequence, hash)` check and classifies a known block as
+    /// `DuplicateKnown` *before* calling `tier1_admit`, so admission never sees
+    /// a duplicate and never re-hashes or re-scans the tree for one — the
+    /// dominant mesh-rebroadcast re-arrival is filtered off the crypto path by
+    /// the dispatcher, not by a second guard here (no redundant self-defense;
+    /// no signature-verification cache needed). `hash` is the already-computed
+    /// `block.hash()`, threaded in so it is computed exactly once per receive.
     ///
     /// **Collecting-state invariant (AC4):** every admitted block is `Stored`
     /// — no Connected/Active is assigned, because no active chain exists and no
     /// promotion driver runs in Epic 4.
     ///
-    /// **Duplicate-first ordering (FR11 / FR10):** the `(sequence, hash)` guard
-    /// runs *before* Tier 1, so a re-arriving already-stored block is rejected
-    /// as `AlreadyPresent` without re-running signature verification — a purely
-    /// structural check (a stored block already passed Tier 1, and an identical
-    /// hash means identical bytes, so the verdict cannot differ). This — not a
-    /// signature-verification cache — is what keeps the dominant mesh-rebroadcast
-    /// re-arrival case off the crypto path. (Story 4.3's `receive_block` is the
-    /// authoritative FR11 duplicate classifier; this guard makes `tier1_admit`
-    /// cheap and robust on its own, independent of the caller.)
-    ///
     /// **Storage-first ordering:** the block is saved to durable storage at the
-    /// slot [`BlockTable::insert`] will choose *before* the tree is mutated, so
-    /// a storage failure leaves the tree untouched (there is no deletion path
-    /// to roll back a tree insert until Story 4.4).
+    /// slot [`BlockTable::next_free_index`] returns *before* the tree is
+    /// mutated, so a storage failure leaves the tree untouched (there is no
+    /// deletion path to roll back a tree insert until Story 4.4). The entry is
+    /// then written at that same slot via [`BlockTable::insert_at`] — no
+    /// second free-slot scan.
     ///
-    /// **Parent linkage is deferred to Story 4.4:** the entry is inserted with
-    /// an unresolved parent (`NONE_REF`). Resolving `previous_hash` to a parent
-    /// index (and FR19 parent-recovery for a missing parent) is Story 4.4's
-    /// `chain_heads` work — this crate has no find-by-hash yet.
-    #[allow(dead_code)] // consumed by Story 4.3's intake surface; tests exercise it here.
-    pub(crate) fn tier1_admit(&mut self, block: &BlockView) -> Result<u32, AdmitError> {
-        // Duplicate-first (FR11 / FR10): reject an already-stored (sequence, hash)
-        // before any Tier 1 crypto. A stored block already passed Tier 1, and an
-        // identical hash means identical bytes, so re-verification could only
-        // reach the same verdict — skipping it is safe and keeps mesh-rebroadcast
-        // re-arrivals off the signature-verification path (the reason this story
-        // needs no signature-verification cache).
-        let hash = block.hash();
-        if self.blocks.find(block.sequence(), &hash).is_some() {
-            return Err(AdmitError::AlreadyPresent);
-        }
-
+    /// **Parent linkage + FR19 chain_heads (Story 4.4):** the block's parent is
+    /// resolved via `blocks.find_parent(previous_hash, sequence)` (the parent's
+    /// sequence is `sequence − 1`, so no find-by-hash-alone is needed) and the
+    /// entry is inserted with that `parent_ref` (or `NONE_REF` when unresolved).
+    /// After insertion the chain_heads mutation events (i) new-block admission
+    /// and (ii) tail-pointing parent admission run, tracking the tip and
+    /// scheduling parent-recovery for a missing ancestor. `now` stamps the head
+    /// arrival timestamp (FR18) and drives the bootstrap `last_request_timestamp`.
+    pub(crate) fn tier1_admit(
+        &mut self,
+        block: &BlockView,
+        hash: &[u8; 32],
+        now: u64,
+    ) -> Result<u32, AdmitError> {
         let block_size_limit = self.chain_config.current_block_size_limit();
-        tier1_gate(block, &self.node_zero_public_key, block_size_limit, &self.crypto).map_err(AdmitError::Rejected)?;
+        tier1_gate(
+            block,
+            &self.node_zero_public_key,
+            block_size_limit,
+            &self.crypto,
+        )
+        .map_err(AdmitError::Rejected)?;
 
-        // Storage-first: reserve the slot `insert` will pick, persist there,
-        // then insert. Reconstruct an owned `Block` for the storage seam
+        // Storage-first: peek the slot, persist there, then write the entry at
+        // that same slot. Reconstruct an owned `Block` for the storage seam
         // (`save_block` takes `&Block`); this copy happens only on the success
         // path, after Tier 1 passed.
         let idx = self.blocks.next_free_index().ok_or(AdmitError::TableFull)?;
@@ -523,21 +653,168 @@ impl<
             .save_block(idx, &owned)
             .map_err(|_| AdmitError::StorageSaveFailed)?;
 
-        let mut entry = BlockEntry::new(hash, NONE_REF, block.sequence());
+        // FR19 parent resolution (Story 4.4). `previous_hash()` is a 32-byte
+        // slice; convert to the array key. Genesis (`sequence == 0`) has no parent.
+        let prev_hash: [u8; 32] = block.previous_hash().try_into().unwrap_or([0; 32]);
+        let parent = self.blocks.find_parent(&prev_hash, block.sequence());
+
+        // FR19 bootstrap (AC7): a genesis block (sequence 0, no parent) anchors
+        // the active chain — mark it on-chain and record it as the active head so
+        // event (i) classifies its head Connected.
+        let is_genesis = block.sequence() == 0 && parent.is_none();
+
+        let mut entry = BlockEntry::new(*hash, parent.unwrap_or(NONE_REF), block.sequence());
         entry.set_status(BlockStatus::Stored);
-        match self.blocks.insert(entry) {
-            Ok(inserted) => {
-                debug_assert_eq!(inserted, idx, "storage-first slot must match insert slot");
-                Ok(inserted)
-            }
-            Err(BlockTableError::Full) => Err(AdmitError::TableFull),
-            Err(BlockTableError::DuplicateEntry) => Err(AdmitError::AlreadyPresent),
-            Err(BlockTableError::ReservedSequence) => {
-                // Unreachable: `tier1_gate` already rejects sequence == u32::MAX
-                // (FR53 (ii)) before we get here.
-                Err(AdmitError::Rejected(Tier1Failure::SequenceCeiling))
-            }
+        if is_genesis {
+            entry.set_on_active_chain(true);
         }
+        self.blocks.insert_at(idx, entry);
+        if is_genesis {
+            self.active_chain_head_idx = idx;
+        }
+
+        // FR19 chain_heads mutation events (i) + (ii).
+        let active_head = self.active_chain_head_idx;
+        self.chain_heads.on_block_admitted(
+            &mut self.blocks,
+            idx,
+            parent,
+            prev_hash,
+            now,
+            active_head,
+        );
+        Ok(idx)
+    }
+
+    /// FR10 block-intake surface (Story 4.3). Classifies a submitted block into
+    /// exactly one [`ReceiveBlockOutcome`] (single-outcome scheduling-pull, AR4)
+    /// and pairs it with a [`NextCall`]. Classification is deterministic in the
+    /// block bytes + current authoritative state and independent of transport
+    /// origin (there is no origin parameter). Delegates to the stateless
+    /// [`crate::intake::classify_block`] dispatcher (FR11 dedup → FR60 window →
+    /// FR17 chain-config → Story 4.2 Tier 1).
+    ///
+    /// After admission (Story 4.4), returns `NextCall::At(exact next-eligible
+    /// instant)` when the tree holds ≥1 Stored head — so the bridge calls
+    /// [`Self::on_tick`] exactly when the FR19 parent-recovery scheduler can emit
+    /// — else `NextCall::Idle`. The request itself is emitted from the tick
+    /// (never inline here), gated by the FR46 global cooldown; see [`TickOutcome`].
+    pub fn receive_block(
+        &mut self,
+        block: BlockView<'_>,
+        now: u64,
+    ) -> CallResult<ReceiveBlockOutcome> {
+        let window = self.active_snake_chain_window();
+        let outcome = classify_block(self, &block, window, now);
+        (outcome, self.next_parent_recovery_call())
+    }
+
+    /// FR19/FR46 tick: run the parent-recovery scheduler. First evaluates the
+    /// FR46 **global emit cooldown** (`last_parent_request_emit_timestamp +
+    /// parent_recovery_min_emit_interval ≤ now`); only if it has cleared does it
+    /// select the most-overdue Stored head (deterministic FR63 tie-breaks) and
+    /// emit **exactly one** [`ParentRecoveryRequest`], updating both the head's
+    /// `last_request_timestamp` and the module-scope emit timestamp to `now`.
+    /// Reports `NextCall::At(exact next-eligible instant)` while Stored heads
+    /// remain (`NextCall::Idle` when none do). Story 8.4 extends this into the
+    /// full multi-deadline scheduler.
+    pub fn on_tick(&mut self, now: u64) -> CallResult<TickOutcome> {
+        let min_emit = self.chain_config.parent_recovery_min_emit_interval_ms();
+        let per_head_retry = self
+            .chain_config
+            .parent_recovery_per_head_retry_interval_ms();
+
+        let cooldown_cleared = self
+            .last_parent_request_emit_timestamp
+            .saturating_add(min_emit)
+            <= now;
+        let outcome = if cooldown_cleared {
+            match self
+                .chain_heads
+                .select_parent_recovery(&self.blocks, now, per_head_retry)
+            {
+                Some((slot, request)) => {
+                    self.chain_heads.mark_requested(slot, now);
+                    self.last_parent_request_emit_timestamp = now;
+                    TickOutcome::SendParentRecoveryRequest(request)
+                }
+                None => TickOutcome::Idle,
+            }
+        } else {
+            TickOutcome::Idle
+        };
+        (outcome, self.next_parent_recovery_call())
+    }
+
+    /// The next parent-recovery wake-up as the **exact** instant a request can
+    /// next be emitted (AR4 scheduling-pull — no fixed periodic tick): the later
+    /// of the earliest Stored-head per-head eligibility and the FR46 global emit
+    /// cooldown clearing. `NextCall::Idle` when no Stored head awaits a parent
+    /// (FR46 "deadline not scheduled when no Stored heads present"). An instant
+    /// already in the past means "call back ASAP" (a request is due now).
+    fn next_parent_recovery_call(&self) -> NextCall {
+        let per_head_retry = self
+            .chain_config
+            .parent_recovery_per_head_retry_interval_ms();
+        match self.chain_heads.earliest_recovery_deadline(per_head_retry) {
+            Some(head_ready) => {
+                let min_emit = self.chain_config.parent_recovery_min_emit_interval_ms();
+                let cooldown_clear = self
+                    .last_parent_request_emit_timestamp
+                    .saturating_add(min_emit);
+                NextCall::At(head_ready.max(cooldown_clear))
+            }
+            None => NextCall::Idle,
+        }
+    }
+
+    /// FR19 — the active-chain head's sequence, or `None` when no active head is
+    /// established yet (collecting, pre-bootstrap). Architecture §3.1.
+    pub fn current_active_head(&self) -> Option<u32> {
+        if self.active_chain_head_idx == NONE_REF {
+            return None;
+        }
+        self.blocks
+            .get(self.active_chain_head_idx)
+            .map(|entry| entry.sequence())
+    }
+
+    /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
+    /// in collecting state (which suppresses the FR60 window check + its
+    /// `long-disconnect-detected` log per AC7).
+    ///
+    /// Epic 4 is collecting-only: there is no lifecycle machine (Epic 5) and no
+    /// snake-chain head/tail state (Epic 9), so this returns `None`
+    /// unconditionally. Epic 5 will gate it on `lifecycle_phase == Ready`; Epic 9
+    /// (`snake_chain.rs`) will derive `(S_tail, S_head)` from the
+    /// `_snake_chain_tail_idx` / `_active_chain_head_idx` block-table indices.
+    fn active_snake_chain_window(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// FR11 duplicate-index probe used by the intake dispatcher: `true` iff a
+    /// block with this `(sequence, hash)` is already in the block-tree.
+    pub(crate) fn block_tree_contains(&self, sequence: u32, hash: &[u8; 32]) -> bool {
+        self.blocks.find(sequence, hash).is_some()
+    }
+
+    /// Number of blocks currently retained in the block-tree. Test-only
+    /// accessor for the `intake.rs` tests (a separate module cannot reach the
+    /// private `blocks` field); `api.rs`'s own tests read `self.blocks.len()`.
+    #[cfg(test)]
+    pub(crate) fn block_tree_len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// FR8 durable-lock state of the chain-config (via the FR56 seam).
+    pub(crate) fn is_chain_config_durable_locked(&self) -> bool {
+        self.chain_config.is_durable_locked()
+    }
+
+    /// The durable-locked chain-config payload bytes, if any have been retained
+    /// (the FR17 content-mismatch comparand). `None` before genesis retention.
+    pub(crate) fn locked_chain_config_bytes(&self) -> Option<&[u8]> {
+        self.chain_config.initial_chain_config_bytes()
     }
 }
 
@@ -600,6 +877,12 @@ mod tests {
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
         assert_eq!(bc.blocks.len(), 0);
         assert_eq!(bc.node_zero_public_key, [3u8; PUBLIC_KEY_SIZE]);
+        // Story 4.4: the `chain_heads` table + scheduler state must init to
+        // their empty/sentinel values too (the unsafe
+        // `ChainHeadsTable::init_in_place` writes every entry element-by-element).
+        assert_eq!(bc.chain_heads.count(), 0);
+        assert_eq!(bc.active_chain_head_idx, NONE_REF);
+        assert_eq!(bc.last_parent_request_emit_timestamp, 0);
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
@@ -891,7 +1174,10 @@ mod tests {
             signature: [0u8; 64],
         };
         let mut builder = BlockBuilder::new().header(header);
-        builder.add_node_transfer(&nt).ok().expect("add node transfer");
+        builder
+            .add_node_transfer(&nt)
+            .ok()
+            .expect("add node transfer");
         builder.build_signed(&signer).ok().expect("build signed")
     }
 
@@ -900,7 +1186,9 @@ mod tests {
     fn tier1_admit_inserts_at_stored() {
         let mut bc = new_test_chain();
         let block = node_transfer_block(5, 3, 4, 7);
-        let idx = bc.tier1_admit(&block.view()).expect("well-formed block is admitted");
+        let idx = bc
+            .tier1_admit(&block.view(), &block.view().hash(), 1_000)
+            .expect("well-formed block is admitted");
         assert_eq!(bc.blocks.len(), 1);
         assert_eq!(
             bc.blocks.get(idx).expect("entry present").status(),
@@ -917,20 +1205,208 @@ mod tests {
         let mut bc = new_test_chain();
         // initializer == vote == 7 → FR6 self-vote.
         let block = node_transfer_block(5, 7, 4, 7);
-        let result = bc.tier1_admit(&block.view());
+        let result = bc.tier1_admit(&block.view(), &block.view().hash(), 1_000);
         assert_eq!(result, Err(AdmitError::Rejected(Tier1Failure::SelfVote)));
         assert_eq!(bc.blocks.len(), 0, "a rejected block must not be stored");
     }
 
-    /// FR11 defensive guard: re-admitting an identical block reports it as
-    /// already present rather than double-storing it.
+    // (FR11 de-duplication is owned by `classify_block`, not `tier1_admit`, so
+    // there is no `tier1_admit` duplicate case — the dedup outcome is covered
+    // by `intake::tests::receive_block_duplicate_is_duplicate_known`.)
+
+    // --- Story 4.4: FR19 chain_heads admission / scheduler / bootstrap -------
+
+    /// A transfer block whose `previous_hash` is set to `prev` (so it can extend
+    /// a specific parent). `node_transfer_block` zero-fills `previous_hash`, which
+    /// makes an orphan (Stored head); this helper links a child to its parent.
+    fn linked_transfer_block(seq: u32, prev: [u8; 32]) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(3, seq.saturating_sub(1), 7, 9, 100, 1, 0, &signer);
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        builder
+            .add_node_transfer(&nt)
+            .ok()
+            .expect("add node transfer");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// AC7 — a genesis block (sequence 0, no parent) anchors the active chain: it
+    /// becomes a Connected head, `active_chain_head_idx` is set, and no Stored
+    /// head (hence no parent-recovery tick) is scheduled.
     #[test]
-    fn tier1_admit_duplicate_is_already_present() {
+    fn receive_block_genesis_anchors_active_head() {
         let mut bc = new_test_chain();
-        let block = node_transfer_block(5, 3, 4, 7);
-        bc.tier1_admit(&block.view()).expect("first admission");
-        let second = bc.tier1_admit(&block.view());
-        assert_eq!(second, Err(AdmitError::AlreadyPresent));
-        assert_eq!(bc.blocks.len(), 1, "duplicate must not be re-stored");
+        // Block-zero waives the self-vote / anchor Tier 1 checks.
+        let genesis = node_transfer_block(0, 7, 0, 7);
+        let (outcome, next) = bc.receive_block(genesis.view(), 100);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            bc.current_active_head(),
+            Some(0),
+            "genesis is the active head"
+        );
+        assert!(
+            matches!(next, NextCall::Idle),
+            "a Connected genesis head schedules no parent recovery"
+        );
+    }
+
+    /// AC7 — a non-genesis first block with an unresolved parent creates a Stored
+    /// head and schedules the initial parent-recovery tick.
+    #[test]
+    fn receive_block_orphan_creates_stored_head_and_schedules() {
+        let mut bc = new_test_chain();
+        let orphan = node_transfer_block(5, 3, 4, 7);
+        let (outcome, next) = bc.receive_block(orphan.view(), 1_000);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert!(bc.current_active_head().is_none());
+        assert!(
+            matches!(next, NextCall::At(_)),
+            "orphan schedules parent recovery"
+        );
+    }
+
+    /// AC2 — `on_tick` emits exactly one FR19 request for the Stored head, with
+    /// the tail-point's missing-parent hash and `tail.sequence − 1`.
+    #[test]
+    fn on_tick_emits_parent_recovery_request() {
+        let mut bc = new_test_chain();
+        let orphan = node_transfer_block(5, 3, 4, 7); // previous_hash == [0; 32]
+        bc.receive_block(orphan.view(), 0);
+        // Advance past the FR46 global cooldown + per-head retry (lrt == 0).
+        let (outcome, next) = bc.on_tick(1_000_000);
+        match outcome {
+            TickOutcome::SendParentRecoveryRequest(req) => {
+                assert_eq!(req.missing_parent_hash(), &[0u8; 32]);
+                assert_eq!(req.claimed_parent_sequence(), 4, "tail.sequence - 1");
+            }
+            TickOutcome::Idle => panic!("a Stored head past its retry window must emit"),
+        }
+        assert!(
+            matches!(next, NextCall::At(_)),
+            "Stored head still awaits its parent"
+        );
+    }
+
+    /// AC2/AC3 — the FR46 global emit cooldown suppresses a second emission within
+    /// `parent_recovery_min_emit_interval`, even with an eligible head.
+    #[test]
+    fn on_tick_global_cooldown_suppresses_second_emission() {
+        let mut bc = new_test_chain();
+        // Two orphan heads so a head is always eligible.
+        bc.receive_block(node_transfer_block(5, 3, 4, 7).view(), 0);
+        bc.receive_block(linked_transfer_block(9, [0xAB; 32]).view(), 0);
+        let t = 1_000_000;
+        let (first, _) = bc.on_tick(t);
+        assert!(matches!(first, TickOutcome::SendParentRecoveryRequest(_)));
+        // min_emit is 10_000ms; a tick 5_000ms later is inside the cooldown.
+        let (second, _) = bc.on_tick(t + 5_000);
+        assert_eq!(second, TickOutcome::Idle, "global cooldown suppresses");
+        // Past the cooldown, emission resumes.
+        let (third, _) = bc.on_tick(t + 10_000);
+        assert!(matches!(third, TickOutcome::SendParentRecoveryRequest(_)));
+    }
+
+    /// The `NextCall` is the **exact** next-eligible instant (AR4 pull model),
+    /// not `now + a fixed periodic tick`. A fresh orphan (`lrt == 0`, module
+    /// never emitted) is gated only by the FR46 boot-time global cooldown, so the
+    /// deadline is `min_emit` regardless of `now`; after an emission it is the
+    /// per-head window end.
+    #[test]
+    fn parent_recovery_nextcall_is_exact_deadline() {
+        let mut bc = new_test_chain();
+        let orphan = node_transfer_block(5, 3, 4, 7);
+        // min_emit (stub) = 10_000; last_emit = 0 → deadline = max(0, 10_000).
+        let (_, next) = bc.receive_block(orphan.view(), 5_000);
+        assert!(
+            matches!(next, NextCall::At(10_000)),
+            "exact cooldown deadline, independent of now (5_000)"
+        );
+        // Emit at a large now; the next deadline is the per-head window end
+        // (lrt 1_000_000 + per_head_retry 120_000), not now + a fixed interval.
+        let (_, next2) = bc.on_tick(1_000_000);
+        assert!(
+            matches!(next2, NextCall::At(1_120_000)),
+            "exact per-head window end after emission"
+        );
+    }
+
+    /// AC3 — a fresh chain (no Stored heads) ticks Idle with no wake-up.
+    #[test]
+    fn on_tick_idle_without_stored_heads() {
+        let mut bc = new_test_chain();
+        let (outcome, next) = bc.on_tick(5_000);
+        assert_eq!(outcome, TickOutcome::Idle);
+        assert!(matches!(next, NextCall::Idle));
+    }
+
+    /// AC4 — an extend admission advances the single head (no second head).
+    #[test]
+    fn receive_block_extend_advances_head() {
+        let mut bc = new_test_chain();
+        let a = node_transfer_block(5, 3, 4, 7);
+        bc.receive_block(a.view(), 0);
+        let a_hash = a.view().hash();
+        let b = linked_transfer_block(6, a_hash);
+        let (outcome, _) = bc.receive_block(b.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(bc.block_tree_len(), 2);
+        // Still one Stored head (A's orphan tail), advanced to B: on_tick emits a
+        // request whose claimed parent is A's missing parent (tail seq 5 - 1 = 4).
+        let (outcome, _) = bc.on_tick(1_000_000);
+        match outcome {
+            TickOutcome::SendParentRecoveryRequest(req) => {
+                assert_eq!(req.claimed_parent_sequence(), 4);
+            }
+            TickOutcome::Idle => {
+                panic!("the advanced Stored head must still request its tail parent")
+            }
+        }
+    }
+
+    /// AC9 — replaying an identical block + tick sequence against two fresh chains
+    /// yields identical emitted `ParentRecoveryRequest`s and tree/head state,
+    /// regardless of the `now` values used for scheduling.
+    #[test]
+    fn parent_recovery_is_deterministic_replay() {
+        // `no_std`: collect emitted claimed-sequences into a fixed array
+        // (at most one per tick).
+        fn run(ticks: &[u64; 3]) -> (usize, [Option<u32>; 3]) {
+            let mut bc = new_test_chain();
+            // Three orphan heads with distinct sequences.
+            for seq in [7u32, 5, 9] {
+                bc.receive_block(node_transfer_block(seq, 3, seq - 1, 7).view(), 0);
+            }
+            let mut claimed: [Option<u32>; 3] = [None; 3];
+            for (i, &t) in ticks.iter().enumerate() {
+                if let (TickOutcome::SendParentRecoveryRequest(req), _) = bc.on_tick(t) {
+                    claimed[i] = Some(req.claimed_parent_sequence());
+                }
+            }
+            (bc.block_tree_len(), claimed)
+        }
+        // Widely spaced ticks so each clears the global cooldown + per-head retry.
+        let ticks = [1_000_000, 2_000_000, 3_000_000];
+        let (len_a, claims_a) = run(&ticks);
+        let (len_b, claims_b) = run(&ticks);
+        assert_eq!(len_a, len_b);
+        assert_eq!(
+            claims_a, claims_b,
+            "identical emission order across replays"
+        );
+        // Deterministic selection: smallest head_sequence (5) first → claimed 4.
+        assert_eq!(claims_a[0], Some(4));
     }
 }
