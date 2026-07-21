@@ -1016,6 +1016,46 @@ impl<
         (outcome, self.next_parent_recovery_call())
     }
 
+    // --- State-changing ready-only intake entry points (FR14 / FR55) ---------
+    // Not-ready-gated in Story 5.1 (FR1). These are **state-changing** (`&mut
+    // self`) and carry a `NextCall` (AR4) — grouped here with the other
+    // state-changing methods (`receive_block`, `on_tick`), NOT with the read-only
+    // queries below. While not `Ready` each returns its `Outcome::NotReady` with
+    // `NextCall::Idle`; the ready-state body is built by the owning epic
+    // (`todo!()` forward-tag, reachable only by a genesis(Ready) node in tests).
+
+    /// FR14/FR10 transaction intake (ready-only). While not `Ready` the module
+    /// returns [`ReceiveTransactionOutcome::NotReady`] with `NextCall::Idle`
+    /// (FR1: FR14's classification inputs — anchor-sequence window, already-
+    /// confirmed detection, deferred evaluation — are defined against the active
+    /// chain, which does not exist while collecting). Ready-state classification
+    /// is **Epic 7** (FR14); Story 5.1 builds only the gate.
+    pub fn receive_transaction(
+        &mut self,
+        _tx: TransactionView<'_>,
+        _now: u64,
+    ) -> CallResult<ReceiveTransactionOutcome> {
+        if !self.is_ready() {
+            return (ReceiveTransactionOutcome::NotReady, NextCall::Idle);
+        }
+        todo!("FR14 ready-state transaction classification — Epic 7")
+    }
+
+    /// FR55 local transaction-creation surface (ready-only). While not `Ready`
+    /// returns [`LocalTransactionOutcome::NotReady`] (FR55's mandated
+    /// `Rejected(not-ready)`). The `Created` / `Held` / `Rejected` body is
+    /// **Epic 10**; Story 5.1 builds only the gate.
+    pub fn submit_local_transaction(
+        &mut self,
+        _tx: TransactionView<'_>,
+        _now: u64,
+    ) -> CallResult<LocalTransactionOutcome> {
+        if !self.is_ready() {
+            return (LocalTransactionOutcome::NotReady, NextCall::Idle);
+        }
+        todo!("FR55 ready-state local transaction creation — Epic 10")
+    }
+
     /// The next parent-recovery wake-up as the **exact** instant a request can
     /// next be emitted (AR4 scheduling-pull — no fixed periodic tick): the later
     /// of the earliest Stored-head per-head eligibility and the FR46 global emit
@@ -1049,47 +1089,15 @@ impl<
             .map(|entry| entry.sequence())
     }
 
-    // ---------------------------------------------------------------------
-    // Ready-only entry points — not-ready-gated in Story 5.1 (FR1).
-    //
-    // Each checks `is_ready()` and returns its uniform not-ready value while the
-    // node is Collecting/Processing; the ready-state body (beyond the gate) is
-    // built by the owning epic (`todo!()` forward-tag), reachable only by a
-    // genesis(Ready) node in tests until then. Queries return `Result<_, E>`
-    // (a `Result`, not `Option`, so `NotReady` ≠ the domain "absent" case).
-    // ---------------------------------------------------------------------
-
-    /// FR14/FR10 transaction intake (ready-only). While not `Ready` the module
-    /// returns [`ReceiveTransactionOutcome::NotReady`] with `NextCall::Idle`
-    /// (FR1: FR14's classification inputs — anchor-sequence window, already-
-    /// confirmed detection, deferred evaluation — are defined against the active
-    /// chain, which does not exist while collecting). Ready-state classification
-    /// is **Epic 7** (FR14); Story 5.1 builds only the gate.
-    pub fn receive_transaction(
-        &mut self,
-        _tx: TransactionView<'_>,
-        _now: u64,
-    ) -> CallResult<ReceiveTransactionOutcome> {
-        if !self.is_ready() {
-            return (ReceiveTransactionOutcome::NotReady, NextCall::Idle);
-        }
-        todo!("FR14 ready-state transaction classification — Epic 7")
-    }
-
-    /// FR55 local transaction-creation surface (ready-only). While not `Ready`
-    /// returns [`LocalTransactionOutcome::NotReady`] (FR55's mandated
-    /// `Rejected(not-ready)`). The `Created` / `Held` / `Rejected` body is
-    /// **Epic 10**; Story 5.1 builds only the gate.
-    pub fn submit_local_transaction(
-        &mut self,
-        _tx: TransactionView<'_>,
-        _now: u64,
-    ) -> CallResult<LocalTransactionOutcome> {
-        if !self.is_ready() {
-            return (LocalTransactionOutcome::NotReady, NextCall::Idle);
-        }
-        todo!("FR55 ready-state local transaction creation — Epic 10")
-    }
+    // --- Read-only ready-only queries (FR40–FR44) ----------------------------
+    // Not-ready-gated in Story 5.1 (FR1). Read-only (no `NextCall`, AR4) and
+    // served only in `Ready`: while Collecting/Processing each returns
+    // `Err(E::NotReady)`. `Result<T, E>` (not `Option`) so `NotReady` ≠ the
+    // domain "absent" case. Ready-state lookup is built by the owning epic
+    // (`todo!()` forward-tag, reachable only by a genesis(Ready) node in tests).
+    // (The state-changing intake entry points `receive_transaction` /
+    // `submit_local_transaction` are grouped above with the state-changing
+    // methods, not here — they carry a `NextCall`.)
 
     /// FR41 node-balance query (ready-only). `Err(BalanceQueryError::NotReady)`
     /// while not `Ready`; the ready-state lookup (and the `UnknownNode` arm) is
@@ -1899,8 +1907,8 @@ mod tests {
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
     }
 
-    /// AC4 — read-only ready-only queries return `Err(NotReady)` while Collecting
-    /// (a `Result`, so not-ready is a distinct signal, not `None`).
+    /// AC4 — the read-only queries return `Err(NotReady)` while Collecting (a
+    /// `Result`, so not-ready is a distinct signal, not `None`).
     #[test]
     fn collecting_gates_ready_only_queries() {
         let bc = new_test_chain();
