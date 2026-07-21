@@ -1083,6 +1083,29 @@ mod tests {
         assert_eq!(bc.chain_heads.count(), 1, "one active head after genesis");
     }
 
+    /// The single genesis head is **Connected** (on the active chain), not a
+    /// Stored tail-point — so there is nothing to parent-recover: `on_tick`
+    /// stays `Idle` and no `SendParentRecoveryRequest` is emitted for the
+    /// self-authored chain. Guards against a misclassified genesis head.
+    #[test]
+    fn genesis_head_is_connected_no_parent_recovery() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        bc.process_genesis(1_000_000_000, &[0xAB])
+            .ok()
+            .expect("genesis must succeed");
+
+        assert!(
+            !bc.chain_heads.has_stored_head(),
+            "the genesis head must be Connected, not a Stored tail-point"
+        );
+        let (outcome, _next) = bc.on_tick(1_000_000);
+        assert!(
+            matches!(outcome, TickOutcome::Idle),
+            "a complete genesis chain schedules no parent-recovery"
+        );
+    }
+
     /// AC2 — `local_node_id != 0` refuses genesis and leaves the chain empty.
     /// The `Err(_)` arm is forward-compat for the additional
     /// `GenesisRejectReason` variants Story 5.6+ introduces.
