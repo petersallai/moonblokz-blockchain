@@ -203,10 +203,11 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
             if entry.parent_ref() == NONE_REF {
                 return Anchor::Tail(current);
             }
-        last_valid = current;
-        current = entry.parent_ref();
+            last_valid = current;
+            current = entry.parent_ref();
+        }
+        Anchor::Tail(last_valid)
     }
-    Anchor::Tail(last_valid)
 
     /// The cached missing-parent hash for a Stored head whose tail-point is
     /// `tail_idx` (copied when a new head shares an existing branch's tail).
@@ -238,6 +239,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
                 self.heads[slot].last_request_timestamp = 0; // scheduling removed
                 self.heads[slot].missing_parent_hash = [0; 32];
             }
+            Anchor::Tail(tail_idx) => {
+                self.heads[slot].flags &= !FLAG_CONNECTED;
+                self.heads[slot].tail_or_connection_idx = tail_idx;
                 let hash = if tail_idx == anchor_block_idx {
                     *anchor_block_prev_hash
                 } else {
@@ -681,6 +685,38 @@ mod tests {
             "extend leaves parent unchanged"
         );
         assert_eq!(blocks.head_ref_count(b), Some(1));
+    }
+
+    // Regression guard for the Copilot-Autofix corruption of `recompute_caches`
+    // (fix/copilot-autofix-chain-heads): the `Anchor::Tail(tail_idx)` match arm —
+    // which clears FLAG_CONNECTED, sets the tail-point, and preserves the head's
+    // missing-parent hash — must run when a *Stored* branch is extended. Extending
+    // an orphan head (tail-point deeper than the new head block) exercises exactly
+    // the arm the mangled autofix had deleted (undefined `tail_idx`, missing
+    // `locate_anchor` brace). Asserts the recomputed cache, not just the ref-count.
+    #[test]
+    fn extend_of_stored_branch_recomputes_tail_cache() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        // Orphan A (seq 5) whose parent (hash 9) is missing → Stored head, tail = A.
+        let a = put(&mut blocks, 1, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
+        // Extend with B (seq 6, parent = A). Head advances A→B; the branch is still
+        // Stored (tail-point A's parent is still missing), so `recompute_caches`
+        // takes the Tail arm with tail_idx = A != new_idx = B.
+        let b = put(&mut blocks, 2, a, 6);
+        ch.on_block_admitted(&mut blocks, b, Some(a), hash_of(1), 2, NONE_REF);
+        assert!(ch.head_at(0).is_stored(), "extended branch stays Stored");
+        assert_eq!(
+            ch.head_at(0).tail_or_connection_idx, a,
+            "tail-point remains the deepest unresolved-parent block A"
+        );
+        assert_eq!(
+            ch.head_at(0).missing_parent_hash,
+            hash_of(9),
+            "the head's own missing-parent hash is preserved (fallback branch), \
+             not overwritten with the extending block's previous_hash"
+        );
     }
 
     #[test]
