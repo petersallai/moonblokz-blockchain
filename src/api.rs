@@ -183,6 +183,50 @@ pub enum BlockQueryError {
     NotReady,
 }
 
+/// FR40 transaction-state query result: the three states FR40 fixes. The
+/// ready-state lookup that produces `InMempool`/`Confirmed`/`Unknown` is
+/// **Epic 10**; the value type is defined here so the gated query can be typed.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum TransactionState {
+    /// Not known to the module (neither in the mempool nor confirmed on-chain).
+    Unknown,
+    /// Present in the mempool but not yet confirmed on the active chain.
+    InMempool,
+    /// Confirmed on the active chain.
+    Confirmed,
+}
+
+/// Why a transaction-state query [`Blockchain::query_transaction_state`]
+/// returned no value. `NotReady` now (FR1/FR40); Epic 10 adds any domain arms.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum TxStateQueryError {
+    /// FR1/FR40 — the module is not in `Ready`; transaction state is unavailable.
+    NotReady,
+}
+
+/// FR44 creator-role determination result: the binary determination FR44
+/// defines (local node vs. the top of the creator-order projection). The
+/// ready-state comparison against the FR38 creator-order is **Epic 8**.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum CreatorRole {
+    /// The local node is the currently expected block creator (FR44/FR45).
+    LocalIsCurrentCreator,
+    /// The local node is not the currently expected block creator.
+    LocalIsNotCurrentCreator,
+}
+
+/// Why a creator-role query [`Blockchain::creator_role`] returned no value.
+/// `NotReady` now (FR1/FR44); Epic 8 builds the ready-state determination.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum CreatorQueryError {
+    /// FR1/FR44 — the module is not in `Ready`; creator-order does not exist yet.
+    NotReady,
+}
+
 /// Outcome of the internal FR9 Tier 1 admission entry point
 /// [`Blockchain::tier1_admit`]. Story 4.3's `receive_block` intake surface
 /// maps each variant to the single-outcome `ReceiveBlockOutcome`:
@@ -848,6 +892,24 @@ impl<
         )
         .map_err(AdmitError::Rejected)?;
 
+        // Single-genesis guard (Story 5.1, deferred from the Story-4.4 review).
+        // There is structurally exactly one genesis anchor. A distinct `sequence
+        // == 0` block (FR11 dedup already filtered an identical one upstream) that
+        // arrives once the active chain is anchored is rejected as exact evidence
+        // (FR16) — BEFORE any storage write — rather than admitted. Admitting it
+        // would either reseat the anchor (the Story-4.4 defect this guard closes)
+        // or, as a `parent.is_none()` orphan, create a `sequence == 0` Stored head
+        // that emits a perpetual bogus parent-recovery request for a nonexistent
+        // seq-0 parent (violating the `chain_heads` "tail-point never has sequence
+        // 0" invariant). NOTE: authenticity (only node #0 may sign a genesis) is
+        // not yet enforced — the block-creator signature is not a Tier-1 check
+        // until FR69 lands — so this guard enforces single-*anchor* structurally,
+        // not *authenticity*; a forged first-arriving seq-0 would anchor until
+        // FR69. See the Story-5.1 code-review record.
+        if block.sequence() == 0 && self.active_chain_head_idx != NONE_REF {
+            return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
+        }
+
         // Storage-first: peek the slot, persist there, then write the entry at
         // that same slot. Reconstruct an owned `Block` for the storage seam
         // (`save_block` takes `&Block`); this copy happens only on the success
@@ -866,18 +928,10 @@ impl<
 
         // FR19 bootstrap (AC7): a genesis block (sequence 0, no parent) anchors
         // the active chain — mark it on-chain and record it as the active head so
-        // event (i) classifies its head Connected.
-        //
-        // Single-genesis guard (Story 5.1, deferred from the Story-4.4 review):
-        // only anchor when the active chain is **not already anchored**
-        // (`active_chain_head_idx == NONE_REF`). A second distinct `sequence == 0`
-        // block (trust-anchor equivocation — only node #0 can validly sign one)
-        // must NOT silently reseat the active chain; with this guard it is instead
-        // admitted as an ordinary Stored orphan head (its spurious parent-recovery
-        // request for a `sequence == 0` parent is harmless — the scheduler's
-        // `claimed_parent_sequence` saturates at 0).
-        let is_genesis =
-            block.sequence() == 0 && parent.is_none() && self.active_chain_head_idx == NONE_REF;
+        // event (i) classifies its head Connected. The single-genesis guard above
+        // already rejected any seq-0 block once an anchor exists, so this only ever
+        // fires for the *first* genesis (`active_chain_head_idx == NONE_REF`).
+        let is_genesis = block.sequence() == 0 && parent.is_none();
 
         let mut entry = BlockEntry::new(*hash, parent.unwrap_or(NONE_REF), block.sequence());
         entry.set_status(BlockStatus::Stored);
@@ -1066,6 +1120,30 @@ impl<
             return Err(BlockQueryError::NotReady);
         }
         todo!("FR42 ready-state block retrieval by sequence — Epic 10")
+    }
+
+    /// FR40 transaction-state query (ready-only). `Err(TxStateQueryError::NotReady)`
+    /// while not `Ready`; the `Unknown`/`InMempool`/`Confirmed` lookup against the
+    /// mempool + active chain is **Epic 10**.
+    pub fn query_transaction_state(
+        &self,
+        _tx_hash: &[u8; 32],
+    ) -> Result<TransactionState, TxStateQueryError> {
+        if !self.is_ready() {
+            return Err(TxStateQueryError::NotReady);
+        }
+        todo!("FR40 ready-state transaction-state query — Epic 10")
+    }
+
+    /// FR44 creator-role determination (ready-only) — gates FR45 block creation.
+    /// `Err(CreatorQueryError::NotReady)` while not `Ready`; the binary comparison
+    /// of the local node id against the top of the FR38 creator-order projection
+    /// is **Epic 8**.
+    pub fn creator_role(&self) -> Result<CreatorRole, CreatorQueryError> {
+        if !self.is_ready() {
+            return Err(CreatorQueryError::NotReady);
+        }
+        todo!("FR44 ready-state creator-role determination — Epic 8")
     }
 
     /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
@@ -1835,6 +1913,11 @@ mod tests {
             bc.serve_block_by_sequence(0),
             Err(BlockQueryError::NotReady)
         ));
+        assert_eq!(
+            bc.query_transaction_state(&[0u8; 32]),
+            Err(TxStateQueryError::NotReady)
+        );
+        assert_eq!(bc.creator_role(), Err(CreatorQueryError::NotReady));
     }
 
     /// AC4 — state-changing ready-only intake surfaces return `NotReady` with
@@ -1857,10 +1940,13 @@ mod tests {
         assert!(matches!(n2, NextCall::Idle));
     }
 
-    /// AC5 — the single-genesis guard: a second distinct `sequence == 0` block
-    /// does not reseat the active chain (it is admitted as a Stored orphan).
+    /// AC5 — the single-genesis guard: once an anchor exists, a second distinct
+    /// `sequence == 0` block is rejected as invalid evidence (FR16) — not stored,
+    /// not made a Stored orphan (which would emit perpetual bogus parent-recovery
+    /// and break the `chain_heads` "tail never seq 0" invariant), and it never
+    /// reseats the active chain.
     #[test]
-    fn single_genesis_guard_second_seq0_does_not_reseat() {
+    fn single_genesis_guard_rejects_second_seq0() {
         let mut bc = new_test_chain();
 
         // First genesis (seq 0) anchors the active chain at slot 0.
@@ -1869,9 +1955,10 @@ mod tests {
         assert_eq!(o1, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(bc.active_chain_head_idx, 0);
         assert_eq!(bc.current_active_head(), Some(0));
+        assert_eq!(bc.blocks.len(), 1);
 
         // A second, distinct seq-0 block (different vote/initializer → different
-        // hash) must NOT reseat the active chain.
+        // hash) is rejected and leaves the chain untouched.
         let g2 = node_transfer_block(0, 3, 0, 3);
         assert_ne!(
             g1.view().hash(),
@@ -1879,19 +1966,43 @@ mod tests {
             "distinct genesis blocks"
         );
         let (o2, _) = bc.receive_block(g2.view(), 200);
-        assert_eq!(o2, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            o2,
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
         assert_eq!(
             bc.active_chain_head_idx, 0,
             "second genesis must not reseat the active chain"
         );
-        assert_eq!(
-            bc.blocks.len(),
-            2,
-            "second genesis is admitted as an orphan"
-        );
-        assert!(
-            !bc.blocks.get(1).expect("orphan entry").is_on_active_chain(),
-            "the second seq-0 block is not on the active chain"
-        );
+        assert_eq!(bc.blocks.len(), 1, "second genesis must not be stored");
+        assert_eq!(bc.chain_heads.count(), 1, "no spurious Stored head created");
+    }
+
+    /// AC8 (FR63/NFR5) — the lifecycle/gating surface is deterministic and
+    /// wall-clock-independent: replaying the identical init + block sequence with
+    /// **different** `now` values yields identical phase, active-head, and gate
+    /// outcomes. `now` affects only scheduling, never a phase/gate decision.
+    #[test]
+    fn lifecycle_surface_is_now_independent() {
+        fn run(now_base: u64) -> (bool, Option<u32>, bool, bool) {
+            let mut bc = new_test_chain();
+            // Empty-storage init path (join).
+            let (init_outcome, _) = bc.initialize_from_storage(now_base);
+            assert_eq!(init_outcome, InitOutcome::StartedCollecting);
+            // Anchor a genesis, then a rejected second genesis — with now derived
+            // from now_base so the two runs use different timestamps.
+            let g1 = node_transfer_block(0, 7, 0, 7);
+            let o1 = bc.receive_block(g1.view(), now_base + 10).0;
+            let g2 = node_transfer_block(0, 3, 0, 3);
+            let o2 = bc.receive_block(g2.view(), now_base + 20).0;
+            (
+                o1 == ReceiveBlockOutcome::AcceptedSilently,
+                bc.current_active_head(),
+                o2 == ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+                bc.is_ready(),
+            )
+        }
+        // Two replays with widely different wall-clock bases must agree.
+        assert_eq!(run(1_000), run(9_999_999));
     }
 }
