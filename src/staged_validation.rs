@@ -140,6 +140,18 @@ pub(crate) enum Tier1Failure {
     /// mechanical verification is deferred. The variant exists so Story 4.3's
     /// `RejectReason` mapping is complete.
     ChainConfigContentSignatureInvalid,
+    /// Story 5.1 single-genesis guard: a distinct `sequence == 0` block arrived
+    /// while the active chain is already anchored (`active_chain_head_idx !=
+    /// NONE_REF`). There is structurally exactly one genesis anchor, so a later
+    /// distinct genesis is rejected as exact evidence (FR16) rather than admitted
+    /// — admitting it would either reseat the anchor (the Story-4.4 defect) or
+    /// create a perpetual-recovery `sequence == 0` Stored orphan. Produced in
+    /// `Blockchain::tier1_admit` (it needs `active_chain_head_idx`, so it cannot
+    /// live in the state-free `tier1_gate`). NOTE: this enforces single-*anchor*
+    /// structurally, not *authenticity* — the genesis block-creator signature is
+    /// not yet Tier-1-verified (FR69, later epic), so a forged first-arriving
+    /// seq-0 would anchor until that check lands.
+    DuplicateGenesis,
 }
 
 // ---------------------------------------------------------------------------

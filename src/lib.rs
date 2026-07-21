@@ -41,8 +41,10 @@ pub(crate) mod spent_bits;
 pub(crate) mod staged_validation;
 
 pub use api::{
-    Blockchain, CallResult, GenesisBlocks, GenesisRejectReason, LifecyclePhase, NextCall,
-    ParentRecoveryRequest, ReceiveBlockOutcome, RejectReason, TickOutcome,
+    BalanceQueryError, BlockQueryError, Blockchain, CallResult, CreatorQueryError, CreatorRole,
+    GenesisBlocks, GenesisRejectReason, InitOutcome, LifecyclePhase, LocalTransactionOutcome,
+    NextCall, ParentRecoveryRequest, ReceiveBlockOutcome, ReceiveTransactionOutcome, RejectReason,
+    TickOutcome, TransactionState, TxStateQueryError,
 };
 pub use chain_config::{
     ChainConfigError, ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
