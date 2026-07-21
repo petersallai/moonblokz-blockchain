@@ -17,8 +17,8 @@
 //! state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    Block, BlockBuilder, BlockHeader, BlockView, NodeTransfer, PAYLOAD_TYPE_TRANSACTION,
-    Registration,
+    Block, BlockBuilder, BlockHeader, BlockView, NodeTransfer, PAYLOAD_TYPE_CHAIN_CONFIG,
+    PAYLOAD_TYPE_TRANSACTION, Registration,
 };
 use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
@@ -53,38 +53,46 @@ pub type CallResult<T> = (T, NextCall);
 /// Reasons the FR54 genesis bootstrap can be refused.
 ///
 /// Story 1.4 surfaces `LocalNodeIdNotZero` (the FR54 caller-side
-/// precondition), initial chain-config retention errors, and storage
-/// persistence failure. Additional reasons
-/// (`StorageNotEmpty`, broader `InvalidConfig`) arrive when Story 5.6+
-/// enforces the full precondition set.
+/// precondition), `StorageNotEmpty` (genesis is only valid on a fresh chain),
+/// initial chain-config retention errors, and storage persistence failure.
+/// The broader `InvalidConfig` precondition and full persisted-storage
+/// emptiness detection on reboot arrive when Story 5.6+ enforces the complete
+/// precondition set.
 pub enum GenesisRejectReason {
     /// `local_node_id` was not `0`. Genesis is a node-zero-only operation
     /// (FR54).
     LocalNodeIdNotZero,
-    /// `initial_chain_config_bytes` would not fit in the future Block #1
+    /// The chain is not empty: this instance has already been bootstrapped
+    /// (Block #0 present, or the initial chain-config already retained), so
+    /// genesis must not run again and overwrite it. Walking-skeleton scope
+    /// checks the in-memory chain state; detecting a non-empty *persisted*
+    /// store on reboot is Story 5.6.
+    StorageNotEmpty,
+    /// `initial_chain_config_bytes` would not fit in the Block #1
     /// chain-config payload.
     InitialChainConfigTooLarge,
     /// The initial chain-config payload has already been retained and must
     /// not be overwritten.
     InitialChainConfigAlreadyStored,
-    /// Block #0 could not be persisted through the storage seam, so genesis
-    /// must not report success.
+    /// Block #0 or Block #1 could not be persisted through the storage seam,
+    /// so genesis must not report success.
     StorageSaveFailed,
 }
 
-/// Outcome of `Blockchain::initialize_genesis_in_place`.
+/// Outcome of [`Blockchain::process_genesis`].
 ///
-/// Walking-skeleton (Story 1.4) scope: returns an **owned** [`Block`] for
-/// Block #0. The architectural `BlockView<'a>` borrow form arrives once
+/// Walking-skeleton (Story 1.4) scope: returns both genesis blocks as **owned**
+/// [`Block`] values. The architectural `BlockView<'a>` borrow form arrives once
 /// `EmitScratch` exists (Story 4.3 / 8.3 per architecture §6.2).
 pub enum InitGenesisOutcome {
-    /// Genesis Block #0 was created and persisted. Caller should broadcast
-    /// it; the next `on_tick(...)` will emit Block #1 (chain-config) per
-    /// AR6 / decisions log #19.
-    Created(Block),
-    /// Genesis was refused; no `Blockchain` instance exists on this path.
-    /// Currently unreachable from the success-path return — kept for
-    /// forward-compatibility with Story 5.6+ when the precondition set
+    /// Both genesis blocks were created and persisted in a single call:
+    /// `block_zero` (node-#0 registration + initial self-transfer, FR54) and
+    /// `block_one` (the chain-config block carrying `initial_chain_config_bytes`,
+    /// `previous_hash` chained to `block_zero`). The caller broadcasts both over
+    /// the radio, lowest-sequence first.
+    Created { block_zero: Block, block_one: Block },
+    /// Genesis was refused. Currently unreachable from the success-path return —
+    /// kept for forward-compatibility with Story 5.6+ when the precondition set
     /// expands. The `Result::Err` carries the actual refusal.
     #[allow(dead_code)]
     Rejected(GenesisRejectReason),
@@ -368,8 +376,9 @@ impl<
     /// reachable anywhere it's needed via a local `MaybeUninit` +
     /// `assume_init()` (exactly as this crate's own tests do), it just
     /// always goes through an in-place write rather than a by-value return.
-    /// See [`Self::initialize_genesis_in_place`] for the one production
-    /// constructor path (FR54).
+    /// This is the single constructor for every node; node zero then runs
+    /// [`Self::process_genesis`] on the constructed instance to bootstrap the
+    /// chain (FR54).
     ///
     /// For embedded firmware, use this from *inside* a
     /// `#[embassy_executor::task]` fn:
@@ -432,56 +441,59 @@ impl<
         }
     }
 
-    /// FR54 genesis bootstrap: builds genesis Block #0 (node-zero
-    /// registration + initial self-transfer), persists it through the
-    /// storage seam, and initializes `*dst` in place — writing every field
-    /// through [`Self::init_in_place`] instead of returning `Self` by value,
-    /// for the same reason [`Self::init_in_place`]'s doc comment gives: this
-    /// is the one production path that constructs a `Blockchain`, so it must
-    /// not reintroduce the by-value-return stack cost `init_in_place` exists
-    /// to avoid. On success, returns the immediate-callback `NextCall::At(now)`
-    /// so the bridge will call `on_tick(...)` to emit Block #1 (chain-config)
-    /// per AR6.
+    /// FR54 genesis bootstrap: builds **both** genesis blocks in a single call
+    /// on an already-constructed (empty, `Collecting`) node-zero `Blockchain`,
+    /// persists them through the storage seam, and returns both so the caller
+    /// can broadcast them over the radio (lowest-sequence first):
     ///
-    /// Refusal: returns `Err(GenesisRejectReason::_)` if `local_node_id != 0`,
-    /// if `initial_chain_config_bytes` doesn't fit or was already retained, or
-    /// if Block #0 cannot be persisted (FR54 caller-side preconditions). Every
-    /// fallible step — including the storage save — runs on the standalone
-    /// `crypto` / `storage` / `chain_config` values *before*
-    /// [`Self::init_in_place`] is called, so `*dst` is left **entirely
-    /// untouched** on every `Err` path; there is no case where `Err` is
-    /// returned after `*dst` was already written.
+    /// - **Block #0** — node-#0 registration + an initial self-transfer of
+    ///   `initial_total_network_currency` (`PAYLOAD_TYPE_TRANSACTION`).
+    /// - **Block #1** — the chain-config block carrying
+    ///   `initial_chain_config_bytes` (`PAYLOAD_TYPE_CHAIN_CONFIG`), with
+    ///   `previous_hash` chained to Block #0's hash. Signed over its full
+    ///   canonical content via [`BlockBuilder::set_chain_config_payload`].
     ///
-    /// **Walking-skeleton scope (Story 1.4).** The Block #0 layout is
-    /// minimum-buildable: registration + self-transfer per FR54. The block
-    /// and bootstrap transactions are finalized through chain-types signed
-    /// builders; full canonical validation still lands in Stories 4.2 / 5.4 /
-    /// 5.6. The `initial_chain_config_bytes` parameter is retained by the
-    /// `chain_config` seam for the later Block #1 emission; validation and
-    /// durable-lock semantics land in Story 5.6.
+    /// This is a plain `&mut self` state transition, not a constructor: the node
+    /// is built once through [`Self::init_in_place`], then genesis runs against
+    /// it. That keeps the single infallible in-place constructor and lets genesis
+    /// use ordinary fallible control flow. (Non-zero nodes never call this; they
+    /// construct via `init_in_place` and receive the chain over the mesh.)
     ///
-    /// # Safety
-    /// `dst` must be valid for writes of `Self` and not yet initialized. On
-    /// `Ok`, `*dst` is fully initialized exactly like [`Self::init_in_place`].
-    /// On `Err`, `*dst` is not written at all — do not call `assume_init`/
-    /// `assume_init_mut` on it.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn initialize_genesis_in_place(
-        dst: *mut Self,
-        crypto: Crypto,
-        mut storage: Storage,
-        mut chain_config: Config,
-        local_node_id: u32,
+    /// Refusal (`Err(GenesisRejectReason::_)`, `self` left unchanged): the local
+    /// node id is not `0`; the chain is not empty (`StorageNotEmpty` — already
+    /// bootstrapped); `initial_chain_config_bytes` does not fit or was already
+    /// retained; or a block cannot be persisted (`StorageSaveFailed`). All
+    /// non-persistence checks run before any storage write, and both blocks are
+    /// built before either is saved, so a refusal never leaves a half-written
+    /// chain from *this* call.
+    ///
+    /// On success, returns `NextCall::At(now)` — an immediate follow-up tick so
+    /// the scheduler proceeds to normal operation. (Block #1 is no longer emitted
+    /// from `on_tick`; both blocks are produced here.)
+    ///
+    /// **Walking-skeleton scope (Story 1.4).** Block layouts are
+    /// minimum-buildable per FR54; blocks are finalized through chain-types signed
+    /// builders. Full canonical validation (Stories 4.2 / 5.4 / 5.6), the
+    /// chain-config durable-lock semantics, block-tree insertion, and detecting a
+    /// non-empty *persisted* store on reboot land in later stories; the
+    /// `StorageNotEmpty` guard here inspects in-memory chain state only.
+    pub fn process_genesis(
+        &mut self,
         initial_total_network_currency: u64,
         initial_chain_config_bytes: &[u8],
-        prng_seed: u64,
         now: u64,
-    ) -> Result<(InitGenesisOutcome, NextCall), GenesisRejectReason> {
-        if local_node_id != 0 {
+    ) -> Result<CallResult<InitGenesisOutcome>, GenesisRejectReason> {
+        if self.local_node_id != 0 {
             return Err(GenesisRejectReason::LocalNodeIdNotZero);
         }
-        let node_zero_public_key = *crypto.public_key().serialize();
-        chain_config
+        // Genesis is only valid on a fresh chain. Re-running it would overwrite
+        // an existing Block #0 / retained chain-config.
+        if self.blocks.len() != 0 || self.chain_config.initial_chain_config_bytes().is_some() {
+            return Err(GenesisRejectReason::StorageNotEmpty);
+        }
+
+        let node_zero_public_key = *self.crypto.public_key().serialize();
+        self.chain_config
             .store_initial_chain_config_bytes(initial_chain_config_bytes)
             .map_err(|err| match err {
                 ChainConfigError::InitialChainConfigTooLarge => {
@@ -501,7 +513,7 @@ impl<
             0, // registration_price
             0, // fee
             &node_zero_public_key,
-            &crypto,
+            &self.crypto,
         );
         let self_transfer = NodeTransfer::new_signed(
             0, // vote
@@ -511,10 +523,10 @@ impl<
             initial_total_network_currency,
             0, // fee
             0, // comment
-            &crypto,
+            &self.crypto,
         );
 
-        let header = BlockHeader {
+        let block_0_header = BlockHeader {
             version: 1,
             sequence: 0,
             creator: 0,
@@ -531,43 +543,68 @@ impl<
         };
 
         // The chain-types builder errors only on payload-type mismatch or
-        // capacity overflow — neither applies to two small bootstrap
-        // transactions. The walking-skeleton uses `unreachable!` to make the
+        // capacity overflow — neither applies to these fixed-size bootstrap
+        // payloads. The walking-skeleton uses `unreachable!` to make the
         // invariant explicit; Story 5.6+ may surface BlockError through a
         // new InitGenesisOutcome::Rejected variant when the assembly grows.
-        let mut builder = BlockBuilder::new().header(header);
+        let mut builder = BlockBuilder::new().header(block_0_header);
         if builder.add_registration(&registration).is_err() {
             unreachable!("Block #0 registration is fixed-size and cannot overflow payload");
         }
         if builder.add_node_transfer(&self_transfer).is_err() {
             unreachable!("Block #0 self-transfer is fixed-size and cannot overflow payload");
         }
-        let block_0 = match builder.build_signed(&crypto) {
+        let block_0 = match builder.build_signed(&self.crypto) {
             Ok(b) => b,
             Err(_) => unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
         };
 
-        // Exercise the storage seam end-to-end *before* `*dst` is touched at
-        // all: if persistence fails, the caller must not receive a `Created`
-        // outcome, and this ordering means `*dst` stays uninitialized on
-        // this path exactly like every other refusal above.
-        storage
+        // Assemble signed Block #1: the chain-config block, chained to Block #0.
+        let block_1_header = BlockHeader {
+            version: 1,
+            sequence: 1,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: block_0.hash(),
+            signature: [0u8; 64],
+        };
+        let mut cfg_builder = BlockBuilder::new().header(block_1_header);
+        // `initial_chain_config_bytes` already passed the capacity check in
+        // `store_initial_chain_config_bytes`, so the payload fits Block #1.
+        if cfg_builder
+            .set_chain_config_payload(initial_chain_config_bytes)
+            .is_err()
+        {
+            unreachable!("initial chain-config bytes were capacity-checked and fit the payload");
+        }
+        let block_1 = match cfg_builder.build_signed(&self.crypto) {
+            Ok(b) => b,
+            Err(_) => unreachable!("Block #1 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
+        };
+
+        // Persist both blocks only after both are built, so a build failure
+        // never leaves a partially-persisted chain. Both go to their chain
+        // slots by sequence; wiring Block #1 through the dedicated
+        // `set_chain_configuration` seam (which needs the storage control plane
+        // initialized first) lands with the Story 5.6 boot flow.
+        self.storage
             .save_block(0, &block_0)
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+        self.storage
+            .save_block(1, &block_1)
+            .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
 
-        unsafe {
-            Self::init_in_place(
-                dst,
-                crypto,
-                storage,
-                chain_config,
-                local_node_id,
-                node_zero_public_key,
-                prng_seed,
-            );
-        }
-
-        Ok((InitGenesisOutcome::Created(block_0), NextCall::At(now)))
+        Ok((
+            InitGenesisOutcome::Created {
+                block_zero: block_0,
+                block_one: block_1,
+            },
+            NextCall::At(now),
+        ))
     }
 
     /// Read-only query — returns the current lifecycle phase (FR1–FR4).
@@ -849,6 +886,42 @@ mod tests {
         (crypto, storage, chain_config)
     }
 
+    /// Helper: build an empty node via `init_in_place` ready for a
+    /// `process_genesis` call. Genesis is node-zero-only, so node zero's own
+    /// key (derived from `crypto`) is stored as the trust anchor.
+    fn new_chain(
+        crypto: Crypto,
+        storage: MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        chain_config: FixedChainConfig,
+        local_node_id: u32,
+        prng_seed: u64,
+    ) -> Blockchain<
+        Crypto,
+        MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        FixedChainConfig,
+        16,
+        16,
+        4,
+        16,
+        4,
+        16,
+    > {
+        let node_zero = *crypto.public_key().serialize();
+        let mut bc_slot = core::mem::MaybeUninit::uninit();
+        unsafe {
+            Blockchain::init_in_place(
+                bc_slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                local_node_id,
+                node_zero,
+                prng_seed,
+            );
+            bc_slot.assume_init()
+        }
+    }
+
     /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
     /// `blocks` filled element-by-element via `BlockTable::init_in_place`)
     /// must land every field in its correct default state — a wrong field
@@ -886,8 +959,9 @@ mod tests {
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
-    /// yields Block #0 + `NextCall::At(now)` (immediate callback for the
-    /// later Block #1 step), no embassy deps anywhere in the harness.
+    /// yields **both** Block #0 and Block #1 in a single `process_genesis`
+    /// call, plus `NextCall::At(now)`, with no embassy deps anywhere in the
+    /// harness.
     #[test]
     fn walking_skeleton_genesis_success() {
         let (crypto, storage, chain_config) = test_backends();
@@ -895,30 +969,31 @@ mod tests {
         let now: u64 = 12_345;
         let initial_chain_config_bytes = [0xC0, 0xA5, 0xF6, 0x01];
 
-        let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let outcome = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                0,                           // local_node_id
-                1_000_000_000,               // initial_total_network_currency
-                &initial_chain_config_bytes, // retained for the later Block #1 emit
-                0xDEAD_BEEF_CAFE_F00D,
-                now,
-            )
-        };
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0xDEAD_BEEF_CAFE_F00D);
+        let outcome = bc.process_genesis(
+            1_000_000_000, // initial_total_network_currency
+            &initial_chain_config_bytes,
+            now,
+        );
 
         match outcome {
-            Ok((InitGenesisOutcome::Created(block), NextCall::At(t))) => {
-                assert_eq!(block.sequence(), 0);
-                assert_eq!(block.creator(), 0);
-                assert_eq!(block.version(), 1);
-                assert_eq!(block.payload_type(), PAYLOAD_TYPE_TRANSACTION);
-                assert!(any_nonzero(block.signature()), "Block #0 must be signed");
-                let mut transactions = block
+            Ok((
+                InitGenesisOutcome::Created {
+                    block_zero,
+                    block_one,
+                },
+                NextCall::At(t),
+            )) => {
+                // --- Block #0: registration + self-transfer ---
+                assert_eq!(block_zero.sequence(), 0);
+                assert_eq!(block_zero.creator(), 0);
+                assert_eq!(block_zero.version(), 1);
+                assert_eq!(block_zero.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+                assert!(
+                    any_nonzero(block_zero.signature()),
+                    "Block #0 must be signed"
+                );
+                let mut transactions = block_zero
                     .transactions()
                     .expect("genesis Block #0 should contain transaction payload")
                     .iter();
@@ -940,9 +1015,28 @@ mod tests {
                     .expect("second genesis transaction should be NodeTransfer");
                 assert!(any_nonzero(self_transfer.signature()));
                 assert!(transactions.next().is_none());
-                assert_eq!(t, now, "Block #1 needs an immediate-callback tick (AR6)");
 
-                let bc = unsafe { bc_slot.assume_init() };
+                // --- Block #1: chain-config, chained to Block #0 ---
+                assert_eq!(block_one.sequence(), 1);
+                assert_eq!(block_one.version(), 1);
+                assert_eq!(block_one.payload_type(), PAYLOAD_TYPE_CHAIN_CONFIG);
+                assert_eq!(
+                    block_one.previous_hash(),
+                    &block_zero.hash()[..],
+                    "Block #1 must chain to Block #0"
+                );
+                assert_eq!(
+                    block_one.payload(),
+                    &initial_chain_config_bytes[..],
+                    "Block #1 payload is the initial chain-config verbatim"
+                );
+                assert!(
+                    any_nonzero(block_one.signature()),
+                    "Block #1 must be signed"
+                );
+
+                assert_eq!(t, now, "genesis schedules an immediate follow-up tick");
+
                 assert_eq!(
                     bc.chain_config.initial_chain_config_bytes(),
                     Some(&initial_chain_config_bytes[..])
@@ -954,65 +1048,41 @@ mod tests {
                 panic!("walking-skeleton success path should not return Rejected outcome");
             }
             Ok((_, NextCall::Idle)) => {
-                panic!("genesis must schedule the Block #1 callback (AR6)");
+                panic!("genesis must schedule the immediate follow-up tick");
             }
             Err(_) => panic!("genesis with local_node_id == 0 must succeed (FR54)"),
         }
     }
 
-    /// AC2 — `local_node_id != 0` refuses genesis; no `Blockchain` is
-    /// constructed. The `Err(_)` arm is forward-compat for the additional
+    /// AC2 — `local_node_id != 0` refuses genesis and leaves the chain empty.
+    /// The `Err(_)` arm is forward-compat for the additional
     /// `GenesisRejectReason` variants Story 5.6+ introduces.
     #[allow(unreachable_patterns)]
     #[test]
     fn walking_skeleton_refuses_non_zero_local_node_id() {
         let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 1, 0);
 
-        let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let outcome = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                1, // local_node_id != 0 → refusal
-                1_000_000_000,
-                &[],
-                0,
-                0,
-            )
-        };
+        let outcome = bc.process_genesis(1_000_000_000, &[], 0);
 
         match outcome {
             Err(GenesisRejectReason::LocalNodeIdNotZero) => {}
             Err(_) => panic!("expected LocalNodeIdNotZero refusal"),
             Ok(_) => panic!("FR54 precondition must refuse local_node_id != 0"),
         }
+        // Nothing was retained on the refusal path.
+        assert!(bc.chain_config.initial_chain_config_bytes().is_none());
     }
 
-    /// Oversized genesis chain-config bytes are rejected before a `Blockchain`
-    /// instance is constructed; the bounded retention lives in `chain_config.rs`.
+    /// Oversized genesis chain-config bytes are rejected; the bounded
+    /// retention lives in `chain_config.rs`.
     #[test]
     fn walking_skeleton_rejects_oversized_initial_chain_config() {
         let (crypto, storage, chain_config) = test_backends();
         let oversized = [0u8; INITIAL_CHAIN_CONFIG_BYTES_CAPACITY + 1];
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let outcome = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                0,
-                1_000_000_000,
-                &oversized,
-                0,
-                0,
-            )
-        };
+        let outcome = bc.process_genesis(1_000_000_000, &oversized, 0);
 
         match outcome {
             Err(GenesisRejectReason::InitialChainConfigTooLarge) => {}
@@ -1021,40 +1091,50 @@ mod tests {
         }
     }
 
-    /// Already-retained initial chain-config bytes are not overwritten during
-    /// genesis setup.
+    /// A chain that already retains initial chain-config bytes is not empty, so
+    /// genesis is refused before it can overwrite them (`StorageNotEmpty`).
     #[test]
-    fn walking_skeleton_rejects_already_stored_initial_chain_config() {
+    fn walking_skeleton_refuses_genesis_when_chain_config_already_retained() {
         let (crypto, storage, mut chain_config) = test_backends();
         chain_config
             .store_initial_chain_config_bytes(&[0x01, 0x02])
             .unwrap();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let outcome = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                0,
-                1_000_000_000,
-                &[0x03, 0x04],
-                0,
-                0,
-            )
-        };
+        let outcome = bc.process_genesis(1_000_000_000, &[0x03, 0x04], 0);
 
         match outcome {
-            Err(GenesisRejectReason::InitialChainConfigAlreadyStored) => {}
-            Err(_) => panic!("expected InitialChainConfigAlreadyStored refusal"),
+            Err(GenesisRejectReason::StorageNotEmpty) => {}
+            Err(_) => panic!("expected StorageNotEmpty refusal"),
             Ok(_) => panic!("genesis must not overwrite retained chain-config bytes"),
+        }
+        // The pre-existing bytes are untouched.
+        assert_eq!(
+            bc.chain_config.initial_chain_config_bytes(),
+            Some(&[0x01, 0x02][..])
+        );
+    }
+
+    /// Genesis is a one-shot bootstrap: a second `process_genesis` on the same
+    /// node refuses with `StorageNotEmpty` (the chain now carries genesis state).
+    #[test]
+    fn walking_skeleton_refuses_second_genesis() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+
+        let first = bc.process_genesis(1_000_000_000, &[0xAA], 1);
+        assert!(first.is_ok(), "first genesis must succeed");
+
+        let second = bc.process_genesis(1_000_000_000, &[0xBB], 2);
+        match second {
+            Err(GenesisRejectReason::StorageNotEmpty) => {}
+            Err(_) => panic!("expected StorageNotEmpty on the second genesis"),
+            Ok(_) => panic!("genesis must run at most once per chain"),
         }
     }
 
     /// Storage persistence failure refuses genesis; no `Created` outcome is
-    /// returned when Block #0 cannot be retained locally.
+    /// returned when a genesis block cannot be retained locally.
     #[test]
     fn walking_skeleton_refuses_storage_save_failure() {
         let private_key = [1u8; PRIVATE_KEY_SIZE];
@@ -1063,27 +1143,29 @@ mod tests {
             .expect("test private key should be accepted by the backend");
         let storage = MemoryBackend::<0>::new();
         let chain_config = FixedChainConfig::new();
+        let node_zero = *crypto.public_key().serialize();
 
         let mut bc_slot =
             core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let outcome = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
+        let mut bc = unsafe {
+            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
                 bc_slot.as_mut_ptr(),
                 crypto,
                 storage,
                 chain_config,
                 0,
-                1_000_000_000,
-                &[],
+                node_zero,
                 0,
-                0,
-            )
+            );
+            bc_slot.assume_init()
         };
+
+        let outcome = bc.process_genesis(1_000_000_000, &[], 0);
 
         match outcome {
             Err(GenesisRejectReason::StorageSaveFailed) => {}
             Err(_) => panic!("expected StorageSaveFailed refusal"),
-            Ok(_) => panic!("genesis must not succeed when Block #0 cannot be persisted"),
+            Ok(_) => panic!("genesis must not succeed when a genesis block cannot be persisted"),
         }
     }
 
@@ -1094,25 +1176,10 @@ mod tests {
     #[test]
     fn walking_skeleton_query_carries_no_next_call() {
         let (crypto, storage, chain_config) = test_backends();
-
-        let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::initialize_genesis_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                0,
-                1_000_000_000,
-                &[],
-                0,
-                0,
-            )
-        }
-        .ok()
-        .expect("genesis must succeed for local_node_id == 0");
-        let bc = unsafe { bc_slot.assume_init() };
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        bc.process_genesis(1_000_000_000, &[], 0)
+            .ok()
+            .expect("genesis must succeed for local_node_id == 0");
 
         // Type-level assertion: the query result is `LifecyclePhase`,
         // not `(LifecyclePhase, NextCall)`. If the signature ever drifts
