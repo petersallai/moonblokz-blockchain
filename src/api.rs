@@ -777,9 +777,8 @@ impl<
     /// are the only callers. **Genesis does not use this** — it establishes the
     /// initial `Ready` phase directly at bootstrap (initialization, not a runtime
     /// transition; see [`Self::process_genesis`]).
-    // First caller lands in Story 5.2 (Collecting→Processing); declared-and-tagged-
-    // forward, so allow dead_code until then.
-    #[allow(dead_code)]
+    // First runtime caller is the Story 5.2 FR2 dominant-chain acquisition hook in
+    // `receive_block` (Collecting→Processing); Stories 5.4/5.5 add the other edges.
     pub(crate) fn set_lifecycle_phase(&mut self, to: LifecyclePhase) {
         debug_assert!(
             is_legal_transition(&self.lifecycle_phase, &to),
@@ -794,6 +793,63 @@ impl<
     /// not-ready indication.
     pub(crate) fn is_ready(&self) -> bool {
         self.lifecycle_phase == LifecyclePhase::Ready
+    }
+
+    /// FR2 dominant-chain acquisition: evaluate the collecting-phase stopping
+    /// condition over the current block-tree and return the selected candidate
+    /// tip's block-table index, or `None` if no candidate yet qualifies.
+    ///
+    /// Pure and side-effect-free (reads `chain_heads` + `blocks`; no `now`, no
+    /// PRNG, no mutation — FR63/NFR5 determinism). A candidate is an occupied
+    /// `chain_heads` tip whose continuous segment is either **genesis-anchored**
+    /// (earliest block has `sequence == 0`, FR54) or **active-length-satisfying**
+    /// (segment length `≥ SNAKE_CHAIN_LENGTH`). The earliest block is the head's
+    /// cached `tail_or_connection_idx` (the tail for a Stored head; the
+    /// connection-point for a head Connected to the bootstrap-anchored genesis —
+    /// which while collecting is the genesis, `sequence 0`), so no ancestry
+    /// re-walk is needed; continuity implies consecutive sequences, so segment
+    /// length is exact sequence arithmetic.
+    ///
+    /// Selection: highest tip sequence; a same-sequence tie is broken by the
+    /// **lowest tip block hash** (big-endian) — an in-memory total order (distinct
+    /// blocks have distinct hashes) that preserves FR63 determinism. This is a
+    /// bootstrapping pick of which candidate to reconstruct first; the final
+    /// authoritative chain is governed by branch value (FR21/FR22/FR23) once
+    /// ready. The PRD's fuller size→creator→hash tie-break is a deferred
+    /// optimization (ratified 2026-07-22) — it would need tip block content the
+    /// in-memory tree does not retain; see `prd.md` FR2 + `deferred-work.md`.
+    /// `branch_value` (FR21) is never consulted here (it is 0/unpopulated —
+    /// Epic 6).
+    pub(crate) fn evaluate_stopping_condition(&self) -> Option<u32> {
+        // (head_idx, tip_sequence, tip_hash) of the best qualifying candidate.
+        let mut best: Option<(u32, u32, [u8; 32])> = None;
+        for (head_idx, earliest_idx) in self.chain_heads.occupied_heads() {
+            let (Some(tip), Some(earliest)) =
+                (self.blocks.get(head_idx), self.blocks.get(earliest_idx))
+            else {
+                // A head always resolves in the tree; skip defensively, never panic.
+                continue;
+            };
+            let tip_seq = tip.sequence();
+            let earliest_seq = earliest.sequence();
+            let genesis_anchored = earliest_seq == 0;
+            // Continuity ⇒ consecutive sequences, so length is exact arithmetic.
+            let segment_len = tip_seq.saturating_sub(earliest_seq) + 1;
+            if !(genesis_anchored || segment_len >= SNAKE_CHAIN_LENGTH) {
+                continue;
+            }
+            let tip_hash = *tip.hash();
+            let better = match best {
+                None => true,
+                Some((_, best_seq, best_hash)) => {
+                    tip_seq > best_seq || (tip_seq == best_seq && tip_hash < best_hash)
+                }
+            };
+            if better {
+                best = Some((head_idx, tip_seq, tip_hash));
+            }
+        }
+        best.map(|(head_idx, _, _)| head_idx)
     }
 
     /// Join/restart init follow-up (FR1/FR59): the **safe** counterpart to the
@@ -971,6 +1027,22 @@ impl<
         // FR60 window if Ready+available (Epic 9); any `Err` → no window → FR60 skipped.
         let window = self.active_snake_chain_window().ok();
         let outcome = classify_block(self, &block, window, now);
+        // FR2 dominant-chain acquisition (Story 5.2): a successful collecting-phase
+        // admission may complete a candidate segment. Evaluate the stopping
+        // condition and, on success, transition Collecting→Processing. Runs only
+        // after a real admission (not on duplicate/reject) and only while
+        // Collecting (Processing/Ready never re-trigger).
+        if outcome == ReceiveBlockOutcome::AcceptedSilently
+            && self.lifecycle_phase == LifecyclePhase::Collecting
+            && self.evaluate_stopping_condition().is_some()
+        {
+            self.set_lifecycle_phase(LifecyclePhase::Processing);
+            // Story 5.3 (FR3): run the reconstruction pass here on the selected
+            // candidate tip (re-derive via evaluate_stopping_condition, or thread
+            // it from above — no persistent field). A bootstrap-anchored genesis's
+            // `active_chain_head_idx` is a placeholder the FR3 Ready transition
+            // overwrites; it does not pre-empt FR2 selection.
+        }
         (outcome, self.next_parent_recovery_call())
     }
 
@@ -2004,5 +2076,202 @@ mod tests {
         }
         // Two replays with widely different wall-clock bases must agree.
         assert_eq!(run(1_000), run(9_999_999));
+    }
+
+    // --- Story 5.2: FR2 dominant-chain acquisition (stopping conditions + selection) ---
+
+    /// A linked child block with a tweakable `vote` salt, so two blocks at the same
+    /// `(sequence, previous_hash)` get distinct hashes — for the tie-break test.
+    fn salted_linked_block(seq: u32, prev: [u8; 32], vote: u32) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(vote, seq.saturating_sub(1), 7, 9, 100, 1, 0, &signer);
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        builder
+            .add_node_transfer(&nt)
+            .ok()
+            .expect("add node transfer");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// AC4/AC7 — an orphan block whose short segment neither reaches genesis nor
+    /// spans `W` leaves the node Collecting (no candidate); parent recovery still
+    /// schedules (the FR2 evaluation is side-effect-free w.r.t. the tick cadence).
+    #[test]
+    fn fr2_no_candidate_stays_collecting() {
+        let mut bc = new_test_chain();
+        let orphan = node_transfer_block(5, 3, 4, 7); // tail seq 5, len 1, not genesis
+        let (outcome, next) = bc.receive_block(orphan.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert!(bc.evaluate_stopping_condition().is_none());
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        assert!(
+            matches!(next, NextCall::At(_)),
+            "parent recovery still scheduled while collecting"
+        );
+    }
+
+    /// AC2/AC5/AC6 — receiving the genesis (a length-1 genesis-anchored segment)
+    /// satisfies FR2 at once: the node transitions Collecting→Processing, and the
+    /// bootstrap-anchored genesis (the placeholder active head) is recognized as
+    /// the candidate — no intake change, per the `:142` resolution.
+    #[test]
+    fn fr2_genesis_anchored_triggers_processing() {
+        let mut bc = new_test_chain();
+        let genesis = node_transfer_block(0, 7, 0, 7);
+        let (outcome, _) = bc.receive_block(genesis.view(), 100);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            bc.current_active_head(),
+            Some(0),
+            "genesis anchored as the placeholder active head (AC6)"
+        );
+        assert!(
+            bc.current_phase() == LifecyclePhase::Processing,
+            "genesis-anchored segment → Processing"
+        );
+    }
+
+    /// A test chain with a small active-chain window (`SNAKE_CHAIN_LENGTH = 4`) so
+    /// an active-length segment fits the test harness's block storage. Same shape
+    /// as `new_test_chain` otherwise (local_node_id 5, join/Collecting).
+    fn new_w4_chain() -> Blockchain<
+        Crypto,
+        MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        FixedChainConfig,
+        16,
+        4,
+        4,
+        16,
+        4,
+        16,
+    > {
+        let (crypto, storage, chain_config) = test_backends();
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot = core::mem::MaybeUninit::uninit();
+        unsafe {
+            Blockchain::init_in_place(
+                slot.as_mut_ptr(),
+                crypto,
+                storage,
+                chain_config,
+                5,
+                node_zero,
+                0,
+            );
+            slot.assume_init()
+        }
+    }
+
+    /// AC2 — an active-length segment (`>= W = 4`) that does NOT reach genesis
+    /// triggers Processing; one block short (len 3) it stays Collecting.
+    #[test]
+    fn fr2_active_length_triggers_at_w() {
+        let mut bc = new_w4_chain();
+        // Tail orphan at seq 100 (unresolved parent), then children up to len 3.
+        let tail = node_transfer_block(100, 3, 99, 7);
+        bc.receive_block(tail.view(), 0);
+        let mut prev = tail.view().hash();
+        for seq in 101..=102 {
+            let blk = linked_transfer_block(seq, prev);
+            prev = blk.view().hash();
+            bc.receive_block(blk.view(), 0);
+        }
+        assert_eq!(bc.block_tree_len(), 3);
+        assert!(
+            bc.evaluate_stopping_condition().is_none(),
+            "segment length 3 < W = 4"
+        );
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        // The 4th block brings the continuous segment to length W = 4.
+        let last = linked_transfer_block(103, prev);
+        bc.receive_block(last.view(), 0);
+        assert!(
+            bc.current_phase() == LifecyclePhase::Processing,
+            "segment length 4 >= W → Processing"
+        );
+    }
+
+    /// AC3 — selection takes the highest tip sequence; a same-sequence tie is
+    /// broken by the lowest tip hash (hash-only, in-memory). Built via
+    /// `tier1_admit` (which does not run the FR2 hook), so the multi-head tree can
+    /// be assembled before evaluating.
+    #[test]
+    fn fr2_selection_highest_sequence_then_lowest_hash() {
+        let mut bc = new_test_chain();
+        let g = node_transfer_block(0, 7, 0, 7);
+        bc.tier1_admit(&g.view(), &g.view().hash(), 0)
+            .expect("genesis admitted");
+        let gh = g.view().hash();
+        // Two distinct seq-1 children of genesis (a fork) → both genesis-anchored,
+        // both tip seq 1 → tie broken by lower tip hash.
+        let a = salted_linked_block(1, gh, 3);
+        let b = salted_linked_block(1, gh, 4);
+        let a_idx = bc
+            .tier1_admit(&a.view(), &a.view().hash(), 0)
+            .expect("A admitted");
+        let b_idx = bc
+            .tier1_admit(&b.view(), &b.view().hash(), 0)
+            .expect("B admitted");
+        let a_hash = a.view().hash();
+        let b_hash = b.view().hash();
+        let lower = if a_hash < b_hash { a_idx } else { b_idx };
+        assert_eq!(
+            bc.evaluate_stopping_condition(),
+            Some(lower),
+            "same-sequence tie → lower tip hash wins"
+        );
+        // Extend branch A to seq 2 → the higher sequence now outranks the tie.
+        let c = salted_linked_block(2, a_hash, 3);
+        let c_idx = bc
+            .tier1_admit(&c.view(), &c.view().hash(), 0)
+            .expect("C admitted");
+        assert_eq!(
+            bc.evaluate_stopping_condition(),
+            Some(c_idx),
+            "highest tip sequence wins over the lower-sequence tie"
+        );
+    }
+
+    /// AC8 — the selected candidate is independent of admission order (FR63/NFR5):
+    /// building the same fork in two admission orders yields the same winning tip
+    /// hash (the block-table index differs by order, the chosen tip does not).
+    #[test]
+    fn fr2_selection_is_order_independent() {
+        fn winner_hash(order: &[u32; 2]) -> [u8; 32] {
+            let mut bc = new_test_chain();
+            let g = node_transfer_block(0, 7, 0, 7);
+            bc.tier1_admit(&g.view(), &g.view().hash(), 0)
+                .expect("genesis");
+            let gh = g.view().hash();
+            let blocks = [
+                salted_linked_block(1, gh, order[0]),
+                salted_linked_block(1, gh, order[1]),
+            ];
+            for blk in &blocks {
+                bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
+                    .expect("child admitted");
+            }
+            let win = bc
+                .evaluate_stopping_condition()
+                .expect("a genesis-anchored candidate qualifies");
+            *bc.blocks.get(win).expect("winner is in the tree").hash()
+        }
+        assert_eq!(
+            winner_hash(&[3, 4]),
+            winner_hash(&[4, 3]),
+            "same winning tip regardless of admission order"
+        );
     }
 }

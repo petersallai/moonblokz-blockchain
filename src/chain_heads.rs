@@ -172,6 +172,20 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
             .any(|h| !h.is_empty() && !h.is_connected())
     }
 
+    /// Iterate `(head_idx, earliest_idx)` for every occupied tip. `earliest_idx`
+    /// is the segment's earliest block — the cached `tail_or_connection_idx`: the
+    /// tail-point for a Stored head, or the connection-point for a Connected head
+    /// (which, while collecting, is the bootstrap-anchored genesis). Consumed by
+    /// the FR2 dominant-chain acquisition evaluator (`Blockchain::evaluate_stopping_condition`,
+    /// Story 5.2), which reads the tip/earliest sequences from `blocks` to qualify
+    /// and select candidates — no ancestry re-walk needed.
+    pub(crate) fn occupied_heads(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.heads
+            .iter()
+            .filter(|h| !h.is_empty())
+            .map(|h| (h.head_idx, h.tail_or_connection_idx))
+    }
+
     /// Slot of the entry whose head block is `head_idx`, if any.
     fn slot_of_head(&self, head_idx: u32) -> Option<usize> {
         self.heads
@@ -708,7 +722,8 @@ mod tests {
         ch.on_block_admitted(&mut blocks, b, Some(a), hash_of(1), 2, NONE_REF);
         assert!(ch.head_at(0).is_stored(), "extended branch stays Stored");
         assert_eq!(
-            ch.head_at(0).tail_or_connection_idx, a,
+            ch.head_at(0).tail_or_connection_idx,
+            a,
             "tail-point remains the deepest unresolved-parent block A"
         );
         assert_eq!(
