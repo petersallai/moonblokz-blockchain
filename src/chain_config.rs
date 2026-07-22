@@ -108,6 +108,14 @@ pub trait ChainConfigTrait {
     /// Maximum aggregated signatures per approval-evidence block (ADR-015).
     fn current_max_aggregated_signatures(&self) -> u8;
 
+    /// FR37 `vote_scale` — the per-credit vote value; also the per-block
+    /// anti-capture interest cap. Feeds `VoteEngine` construction (Story 5.3).
+    fn current_vote_scale(&self) -> core::num::NonZeroU16;
+
+    /// FR37 `vote_interest` — the anti-capture vote-interest rate. Feeds
+    /// `VoteEngine` construction (Story 5.3).
+    fn current_vote_interest(&self) -> u8;
+
     /// FR8 durable-lock status. The MVP stub returns `true` (FR56*).
     fn is_durable_locked(&self) -> bool;
 
@@ -177,6 +185,17 @@ impl ChainConfigTrait for FixedChainConfig {
         50
     }
 
+    fn current_vote_scale(&self) -> core::num::NonZeroU16 {
+        // AR14 fixed-value stub. `1000` gives ample headroom for the FR37
+        // anti-capture interest arithmetic without approaching the `u32`
+        // checked-arithmetic ceiling on realistic MVP chains.
+        core::num::NonZeroU16::new(1000).expect("1000 is non-zero")
+    }
+
+    fn current_vote_interest(&self) -> u8 {
+        5
+    }
+
     fn is_durable_locked(&self) -> bool {
         true
     }
@@ -214,6 +233,8 @@ mod tests {
         assert_eq!(cfg.current_block_size_limit(), 2016);
         assert_eq!(cfg.current_max_utxo_outputs(), 255);
         assert_eq!(cfg.current_max_aggregated_signatures(), 50);
+        assert_eq!(cfg.current_vote_scale().get(), 1000);
+        assert_eq!(cfg.current_vote_interest(), 5);
         assert!(cfg.is_durable_locked());
         assert_eq!(cfg.parent_recovery_per_head_retry_interval_ms(), 120_000);
         assert_eq!(cfg.parent_recovery_min_emit_interval_ms(), 10_000);

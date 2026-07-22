@@ -12,4 +12,5 @@ categories = ["embedded", "no-std"]
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
 moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["schnorr", "backend-memory"] }
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false, features = ["schnorr-crypto-bigint"] }
+moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
