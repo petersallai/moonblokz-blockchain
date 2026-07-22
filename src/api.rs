@@ -206,27 +206,6 @@ pub enum TxStateQueryError {
     NotReady,
 }
 
-/// FR44 creator-role determination result: the binary determination FR44
-/// defines (local node vs. the top of the creator-order projection). The
-/// ready-state comparison against the FR38 creator-order is **Epic 8**.
-#[cfg_attr(test, derive(Debug))]
-#[derive(PartialEq, Eq)]
-pub enum CreatorRole {
-    /// The local node is the currently expected block creator (FR44/FR45).
-    LocalIsCurrentCreator,
-    /// The local node is not the currently expected block creator.
-    LocalIsNotCurrentCreator,
-}
-
-/// Why a creator-role query [`Blockchain::query_creator_role`] returned no value.
-/// `NotReady` now (FR1/FR44); Epic 8 builds the ready-state determination.
-#[cfg_attr(test, derive(Debug))]
-#[derive(PartialEq, Eq)]
-pub enum CreatorQueryError {
-    /// FR1/FR44 — the module is not in `Ready`; creator-order does not exist yet.
-    NotReady,
-}
-
 /// Outcome of the internal FR9 Tier 1 admission entry point
 /// [`Blockchain::tier1_admit`]. Story 4.3's `receive_block` intake surface
 /// maps each variant to the single-outcome `ReceiveBlockOutcome`:
@@ -1143,16 +1122,11 @@ impl<
         todo!("FR40 ready-state transaction-state query — Epic 10")
     }
 
-    /// FR44 creator-role determination (Ready-state-only) — gates FR45 block creation.
-    /// `Err(CreatorQueryError::NotReady)` while not `Ready`; the binary comparison
-    /// of the local node id against the top of the FR38 creator-order projection
-    /// is **Epic 8**.
-    pub fn query_creator_role(&self) -> Result<CreatorRole, CreatorQueryError> {
-        if !self.is_ready() {
-            return Err(CreatorQueryError::NotReady);
-        }
-        todo!("FR44 ready-state creator-role determination — Epic 8")
-    }
+    // FR44 creator-role determination is deliberately NOT a public query here.
+    // It is an Epic-8-internal input to FR45 block creation (phase-gated inside
+    // the scheduler — the determination is simply not made while collecting); any
+    // external visibility is feature-gated introspection (architecture §3.5),
+    // never a first-class public API method. See the Story-5.1 review record.
 
     /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
     /// in collecting state (which suppresses the FR60 window check + its
@@ -1925,7 +1899,6 @@ mod tests {
             bc.query_transaction_state(&[0u8; 32]),
             Err(TxStateQueryError::NotReady)
         );
-        assert_eq!(bc.query_creator_role(), Err(CreatorQueryError::NotReady));
     }
 
     /// AC4 — state-changing Ready-state-only intake surfaces return `NotReady` with

@@ -29,12 +29,16 @@
 //! - local transaction creation `submit_local_transaction` (FR55) — Epic 10;
 //! - value/balance query `query_balance` + address-UTXO query (FR41) — Epic 10;
 //! - block-retrieval `query_block_by_hash`/`query_block_by_sequence` (FR42) — Epic 10;
-//! - transaction-state query (FR40), top-mempool-items exchange (FR43),
-//!   creator-role determination (FR44) — Epic 10 / Epic 8: gated with the same
-//!   `Result`/`NotReady` pattern by the owning epic, which also defines the
-//!   method's ready-state return type (`TransactionState`, the mempool
-//!   iterator, `CreatorRole`). Introducing those return types is part of the
-//!   owning epic's body, so their gate lands with them.
+//! - transaction-state query (FR40), top-mempool-items exchange (FR43) — Epic 10:
+//!   gated with the same `Result`/`NotReady` pattern by the owning epic, which
+//!   also defines the method's ready-state return type (`TransactionState`, the
+//!   mempool iterator). Introducing those types is part of the owning epic's
+//!   body, so their gate lands with it.
+//!
+//! FR44 creator-role determination is **not** a public query — it is an Epic-8
+//! internal input to FR45 block creation (phase-gated inside the scheduler); any
+//! external visibility is feature-gated introspection (architecture §3.5),
+//! never a public API method.
 //!
 //! Not gated as public-method stubs: mempool replenishment (FR46) is gated
 //! inside the Epic 8 scheduler (its deadline is simply not scheduled while
