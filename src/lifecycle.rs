@@ -28,7 +28,7 @@
 //! - transaction intake `receive_transaction` (FR14/FR10) — Epic 7;
 //! - local transaction creation `submit_local_transaction` (FR55) — Epic 10;
 //! - value/balance query `query_balance` + address-UTXO query (FR41) — Epic 10;
-//! - block-retrieval `serve_block_by_hash`/`serve_block_by_sequence` (FR42) — Epic 10;
+//! - block-retrieval `query_block_by_hash`/`query_block_by_sequence` (FR42) — Epic 10;
 //! - transaction-state query (FR40), top-mempool-items exchange (FR43),
 //!   creator-role determination (FR44) — Epic 10 / Epic 8: gated with the same
 //!   `Result`/`NotReady` pattern by the owning epic, which also defines the

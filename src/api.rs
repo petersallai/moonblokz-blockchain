@@ -170,8 +170,8 @@ pub enum BalanceQueryError {
     NotReady,
 }
 
-/// Why a block-retrieval query ([`Blockchain::serve_block_by_hash`] /
-/// [`Blockchain::serve_block_by_sequence`]) returned no block.
+/// Why a block-retrieval query ([`Blockchain::query_block_by_hash`] /
+/// [`Blockchain::query_block_by_sequence`]) returned no block.
 ///
 /// A `Result` (not `Option`) so `NotReady` (FR42: block-retrieval is Ready-state-only)
 /// stays distinct from the domain "absent" case: **Epic 10** adds `NotFound`
@@ -218,7 +218,7 @@ pub enum CreatorRole {
     LocalIsNotCurrentCreator,
 }
 
-/// Why a creator-role query [`Blockchain::creator_role`] returned no value.
+/// Why a creator-role query [`Blockchain::query_creator_role`] returned no value.
 /// `NotReady` now (FR1/FR44); Epic 8 builds the ready-state determination.
 #[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Eq)]
@@ -1114,7 +1114,7 @@ impl<
     /// while not `Ready` — a collecting node does not serve blocks, including
     /// radio-forwarded peer requests (FR1). Ready-state lookup (and the
     /// `NotFound` arm) is **Epic 10**.
-    pub fn serve_block_by_hash(&self, _hash: &[u8; 32]) -> Result<BlockView<'_>, BlockQueryError> {
+    pub fn query_block_by_hash(&self, _hash: &[u8; 32]) -> Result<BlockView<'_>, BlockQueryError> {
         if !self.is_ready() {
             return Err(BlockQueryError::NotReady);
         }
@@ -1123,7 +1123,7 @@ impl<
 
     /// FR42 block-retrieval by sequence (Ready-state-only). `Err(BlockQueryError::NotReady)`
     /// while not `Ready`. Ready-state lookup is **Epic 10**.
-    pub fn serve_block_by_sequence(&self, _seq: u32) -> Result<BlockView<'_>, BlockQueryError> {
+    pub fn query_block_by_sequence(&self, _seq: u32) -> Result<BlockView<'_>, BlockQueryError> {
         if !self.is_ready() {
             return Err(BlockQueryError::NotReady);
         }
@@ -1147,7 +1147,7 @@ impl<
     /// `Err(CreatorQueryError::NotReady)` while not `Ready`; the binary comparison
     /// of the local node id against the top of the FR38 creator-order projection
     /// is **Epic 8**.
-    pub fn creator_role(&self) -> Result<CreatorRole, CreatorQueryError> {
+    pub fn query_creator_role(&self) -> Result<CreatorRole, CreatorQueryError> {
         if !self.is_ready() {
             return Err(CreatorQueryError::NotReady);
         }
@@ -1914,18 +1914,18 @@ mod tests {
         let bc = new_test_chain();
         assert_eq!(bc.query_balance(1), Err(BalanceQueryError::NotReady));
         assert!(matches!(
-            bc.serve_block_by_hash(&[0u8; 32]),
+            bc.query_block_by_hash(&[0u8; 32]),
             Err(BlockQueryError::NotReady)
         ));
         assert!(matches!(
-            bc.serve_block_by_sequence(0),
+            bc.query_block_by_sequence(0),
             Err(BlockQueryError::NotReady)
         ));
         assert_eq!(
             bc.query_transaction_state(&[0u8; 32]),
             Err(TxStateQueryError::NotReady)
         );
-        assert_eq!(bc.creator_role(), Err(CreatorQueryError::NotReady));
+        assert_eq!(bc.query_creator_role(), Err(CreatorQueryError::NotReady));
     }
 
     /// AC4 — state-changing Ready-state-only intake surfaces return `NotReady` with
