@@ -77,10 +77,9 @@ pub enum LifecyclePhase {
 /// `Ready` directly at bootstrap — that is initialization, not a runtime
 /// transition, so it does not route through this predicate (architecture
 /// §3.6). Join/restart pass through `Collecting`.
-// Consumed by `Blockchain::set_lifecycle_phase`; both go live when the FR2/FR6/FR5
-// runtime-transition drivers land (Stories 5.2/5.4/5.5). Declared-and-tagged-forward
-// per the crate's discipline — allow dead_code until the first driver calls it.
-#[allow(dead_code)]
+// Consumed by `Blockchain::set_lifecycle_phase`, whose first runtime caller is the
+// Story 5.2 FR2 dominant-chain acquisition hook (`Collecting → Processing`); the
+// `Processing → Ready` / `Processing → Collecting` drivers land in Stories 5.4/5.5.
 pub(crate) fn is_legal_transition(from: &LifecyclePhase, to: &LifecyclePhase) -> bool {
     matches!(
         (from, to),
