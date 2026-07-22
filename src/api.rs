@@ -170,8 +170,8 @@ pub enum BalanceQueryError {
     NotReady,
 }
 
-/// Why a block-retrieval query ([`Blockchain::serve_block_by_hash`] /
-/// [`Blockchain::serve_block_by_sequence`]) returned no block.
+/// Why a block-retrieval query ([`Blockchain::query_block_by_hash`] /
+/// [`Blockchain::query_block_by_sequence`]) returned no block.
 ///
 /// A `Result` (not `Option`) so `NotReady` (FR42: block-retrieval is Ready-state-only)
 /// stays distinct from the domain "absent" case: **Epic 10** adds `NotFound`
@@ -181,6 +181,21 @@ pub enum BalanceQueryError {
 pub enum BlockQueryError {
     /// FR1/FR42 — the module is not in `Ready`; block-retrieval is not served.
     NotReady,
+}
+
+/// Why the active-chain snake-chain window is unavailable — the `Err` side of
+/// [`Blockchain::active_snake_chain_window`]. A `Result` rather than `Option`
+/// so the *reason* there is no FR60 window is explicit, never a bare `None`.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub(crate) enum SnakeChainWindowError {
+    /// Not in `Ready` (Collecting / Processing): no active chain, so no window —
+    /// the FR60 check stays inactive and every admitted block is `Stored`.
+    NotReady,
+    /// `Ready`, but the `(S_tail, S_head)` derivation is Epic 9 (`snake_chain.rs`)
+    /// and not yet available, so FR60 stays inactive even in `Ready`. Epic 9
+    /// removes this arm when it supplies the real window (Ready branch → `Ok`).
+    NotYetDerived,
 }
 
 /// FR40 transaction-state query result: the three states FR40 fixes. The
@@ -203,27 +218,6 @@ pub enum TransactionState {
 #[derive(PartialEq, Eq)]
 pub enum TxStateQueryError {
     /// FR1/FR40 — the module is not in `Ready`; transaction state is unavailable.
-    NotReady,
-}
-
-/// FR44 creator-role determination result: the binary determination FR44
-/// defines (local node vs. the top of the creator-order projection). The
-/// ready-state comparison against the FR38 creator-order is **Epic 8**.
-#[cfg_attr(test, derive(Debug))]
-#[derive(PartialEq, Eq)]
-pub enum CreatorRole {
-    /// The local node is the currently expected block creator (FR44/FR45).
-    LocalIsCurrentCreator,
-    /// The local node is not the currently expected block creator.
-    LocalIsNotCurrentCreator,
-}
-
-/// Why a creator-role query [`Blockchain::creator_role`] returned no value.
-/// `NotReady` now (FR1/FR44); Epic 8 builds the ready-state determination.
-#[cfg_attr(test, derive(Debug))]
-#[derive(PartialEq, Eq)]
-pub enum CreatorQueryError {
-    /// FR1/FR44 — the module is not in `Ready`; creator-order does not exist yet.
     NotReady,
 }
 
@@ -974,7 +968,8 @@ impl<
         block: BlockView<'_>,
         now: u64,
     ) -> CallResult<ReceiveBlockOutcome> {
-        let window = self.active_snake_chain_window();
+        // FR60 window if Ready+available (Epic 9); any `Err` → no window → FR60 skipped.
+        let window = self.active_snake_chain_window().ok();
         let outcome = classify_block(self, &block, window, now);
         (outcome, self.next_parent_recovery_call())
     }
@@ -1114,7 +1109,7 @@ impl<
     /// while not `Ready` — a collecting node does not serve blocks, including
     /// radio-forwarded peer requests (FR1). Ready-state lookup (and the
     /// `NotFound` arm) is **Epic 10**.
-    pub fn serve_block_by_hash(&self, _hash: &[u8; 32]) -> Result<BlockView<'_>, BlockQueryError> {
+    pub fn query_block_by_hash(&self, _hash: &[u8; 32]) -> Result<BlockView<'_>, BlockQueryError> {
         if !self.is_ready() {
             return Err(BlockQueryError::NotReady);
         }
@@ -1123,7 +1118,7 @@ impl<
 
     /// FR42 block-retrieval by sequence (Ready-state-only). `Err(BlockQueryError::NotReady)`
     /// while not `Ready`. Ready-state lookup is **Epic 10**.
-    pub fn serve_block_by_sequence(&self, _seq: u32) -> Result<BlockView<'_>, BlockQueryError> {
+    pub fn query_block_by_sequence(&self, _seq: u32) -> Result<BlockView<'_>, BlockQueryError> {
         if !self.is_ready() {
             return Err(BlockQueryError::NotReady);
         }
@@ -1143,34 +1138,29 @@ impl<
         todo!("FR40 ready-state transaction-state query — Epic 10")
     }
 
-    /// FR44 creator-role determination (Ready-state-only) — gates FR45 block creation.
-    /// `Err(CreatorQueryError::NotReady)` while not `Ready`; the binary comparison
-    /// of the local node id against the top of the FR38 creator-order projection
-    /// is **Epic 8**.
-    pub fn creator_role(&self) -> Result<CreatorRole, CreatorQueryError> {
-        if !self.is_ready() {
-            return Err(CreatorQueryError::NotReady);
-        }
-        todo!("FR44 ready-state creator-role determination — Epic 8")
-    }
+    // FR44 creator-role determination is deliberately NOT a public query here.
+    // It is an Epic-8-internal input to FR45 block creation (phase-gated inside
+    // the scheduler — the determination is simply not made while collecting); any
+    // external visibility is feature-gated introspection (architecture §3.5),
+    // never a first-class public API method. See the Story-5.1 review record.
 
-    /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
-    /// in collecting state (which suppresses the FR60 window check + its
-    /// `long-disconnect-detected` log per AC7).
+    /// The active-chain `(S_tail, S_head)` sequence bounds for the FR60 window
+    /// check, or an [`SnakeChainWindowError`] explaining why there is none.
     ///
-    /// Gated on `Ready` (Story 5.1): while the node is not `Ready` (Collecting /
-    /// Processing) there is no active chain, so this returns `None` and the FR60
-    /// window check stays inactive — every admitted block is `Stored` (FR9/AC6).
-    /// The decision is now phase-driven, not a hardcoded `None`. Epic 9
-    /// (`snake_chain.rs`) supplies the real `(S_tail, S_head)` from the
-    /// `_snake_chain_tail_idx` / `active_chain_head_idx` block-table indices once
-    /// Ready; until it lands, the Ready branch also yields `None`.
-    fn active_snake_chain_window(&self) -> Option<(u32, u32)> {
+    /// `Result` (not `Option`) so the *reason* is explicit: `Err(NotReady)` while
+    /// not `Ready` (Collecting / Processing — no active chain) and
+    /// `Err(NotYetDerived)` in `Ready` until Epic 9 (`snake_chain.rs`) supplies
+    /// the real window from the `_snake_chain_tail_idx` / `active_chain_head_idx`
+    /// indices. Either `Err` leaves the FR60 window inactive, so every admitted
+    /// block stays `Stored` (FR9/AC6). The intake caller only needs "window or
+    /// not", so it maps this with `.ok()`.
+    fn active_snake_chain_window(&self) -> Result<(u32, u32), SnakeChainWindowError> {
         if !self.is_ready() {
-            return None;
+            return Err(SnakeChainWindowError::NotReady);
         }
-        // Epic 9 derives the real (S_tail, S_head) here.
-        None
+        // Epic 9 returns `Ok((s_tail, s_head))` here; until then the window is not
+        // derivable, so FR60 stays inactive even in Ready.
+        Err(SnakeChainWindowError::NotYetDerived)
     }
 
     /// FR11 duplicate-index probe used by the intake dispatcher: `true` iff a
@@ -1893,7 +1883,10 @@ mod tests {
     #[test]
     fn snake_chain_window_none_while_collecting() {
         let bc = new_test_chain();
-        assert!(bc.active_snake_chain_window().is_none());
+        assert_eq!(
+            bc.active_snake_chain_window(),
+            Err(SnakeChainWindowError::NotReady)
+        );
     }
 
     /// AC3 — the join follow-up on empty durable storage keeps the node
@@ -1914,18 +1907,17 @@ mod tests {
         let bc = new_test_chain();
         assert_eq!(bc.query_balance(1), Err(BalanceQueryError::NotReady));
         assert!(matches!(
-            bc.serve_block_by_hash(&[0u8; 32]),
+            bc.query_block_by_hash(&[0u8; 32]),
             Err(BlockQueryError::NotReady)
         ));
         assert!(matches!(
-            bc.serve_block_by_sequence(0),
+            bc.query_block_by_sequence(0),
             Err(BlockQueryError::NotReady)
         ));
         assert_eq!(
             bc.query_transaction_state(&[0u8; 32]),
             Err(TxStateQueryError::NotReady)
         );
-        assert_eq!(bc.creator_role(), Err(CreatorQueryError::NotReady));
     }
 
     /// AC4 — state-changing Ready-state-only intake surfaces return `NotReady` with

@@ -41,7 +41,7 @@ pub(crate) mod spent_bits;
 pub(crate) mod staged_validation;
 
 pub use api::{
-    BalanceQueryError, BlockQueryError, Blockchain, CallResult, CreatorQueryError, CreatorRole,
+    BalanceQueryError, BlockQueryError, Blockchain, CallResult,
     GenesisBlocks, GenesisRejectReason, InitOutcome, LifecyclePhase, LocalTransactionOutcome,
     NextCall, ParentRecoveryRequest, ReceiveBlockOutcome, ReceiveTransactionOutcome, RejectReason,
     TickOutcome, TransactionState, TxStateQueryError,
