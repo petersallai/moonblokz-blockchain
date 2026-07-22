@@ -797,7 +797,10 @@ impl<
 
     /// FR2 dominant-chain acquisition: evaluate the collecting-phase stopping
     /// condition over the current block-tree and return the selected candidate
-    /// tip's block-table index, or `None` if no candidate yet qualifies.
+    /// tip's block-table index, or `None` if no candidate yet qualifies. The
+    /// returned `u32` is this node's **local** handle to the chosen tip (indices
+    /// are assigned by local admission order); the cross-node-deterministic
+    /// quantity is the tip's identity (hash), which the tie-break orders on.
     ///
     /// Pure and side-effect-free (reads `chain_heads` + `blocks`; no `now`, no
     /// PRNG, no mutation — FR63/NFR5 determinism). A candidate is an occupied
@@ -832,9 +835,17 @@ impl<
             };
             let tip_seq = tip.sequence();
             let earliest_seq = earliest.sequence();
+            // Invariant: the head's earliest block (tail-point, or connection-point
+            // — in collecting the only on-active-chain block is the bootstrap
+            // genesis, seq 0) is never above the tip. Surfaces tree/cache
+            // corruption in debug; the saturating math fails safe in release.
+            debug_assert!(earliest_seq <= tip_seq, "chain-head earliest above tip");
             let genesis_anchored = earliest_seq == 0;
-            // Continuity ⇒ consecutive sequences, so length is exact arithmetic.
-            let segment_len = tip_seq.saturating_sub(earliest_seq) + 1;
+            // Continuity ⇒ consecutive sequences (a resolved parent link keys on
+            // `child_sequence - 1`, so a continuous segment has no gaps), making the
+            // length exact. `saturating_add(1)` keeps the reserved `u32::MAX`
+            // sequence sentinel (rejected at intake per FR53) from ever overflowing.
+            let segment_len = tip_seq.saturating_sub(earliest_seq).saturating_add(1);
             if !(genesis_anchored || segment_len >= SNAKE_CHAIN_LENGTH) {
                 continue;
             }
@@ -1031,7 +1042,10 @@ impl<
         // admission may complete a candidate segment. Evaluate the stopping
         // condition and, on success, transition Collecting→Processing. Runs only
         // after a real admission (not on duplicate/reject) and only while
-        // Collecting (Processing/Ready never re-trigger).
+        // Collecting (Processing/Ready never re-trigger). `AcceptedSilently` is
+        // currently the sole accept outcome; when Epic 6/8 add `AcceptedAndSend*`
+        // accept variants they must be included in this gate (else a block admitted
+        // under them would miss the transition).
         if outcome == ReceiveBlockOutcome::AcceptedSilently
             && self.lifecycle_phase == LifecyclePhase::Collecting
             && self.evaluate_stopping_condition().is_some()
@@ -2249,10 +2263,10 @@ mod tests {
     /// hash (the block-table index differs by order, the chosen tip does not).
     #[test]
     fn fr2_selection_is_order_independent() {
-        fn winner_hash(order: &[u32; 2]) -> [u8; 32] {
+        fn winner_hash(order: &[u32; 2], now: u64) -> [u8; 32] {
             let mut bc = new_test_chain();
             let g = node_transfer_block(0, 7, 0, 7);
-            bc.tier1_admit(&g.view(), &g.view().hash(), 0)
+            bc.tier1_admit(&g.view(), &g.view().hash(), now)
                 .expect("genesis");
             let gh = g.view().hash();
             let blocks = [
@@ -2260,7 +2274,7 @@ mod tests {
                 salted_linked_block(1, gh, order[1]),
             ];
             for blk in &blocks {
-                bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
+                bc.tier1_admit(&blk.view(), &blk.view().hash(), now)
                     .expect("child admitted");
             }
             let win = bc
@@ -2268,10 +2282,69 @@ mod tests {
                 .expect("a genesis-anchored candidate qualifies");
             *bc.blocks.get(win).expect("winner is in the tree").hash()
         }
+        // Order- AND now-independent (FR63/NFR5): the evaluator reads no clock/PRNG.
         assert_eq!(
-            winner_hash(&[3, 4]),
-            winner_hash(&[4, 3]),
-            "same winning tip regardless of admission order"
+            winner_hash(&[3, 4], 1_000),
+            winner_hash(&[4, 3], 9_999_999),
+            "same winning tip regardless of admission order or wall-clock base"
+        );
+    }
+
+    /// AC6 — the bootstrap-anchored genesis does not pre-empt selection: a longer
+    /// non-genesis active-length branch at a higher tip sequence is chosen over
+    /// the anchored genesis's short branch (the evaluator never reads
+    /// `active_chain_head_idx`).
+    #[test]
+    fn fr2_anchored_genesis_does_not_preempt_higher_branch() {
+        let mut bc = new_w4_chain();
+        // Anchored genesis (a short genesis-anchored candidate).
+        let g = node_transfer_block(0, 7, 0, 7);
+        bc.tier1_admit(&g.view(), &g.view().hash(), 0)
+            .expect("genesis admitted");
+        assert_eq!(
+            bc.current_active_head(),
+            Some(0),
+            "genesis is the placeholder anchor"
+        );
+        // A separate non-genesis branch of length W = 4 (tail seq 100 → tip 103).
+        let tail = node_transfer_block(100, 3, 99, 7);
+        bc.tier1_admit(&tail.view(), &tail.view().hash(), 0)
+            .expect("tail admitted");
+        let mut prev = tail.view().hash();
+        let mut tip_idx = 0;
+        for seq in 101..=103 {
+            let blk = linked_transfer_block(seq, prev);
+            prev = blk.view().hash();
+            tip_idx = bc
+                .tier1_admit(&blk.view(), &blk.view().hash(), 0)
+                .expect("child admitted");
+        }
+        // Highest tip sequence (103) wins over the anchored genesis (seq 0).
+        assert_eq!(
+            bc.evaluate_stopping_condition(),
+            Some(tip_idx),
+            "the longer non-genesis branch is selected despite the genesis anchor"
+        );
+    }
+
+    /// AC2 — a genesis-anchored segment longer than 1 but shorter than W still
+    /// qualifies (the genesis rule is length-independent — distinct from the
+    /// active-length rule).
+    #[test]
+    fn fr2_genesis_anchored_multiblock_below_w_qualifies() {
+        let mut bc = new_test_chain(); // W = 16
+        let g = node_transfer_block(0, 7, 0, 7);
+        bc.tier1_admit(&g.view(), &g.view().hash(), 0)
+            .expect("genesis admitted");
+        // A child of genesis at seq 1 → a 2-block genesis-anchored segment (< W).
+        let c = linked_transfer_block(1, g.view().hash());
+        let c_idx = bc
+            .tier1_admit(&c.view(), &c.view().hash(), 0)
+            .expect("child admitted");
+        assert_eq!(
+            bc.evaluate_stopping_condition(),
+            Some(c_idx),
+            "genesis-anchored qualifies at length 2, well below W = 16"
         );
     }
 }
