@@ -183,6 +183,21 @@ pub enum BlockQueryError {
     NotReady,
 }
 
+/// Why the active-chain snake-chain window is unavailable — the `Err` side of
+/// [`Blockchain::active_snake_chain_window`]. A `Result` rather than `Option`
+/// so the *reason* there is no FR60 window is explicit, never a bare `None`.
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub(crate) enum SnakeChainWindowError {
+    /// Not in `Ready` (Collecting / Processing): no active chain, so no window —
+    /// the FR60 check stays inactive and every admitted block is `Stored`.
+    NotReady,
+    /// `Ready`, but the `(S_tail, S_head)` derivation is Epic 9 (`snake_chain.rs`)
+    /// and not yet available, so FR60 stays inactive even in `Ready`. Epic 9
+    /// removes this arm when it supplies the real window (Ready branch → `Ok`).
+    NotYetDerived,
+}
+
 /// FR40 transaction-state query result: the three states FR40 fixes. The
 /// ready-state lookup that produces `InMempool`/`Confirmed`/`Unknown` is
 /// **Epic 10**; the value type is defined here so the gated query can be typed.
@@ -953,7 +968,8 @@ impl<
         block: BlockView<'_>,
         now: u64,
     ) -> CallResult<ReceiveBlockOutcome> {
-        let window = self.active_snake_chain_window();
+        // FR60 window if Ready+available (Epic 9); any `Err` → no window → FR60 skipped.
+        let window = self.active_snake_chain_window().ok();
         let outcome = classify_block(self, &block, window, now);
         (outcome, self.next_parent_recovery_call())
     }
@@ -1128,23 +1144,23 @@ impl<
     // external visibility is feature-gated introspection (architecture §3.5),
     // never a first-class public API method. See the Story-5.1 review record.
 
-    /// The current active-chain `(S_tail, S_head)` sequence bounds, or `None`
-    /// in collecting state (which suppresses the FR60 window check + its
-    /// `long-disconnect-detected` log per AC7).
+    /// The active-chain `(S_tail, S_head)` sequence bounds for the FR60 window
+    /// check, or an [`SnakeChainWindowError`] explaining why there is none.
     ///
-    /// Gated on `Ready` (Story 5.1): while the node is not `Ready` (Collecting /
-    /// Processing) there is no active chain, so this returns `None` and the FR60
-    /// window check stays inactive — every admitted block is `Stored` (FR9/AC6).
-    /// The decision is now phase-driven, not a hardcoded `None`. Epic 9
-    /// (`snake_chain.rs`) supplies the real `(S_tail, S_head)` from the
-    /// `_snake_chain_tail_idx` / `active_chain_head_idx` block-table indices once
-    /// Ready; until it lands, the Ready branch also yields `None`.
-    fn active_snake_chain_window(&self) -> Option<(u32, u32)> {
+    /// `Result` (not `Option`) so the *reason* is explicit: `Err(NotReady)` while
+    /// not `Ready` (Collecting / Processing — no active chain) and
+    /// `Err(NotYetDerived)` in `Ready` until Epic 9 (`snake_chain.rs`) supplies
+    /// the real window from the `_snake_chain_tail_idx` / `active_chain_head_idx`
+    /// indices. Either `Err` leaves the FR60 window inactive, so every admitted
+    /// block stays `Stored` (FR9/AC6). The intake caller only needs "window or
+    /// not", so it maps this with `.ok()`.
+    fn active_snake_chain_window(&self) -> Result<(u32, u32), SnakeChainWindowError> {
         if !self.is_ready() {
-            return None;
+            return Err(SnakeChainWindowError::NotReady);
         }
-        // Epic 9 derives the real (S_tail, S_head) here.
-        None
+        // Epic 9 returns `Ok((s_tail, s_head))` here; until then the window is not
+        // derivable, so FR60 stays inactive even in Ready.
+        Err(SnakeChainWindowError::NotYetDerived)
     }
 
     /// FR11 duplicate-index probe used by the intake dispatcher: `true` iff a
@@ -1867,7 +1883,10 @@ mod tests {
     #[test]
     fn snake_chain_window_none_while_collecting() {
         let bc = new_test_chain();
-        assert!(bc.active_snake_chain_window().is_none());
+        assert_eq!(
+            bc.active_snake_chain_window(),
+            Err(SnakeChainWindowError::NotReady)
+        );
     }
 
     /// AC3 — the join follow-up on empty durable storage keeps the node
