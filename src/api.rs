@@ -1102,10 +1102,15 @@ impl<
             // genesis's `active_chain_head_idx` is a placeholder the FR3 Ready
             // transition (Story 5.4) overwrites; it does not pre-empt selection.
             if self.run_processing_pass(candidate_tip_idx).is_err() {
-                // Decision #2 (option b): take only the FR5 phase-revert half now
-                // (Processing→Collecting) so the node retries against the tree on
-                // the next admission; durable deletion of the offending block +
-                // transitive descendants + chain_heads event (iv) is Story 5.5.
+                // Decision #2 (option b): discard the partial working set and take
+                // only the FR5 phase-revert half now (Processing→Collecting) so the
+                // node retries against the tree on the next admission; durable
+                // deletion of the offending block + transitive descendants +
+                // chain_heads event (iv) is Story 5.5. The reset here is
+                // defense-in-depth — the next pass also resets at entry — so no
+                // half-derived projection lingers even transiently.
+                self.node_info.reset();
+                self.reset_vote_engine();
                 self.set_lifecycle_phase(LifecyclePhase::Collecting);
             }
             // Story 5.4 (FR6/FR4): validate the derived projection against the
@@ -1228,7 +1233,11 @@ impl<
                     // FR3/FR54(h): the earliest balance block initializes the
                     // `max_known_node_id` watermark from its `max_node_id` field.
                     if !*saw_balance_block {
-                        self.node_info.set_max_known_node_id(payload.max_node_id());
+                        let advanced = self
+                            .node_info
+                            .max_known_node_id()
+                            .max(payload.max_node_id());
+                        self.node_info.set_max_known_node_id(advanced);
                         *saw_balance_block = true;
                     }
                     // FR50: seed each covered node's balance + public key from the
@@ -1250,7 +1259,7 @@ impl<
                 self.vote_engine
                     .apply_block(block.view())
                     .map_err(ProcessingError::Vote)?;
-                if !is_genesis {
+                if !is_genesis && self.node_info.is_seeded(view.creator()) {
                     self.node_info
                         .credit(view.creator(), view.mined_amount() as u64);
                 }
@@ -1272,10 +1281,14 @@ impl<
                         } else if let Some(reg) = tx.as_registration() {
                             let node_id = reg.new_node_id();
                             // FR54(h): genesis block #0 does not advance the
-                            // watermark; every later registration sets it to
-                            // `new_node_id` (monotone +1 in a valid chain).
-                            if !is_genesis_zero {
-                                self.node_info.set_max_known_node_id(node_id);
+                            // watermark. Every later registration advances it
+                            // monotonically, and only for an in-range id — an
+                            // out-of-range id (unregisterable, `register_node`
+                            // no-ops it) or a lower id must never regress or desync
+                            // the watermark (FR6 rejects a non-`+1` stride in 5.4).
+                            if !is_genesis_zero && (node_id as usize) < MAX_NODES {
+                                let advanced = self.node_info.max_known_node_id().max(node_id);
+                                self.node_info.set_max_known_node_id(advanced);
                             }
                             self.node_info
                                 .register_node(node_id, reg.new_public_key(), idx);
@@ -1320,7 +1333,13 @@ impl<
                 self.vote_engine
                     .apply_block(block.view())
                     .map_err(ProcessingError::Vote)?;
-                if !is_genesis {
+                // FR36 creator credit: (a) mined_amount + (b) transaction fees.
+                // Gated on the creator being seeded — an unseeded creator is in
+                // its pre-seed zone (AC4), so the credit is auto-accepted
+                // (skipped) rather than written onto an unknown baseline. FR36(c)
+                // replay-block reward is deferred (needs FR49/FR51 replay-block
+                // recognition — Epic 9).
+                if !is_genesis && self.node_info.is_seeded(view.creator()) {
                     self.node_info.credit(
                         view.creator(),
                         (view.mined_amount() as u64).saturating_add(total_fees),
@@ -1335,7 +1354,7 @@ impl<
                 self.vote_engine
                     .apply_block(block.view())
                     .map_err(ProcessingError::Vote)?;
-                if !is_genesis {
+                if !is_genesis && self.node_info.is_seeded(view.creator()) {
                     self.node_info
                         .credit(view.creator(), view.mined_amount() as u64);
                 }
@@ -2777,6 +2796,11 @@ mod tests {
         // applies FR37 interest (0 on values < vote_scale) + creator(0) reset.
         assert_eq!(bc.vote_engine.accumulated_vote_of(1), 10);
         assert_eq!(bc.vote_engine.accumulated_vote_of(2), 20);
+        // FR38 creator-order is a read-through of the vote registry: node 2
+        // (vote 20) outranks node 1 (vote 10); the zero-vote tail follows by
+        // ascending node id.
+        assert_eq!(bc.vote_engine.top_creator(), Some(2));
+        assert_eq!(bc.vote_engine.creator_at_rank(1), Some(1));
     }
 
     /// AC3 — a (non-genesis) registration seeds the new node (balance 0, public
@@ -2971,5 +2995,115 @@ mod tests {
             "FR3 pass succeeded → node stays Processing"
         );
         assert!(!bc.is_ready(), "Ready is Story 5.4, not reached here");
+    }
+
+    /// A `payload_type=1` block with an explicit `creator` + `mined_amount`
+    /// header and a single node transfer (used to exercise the FR36 creator
+    /// credit — the other builders hard-code `mined_amount: 0`, which would mask
+    /// a creator-credit bug).
+    fn credit_block(
+        seq: u32,
+        prev: [u8; 32],
+        creator: u32,
+        mined_amount: u32,
+        initializer: u32,
+        receiver: u32,
+        amount: u64,
+    ) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(
+            3,
+            seq.saturating_sub(1),
+            initializer,
+            receiver,
+            amount,
+            0,
+            0,
+            &signer,
+        );
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator,
+            mined_amount,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        builder.add_node_transfer(&nt).ok().expect("add transfer");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// AC4 / FR36 — the creator credit is auto-accepted (skipped) for an unseeded
+    /// creator (pre-seed zone): no phantom balance is written to an unknown
+    /// baseline. Uses a non-zero `mined_amount` so the credit is observable.
+    #[test]
+    fn fr3_creator_credit_skipped_for_unseeded_creator() {
+        let mut bc = new_test_chain();
+        let blk = credit_block(100, [0xAB; 32], 8, 500, 7, 9, 0);
+        let bi = bc
+            .tier1_admit(&blk.view(), &blk.view().hash(), 0)
+            .expect("block admitted");
+
+        bc.run_processing_pass(bi).expect("pass succeeds");
+
+        assert!(
+            !bc.node_info.is_seeded(8),
+            "unseeded creator is not seeded by its own credit"
+        );
+        assert_eq!(
+            bc.node_info.balance_of(8),
+            0,
+            "FR36 creator credit skipped for a pre-seed-zone creator (AC4)"
+        );
+    }
+
+    /// FR36 — a seeded creator IS credited its `mined_amount` (+ fees).
+    #[test]
+    fn fr3_creator_credit_applied_to_seeded_creator() {
+        let mut bc = new_test_chain();
+        let anchor = balance_block(100, [0xAB; 32], &[(3, 100, 0, 0xB3)], 3);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        let blk = credit_block(101, anchor.view().hash(), 3, 500, 7, 9, 0);
+        let bi = bc
+            .tier1_admit(&blk.view(), &blk.view().hash(), 0)
+            .expect("credit block admitted");
+
+        bc.run_processing_pass(bi).expect("pass succeeds");
+
+        assert_eq!(
+            bc.node_info.balance_of(3),
+            600,
+            "seeded creator credited mined_amount (100 seed + 500 mined)"
+        );
+    }
+
+    /// AC3 — the `max_known_node_id` watermark advances monotonically: a
+    /// registration for an id below the already-seen maximum does not regress it.
+    #[test]
+    fn fr3_watermark_does_not_regress_below_seen_max() {
+        let mut bc = new_test_chain();
+        // Balance block declares max_node_id 5 → watermark 5.
+        let anchor = balance_block(100, [0xAB; 32], &[(1, 100, 0, 0xB1)], 5);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        // A later registration for a LOWER id (3) must not regress the watermark.
+        let reg = registration_block(101, anchor.view().hash(), 1, 3, 0xC3);
+        let ri = bc
+            .tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+
+        bc.run_processing_pass(ri).expect("pass succeeds");
+
+        assert_eq!(
+            bc.node_info.max_known_node_id(),
+            5,
+            "monotone watermark: a below-max registration does not regress it"
+        );
     }
 }
