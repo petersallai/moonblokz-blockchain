@@ -9,8 +9,27 @@ keywords = ["embedded", "no-std", "blockchain", "moonblokz"]
 categories = ["embedded", "no-std"]
 
 [dependencies]
+# The crypto backend is not pinned per-dependency; it is selected once by this
+# crate's `[features]` default and forwarded down (below). `backend-memory` on
+# storage is an orthogonal *storage* backend (host/simulator/test), not a crypto
+# choice, so it stays enabled here directly.
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
-moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["schnorr", "backend-memory"] }
-moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false, features = ["schnorr-crypto-bigint"] }
-moonblokz-vote = { path = "../moonblokz-vote" }
+moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["backend-memory"] }
+moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
+moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
+
+[features]
+# Single Schnorr crypto backend for the whole stack, selected here at the top of
+# the graph and forwarded to every crate that carries one. Only crypto-bigint is
+# offered end-to-end because `moonblokz-storage`'s crypto backend is
+# crypto-bigint-only (its `schnorr` feature); the alternate backends that vote +
+# chain-types + crypto already support would additionally require a
+# backend-generic storage.
+default = ["schnorr-crypto-bigint"]
+schnorr-crypto-bigint = [
+    "moonblokz-vote/schnorr-crypto-bigint",
+    "moonblokz-chain-types/schnorr-crypto-bigint",
+    "moonblokz-crypto/schnorr-crypto-bigint",
+    "moonblokz-storage/schnorr",
+]
