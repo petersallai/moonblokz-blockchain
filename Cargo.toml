@@ -9,7 +9,40 @@ keywords = ["embedded", "no-std", "blockchain", "moonblokz"]
 categories = ["embedded", "no-std"]
 
 [dependencies]
+# The crypto backend is not pinned per-dependency; it is selected once by this
+# crate's `[features]` default and forwarded down (below). `backend-memory` on
+# storage is an orthogonal *storage* backend (host/simulator/test), not a crypto
+# choice, so it stays enabled here directly.
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
-moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["schnorr", "backend-memory"] }
-moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false, features = ["schnorr-crypto-bigint"] }
+moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["backend-memory"] }
+moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
+moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
+
+[features]
+# The single Schnorr crypto backend for the whole stack is selected here at the
+# top of the graph and forwarded to every crate that carries one (vote,
+# chain-types, crypto, storage). Choose exactly one; the default is the
+# embedded-oriented crypto-bigint backend. Every crate below is now
+# backend-generic, so any of the three backends is selectable end-to-end via
+# `--no-default-features --features <backend>` (storage's `backend-memory`
+# storage backend stays enabled directly — it is orthogonal to this choice).
+default = ["schnorr-crypto-bigint"]
+schnorr-crypto-bigint = [
+    "moonblokz-vote/schnorr-crypto-bigint",
+    "moonblokz-chain-types/schnorr-crypto-bigint",
+    "moonblokz-crypto/schnorr-crypto-bigint",
+    "moonblokz-storage/schnorr-crypto-bigint",
+]
+schnorr-malachite = [
+    "moonblokz-vote/schnorr-malachite",
+    "moonblokz-chain-types/schnorr-malachite",
+    "moonblokz-crypto/schnorr-malachite",
+    "moonblokz-storage/schnorr-malachite",
+]
+schnorr-num-bigint-dig = [
+    "moonblokz-vote/schnorr-num-bigint-dig",
+    "moonblokz-chain-types/schnorr-num-bigint-dig",
+    "moonblokz-crypto/schnorr-num-bigint-dig",
+    "moonblokz-storage/schnorr-num-bigint-dig",
+]

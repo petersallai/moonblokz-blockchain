@@ -84,7 +84,7 @@ pub(crate) fn is_legal_transition(from: BlockStatus, to: BlockStatus) -> bool {
         (Stored, Connected)  // Tier 2 promotion
             | (Connected, Active)  // Tier 3 promotion (chain-switch / forward-extension)
             | (Stored, Active)     // FR3 processing-pass one-step promotion
-            | (Active, Connected)  // FR23 chain-switch demotion to side-branch
+            | (Active, Connected) // FR23 chain-switch demotion to side-branch
     )
 }
 
@@ -171,8 +171,16 @@ pub(crate) enum Tier1Failure {
 /// the residual same-object Tier 1 → Tier 3 / chain-switch re-verification is
 /// expected-rare given deterministic creator selection, so a ~3.6 KB
 /// content-addressed cache did not earn its keep against the RAM budget.)
-fn verify_signature_bytes<C: CryptoTrait>(crypto: &C, preimage: &[u8], signature_bytes: &[u8], public_key_bytes: &[u8]) -> bool {
-    match (Signature::new(signature_bytes), PublicKey::new(public_key_bytes)) {
+fn verify_signature_bytes<C: CryptoTrait>(
+    crypto: &C,
+    preimage: &[u8],
+    signature_bytes: &[u8],
+    public_key_bytes: &[u8],
+) -> bool {
+    match (
+        Signature::new(signature_bytes),
+        PublicKey::new(public_key_bytes),
+    ) {
         (Ok(sig), Ok(pk)) => crypto.verify_signature(preimage, &sig, &pk),
         _ => false,
     }
@@ -259,12 +267,19 @@ fn tier1_transaction_block<C: CryptoTrait>(
             has_registration = true;
             check_no_self_vote(reg.initializer(), vote, is_genesis_block_zero)?;
             // FR69 (i): node-#0 registration must carry the trust-anchor key.
-            if reg.new_node_id() == NODE_ZERO_ID && reg.new_public_key() != &node_zero_public_key[..] {
+            if reg.new_node_id() == NODE_ZERO_ID
+                && reg.new_public_key() != &node_zero_public_key[..]
+            {
                 return Err(Tier1Failure::NodeZeroRegistrationKeyMismatch);
             }
             // new_key_signature proves possession: the new key signs its own
             // public-key bytes.
-            if !verify_signature_bytes(crypto, reg.new_public_key(), reg.new_key_signature(), reg.new_public_key()) {
+            if !verify_signature_bytes(
+                crypto,
+                reg.new_public_key(),
+                reg.new_key_signature(),
+                reg.new_public_key(),
+            ) {
                 return Err(Tier1Failure::InvalidNewKeySignature);
             }
         } else if let Some(cx) = tx.as_complex() {
@@ -407,7 +422,11 @@ fn tier1_chain_config_block(
 /// `initializer == 0`, `vote == 0` never violates. This guarantees node #0
 /// always has a valid vote choice, preventing the early-chain bootstrap
 /// deadlock.
-fn check_no_self_vote(initializer: u32, vote: u32, is_genesis_block_zero: bool) -> Result<(), Tier1Failure> {
+fn check_no_self_vote(
+    initializer: u32,
+    vote: u32,
+    is_genesis_block_zero: bool,
+) -> Result<(), Tier1Failure> {
     if is_genesis_block_zero {
         return Ok(());
     }
@@ -430,12 +449,14 @@ mod tests {
     use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE};
 
     /// Block-size limit used by the "normal" Tier 1 tests (the chain-config
-    /// stub's `current_block_size_limit()`).
+    /// stub's `block_size_limit()`).
     const NORMAL_LIMIT: u16 = 2016;
     const DUMMY_SIG: [u8; 64] = [0u8; 64];
 
     fn crypto(seed: u8) -> Crypto {
-        Crypto::new([seed; PRIVATE_KEY_SIZE]).ok().expect("valid test private key")
+        Crypto::new([seed; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("valid test private key")
     }
 
     fn pubkey_bytes(c: &Crypto) -> [u8; PUBLIC_KEY_SIZE] {
@@ -457,10 +478,19 @@ mod tests {
         }
     }
 
-    fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer: u32, signer: &Crypto) -> Block {
+    fn node_transfer_block(
+        seq: u32,
+        vote: u32,
+        anchor: u32,
+        initializer: u32,
+        signer: &Crypto,
+    ) -> Block {
         let nt = NodeTransfer::new_signed(vote, anchor, initializer, 9, 100, 1, 0, signer);
         let mut builder = BlockBuilder::new().header(header(seq, PAYLOAD_TYPE_TRANSACTION));
-        builder.add_node_transfer(&nt).ok().expect("add node transfer");
+        builder
+            .add_node_transfer(&nt)
+            .ok()
+            .expect("add node transfer");
         builder.build_signed(signer).ok().expect("build signed")
     }
 
@@ -544,7 +574,10 @@ mod tests {
         let bytes = raw_block(1, 5, PAYLOAD_TYPE_CHAIN_CONFIG);
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
-        assert_eq!(tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c), Ok(()));
+        assert_eq!(
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            Ok(())
+        );
     }
 
     // --- AC2/AC3: transaction-payload checks --------------------------------
@@ -552,7 +585,12 @@ mod tests {
     #[test]
     fn tier1_accepts_wellformed_node_transfer() {
         let c = crypto(1);
-        let block = node_transfer_block(5, 3 /*vote*/, 4 /*anchor*/, 7 /*initializer*/, &c);
+        let block = node_transfer_block(
+            5, 3, /*vote*/
+            4, /*anchor*/
+            7, /*initializer*/
+            &c,
+        );
         assert_eq!(
             tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
@@ -605,9 +643,20 @@ mod tests {
     }
 
     fn registration_block(seq: u32, new_node_id: u32, new_pk: &[u8; 32], signer: &Crypto) -> Block {
-        let reg = Registration::new_signed(3 /*vote*/, 5 /*initializer*/, new_node_id, 0, 0, new_pk, signer);
+        let reg = Registration::new_signed(
+            3, /*vote*/
+            5, /*initializer*/
+            new_node_id,
+            0,
+            0,
+            new_pk,
+            signer,
+        );
         let mut builder = BlockBuilder::new().header(header(seq, PAYLOAD_TYPE_TRANSACTION));
-        builder.add_registration(&reg).ok().expect("add registration");
+        builder
+            .add_registration(&reg)
+            .ok()
+            .expect("add registration");
         builder.build_signed(signer).ok().expect("build signed")
     }
 
@@ -652,11 +701,16 @@ mod tests {
         let pk_a = pubkey_bytes(&a);
         let reg = Registration::new_signed(3, 5, 9, 0, 0, &pk_a, &a);
         let mut cx = ComplexTransaction::new(3 /*vote*/);
-        cx.add_balance_input(4 /*anchor*/, 8 /*initializer*/, 50, 0, &DUMMY_SIG).ok().unwrap();
+        cx.add_balance_input(4 /*anchor*/, 8 /*initializer*/, 50, 0, &DUMMY_SIG)
+            .ok()
+            .unwrap();
         cx.add_balance_output(9, 40).ok().unwrap();
         let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
         builder.add_registration(&reg).ok().expect("add reg");
-        builder.add_complex_transaction(&cx).ok().expect("add complex");
+        builder
+            .add_complex_transaction(&cx)
+            .ok()
+            .expect("add complex");
         let block = builder.build_signed(&a).ok().expect("build");
         assert_eq!(
             tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a),
@@ -664,11 +718,19 @@ mod tests {
         );
     }
 
-    fn complex_block<F: FnOnce(&mut ComplexTransaction)>(seq: u32, vote: u32, signer: &Crypto, build: F) -> Block {
+    fn complex_block<F: FnOnce(&mut ComplexTransaction)>(
+        seq: u32,
+        vote: u32,
+        signer: &Crypto,
+        build: F,
+    ) -> Block {
         let mut cx = ComplexTransaction::new(vote);
         build(&mut cx);
         let mut builder = BlockBuilder::new().header(header(seq, PAYLOAD_TYPE_TRANSACTION));
-        builder.add_complex_transaction(&cx).ok().expect("add complex");
+        builder
+            .add_complex_transaction(&cx)
+            .ok()
+            .expect("add complex");
         builder.build_signed(signer).ok().expect("build signed")
     }
 
