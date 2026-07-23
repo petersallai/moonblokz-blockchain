@@ -1278,8 +1278,13 @@ impl<
         // failure rollback below restores exactly this baseline (not the whole
         // vector against an unknown prior state). For the MVP join/reconstruct flow
         // the marked blocks are freshly-admitted `Stored` blocks (spent-bits already
-        // 0); the reset makes the reusable primitive self-consistent for the
-        // Story-5.7 restart and Epic-6 deep-zone re-derivation.
+        // 0); the reset makes the reusable primitive self-consistent for a
+        // re-derivation over a candidate whose blocks are NOT shared with an
+        // already-active chain (fresh join, the Story-5.7 restart, and the Epic-6
+        // deep-zone reconstruction of a *new* branch). A chain-switch that
+        // re-derives over blocks shared with the active chain must operate on a
+        // working copy instead (owned by Epic 6): a failed re-derivation here would
+        // zero a shared block's committed spent-bits rather than restore them.
         for slot in marked.iter().take(count) {
             self.blocks.clear_spent_bits(*slot);
         }
@@ -1415,9 +1420,12 @@ impl<
             Some(false) => return Err(invalid(ValidationReason::CreatorSignatureInvalid)),
             // On a genesis-anchored candidate the creator's key must be derivable
             // (it registered earlier in the same fully-re-derived chain); a
-            // non-derivable creator on a non-genesis block is exact evidence of
-            // invalidity, not a trusted pre-seed block (AC2/AC4 genesis-anchored).
-            None if genesis_anchored && !is_genesis => {
+            // non-derivable creator past block #0 is exact evidence of invalidity,
+            // not a trusted pre-seed block (AC2/AC4 genesis-anchored). Uses
+            // `!is_genesis_zero` — the same "only block #0 is bootstrap-exempt"
+            // predicate as the tx-level actor checks below (block #1's config
+            // creator is node #0, which resolves to the trust anchor, never `None`).
+            None if genesis_anchored && !is_genesis_zero => {
                 return Err(invalid(ValidationReason::UnseededActor));
             }
             _ => {}
@@ -1545,18 +1553,20 @@ impl<
                                 total_fees = total_fees.saturating_add(reg.fee());
                             }
                         }
+                        // [E] FR6 registration uniqueness: `new_public_key` must not
+                        // already be held by a seeded/registered node on the
+                        // candidate (within-block earlier registrations are seeded
+                        // in tx order, so a same-block collision is caught too).
+                        // Checked before any state mutation below, so a rejection
+                        // leaves no dirty watermark/roster.
+                        if self.node_info.key_is_registered(reg.new_public_key()) {
+                            return Err(invalid(ValidationReason::DuplicatePublicKey));
+                        }
                         // Advance the watermark for an in-range id (genesis #0 does
                         // not advance it — FR54(h)); then register the roster entry.
                         if !is_genesis_zero && (node_id as usize) < MAX_NODES {
                             let advanced = self.node_info.max_known_node_id().max(node_id);
                             self.node_info.set_max_known_node_id(advanced);
-                        }
-                        // [E] FR6 registration uniqueness: `new_public_key` must not
-                        // already be held by a seeded/registered node on the
-                        // candidate (within-block earlier registrations are seeded
-                        // in tx order, so a same-block collision is caught too).
-                        if self.node_info.key_is_registered(reg.new_public_key()) {
-                            return Err(invalid(ValidationReason::DuplicatePublicKey));
                         }
                         self.node_info
                             .register_node(node_id, reg.new_public_key(), idx);
@@ -1784,7 +1794,11 @@ impl<
             // comes *after* the block that created it. Skip any candidate block at
             // or after the consuming block's sequence — resolving against a
             // same/later block would let a tx spend an output that does not exist
-            // yet at its own point in the chain.
+            // yet at its own point in the chain. Same-block UTXO chaining (spending
+            // an output created by an earlier tx in the SAME block) is
+            // conservatively forbidden here (`>=`, not `>`): the per-block spent-bit
+            // model cannot order txs within a block, so tx-order-aware intra-block
+            // resolution is deferred to the Story-7.1 UTXO cache.
             if self
                 .blocks
                 .get(m_idx)
