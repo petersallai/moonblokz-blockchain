@@ -171,7 +171,7 @@ pub(crate) enum Tier1Failure {
 /// the residual same-object Tier 1 → Tier 3 / chain-switch re-verification is
 /// expected-rare given deterministic creator selection, so a ~3.6 KB
 /// content-addressed cache did not earn its keep against the RAM budget.)
-fn verify_signature_bytes<C: CryptoTrait>(
+pub(crate) fn verify_signature_bytes<C: CryptoTrait>(
     crypto: &C,
     preimage: &[u8],
     signature_bytes: &[u8],

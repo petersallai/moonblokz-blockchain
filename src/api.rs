@@ -18,8 +18,9 @@
 //! therefore yield identical state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    Block, BlockBuilder, BlockHeader, BlockView, NodeTransfer, PAYLOAD_TYPE_BALANCE,
-    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, Registration, TransactionView,
+    Block, BlockBuilder, BlockHeader, BlockView, HEADER_SIZE, MAX_BLOCK_SIZE, NodeTransfer,
+    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE,
+    Registration, TransactionView,
 };
 use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
 use moonblokz_storage::StorageTrait;
@@ -32,7 +33,8 @@ use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
 use crate::node_info::NodeInfoState;
 use crate::prng::Prng;
-use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate};
+use crate::spent_bits::resolve_utxo_bit;
+use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate, verify_signature_bytes};
 
 // `LifecyclePhase` is owned by `lifecycle.rs` (architecture §4.2) and
 // re-exported here so the crate's public surface (`api::LifecyclePhase`, and in
@@ -395,6 +397,59 @@ pub(crate) enum ProcessingError {
     StorageRead,
     /// The vote engine rejected a block (FR37 checked-arithmetic over/underflow).
     Vote(VoteEngineError),
+    /// FR6 full-chain validation (Story 5.4) found an invariant violation. The
+    /// FR5 recovery (Story 5.5) reads `block_idx` — the **earliest** offending
+    /// block on the forward pass — as its deletion target; `reason` records the
+    /// violated invariant class for diagnostics / the FR64 log.
+    Invalid {
+        block_idx: u32,
+        reason: ValidationReason,
+    },
+}
+
+/// Which FR6 invariant a candidate block violated (Story 5.4). Diagnostic /
+/// forward-log detail carried by [`ProcessingError::Invalid`]; the FR5 recovery
+/// only needs the offending `block_idx`, so this is test-visible only.
+#[cfg_attr(test, derive(Debug, PartialEq, Clone, Copy))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum ValidationReason {
+    /// Block bytes exceed the durable-locked chain-config `block_size_limit`.
+    BlockTooLarge,
+    /// A `payload_type=1` block whose payload does not parse as transactions.
+    MalformedPayload,
+    /// `previous_hash` does not link to the immediately-preceding candidate block.
+    PreviousHashMismatch,
+    /// A `payload_type=1` block carries both a registration and a complex tx.
+    RegistrationComplexMutualExclusion,
+    /// Block-creator signature invalid against the creator's derived key.
+    CreatorSignatureInvalid,
+    /// A node-transfer / registration transaction signature is invalid.
+    TransactionSignatureInvalid,
+    /// A node-transfer / balance-input `anchor_sequence` is not before the block.
+    AnchorNotBeforeBlock,
+    /// A debit (transfer amount+fee, registration price+fee, balance input)
+    /// exceeds the initializer's derived balance (negative-balance outcome).
+    InsufficientBalance,
+    /// A registration `new_node_id` is not `pre-block max_known_node_id + 1`
+    /// (out of the stride-1 sequence).
+    RegistrationWatermark,
+    /// A transaction's `vote` names a node absent from the candidate roster at
+    /// its inclusion point.
+    VoteTargetUnknown,
+    /// A transaction's `initializer` equals its `vote` (outside the node-#0 /
+    /// block-#0 exceptions).
+    SelfVote,
+    /// A complex tx UTXO input does not resolve against the candidate window
+    /// (no matching transaction, or `output_index` out of bounds).
+    UtxoUnresolvable,
+    /// A complex tx UTXO input references an output whose spent-bit is already 1.
+    UtxoAlreadySpent,
+    /// A `payload_type=3` block's config content is not byte-identical to the
+    /// durable-locked configuration.
+    ChainConfigMismatch,
+    /// A balance block after the earliest carries a `max_node_id` that diverges
+    /// from the forward-tracked watermark at its sequence (FR3/FR6).
+    BalanceMaxNodeIdMismatch,
 }
 
 // Fields are consumed by the state-changing methods landing in Story 1.4+;
@@ -760,6 +815,7 @@ impl<
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
         let mut entry_0 = BlockEntry::new(block_0.hash(), NONE_REF, 0);
         entry_0.set_on_active_chain(true);
+        entry_0.set_len(block_0.len() as u16);
         self.blocks.insert_at(0, entry_0);
         self.active_chain_head_idx = 0;
         let active_head = self.active_chain_head_idx;
@@ -773,6 +829,7 @@ impl<
         let block_1_prev_hash = block_0.hash();
         let mut entry_1 = BlockEntry::new(block_1.hash(), 0, 1);
         entry_1.set_on_active_chain(true);
+        entry_1.set_len(block_1.len() as u16);
         self.blocks.insert_at(1, entry_1);
         self.active_chain_head_idx = 1;
         let active_head = self.active_chain_head_idx;
@@ -1040,6 +1097,7 @@ impl<
 
         let mut entry = BlockEntry::new(*hash, parent.unwrap_or(NONE_REF), block.sequence());
         entry.set_status(BlockStatus::Stored);
+        entry.set_len(block.len() as u16); // exact length for the FR6 byte-exact checks (Story 5.4)
         if is_genesis {
             entry.set_on_active_chain(true);
         }
@@ -1095,28 +1153,36 @@ impl<
             && let Some(candidate_tip_idx) = self.evaluate_stopping_condition()
         {
             self.set_lifecycle_phase(LifecyclePhase::Processing);
-            // Story 5.3 (FR3): reconstruct the derived projection for the FR2
-            // candidate. On success the node stays in Processing carrying the
-            // working-set projection (no persistent candidate field — the tip is
-            // re-derived above and threaded straight in). A bootstrap-anchored
-            // genesis's `active_chain_head_idx` is a placeholder the FR3 Ready
-            // transition (Story 5.4) overwrites; it does not pre-empt selection.
-            if self.run_processing_pass(candidate_tip_idx).is_err() {
-                // Decision #2 (option b): discard the partial working set and take
-                // only the FR5 phase-revert half now (Processing→Collecting) so the
-                // node retries against the tree on the next admission; durable
-                // deletion of the offending block + transitive descendants +
-                // chain_heads event (iv) is Story 5.5. The reset here is
-                // defense-in-depth — the next pass also resets at entry — so no
-                // half-derived projection lingers even transiently.
-                self.node_info.reset();
-                self.reset_vote_engine();
-                self.set_lifecycle_phase(LifecyclePhase::Collecting);
+            // Story 5.3 (FR3) + Story 5.4 (FR6/FR4): reconstruct AND validate the
+            // derived projection for the FR2 candidate in one forward pass. A
+            // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
+            // the Ready transition below overwrites; it does not pre-empt selection.
+            match self.run_processing_pass(candidate_tip_idx) {
+                Ok(()) => {
+                    // FR6 passed over the full candidate → FR4 Ready transition:
+                    // atomically promote every candidate block Stored→Active
+                    // (the Epic-4-deferred FR9 Tier-3 driver), establish the active
+                    // head, and move Processing→Ready. The FR40-series ready-only
+                    // surface becomes live (its query bodies remain Epic 7/10
+                    // `todo!()` — reachable, but this story wires no caller).
+                    self.promote_candidate_active(candidate_tip_idx);
+                    self.set_lifecycle_phase(LifecyclePhase::Ready);
+                }
+                Err(_) => {
+                    // FR6 failed (or FR3 could not derive). Discard the partial
+                    // working set and take the minimal FR5 phase-revert
+                    // (Processing→Collecting) so the node retries against the tree
+                    // on the next admission. `run_processing_pass` already rolled
+                    // back any spent-bit it flipped; reset the rest of the working
+                    // set here. The **durable deletion** of the offending block
+                    // (captured in the `Err`'s `block_idx`) + its transitive
+                    // descendants + the chain_heads mutation event (iv) is the
+                    // Story 5.5 (FR5) atomic recovery.
+                    self.node_info.reset();
+                    self.reset_vote_engine();
+                    self.set_lifecycle_phase(LifecyclePhase::Collecting);
+                }
             }
-            // Story 5.4 (FR6/FR4): validate the derived projection against the
-            // full FR6 invariant set, atomically promote the candidate blocks
-            // Stored→Active, and transition Processing→Ready (on failure route to
-            // the Story 5.5 FR5 atomic recovery instead of the minimal revert above).
         }
         (outcome, self.next_parent_recovery_call())
     }
@@ -1191,157 +1257,320 @@ impl<
         // FR7/FR8 tentative-vs-durable commitment are Story 5.6 — the derive-only
         // 5.3 scope has no preload consumer, so no separate scan is built.
 
-        // AC2/AC3/AC4: forward traversal anchor → tip. Per-block UTXO spent-bit
-        // vectors remain at their all-zero `BlockEntry` construction default; the
-        // flip-on-consumption + `tr_hash`→(block, output-position) resolution is
-        // co-located with the FR6 UTXO-input validity check in Story 5.4
-        // (Decision #4), so 5.3 sets no spent bits.
+        // AC1/AC2-AC7 (Story 5.4): forward traversal anchor → tip, validating
+        // each block against the FR6 invariant set at the point it becomes
+        // checkable — interleaved with the FR3 derivation, so every check reads
+        // the state derived from the *preceding* candidate blocks. The earliest
+        // offending block aborts with `ProcessingError::Invalid { block_idx, .. }`
+        // (the FR5 recovery, Story 5.5, reads `block_idx` as its deletion target).
+        // Spent-bits flipped mid-pass are rolled back below on any abort (the FR5
+        // working-set rollback's UTXO half); on success they persist as the active
+        // chain's UTXO-consumption state.
         let mut saw_balance_block = false;
+        let mut prev_hash: Option<[u8; 32]> = None;
+        let mut result = Ok(());
         for i in (0..count).rev() {
             let idx = marked[i];
-            let block = self
-                .storage
-                .read_block(idx)
-                .map_err(|_| ProcessingError::StorageRead)?;
-            self.derive_from_block(&block, idx, &mut saw_balance_block)?;
+            let block = match self.storage.read_block(idx) {
+                Ok(b) => b,
+                Err(_) => {
+                    result = Err(ProcessingError::StorageRead);
+                    break;
+                }
+            };
+            // Trim the zero-padded read-back block to its exact stored length so
+            // the byte-exact FR6 checks (block-creator signature, chain-config
+            // content-identity, hash linkage) see the bytes originally signed —
+            // durable backends store blocks in fixed-size slots and read them
+            // back padded (Story 5.4).
+            let full = block.serialized_bytes();
+            let n = match self.blocks.get(idx).map(|e| e.len() as usize) {
+                Some(len) if len > 0 && len <= full.len() => len,
+                _ => full.len(),
+            };
+            let view = match BlockView::from_bytes(&full[..n]) {
+                Ok(v) => v,
+                Err(_) => {
+                    result = Err(ProcessingError::StorageRead);
+                    break;
+                }
+            };
+            let this_hash = view.hash();
+            if let Err(e) = self.validate_and_derive_block(
+                view,
+                idx,
+                prev_hash,
+                &mut saw_balance_block,
+                &marked,
+            ) {
+                result = Err(e);
+                break;
+            }
+            prev_hash = Some(this_hash);
         }
-        Ok(())
+        if result.is_err() {
+            for slot in marked.iter().take(count) {
+                self.blocks.clear_spent_bits(*slot);
+            }
+        }
+        result
     }
 
-    /// Applies one candidate block's effects to the derived projection during the
-    /// FR3 forward pass. Pre-seed-zone per-node effects are auto-accepted (AC4):
-    /// a balance mutation for a not-yet-seeded node is skipped rather than applied
-    /// to an unknown baseline. Balance arithmetic is saturating — FR6 negative /
-    /// overflow validation is Story 5.4.
-    fn derive_from_block(
+    /// Validates one candidate block against the FR6 invariant set **and**
+    /// applies its effects to the derived projection (Story 5.4, interleaved with
+    /// the Story-5.3 FR3 derivation). Every check reads the state derived from the
+    /// preceding candidate blocks; per-node state-dependent checks (balance,
+    /// signature, vote-target) are **gated on the initializer being seeded** —
+    /// the FR3 pre-seed-zone trust rule (AC4): a window-anchored candidate trusts
+    /// history it cannot yet re-derive, so full FR6 re-proof is complete only for
+    /// a genesis-anchored candidate. Returns the earliest offending block's
+    /// `ProcessingError::Invalid { block_idx, reason }` on violation.
+    ///
+    /// `marked` is the candidate segment (tip..anchor); the UTXO-input resolution
+    /// (AC4) scans it to locate a referenced output's containing block.
+    fn validate_and_derive_block(
         &mut self,
-        block: &Block,
+        view: BlockView<'_>,
         idx: u32,
+        prev_hash: Option<[u8; 32]>,
         saw_balance_block: &mut bool,
+        marked: &[u32; MAX_BLOCKS],
     ) -> Result<(), ProcessingError> {
-        let view = block.view();
+        // `view` is the block trimmed to its exact stored length. `bytes` re-views
+        // it for the by-value `VoteEngine` calls (`BlockView` is not `Copy`).
+        let bytes = view.serialized_bytes();
         let seq = view.sequence();
-        // Genesis block #0 (FR54(h)): registration `new_node_id == 0`, watermark
-        // not incremented, no FR36 creator credit. Block #1 (config) is likewise
-        // FR36-exempt (FR54 genesis exception).
+        // FR54 genesis exceptions: block #0 waives no-self-vote / anchor /
+        // watermark-`+1` and mints currency (FR54(d)); blocks #0/#1 are
+        // FR36-exempt.
         let is_genesis_zero = seq == 0;
         let is_genesis = is_genesis_zero || seq == 1;
-        // FR36 (b) transaction-fee total — 0 for non-transaction payloads;
-        // consumed by the shared creator-credit tail after the match.
+        let invalid = |reason| ProcessingError::Invalid {
+            block_idx: idx,
+            reason,
+        };
+
+        // --- FR6 block-level invariants (AC2) ---------------------------------
+        // (a) size ≤ durable-locked chain-config limit.
+        if view.len() > self.chain_config.block_size_limit() as usize {
+            return Err(invalid(ValidationReason::BlockTooLarge));
+        }
+        // (b) previous_hash links to the immediately-preceding candidate block
+        //     (the anchor has no in-segment predecessor → `prev_hash == None`).
+        if let Some(ph) = prev_hash
+            && view.previous_hash() != &ph[..]
+        {
+            return Err(invalid(ValidationReason::PreviousHashMismatch));
+        }
+        // (c) block-creator signature (first signature check anywhere in the
+        //     crate). Skipped when the creator's key is not yet derivable
+        //     (pre-seed zone → trusted); node #0 always resolves to the FR69
+        //     trust anchor, so a genesis-anchored candidate's block #0 is checked.
+        if self.verify_block_creator_signature(&view) == Some(false) {
+            return Err(invalid(ValidationReason::CreatorSignatureInvalid));
+        }
+
+        // FR36 (b) transaction-fee total; consumed by the shared creator tail.
         let mut total_fees: u64 = 0;
 
         match view.payload_type() {
             PAYLOAD_TYPE_BALANCE => {
-                if let Some(payload) = view.balances() {
-                    // FR3/FR54(h): the earliest balance block initializes the
-                    // `max_known_node_id` watermark from its `max_node_id` field.
-                    if !*saw_balance_block {
-                        let advanced = self
-                            .node_info
-                            .max_known_node_id()
-                            .max(payload.max_node_id());
-                        self.node_info.set_max_known_node_id(advanced);
-                        *saw_balance_block = true;
-                    }
-                    // FR50: seed each covered node's balance + public key from the
-                    // NodeInfo entry, recording this block as the seed source.
-                    for info in payload.iter() {
-                        self.node_info.seed_node(
-                            info.owner(),
-                            info.public_key(),
-                            info.balance(),
-                            idx,
-                        );
-                    }
-                    // Seed accumulated vote from the pre-this-block `vote_count`
-                    // snapshots (FR50 NodeInfo snapshot semantics).
-                    self.vote_engine.seed_from_balance_block(block.view());
+                let payload = view
+                    .balances()
+                    .ok_or(invalid(ValidationReason::MalformedPayload))?;
+                if !*saw_balance_block {
+                    // Earliest balance block: initialize the watermark from its
+                    // `max_node_id` (FR3/FR54(h)).
+                    let advanced = self
+                        .node_info
+                        .max_known_node_id()
+                        .max(payload.max_node_id());
+                    self.node_info.set_max_known_node_id(advanced);
+                    *saw_balance_block = true;
+                } else if payload.max_node_id() != self.node_info.max_known_node_id() {
+                    // AC7 (deferred from 5.3): every balance block after the
+                    // earliest must carry `max_node_id` == the forward-tracked
+                    // watermark at its sequence.
+                    return Err(invalid(ValidationReason::BalanceMaxNodeIdMismatch));
+                }
+                for info in payload.iter() {
+                    self.node_info
+                        .seed_node(info.owner(), info.public_key(), info.balance(), idx);
+                }
+                if let Ok(v) = BlockView::from_bytes(bytes) {
+                    self.vote_engine.seed_from_balance_block(v);
                 }
             }
             PAYLOAD_TYPE_TRANSACTION => {
-                if let Some(txs) = view.transactions() {
-                    for tx in txs.iter() {
-                        if let Some(nt) = tx.as_node_transfer() {
-                            let fee = nt.fee() as u64;
-                            if self.node_info.is_seeded(nt.initializer()) {
-                                self.node_info
-                                    .debit(nt.initializer(), nt.amount().saturating_add(fee));
+                let txs = view
+                    .transactions()
+                    .ok_or(invalid(ValidationReason::MalformedPayload))?;
+                let mut has_registration = false;
+                let mut has_complex = false;
+
+                for tx in txs.iter() {
+                    let vote = tx.vote();
+                    if let Some(nt) = tx.as_node_transfer() {
+                        let init = nt.initializer();
+                        // State-dependent FR6 checks apply once the initializer is
+                        // derivable (past its pre-seed zone).
+                        if !is_genesis_zero && self.node_info.is_seeded(init) {
+                            self.check_self_vote(init, vote).map_err(&invalid)?;
+                            self.check_vote_target(vote).map_err(&invalid)?;
+                            if seq <= nt.anchor_sequence() {
+                                return Err(invalid(ValidationReason::AnchorNotBeforeBlock));
                             }
+                            if !self.verify_tx_signature(tx.as_bytes(), init) {
+                                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+                            }
+                        }
+                        let fee = nt.fee() as u64;
+                        let debit = nt.amount().saturating_add(fee);
+                        if is_genesis_zero {
+                            // FR54(d): the genesis self-transfer *creates* currency
+                            // — credit the receiver, no debit (bypass the balance
+                            // check), so node #0's balance becomes the initial
+                            // total network currency explicitly.
                             if self.node_info.is_seeded(nt.receiver()) {
                                 self.node_info.credit(nt.receiver(), nt.amount());
                             }
-                            total_fees = total_fees.saturating_add(fee);
-                        } else if let Some(reg) = tx.as_registration() {
-                            let node_id = reg.new_node_id();
-                            // FR54(h): genesis block #0 does not advance the
-                            // watermark. Every later registration advances it
-                            // monotonically, and only for an in-range id — an
-                            // out-of-range id (unregisterable, `register_node`
-                            // no-ops it) or a lower id must never regress or desync
-                            // the watermark (FR6 rejects a non-`+1` stride in 5.4).
-                            if !is_genesis_zero && (node_id as usize) < MAX_NODES {
-                                let advanced = self.node_info.max_known_node_id().max(node_id);
-                                self.node_info.set_max_known_node_id(advanced);
+                        } else if self.node_info.is_seeded(init) {
+                            if self.node_info.balance_of(init) < debit {
+                                return Err(invalid(ValidationReason::InsufficientBalance));
                             }
-                            self.node_info
-                                .register_node(node_id, reg.new_public_key(), idx);
-                            if !is_genesis && self.node_info.is_seeded(reg.initializer()) {
-                                // `registration_price` is absorbed by the network
-                                // (FR6); the fee is credited to the creator (FR36).
-                                self.node_info.debit(
-                                    reg.initializer(),
-                                    reg.registration_price().saturating_add(reg.fee()),
-                                );
+                            self.node_info.debit(init, debit);
+                            if self.node_info.is_seeded(nt.receiver()) {
+                                self.node_info.credit(nt.receiver(), nt.amount());
+                            }
+                        } else if self.node_info.is_seeded(nt.receiver()) {
+                            // Pre-seed initializer: still credit a seeded receiver
+                            // (its own state is derivable) — trust the debit side.
+                            self.node_info.credit(nt.receiver(), nt.amount());
+                        }
+                        total_fees = total_fees.saturating_add(fee);
+                    } else if let Some(reg) = tx.as_registration() {
+                        has_registration = true;
+                        let node_id = reg.new_node_id();
+                        let init = reg.initializer();
+                        // FR6 registration monotonicity: `new_node_id ==
+                        // pre-block-position watermark + 1`, checked against the
+                        // running watermark so within-block registrations form a
+                        // stride-1 sequence. Waived for genesis block #0
+                        // (`new_node_id == 0`, FR54(h)).
+                        if !is_genesis_zero {
+                            let expected = self.node_info.max_known_node_id().wrapping_add(1);
+                            if node_id != expected {
+                                return Err(invalid(ValidationReason::RegistrationWatermark));
+                            }
+                            if self.node_info.is_seeded(init) {
+                                self.check_self_vote(init, vote).map_err(&invalid)?;
+                                self.check_vote_target(vote).map_err(&invalid)?;
+                                if !self.verify_tx_signature(tx.as_bytes(), init) {
+                                    return Err(invalid(
+                                        ValidationReason::TransactionSignatureInvalid,
+                                    ));
+                                }
+                                let debit = reg.registration_price().saturating_add(reg.fee());
+                                if self.node_info.balance_of(init) < debit {
+                                    return Err(invalid(ValidationReason::InsufficientBalance));
+                                }
+                                // `registration_price` is absorbed (debited, credited
+                                // to no node); the fee goes to the creator (FR36).
+                                self.node_info.debit(init, debit);
                                 total_fees = total_fees.saturating_add(reg.fee());
                             }
-                        } else if let Some(cx) = tx.as_complex() {
-                            // Balance inputs/outputs move the derived balance
-                            // projection; UTXO inputs/outputs live in the UTXO
-                            // value space (spent-bits, Story 5.4/7.1) and do not
-                            // touch node balances here.
-                            let mut in_sum: u64 = 0;
-                            let mut out_sum: u64 = 0;
-                            for input in cx.inputs() {
-                                if let Some(bi) = input.as_balance() {
-                                    if self.node_info.is_seeded(bi.initializer()) {
-                                        self.node_info.debit(bi.initializer(), bi.amount());
-                                    }
-                                    in_sum = in_sum.saturating_add(bi.amount());
-                                }
-                            }
-                            for output in cx.outputs() {
-                                if let Some(bo) = output.as_balance() {
-                                    if self.node_info.is_seeded(bo.receiver()) {
-                                        self.node_info.credit(bo.receiver(), bo.amount());
-                                    }
-                                    out_sum = out_sum.saturating_add(bo.amount());
-                                }
-                            }
-                            // Fee is the balance-side input/output surplus; the
-                            // UTXO-side fee term is validated in Story 5.4.
-                            total_fees = total_fees.saturating_add(in_sum.saturating_sub(out_sum));
                         }
+                        // Advance the watermark for an in-range id (genesis #0 does
+                        // not advance it — FR54(h)); then register the roster entry.
+                        if !is_genesis_zero && (node_id as usize) < MAX_NODES {
+                            let advanced = self.node_info.max_known_node_id().max(node_id);
+                            self.node_info.set_max_known_node_id(advanced);
+                        }
+                        self.node_info
+                            .register_node(node_id, reg.new_public_key(), idx);
+                    } else if let Some(cx) = tx.as_complex() {
+                        has_complex = true;
+                        let mut in_sum: u64 = 0;
+                        let mut out_sum: u64 = 0;
+                        for input in cx.inputs() {
+                            if let Some(bi) = input.as_balance() {
+                                let binit = bi.initializer();
+                                if !is_genesis_zero && self.node_info.is_seeded(binit) {
+                                    self.check_self_vote(binit, vote).map_err(&invalid)?;
+                                    self.check_vote_target(vote).map_err(&invalid)?;
+                                    if seq <= bi.anchor_sequence() {
+                                        return Err(invalid(
+                                            ValidationReason::AnchorNotBeforeBlock,
+                                        ));
+                                    }
+                                    if self.node_info.balance_of(binit) < bi.amount() {
+                                        return Err(invalid(ValidationReason::InsufficientBalance));
+                                    }
+                                    self.node_info.debit(binit, bi.amount());
+                                }
+                                in_sum = in_sum.saturating_add(bi.amount());
+                            } else if let Some(ui) = input.as_utxo() {
+                                // AC4: resolve the UTXO input against the candidate
+                                // window, require its spent-bit == 0, then flip it.
+                                // Balance/UTXO-input signature verification is
+                                // deferred (undefined scope — see Dev Notes).
+                                let oi = ui.output_index();
+                                let mut tr = [0u8; 32];
+                                tr.copy_from_slice(&ui.tr_hash()[..32]);
+                                self.resolve_and_spend_utxo(marked, &tr, oi)
+                                    .map_err(&invalid)?;
+                            }
+                        }
+                        for output in cx.outputs() {
+                            if let Some(bo) = output.as_balance() {
+                                if self.node_info.is_seeded(bo.receiver()) {
+                                    self.node_info.credit(bo.receiver(), bo.amount());
+                                }
+                                out_sum = out_sum.saturating_add(bo.amount());
+                            }
+                        }
+                        total_fees = total_fees.saturating_add(in_sum.saturating_sub(out_sum));
+                    } else {
+                        return Err(invalid(ValidationReason::MalformedPayload));
                     }
+                }
+                // FR6 registration/complex mutual-exclusivity (also gated at Tier 1
+                // intake; re-affirmed here over the candidate).
+                if has_registration && has_complex {
+                    return Err(invalid(
+                        ValidationReason::RegistrationComplexMutualExclusion,
+                    ));
+                }
+            }
+            PAYLOAD_TYPE_CHAIN_CONFIG => {
+                // AC6: every chain-config block must carry config content
+                // byte-identical to the durable-locked configuration, when one is
+                // present. Establishing the lock from the candidate (no lock yet)
+                // and the FR7 content-signature are Story 5.6.
+                if let Some(locked) = self.chain_config.initial_chain_config_bytes()
+                    && view.payload() != locked
+                {
+                    return Err(invalid(ValidationReason::ChainConfigMismatch));
                 }
             }
             _ => {
-                // Chain-config (3) / approval (4): no per-node balance/roster
-                // mutation and no fees. The shared tail below still runs this
-                // block's FR37 vote effects and the FR36 mined-amount credit.
-                // Chain-config content preload for the derived checks is Story 5.6.
+                // Approval-evidence (payload_type=4): full validation is deferred
+                // to Epic 6 (the deterministic supporting-subgroup primitive it
+                // needs, ADR-015 / FR27/FR28, is unbuilt). The shared tail still
+                // applies this block's FR37 vote effects.
             }
         }
 
         // Shared FR37 + FR36 tail (every payload type): apply this block's vote
         // effects once (anti-capture interest + creator reset), then credit the
-        // creator with (a) mined_amount + (b) transaction fees — `total_fees` is
-        // 0 for non-transaction payloads. Gated on `is_seeded` so a pre-seed-zone
-        // creator is auto-accepted (skipped), never written onto an unknown
-        // baseline (AC4); genesis blocks #0/#1 are FR36-exempt. FR36(c) replay-
-        // block reward is deferred (needs FR49/FR51 recognition — Epic 9).
-        self.vote_engine
-            .apply_block(block.view())
-            .map_err(ProcessingError::Vote)?;
+        // creator with (a) mined_amount + (b) transaction fees. Gated on
+        // `is_seeded` so a pre-seed-zone creator is auto-accepted; genesis blocks
+        // #0/#1 are FR36-exempt. FR36(c) replay-block reward is deferred (Epic 9).
+        if let Ok(v) = BlockView::from_bytes(bytes) {
+            self.vote_engine
+                .apply_block(v)
+                .map_err(ProcessingError::Vote)?;
+        }
         if !is_genesis && self.node_info.is_seeded(view.creator()) {
             self.node_info.credit(
                 view.creator(),
@@ -1349,6 +1578,154 @@ impl<
             );
         }
         Ok(())
+    }
+
+    /// FR6 no-self-vote (AC5): a transaction's `initializer` must not equal its
+    /// `vote`, with the permanent node-#0 self-vote exception. (Also enforced at
+    /// Tier 1 intake; re-affirmed here over the candidate.)
+    fn check_self_vote(&self, initializer: u32, vote: u32) -> Result<(), ValidationReason> {
+        if initializer == 0 && vote == 0 {
+            return Ok(());
+        }
+        if initializer == vote {
+            return Err(ValidationReason::SelfVote);
+        }
+        Ok(())
+    }
+
+    /// FR6 vote-target existence (AC5): the `vote` node id must be present on the
+    /// candidate roster at the transaction's inclusion point (a node is on the
+    /// roster once seeded/registered during the forward pass). Node #0 is the
+    /// permanent exception — it is established at genesis and exists on every
+    /// chain, so `vote == 0` is always a valid target (FR37/FR54 node-#0
+    /// vote-target exception), even for a window-anchored candidate that does not
+    /// itself contain block #0.
+    fn check_vote_target(&self, vote: u32) -> Result<(), ValidationReason> {
+        if vote == 0 || self.node_info.is_seeded(vote) {
+            Ok(())
+        } else {
+            Err(ValidationReason::VoteTargetUnknown)
+        }
+    }
+
+    /// Verifies the FR6 block-creator signature (AC2b) over the canonical signing
+    /// preimage (the full block bytes with the trailing-64 header signature field
+    /// zero-filled — exactly what `BlockBuilder::build_signed` signs; the
+    /// signature is the last 64 bytes of the fixed `HEADER_SIZE` header). Returns
+    /// `Some(valid)`, or `None` when the creator's public key is not yet derivable
+    /// (pre-seed zone → the block is trusted, not re-proved). Node #0 resolves to
+    /// the FR69 trust anchor (`node_zero_public_key`), available from construction.
+    fn verify_block_creator_signature(&self, view: &BlockView) -> Option<bool> {
+        let creator = view.creator();
+        let key: [u8; PUBLIC_KEY_SIZE] = if creator == 0 {
+            self.node_zero_public_key
+        } else {
+            *self.node_info.public_key_of(creator)?
+        };
+        const SIG_LEN: usize = 64;
+        let sig_off = HEADER_SIZE - SIG_LEN;
+        let bytes = view.serialized_bytes();
+        let len = bytes.len();
+        let mut preimage = [0u8; MAX_BLOCK_SIZE];
+        preimage[..len].copy_from_slice(bytes);
+        for b in preimage[sig_off..HEADER_SIZE].iter_mut() {
+            *b = 0;
+        }
+        Some(verify_signature_bytes(
+            &self.crypto,
+            &preimage[..len],
+            view.signature(),
+            &key,
+        ))
+    }
+
+    /// Verifies a node-transfer / registration transaction signature (AC3): the
+    /// signer (the `signer_node_id`, resolved to its derived key) signs the full
+    /// transaction bytes with the trailing-64 signature field zero-filled (the
+    /// `*::new_signed` convention — the signature is the last 64 bytes of the
+    /// fixed-size transaction). Returns `false` on an unresolvable signer key or a
+    /// bad signature. Only node-transfer / registration transactions have this
+    /// fixed trailing-64 layout; balance/UTXO input signatures (embedded, no
+    /// `new_signed` convention) are a deferred seam.
+    fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
+        let Some(key) = self.node_info.public_key_of(signer_node_id) else {
+            return false;
+        };
+        let key = *key;
+        let len = tx_bytes.len();
+        if !(64..=REGISTRATION_SIZE).contains(&len) {
+            return false;
+        }
+        let mut preimage = [0u8; REGISTRATION_SIZE];
+        preimage[..len].copy_from_slice(tx_bytes);
+        for b in preimage[len - 64..len].iter_mut() {
+            *b = 0;
+        }
+        verify_signature_bytes(
+            &self.crypto,
+            &preimage[..len],
+            &tx_bytes[len - 64..len],
+            &key,
+        )
+    }
+
+    /// AC4: resolves a UTXO input reference `(tr_hash, output_index)` against the
+    /// candidate segment `marked`, requires the referenced output's spent-bit to
+    /// be 0 (unspent), then flips it to 1. Returns [`ValidationReason::UtxoUnresolvable`]
+    /// if no candidate block holds a matching transaction / the index is out of
+    /// bounds, or [`ValidationReason::UtxoAlreadySpent`] on a double-spend. Scans
+    /// the marked set re-reading each block from storage — O(segment) per input;
+    /// the FR34 block-navigation/UTXO cache that makes this O(1) is Story 7.1.
+    fn resolve_and_spend_utxo(
+        &mut self,
+        marked: &[u32; MAX_BLOCKS],
+        tr_hash: &[u8; 32],
+        output_index: u8,
+    ) -> Result<(), ValidationReason> {
+        for &m_idx in marked.iter() {
+            if m_idx == NONE_REF {
+                continue;
+            }
+            let Ok(candidate) = self.storage.read_block(m_idx) else {
+                continue;
+            };
+            if let Some(bit) = resolve_utxo_bit(&candidate.view(), tr_hash, output_index) {
+                return match self.blocks.spent_bit(m_idx, bit) {
+                    Some(false) => {
+                        self.blocks.set_spent_bit(m_idx, bit, true);
+                        Ok(())
+                    }
+                    Some(true) => Err(ValidationReason::UtxoAlreadySpent),
+                    None => Err(ValidationReason::UtxoUnresolvable),
+                };
+            }
+        }
+        Err(ValidationReason::UtxoUnresolvable)
+    }
+
+    /// FR4 / FR9 Tier-3 Active-promotion driver (AC9): on a clean FR6 pass, walk
+    /// the validated candidate tip → anchor and atomically flip every block
+    /// `Stored → Active` with `is_on_active_chain = true`, then establish
+    /// `active_chain_head_idx = tip` (overwriting any Story-5.2 bootstrap
+    /// placeholder). A pure `parent_ref` walk (no storage reads), bounded by
+    /// `MAX_BLOCKS`.
+    fn promote_candidate_active(&mut self, candidate_tip_idx: u32) {
+        let mut cur = candidate_tip_idx;
+        for _ in 0..MAX_BLOCKS {
+            self.blocks.set_status(cur, BlockStatus::Active);
+            self.blocks.set_on_active_chain(cur, true);
+            match self.blocks.get(cur) {
+                Some(entry) => {
+                    let parent = entry.parent_ref();
+                    if parent == NONE_REF {
+                        break;
+                    }
+                    cur = parent;
+                }
+                None => break,
+            }
+        }
+        self.active_chain_head_idx = candidate_tip_idx;
     }
 
     /// FR19/FR46 tick: run the parent-recovery scheduler. First evaluates the
@@ -2427,10 +2804,13 @@ mod tests {
         );
     }
 
-    /// AC2/AC5/AC6 — receiving the genesis (a length-1 genesis-anchored segment)
-    /// satisfies FR2 at once: the node transitions Collecting→Processing, and the
-    /// bootstrap-anchored genesis (the placeholder active head) is recognized as
-    /// the candidate — no intake change, per the `:142` resolution.
+    /// AC2/AC5/AC6 + Story 5.4 — receiving the genesis (a length-1
+    /// genesis-anchored segment) satisfies FR2 at once and, since block #0 passes
+    /// the (genesis-waived) FR6 invariant set, the node runs the full
+    /// Collecting→Processing→Ready transition in the one `receive_block` call. The
+    /// bootstrap-anchored genesis is recognized as the candidate (no intake
+    /// change, per the `:142` resolution) and stays the active head after the FR4
+    /// promotion.
     #[test]
     fn fr2_genesis_anchored_triggers_processing() {
         let mut bc = new_test_chain();
@@ -2440,11 +2820,11 @@ mod tests {
         assert_eq!(
             bc.current_active_head(),
             Some(0),
-            "genesis anchored as the placeholder active head (AC6)"
+            "genesis is the active head after the FR4 promotion (AC9)"
         );
         assert!(
-            bc.current_phase() == LifecyclePhase::Processing,
-            "genesis-anchored segment → Processing"
+            bc.is_ready(),
+            "genesis-anchored candidate validates → Ready (FR6/FR4, Story 5.4)"
         );
     }
 
@@ -2499,12 +2879,15 @@ mod tests {
             "segment length 3 < W = 4"
         );
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
-        // The 4th block brings the continuous segment to length W = 4.
+        // The 4th block brings the continuous segment to length W = 4 → FR2
+        // qualifies, and the window-anchored candidate (unseeded initializers, so
+        // the per-node FR6 checks are pre-seed-skipped, and every block is
+        // node-#0-signed against the trust anchor) validates → Ready (Story 5.4).
         let last = linked_transfer_block(103, prev);
         bc.receive_block(last.view(), 0);
         assert!(
-            bc.current_phase() == LifecyclePhase::Processing,
-            "segment length 4 >= W → Processing"
+            bc.is_ready(),
+            "segment length 4 >= W → FR2 qualifies, FR6 validates → Ready"
         );
     }
 
@@ -2649,17 +3032,20 @@ mod tests {
         prev: [u8; 32],
         initializer: u32,
         new_node_id: u32,
-        pk_byte: u8,
+        _pk_byte: u8,
     ) -> Block {
         let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-        // The new-key signature is a Tier 1 gate (FR9), so `new_public_key` must
-        // be a real key whose signature verifies — derive a distinct keypair
-        // from `pk_byte` and let it sign its own public key.
-        let node_signer = Crypto::new([pk_byte; PRIVATE_KEY_SIZE])
-            .ok()
-            .expect("node test key");
-        let pk = *node_signer.public_key().serialize();
-        let reg = Registration::new_signed(0, initializer, new_node_id, 50, 1, &pk, &node_signer);
+        // Story 5.4 verifies BOTH the new-key signature (Tier 1 proof-of-possession
+        // over `new_public_key`) AND the registration's initializer signature (FR6,
+        // against the initializer's DERIVED key). Every seeded node carries the
+        // universal test key `pubkey([1u8])` (see `balance_block`), and
+        // `Registration::new_signed` uses one signer for both signatures — so the
+        // registration is `[1u8]`-signed and `new_public_key` is that same key: the
+        // initializer signature verifies against the seeded initializer, and the
+        // proof-of-possession verifies against `new_public_key`. `_pk_byte` is kept
+        // for call-site readability but no longer distinguishes the stored key.
+        let pk = *signer.public_key().serialize();
+        let reg = Registration::new_signed(0, initializer, new_node_id, 50, 1, &pk, &signer);
         let header = BlockHeader {
             version: 1,
             sequence: seq,
@@ -2690,6 +3076,13 @@ mod tests {
     ) -> Block {
         use moonblokz_chain_types::NodeInfo;
         let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        // Seed every node with the *real* universal test public key (node zero's,
+        // = `pubkey([1u8])`), not a raw `[pk_byte; 32]` pattern: Story 5.4 verifies
+        // block-creator + transaction signatures against the derived key, and all
+        // test blocks/txs are `[1u8]`-signed — so a seeded node's key must be a
+        // genuine key that key produces. `pk_byte` is retained in the tuple API
+        // for call-site readability but no longer distinguishes the stored key.
+        let real_key = *signer.public_key().serialize();
         let header = BlockHeader {
             version: 1,
             sequence: seq,
@@ -2703,8 +3096,8 @@ mod tests {
             signature: [0u8; 64],
         };
         let mut builder = BlockBuilder::new().header(header);
-        for &(owner, balance, vote_count, pk_byte) in entries {
-            let ni = NodeInfo::new(owner, balance, vote_count, &[pk_byte; 32]);
+        for &(owner, balance, vote_count, _pk_byte) in entries {
+            let ni = NodeInfo::new(owner, balance, vote_count, &real_key);
             builder.add_node_info(&ni).ok().expect("add node info");
         }
         builder
@@ -2800,7 +3193,9 @@ mod tests {
         let anchor = balance_block(100, [0xAB; 32], &[(1, 100, 0, 0xB1)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let reg = registration_block(101, anchor.view().hash(), 1, 5, 0xC5);
+        // FR6 registration monotonicity: `new_node_id` must be the pre-block
+        // watermark + 1 (watermark is 1 from the balance block's max_node_id → 2).
+        let reg = registration_block(101, anchor.view().hash(), 1, 2, 0xC5);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -2808,15 +3203,15 @@ mod tests {
         bc.run_processing_pass(ri).expect("pass succeeds");
 
         assert!(
-            bc.node_info.public_key_of(5).is_some(),
+            bc.node_info.public_key_of(2).is_some(),
             "new node registered"
         );
         assert_eq!(
-            bc.node_info.balance_of(5),
+            bc.node_info.balance_of(2),
             0,
             "new node balance is 0 (FR50)"
         );
-        assert_eq!(bc.node_info.max_known_node_id(), 5, "watermark advanced");
+        assert_eq!(bc.node_info.max_known_node_id(), 2, "watermark advanced");
         assert_eq!(
             bc.node_info.balance_of(1),
             49,
@@ -2832,7 +3227,9 @@ mod tests {
         let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 3);
+        // vote 0 — the permanent node-#0 vote-target exception (FR37/FR54), so the
+        // FR6 vote-target check passes without seeding a dedicated target node.
+        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
         let ti = bc
             .tier1_admit(&tx.view(), &tx.view().hash(), 0)
             .expect("transfer admitted");
@@ -2898,8 +3295,8 @@ mod tests {
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let ah = anchor.view().hash();
-        let left = transfer_block(101, ah, 1, 2, 100, 0, 4); // 1 → 2
-        let right = transfer_block(101, ah, 1, 3, 200, 0, 5); // 1 → 3 (sibling)
+        let left = transfer_block(101, ah, 1, 2, 100, 0, 0); // 1 → 2 (vote node #0)
+        let right = transfer_block(101, ah, 1, 3, 200, 0, 0); // 1 → 3 (sibling; vote node #0)
         let li = bc
             .tier1_admit(&left.view(), &left.view().hash(), 0)
             .expect("left admitted");
@@ -2922,7 +3319,7 @@ mod tests {
         let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 10, 0xB1)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let tx = transfer_block(101, anchor.view().hash(), 1, 1, 0, 3, 2);
+        let tx = transfer_block(101, anchor.view().hash(), 1, 1, 0, 3, 0);
         let ti = bc
             .tier1_admit(&tx.view(), &tx.view().hash(), 0)
             .expect("tx admitted");
@@ -2955,7 +3352,7 @@ mod tests {
             let _ai = bc
                 .tier1_admit(&anchor.view(), &anchor.view().hash(), now_base)
                 .expect("anchor admitted");
-            let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 3);
+            let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
             let ti = bc
                 .tier1_admit(&tx.view(), &tx.view().hash(), now_base + 5_000)
                 .expect("tx admitted");
@@ -2963,26 +3360,64 @@ mod tests {
             (
                 bc.node_info.balance_of(1),
                 bc.node_info.balance_of(2),
-                bc.vote_engine.accumulated_vote_of(3),
+                bc.vote_engine.accumulated_vote_of(0),
                 bc.node_info.max_known_node_id(),
             )
         }
         assert_eq!(run(0), run(1_000_000), "projection independent of `now`");
     }
 
-    /// AC7 — scope guard: after the FR3 seam runs the pass on a qualifying
-    /// admission the node stays in `Processing` (no `Stored→Active` promotion, no
-    /// `Processing→Ready` — those are Story 5.4).
+    /// AC9 (Story 5.4) — the FR4 Ready transition + FR9 Tier-3 Active-promotion
+    /// driver: a qualifying genesis-anchored candidate that passes FR6 moves
+    /// Collecting→Processing→Ready in one `receive_block`, every candidate block is
+    /// atomically promoted `Stored→Active` with `is_on_active_chain`, and
+    /// `active_chain_head_idx` is established at the tip.
     #[test]
-    fn fr3_seam_stays_processing_not_ready() {
+    fn fr4_seam_reaches_ready_and_promotes_active() {
         let mut bc = new_test_chain();
-        // A seq-0 admission qualifies (genesis-anchored) and drives the FR3 seam.
-        let (_outcome, _next) = bc.receive_block(node_transfer_block(0, 3, 0, 7).view(), 0);
+        let (outcome, _next) = bc.receive_block(node_transfer_block(0, 3, 0, 7).view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert!(
-            bc.current_phase() == LifecyclePhase::Processing,
-            "FR3 pass succeeded → node stays Processing"
+            bc.is_ready(),
+            "valid genesis-anchored candidate → Ready (FR4)"
         );
-        assert!(!bc.is_ready(), "Ready is Story 5.4, not reached here");
+        let tip = bc.active_chain_head_idx;
+        assert_ne!(tip, NONE_REF, "active head established");
+        let entry = bc.blocks.get(tip).expect("tip present");
+        assert_eq!(
+            entry.status(),
+            BlockStatus::Active,
+            "candidate tip promoted Stored→Active (FR9 Tier 3)"
+        );
+        assert!(entry.is_on_active_chain(), "tip is on the active chain");
+    }
+
+    /// AC10 (Story 5.4) — the FR6-failure path: a qualifying candidate that
+    /// violates an FR6 invariant reverts `Processing→Collecting` (never Ready),
+    /// with the derived working set reset. The candidate `[#0 genesis, #1
+    /// registration]` is continuous genesis-anchored (so FR2 qualifies on the
+    /// genesis admission) but block #1's `new_node_id = 5 ≠ watermark + 1 = 1`
+    /// violates the FR6 registration-monotonicity rule.
+    #[test]
+    fn fr5_seam_reverts_to_collecting_on_invalid_candidate() {
+        let mut bc = new_test_chain();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        // Out-of-sequence registration child (new_node_id 5, expected 1).
+        let child = registration_block(1, genesis.view().hash(), 1, 5, 0xC5);
+        // Admit the child first as an orphan (Stored, no FR2 — not yet anchored),
+        // then the genesis so the continuous genesis-anchored candidate qualifies.
+        bc.receive_block(child.view(), 0);
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        bc.receive_block(genesis.view(), 0);
+        assert!(
+            bc.current_phase() == LifecyclePhase::Collecting,
+            "invalid candidate reverts Processing→Collecting (FR5 phase-revert)"
+        );
+        assert!(!bc.is_ready(), "an invalid candidate never reaches Ready");
+        assert!(
+            !bc.node_info.is_seeded(5),
+            "the derived working set is reset after the failed pass"
+        );
     }
 
     /// A `payload_type=1` block with an explicit `creator` + `mined_amount`
@@ -3071,27 +3506,173 @@ mod tests {
         );
     }
 
-    /// AC3 — the `max_known_node_id` watermark advances monotonically: a
-    /// registration for an id below the already-seen maximum does not regress it.
+    /// AC3 (Story 5.4) — FR6 registration monotonicity: a registration whose
+    /// `new_node_id` is not `pre-block watermark + 1` is exact evidence of
+    /// invalidity. (In Story 5.3 the derive-only pass merely absorbed the id
+    /// monotonically; FR6 now *rejects* an out-of-sequence registration, routing
+    /// to the FR5 recovery via the earliest-offending-block error.)
     #[test]
-    fn fr3_watermark_does_not_regress_below_seen_max() {
+    fn fr6_rejects_out_of_sequence_registration() {
         let mut bc = new_test_chain();
-        // Balance block declares max_node_id 5 → watermark 5.
+        // Balance block declares max_node_id 5 → watermark 5; the next valid
+        // registration id is 6. A registration for id 3 violates the stride-1 rule.
         let anchor = balance_block(100, [0xAB; 32], &[(1, 100, 0, 0xB1)], 5);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        // A later registration for a LOWER id (3) must not regress the watermark.
         let reg = registration_block(101, anchor.view().hash(), 1, 3, 0xC3);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
-            .expect("registration admitted");
+            .expect("registration admitted (Tier 1 does not check the watermark)");
 
-        bc.run_processing_pass(ri).expect("pass succeeds");
-
+        let result = bc.run_processing_pass(ri);
         assert_eq!(
-            bc.node_info.max_known_node_id(),
-            5,
-            "monotone watermark: a below-max registration does not regress it"
+            result,
+            Err(ProcessingError::Invalid {
+                block_idx: ri,
+                reason: ValidationReason::RegistrationWatermark,
+            }),
+            "FR6 rejects a non-(watermark+1) registration as the earliest offender"
+        );
+    }
+
+    // Note: the FR6 no-self-vote rule is a *structural* invariant checkable from
+    // block bytes alone, so it is enforced at Tier 1 intake (`staged_validation`,
+    // `Rejected(SelfVote)`) before a block can ever reach the Tier-3 processing
+    // pass — the FR6 re-affirmation in `validate_and_derive_block` is
+    // defense-in-depth. Self-vote rejection is therefore covered by the Tier-1
+    // tests; only the roster-dependent vote-target check below is Tier-3-only.
+
+    /// AC5 (Story 5.4) — FR6 vote-target existence: a `vote` that names a node
+    /// absent from the candidate roster at inclusion is exact evidence of
+    /// invalidity. (Node #0 and `vote == 0` remain the permanent exception.)
+    #[test]
+    fn fr6_rejects_unknown_vote_target() {
+        let mut bc = new_test_chain();
+        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 1);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        // Vote target 9 is never seeded/registered on the candidate.
+        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 9);
+        let ti = bc
+            .tier1_admit(&tx.view(), &tx.view().hash(), 0)
+            .expect("tx admitted");
+        assert_eq!(
+            bc.run_processing_pass(ti),
+            Err(ProcessingError::Invalid {
+                block_idx: ti,
+                reason: ValidationReason::VoteTargetUnknown,
+            }),
+            "FR6 rejects an unknown vote target"
+        );
+    }
+
+    /// AC2 (Story 5.4) — FR6 block-creator signature: a block whose creator key
+    /// is derivable (node #0 → the FR69 trust anchor) but whose signature was
+    /// produced by a different key is rejected (the first block-creator-signature
+    /// check in the crate).
+    #[test]
+    fn fr6_rejects_wrong_block_creator_signature() {
+        let mut bc = new_test_chain();
+        // A genesis (#0) block, creator = node #0, but signed by the WRONG key
+        // ([9u8] ≠ the trust anchor pubkey([1u8])).
+        let wrong = Crypto::new([9u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("wrong test key");
+        let nt = NodeTransfer::new_signed(0, 0, 0, 9, 100, 1, 0, &wrong);
+        let header = BlockHeader {
+            version: 1,
+            sequence: 0,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        builder.add_node_transfer(&nt).ok().expect("add transfer");
+        let block = builder.build_signed(&wrong).ok().expect("build signed");
+        let idx = bc
+            .tier1_admit(&block.view(), &block.view().hash(), 0)
+            .expect("admitted (creator signature is not a Tier 1 gate)");
+        assert_eq!(
+            bc.run_processing_pass(idx),
+            Err(ProcessingError::Invalid {
+                block_idx: idx,
+                reason: ValidationReason::CreatorSignatureInvalid,
+            }),
+            "FR6 rejects a block-creator signature that fails against the derived key"
+        );
+    }
+
+    /// AC7 (Story 5.4) — FR6 requires every balance block *after the earliest* to
+    /// carry `max_node_id` equal to the forward-traversal-tracked watermark at its
+    /// sequence; a divergence is exact evidence of invalidity. (Deferred from
+    /// Story 5.3, which only initialized the watermark from the earliest block.)
+    #[test]
+    fn fr6_rejects_later_balance_block_max_node_id_mismatch() {
+        let mut bc = new_test_chain();
+        // Earliest balance block → watermark initialized to 1.
+        let b0 = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 1);
+        bc.tier1_admit(&b0.view(), &b0.view().hash(), 0)
+            .expect("earliest balance block admitted");
+        // A later balance block claims max_node_id 5 ≠ the tracked watermark 1.
+        let b1 = balance_block(101, b0.view().hash(), &[(1, 400, 0, 0xB1)], 5);
+        let i1 = bc
+            .tier1_admit(&b1.view(), &b1.view().hash(), 0)
+            .expect("later balance block admitted");
+        assert_eq!(
+            bc.run_processing_pass(i1),
+            Err(ProcessingError::Invalid {
+                block_idx: i1,
+                reason: ValidationReason::BalanceMaxNodeIdMismatch,
+            }),
+            "FR6 rejects a later balance block whose max_node_id diverges from the watermark"
+        );
+    }
+
+    /// AC6 (Story 5.4) — FR6 chain-config compliance: a chain-config block
+    /// (`payload_type=3`) whose content is not byte-identical to the durable-locked
+    /// configuration is exact evidence of invalidity. (The FR7 content-signature
+    /// gate and establishing the lock from the candidate are Story 5.6.)
+    #[test]
+    fn fr6_rejects_divergent_chain_config() {
+        let mut bc = new_test_chain();
+        bc.chain_config
+            .store_initial_chain_config_bytes(&[0x01, 0x02, 0x03])
+            .expect("retain durable-locked config");
+        // A chain-config block whose payload diverges from the retained config.
+        let header = BlockHeader {
+            version: 1,
+            sequence: 5,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let mut builder = BlockBuilder::new().header(header);
+        builder
+            .set_chain_config_payload(&[0x09, 0x09, 0x09])
+            .ok()
+            .expect("set chain-config payload");
+        let block = builder.build_signed(&signer).ok().expect("build signed");
+        let idx = bc
+            .tier1_admit(&block.view(), &block.view().hash(), 0)
+            .expect("admitted (content-signature gate is Story 5.6)");
+        assert_eq!(
+            bc.run_processing_pass(idx),
+            Err(ProcessingError::Invalid {
+                block_idx: idx,
+                reason: ValidationReason::ChainConfigMismatch,
+            }),
+            "FR6 rejects a chain-config block diverging from the durable-locked config"
         );
     }
 }
