@@ -377,6 +377,12 @@ pub enum TickOutcome {
 /// `SNAKE_CHAIN_LENGTH = 500`, `VERIFICATION_HORIZON = 20`,
 /// `MAX_BLOCKS = 600`, `MAX_BRANCH_COUNT = 40`,
 /// `MAX_BLOCK_UTXO_OUTPUT = 256`.
+// `BlockEntry.len` stores the exact stored block length as a `u16`; the FR6
+// byte-exact trim (`e.len() as usize`) and the admit-time `set_len(len as u16)`
+// rely on `MAX_BLOCK_SIZE` fitting a `u16`. Guard it at compile time so a future
+// larger block size cannot silently truncate the trim length.
+const _: () = assert!(MAX_BLOCK_SIZE <= u16::MAX as usize);
+
 /// Failure modes of the FR3 processing pass (Story 5.3).
 ///
 /// Derive-only: an `Err` routes to the minimal FR5 phase-revert in
@@ -450,6 +456,21 @@ pub(crate) enum ValidationReason {
     /// A balance block after the earliest carries a `max_node_id` that diverges
     /// from the forward-tracked watermark at its sequence (FR3/FR6).
     BalanceMaxNodeIdMismatch,
+    /// On a **genesis-anchored** candidate (the whole chain is re-derivable from
+    /// block #0), a non-genesis block's creator or a transaction's initializer is
+    /// not present on the derived roster — i.e. it acts before it exists. There is
+    /// no pre-seed trust zone on a genesis-anchored candidate, so this is exact
+    /// evidence of invalidity (FR6). (On a window-anchored candidate the same
+    /// unseeded state is legitimately trusted pre-window history, AC4.)
+    UnseededActor,
+    /// A registration's `new_public_key` is not globally unique within the
+    /// candidate — an earlier accepted registration (or balance-block seed) on the
+    /// candidate already carries the same key (FR6 registration uniqueness).
+    DuplicatePublicKey,
+    /// A balance-only complex transaction's total balance inputs are less than its
+    /// total balance outputs (money creation). The UTXO-value side of this
+    /// invariant is validated with the Story-7.1 UTXO cache (see Dev Notes).
+    InsufficientInputs,
 }
 
 // Fields are consumed by the state-changing methods landing in Story 1.4+;
@@ -1251,6 +1272,28 @@ impl<
             cur = parent;
         }
 
+        // AC5 (spent-bit lifecycle): establish the clean all-zero baseline for the
+        // marked segment's spent-bits at entry — matching the `node_info` /
+        // `vote_engine` reset above — so the pass is idempotent on re-entry and the
+        // failure rollback below restores exactly this baseline (not the whole
+        // vector against an unknown prior state). For the MVP join/reconstruct flow
+        // the marked blocks are freshly-admitted `Stored` blocks (spent-bits already
+        // 0); the reset makes the reusable primitive self-consistent for the
+        // Story-5.7 restart and Epic-6 deep-zone re-derivation.
+        for slot in marked.iter().take(count) {
+            self.blocks.clear_spent_bits(*slot);
+        }
+
+        // A genesis-anchored candidate (anchor == block #0) is re-derivable in full,
+        // so it has NO pre-seed trust zone: an unseeded creator / initializer is
+        // exact evidence of invalidity (FR6). A window-anchored candidate legitimately
+        // trusts its pre-window history (AC4). The anchor is `marked[count - 1]`.
+        let genesis_anchored = count > 0
+            && self
+                .blocks
+                .get(marked[count - 1])
+                .is_some_and(|e| e.sequence() == 0);
+
         // AC1: chain-config preload. The candidate's chain-config block(s)
         // (`payload_type == 3`) are inside the marked set and read during the
         // forward pass below; the byte-identical FR6 compliance verify and the
@@ -1302,6 +1345,7 @@ impl<
                 prev_hash,
                 &mut saw_balance_block,
                 &marked,
+                genesis_anchored,
             ) {
                 result = Err(e);
                 break;
@@ -1335,6 +1379,7 @@ impl<
         prev_hash: Option<[u8; 32]>,
         saw_balance_block: &mut bool,
         marked: &[u32; MAX_BLOCKS],
+        genesis_anchored: bool,
     ) -> Result<(), ProcessingError> {
         // `view` is the block trimmed to its exact stored length. `bytes` re-views
         // it for the by-value `VoteEngine` calls (`BlockView` is not `Copy`).
@@ -1366,8 +1411,16 @@ impl<
         //     crate). Skipped when the creator's key is not yet derivable
         //     (pre-seed zone → trusted); node #0 always resolves to the FR69
         //     trust anchor, so a genesis-anchored candidate's block #0 is checked.
-        if self.verify_block_creator_signature(&view) == Some(false) {
-            return Err(invalid(ValidationReason::CreatorSignatureInvalid));
+        match self.verify_block_creator_signature(&view) {
+            Some(false) => return Err(invalid(ValidationReason::CreatorSignatureInvalid)),
+            // On a genesis-anchored candidate the creator's key must be derivable
+            // (it registered earlier in the same fully-re-derived chain); a
+            // non-derivable creator on a non-genesis block is exact evidence of
+            // invalidity, not a trusted pre-seed block (AC2/AC4 genesis-anchored).
+            None if genesis_anchored && !is_genesis => {
+                return Err(invalid(ValidationReason::UnseededActor));
+            }
+            _ => {}
         }
 
         // FR36 (b) transaction-fee total; consumed by the shared creator tail.
@@ -1412,6 +1465,12 @@ impl<
                     let vote = tx.vote();
                     if let Some(nt) = tx.as_node_transfer() {
                         let init = nt.initializer();
+                        // [A] Genesis-anchored: an unseeded initializer means the
+                        // node transacts before it exists — invalid (no pre-seed
+                        // trust zone). Window-anchored: trusted pre-window history.
+                        if genesis_anchored && !is_genesis_zero && !self.node_info.is_seeded(init) {
+                            return Err(invalid(ValidationReason::UnseededActor));
+                        }
                         // State-dependent FR6 checks apply once the initializer is
                         // derivable (past its pre-seed zone).
                         if !is_genesis_zero && self.node_info.is_seeded(init) {
@@ -1452,6 +1511,12 @@ impl<
                         has_registration = true;
                         let node_id = reg.new_node_id();
                         let init = reg.initializer();
+                        // [A] Genesis-anchored: the registering initializer must be
+                        // an existing (seeded) node; unseeded ⇒ invalid (block #0's
+                        // node-#0 self-registration is the FR54 bootstrap exception).
+                        if genesis_anchored && !is_genesis_zero && !self.node_info.is_seeded(init) {
+                            return Err(invalid(ValidationReason::UnseededActor));
+                        }
                         // FR6 registration monotonicity: `new_node_id ==
                         // pre-block-position watermark + 1`, checked against the
                         // running watermark so within-block registrations form a
@@ -1486,15 +1551,31 @@ impl<
                             let advanced = self.node_info.max_known_node_id().max(node_id);
                             self.node_info.set_max_known_node_id(advanced);
                         }
+                        // [E] FR6 registration uniqueness: `new_public_key` must not
+                        // already be held by a seeded/registered node on the
+                        // candidate (within-block earlier registrations are seeded
+                        // in tx order, so a same-block collision is caught too).
+                        if self.node_info.key_is_registered(reg.new_public_key()) {
+                            return Err(invalid(ValidationReason::DuplicatePublicKey));
+                        }
                         self.node_info
                             .register_node(node_id, reg.new_public_key(), idx);
                     } else if let Some(cx) = tx.as_complex() {
                         has_complex = true;
                         let mut in_sum: u64 = 0;
                         let mut out_sum: u64 = 0;
+                        let mut has_utxo_input = false;
                         for input in cx.inputs() {
                             if let Some(bi) = input.as_balance() {
                                 let binit = bi.initializer();
+                                // [A] Genesis-anchored: a balance-input initializer
+                                // must be seeded (it spends a derived balance).
+                                if genesis_anchored
+                                    && !is_genesis_zero
+                                    && !self.node_info.is_seeded(binit)
+                                {
+                                    return Err(invalid(ValidationReason::UnseededActor));
+                                }
                                 if !is_genesis_zero && self.node_info.is_seeded(binit) {
                                     self.check_self_vote(binit, vote).map_err(&invalid)?;
                                     self.check_vote_target(vote).map_err(&invalid)?;
@@ -1510,14 +1591,18 @@ impl<
                                 }
                                 in_sum = in_sum.saturating_add(bi.amount());
                             } else if let Some(ui) = input.as_utxo() {
-                                // AC4: resolve the UTXO input against the candidate
-                                // window, require its spent-bit == 0, then flip it.
-                                // Balance/UTXO-input signature verification is
-                                // deferred (undefined scope — see Dev Notes).
+                                // [H] AC4: resolve the UTXO input against the
+                                // candidate segment (only blocks *earlier* than this
+                                // one — a causal reference), require its spent-bit ==
+                                // 0, then flip it. The UTXO input's value (for the
+                                // inputs≥outputs sum) and its signature are validated
+                                // with the Story-7.1 UTXO cache (Decision: the UTXO
+                                // value space is Story 7.1).
+                                has_utxo_input = true;
                                 let oi = ui.output_index();
                                 let mut tr = [0u8; 32];
                                 tr.copy_from_slice(&ui.tr_hash()[..32]);
-                                self.resolve_and_spend_utxo(marked, &tr, oi)
+                                self.resolve_and_spend_utxo(marked, seq, &tr, oi)
                                     .map_err(&invalid)?;
                             }
                         }
@@ -1528,6 +1613,14 @@ impl<
                                 }
                                 out_sum = out_sum.saturating_add(bo.amount());
                             }
+                        }
+                        // [D] FR6 total-inputs ≥ total-outputs, enforced for a
+                        // balance-only complex tx with ≥1 input (a zero-input
+                        // carry-forward is exempt per FR6). When the tx has a UTXO
+                        // input, `in_sum` omits the UTXO-side value (Story 7.1), so
+                        // the full inputs≥outputs check lands with that value cache.
+                        if !has_utxo_input && cx.input_count() > 0 && out_sum > in_sum {
+                            return Err(invalid(ValidationReason::InsufficientInputs));
                         }
                         total_fees = total_fees.saturating_add(in_sum.saturating_sub(out_sum));
                     } else {
@@ -1679,11 +1772,24 @@ impl<
     fn resolve_and_spend_utxo(
         &mut self,
         marked: &[u32; MAX_BLOCKS],
+        consuming_seq: u32,
         tr_hash: &[u8; 32],
         output_index: u8,
     ) -> Result<(), ValidationReason> {
         for &m_idx in marked.iter() {
             if m_idx == NONE_REF {
+                continue;
+            }
+            // [H] Causality: a UTXO output can only be consumed by a block that
+            // comes *after* the block that created it. Skip any candidate block at
+            // or after the consuming block's sequence — resolving against a
+            // same/later block would let a tx spend an output that does not exist
+            // yet at its own point in the chain.
+            if self
+                .blocks
+                .get(m_idx)
+                .is_none_or(|e| e.sequence() >= consuming_seq)
+            {
                 continue;
             }
             let Ok(candidate) = self.storage.read_block(m_idx) else {
@@ -1950,7 +2056,7 @@ mod tests {
         ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
     };
     use moonblokz_chain_types::MAX_BLOCK_SIZE;
-    use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE, SignatureTrait};
     use moonblokz_storage::backend_memory::MemoryBackend;
 
     fn any_nonzero(bytes: &[u8]) -> bool {
@@ -3032,20 +3138,50 @@ mod tests {
         prev: [u8; 32],
         initializer: u32,
         new_node_id: u32,
-        _pk_byte: u8,
+        pk_byte: u8,
     ) -> Block {
-        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-        // Story 5.4 verifies BOTH the new-key signature (Tier 1 proof-of-possession
-        // over `new_public_key`) AND the registration's initializer signature (FR6,
-        // against the initializer's DERIVED key). Every seeded node carries the
-        // universal test key `pubkey([1u8])` (see `balance_block`), and
-        // `Registration::new_signed` uses one signer for both signatures — so the
-        // registration is `[1u8]`-signed and `new_public_key` is that same key: the
-        // initializer signature verifies against the seeded initializer, and the
-        // proof-of-possession verifies against `new_public_key`. `_pk_byte` is kept
-        // for call-site readability but no longer distinguishes the stored key.
-        let pk = *signer.public_key().serialize();
-        let reg = Registration::new_signed(0, initializer, new_node_id, 50, 1, &pk, &signer);
+        // Story 5.4 verifies BOTH signatures of a registration against DIFFERENT
+        // keys, and enforces `new_public_key` uniqueness — so a valid registration
+        // needs two signers: the **initializer** ([1u8], the universal seeded key —
+        // see `balance_block`) signs the transaction, and the **new node key**
+        // ([pk_byte], a distinct key giving a unique `new_public_key`) signs the
+        // proof-of-possession. `Registration::new_signed` uses one signer for both,
+        // which cannot express a cross-key registration, so build it via
+        // `Registration::new` with the two signatures computed separately.
+        let init_signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("init key");
+        let new_signer = Crypto::new([pk_byte; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("new key");
+        let new_pk = *new_signer.public_key().serialize();
+        let mut new_key_sig = [0u8; 64];
+        new_key_sig.copy_from_slice(&new_signer.sign(&new_pk).serialize()[..64]);
+        // The transaction signature signs the tx bytes with its signature field
+        // zeroed and the new-key signature already present (the `new_signed`
+        // convention), produced here by the initializer's key.
+        let zero = [0u8; 64];
+        let unsigned = Registration::new(
+            0,
+            initializer,
+            new_node_id,
+            50,
+            1,
+            &new_pk,
+            &new_key_sig,
+            &zero,
+        );
+        let mut tx_sig = [0u8; 64];
+        tx_sig.copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..64]);
+        let reg = Registration::new(
+            0,
+            initializer,
+            new_node_id,
+            50,
+            1,
+            &new_pk,
+            &new_key_sig,
+            &tx_sig,
+        );
+        let signer = init_signer;
         let header = BlockHeader {
             version: 1,
             sequence: seq,
@@ -3673,6 +3809,57 @@ mod tests {
                 reason: ValidationReason::ChainConfigMismatch,
             }),
             "FR6 rejects a chain-config block diverging from the durable-locked config"
+        );
+    }
+
+    /// AC3 (Story 5.4) — FR6 registration `new_public_key` global uniqueness: a
+    /// registration whose new key collides with an already-seeded node's key is
+    /// exact evidence of invalidity.
+    #[test]
+    fn fr6_rejects_duplicate_public_key() {
+        let mut bc = new_test_chain();
+        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 1);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        // pk_byte == 1 ⇒ new_public_key == pubkey([1u8]) == node 1's seeded key.
+        let reg = registration_block(101, anchor.view().hash(), 1, 2, 1);
+        let ri = bc
+            .tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+        assert_eq!(
+            bc.run_processing_pass(ri),
+            Err(ProcessingError::Invalid {
+                block_idx: ri,
+                reason: ValidationReason::DuplicatePublicKey,
+            }),
+            "FR6 rejects a registration whose new_public_key duplicates a seeded node's key"
+        );
+    }
+
+    /// AC2/AC4 (Story 5.4) — on a GENESIS-anchored candidate (re-derivable in full
+    /// from block #0) there is no pre-seed trust zone: a transaction whose
+    /// initializer was never registered/seeded acts before it exists and is exact
+    /// evidence of invalidity (`UnseededActor`) — unlike a window-anchored
+    /// candidate, which legitimately trusts such pre-window history.
+    #[test]
+    fn fr6_rejects_unseeded_actor_on_genesis_anchored_candidate() {
+        let mut bc = new_test_chain();
+        // Genesis block #0 seeds no node (a bare transfer, not a node-#0 registration).
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+            .expect("genesis admitted");
+        // Block #1: a transfer whose initializer (node 1) never registered.
+        let child = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+        let ci = bc
+            .tier1_admit(&child.view(), &child.view().hash(), 0)
+            .expect("child admitted");
+        assert_eq!(
+            bc.run_processing_pass(ci),
+            Err(ProcessingError::Invalid {
+                block_idx: ci,
+                reason: ValidationReason::UnseededActor,
+            }),
+            "genesis-anchored: an unseeded initializer is invalid (no pre-seed trust)"
         );
     }
 }
