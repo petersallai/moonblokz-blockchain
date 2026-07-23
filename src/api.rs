@@ -1226,6 +1226,9 @@ impl<
         // FR36-exempt (FR54 genesis exception).
         let is_genesis_zero = seq == 0;
         let is_genesis = is_genesis_zero || seq == 1;
+        // FR36 (b) transaction-fee total — 0 for non-transaction payloads;
+        // consumed by the shared creator-credit tail after the match.
+        let mut total_fees: u64 = 0;
 
         match view.payload_type() {
             PAYLOAD_TYPE_BALANCE => {
@@ -1254,18 +1257,8 @@ impl<
                     // snapshots (FR50 NodeInfo snapshot semantics).
                     self.vote_engine.seed_from_balance_block(block.view());
                 }
-                // Apply this block's own FR37 acceptance effects (anti-capture
-                // interest + creator reset) on top of the seeded values (FR50).
-                self.vote_engine
-                    .apply_block(block.view())
-                    .map_err(ProcessingError::Vote)?;
-                if !is_genesis && self.node_info.is_seeded(view.creator()) {
-                    self.node_info
-                        .credit(view.creator(), view.mined_amount() as u64);
-                }
             }
             PAYLOAD_TYPE_TRANSACTION => {
-                let mut total_fees: u64 = 0;
                 if let Some(txs) = view.transactions() {
                     for tx in txs.iter() {
                         if let Some(nt) = tx.as_node_transfer() {
@@ -1330,35 +1323,30 @@ impl<
                         }
                     }
                 }
-                self.vote_engine
-                    .apply_block(block.view())
-                    .map_err(ProcessingError::Vote)?;
-                // FR36 creator credit: (a) mined_amount + (b) transaction fees.
-                // Gated on the creator being seeded — an unseeded creator is in
-                // its pre-seed zone (AC4), so the credit is auto-accepted
-                // (skipped) rather than written onto an unknown baseline. FR36(c)
-                // replay-block reward is deferred (needs FR49/FR51 replay-block
-                // recognition — Epic 9).
-                if !is_genesis && self.node_info.is_seeded(view.creator()) {
-                    self.node_info.credit(
-                        view.creator(),
-                        (view.mined_amount() as u64).saturating_add(total_fees),
-                    );
-                }
             }
             _ => {
                 // Chain-config (3) / approval (4): no per-node balance/roster
-                // mutation; FR37 anti-capture interest + creator reset still apply
-                // on acceptance. Chain-config content preload for chain-config-
-                // derived checks is Story 5.6.
-                self.vote_engine
-                    .apply_block(block.view())
-                    .map_err(ProcessingError::Vote)?;
-                if !is_genesis && self.node_info.is_seeded(view.creator()) {
-                    self.node_info
-                        .credit(view.creator(), view.mined_amount() as u64);
-                }
+                // mutation and no fees. The shared tail below still runs this
+                // block's FR37 vote effects and the FR36 mined-amount credit.
+                // Chain-config content preload for the derived checks is Story 5.6.
             }
+        }
+
+        // Shared FR37 + FR36 tail (every payload type): apply this block's vote
+        // effects once (anti-capture interest + creator reset), then credit the
+        // creator with (a) mined_amount + (b) transaction fees — `total_fees` is
+        // 0 for non-transaction payloads. Gated on `is_seeded` so a pre-seed-zone
+        // creator is auto-accepted (skipped), never written onto an unknown
+        // baseline (AC4); genesis blocks #0/#1 are FR36-exempt. FR36(c) replay-
+        // block reward is deferred (needs FR49/FR51 recognition — Epic 9).
+        self.vote_engine
+            .apply_block(block.view())
+            .map_err(ProcessingError::Vote)?;
+        if !is_genesis && self.node_info.is_seeded(view.creator()) {
+            self.node_info.credit(
+                view.creator(),
+                (view.mined_amount() as u64).saturating_add(total_fees),
+            );
         }
         Ok(())
     }
