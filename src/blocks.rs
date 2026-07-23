@@ -14,14 +14,24 @@
 //! note on that below); `BlockTable::insert` never evicts or overwrites a
 //! non-empty slot — a full table is a terminal [`BlockTableError::Full`].
 //!
-//! **Once inserted, an entry is not mutated in place — only deleted and
-//! replaced.** `BlockTable` deliberately exposes no `get_mut`/update-by-index
-//! method (2026-07-04 design decision). Any change to an already-inserted
-//! block's ancestry or status bits (e.g. flipping `is_on_active_chain`
-//! during a future FR23 chain-switch) goes through delete-then-`insert`,
-//! not an in-place field write. `BlockTable` itself has no deletion method
-//! yet — that lands in Story 4.4 alongside `chain_heads.rs`'s eviction path,
-//! the first authorized way to free a slot (FR19 chain_heads-eviction).
+//! **Ancestry identity is immutable once inserted — only deleted and
+//! replaced.** `BlockTable` deliberately exposes no general `get_mut`/
+//! update-by-index method (2026-07-04 design decision): a block's `hash`,
+//! `sequence`, and (once resolved) `parent_ref` never change under it, so
+//! any identity change goes through delete-then-`insert`, not an in-place
+//! field write. **Narrow, invariant-preserving exceptions exist for
+//! *non-identity* metadata**, each a distinct method (never a raw `get_mut`):
+//! `adjust_head_ref_count` / `resolve_parent_ref` (FR19 structural
+//! bookkeeping, Story 4.4), and — added in Story 5.4 — the FR6/FR4 value
+//! setters `set_status` / `set_on_active_chain` / `set_spent_bit`. The last
+//! three are **bidirectional and value-based on purpose**: the FR3 Ready
+//! transition promotes `Stored→Active` + `on_active_chain=true` and flips
+//! UTXO spent-bits `0→1`, while the FR5 recovery (Story 5.5) and the FR23
+//! chain-switch (Epic 6) reverse the very same fields — so a one-way
+//! `promote`/`flip` API would be wrong; both directions reuse one setter.
+//! The block's `hash`/`sequence`/`parent_ref` stay immutable throughout.
+//! `BlockTable`'s first deletion path lands in Story 4.4 alongside
+//! `chain_heads.rs`'s eviction (FR19 chain_heads-eviction).
 //!
 //! **Chain-head arrival timestamp deferred to Story 4.4.** FR18 requires
 //! retaining the local wall-clock arrival timestamp "at least for every
@@ -90,6 +100,15 @@ pub(crate) struct BlockEntry {
     spent_bits: [u8; SPENT_BITS_BYTES],
     head_ref_count: u8,
     flags: u8,
+    /// The block's exact serialized length in bytes, recorded at intake (Story
+    /// 5.4). Durable backends store blocks in fixed-size slots and read them back
+    /// zero-padded to the slot size (`MemoryBackend`), so a read-back block is not
+    /// byte-identical to the block that was signed; the FR6 byte-exact checks
+    /// (block-creator signature, chain-config content-identity) trim the read-back
+    /// bytes to this length first. `0` for entries constructed directly in tests
+    /// that never round-trip through storage. Fits the struct's existing 2-byte
+    /// tail padding — `size_of::<BlockEntry>()` stays 76 B.
+    len: u16,
 }
 
 // `new`/`is_on_active_chain`/`set_on_active_chain` are consumed starting
@@ -107,11 +126,14 @@ impl BlockEntry {
             spent_bits: [0; SPENT_BITS_BYTES],
             head_ref_count: 0,
             flags: 0,
+            len: 0,
         }
     }
 
     /// Constructs an occupied entry. `parent_ref == NONE_REF` means no
-    /// resolved parent (e.g. genesis, or an as-yet-unrecovered ancestor).
+    /// resolved parent (e.g. genesis, or an as-yet-unrecovered ancestor). `len`
+    /// defaults to 0; the admission path stamps the block's true serialized
+    /// length via [`Self::set_len`] before insertion (Story 5.4).
     pub(crate) fn new(hash: [u8; 32], parent_ref: u32, sequence: u32) -> Self {
         Self {
             hash,
@@ -120,7 +142,21 @@ impl BlockEntry {
             spent_bits: [0; SPENT_BITS_BYTES],
             head_ref_count: 0,
             flags: 0,
+            len: 0,
         }
+    }
+
+    /// The block's exact serialized length recorded at intake (Story 5.4), or 0
+    /// if never stamped (test entries that do not round-trip through storage).
+    pub(crate) fn len(&self) -> u16 {
+        self.len
+    }
+
+    /// Stamps the block's exact serialized length onto a `BlockEntry` value
+    /// **before** it is inserted (Story 5.4 — the byte-exact FR6 checks trim a
+    /// zero-padded read-back block to this length).
+    pub(crate) fn set_len(&mut self, len: u16) {
+        self.len = len;
     }
 
     fn is_empty_slot(&self) -> bool {
@@ -205,6 +241,35 @@ impl BlockEntry {
         };
         self.flags =
             (self.flags & !FLAG_STATUS_MASK) | ((bits << FLAG_STATUS_SHIFT) & FLAG_STATUS_MASK);
+    }
+
+    /// ADR-016 UTXO spent-bit read (`bit` = 0-based position in this block's
+    /// UTXO-output stream). An out-of-range bit reads as `true` (spent) — a
+    /// fail-safe so a malformed / oversized reference can never be treated as
+    /// unspent by the FR6 double-spend check (Story 5.4).
+    pub(crate) fn spent_bit(&self, bit: usize) -> bool {
+        let byte = bit / 8;
+        if byte >= SPENT_BITS_BYTES {
+            return true;
+        }
+        self.spent_bits[byte] & (1u8 << (bit % 8)) != 0
+    }
+
+    /// Sets UTXO spent-bit `bit` to `value` (ADR-016). Value-based and
+    /// bidirectional (Story 5.4): the FR6 forward pass sets `0→1` on
+    /// consumption, the FR5 rollback (Story 5.5) resets `1→0`. An
+    /// out-of-range `bit` is ignored (the read side already fails safe).
+    pub(crate) fn set_spent_bit(&mut self, bit: usize, value: bool) {
+        let byte = bit / 8;
+        if byte >= SPENT_BITS_BYTES {
+            return;
+        }
+        let mask = 1u8 << (bit % 8);
+        if value {
+            self.spent_bits[byte] |= mask;
+        } else {
+            self.spent_bits[byte] &= !mask;
+        }
     }
 }
 
@@ -491,6 +556,72 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         }
     }
 
+    /// FR6/FR4 value setter — the block's FR9 `BlockStatus` (bits 1-2 of
+    /// `flags`) on an **already-inserted** block. Bidirectional and value-based
+    /// (Story 5.4): the FR3 Ready transition promotes `Stored→Active`; the FR5
+    /// recovery (5.5) / FR23 chain-switch (Epic 6) reverse it. Same
+    /// structural-not-identity rationale as [`Self::adjust_head_ref_count`] —
+    /// the status bits are non-identity metadata; `hash`/`sequence`/`parent_ref`
+    /// stay immutable. Returns `false` for an empty/out-of-bounds slot.
+    pub(crate) fn set_status(&mut self, idx: u32, status: BlockStatus) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.set_status(status);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// FR6/FR4 value setter — `is_on_active_chain` (bit 0 of `flags`) on an
+    /// **already-inserted** block. Bidirectional (Story 5.4): the Ready
+    /// transition sets `true` for every candidate block; the FR23 chain-switch
+    /// (Epic 6) flips it both ways. Returns `false` for an empty/out-of-bounds
+    /// slot.
+    pub(crate) fn set_on_active_chain(&mut self, idx: u32, value: bool) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.set_on_active_chain(value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// ADR-016 UTXO spent-bit read at `bit` on the block at `idx`, or `None`
+    /// for an empty/out-of-bounds slot. Read by the FR6 double-spend check
+    /// (Story 5.4).
+    pub(crate) fn spent_bit(&self, idx: u32, bit: usize) -> Option<bool> {
+        self.get(idx).map(|entry| entry.spent_bit(bit))
+    }
+
+    /// ADR-016 UTXO spent-bit value setter on an **already-inserted** block
+    /// (Story 5.4). Bidirectional: the FR6 forward pass sets `0→1` on
+    /// consumption; the FR5 rollback (5.5) resets `1→0`. Returns `false` for an
+    /// empty/out-of-bounds slot.
+    pub(crate) fn set_spent_bit(&mut self, idx: u32, bit: usize, value: bool) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.set_spent_bit(bit, value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Clears the entire UTXO spent-bit vector of the block at `idx` back to the
+    /// all-zero construction default (ADR-016). Used by the FR6 pass's aborted-
+    /// run rollback (Story 5.4 — the FR5 working-set-rollback UTXO half): a
+    /// candidate that fails validation must not leave any spent-bit it flipped
+    /// set. No-op for an empty/out-of-bounds slot.
+    pub(crate) fn clear_spent_bits(&mut self, idx: u32) {
+        if let Some(entry) = self.blocks.get_mut(idx as usize)
+            && !entry.is_empty_slot()
+        {
+            entry.spent_bits = [0u8; SPENT_BITS_BYTES];
+        }
+    }
+
     /// FR19 eviction: free the slot at `idx` (reset to the empty-slot sentinel),
     /// returning whether an occupied block was removed. This is the block-tree's
     /// **first** deletion path (Story 4.1 deferred it here) — an authorized
@@ -533,11 +664,13 @@ mod tests {
     #[test]
     fn block_entry_size_is_within_budget() {
         // 32 hash + 4 parent_ref + 4 sequence + 32 spent_bits +
-        // 1 head_ref_count + 1 flags = 74 B effective, 4-byte aligned
-        // (largest field is u32) -> 76 B padded, matching architecture
-        // §6.2 exactly. Pinned exactly, not just bounded, so a future field
-        // addition must consciously update this (same discipline as
-        // chain-types' `block_view_size_is_pointer_plus_length`).
+        // 1 head_ref_count + 1 flags + 2 len = 76 B effective, 4-byte aligned
+        // (largest field is u32) -> 76 B, matching architecture §6.2. The
+        // Story-5.4 `len: u16` field consumed the 2 bytes of tail padding the
+        // 74-byte layout previously wasted, so the entry size is unchanged.
+        // Pinned exactly, not just bounded, so a future field addition must
+        // consciously update this (same discipline as chain-types'
+        // `block_view_size_is_pointer_plus_length`).
         assert_eq!(core::mem::size_of::<BlockEntry>(), 76);
     }
 
