@@ -93,28 +93,28 @@ impl PendingInitialChainConfig {
 /// embedded targets.
 pub trait ChainConfigTrait {
     /// FR45 (b) inter-block creation wait time, milliseconds.
-    fn current_inter_block_interval_ms(&self) -> u64;
+    fn inter_block_interval_ms(&self) -> u64;
 
     /// FR47 grace-period window length, milliseconds.
-    fn current_grace_period_window_ms(&self) -> u64;
+    fn grace_period_window_ms(&self) -> u64;
 
     /// Chain-config-derived block-size limit
     /// (upper-bounded by `moonblokz_chain_types::MAX_BLOCK_SIZE`).
-    fn current_block_size_limit(&self) -> u16;
+    fn block_size_limit(&self) -> u16;
 
     /// Maximum UTXO outputs per block (ADR-016 / `MAX_BLOCK_UTXO_OUTPUT`).
-    fn current_max_utxo_outputs(&self) -> u8;
+    fn max_utxo_outputs(&self) -> u8;
 
     /// Maximum aggregated signatures per approval-evidence block (ADR-015).
-    fn current_max_aggregated_signatures(&self) -> u8;
+    fn max_aggregated_signatures(&self) -> u8;
 
     /// FR37 `vote_scale` — the per-credit vote value; also the per-block
     /// anti-capture interest cap. Feeds `VoteEngine` construction (Story 5.3).
-    fn current_vote_scale(&self) -> core::num::NonZeroU16;
+    fn vote_scale(&self) -> core::num::NonZeroU16;
 
     /// FR37 `vote_interest` — the anti-capture vote-interest rate. Feeds
     /// `VoteEngine` construction (Story 5.3).
-    fn current_vote_interest(&self) -> u8;
+    fn vote_interest(&self) -> u8;
 
     /// FR8 durable-lock status. The MVP stub returns `true` (FR56*).
     fn is_durable_locked(&self) -> bool;
@@ -165,34 +165,34 @@ impl FixedChainConfig {
 }
 
 impl ChainConfigTrait for FixedChainConfig {
-    fn current_inter_block_interval_ms(&self) -> u64 {
+    fn inter_block_interval_ms(&self) -> u64 {
         60_000
     }
 
-    fn current_grace_period_window_ms(&self) -> u64 {
+    fn grace_period_window_ms(&self) -> u64 {
         30_000
     }
 
-    fn current_block_size_limit(&self) -> u16 {
+    fn block_size_limit(&self) -> u16 {
         FIXED_BLOCK_SIZE_LIMIT
     }
 
-    fn current_max_utxo_outputs(&self) -> u8 {
+    fn max_utxo_outputs(&self) -> u8 {
         255
     }
 
-    fn current_max_aggregated_signatures(&self) -> u8 {
+    fn max_aggregated_signatures(&self) -> u8 {
         50
     }
 
-    fn current_vote_scale(&self) -> core::num::NonZeroU16 {
+    fn vote_scale(&self) -> core::num::NonZeroU16 {
         // AR14 fixed-value stub. `1000` gives ample headroom for the FR37
         // anti-capture interest arithmetic without approaching the `u32`
         // checked-arithmetic ceiling on realistic MVP chains.
         core::num::NonZeroU16::new(1000).expect("1000 is non-zero")
     }
 
-    fn current_vote_interest(&self) -> u8 {
+    fn vote_interest(&self) -> u8 {
         5
     }
 
@@ -228,13 +228,13 @@ mod tests {
     #[test]
     fn fixed_returns_expected_constants() {
         let cfg = FixedChainConfig::new();
-        assert_eq!(cfg.current_inter_block_interval_ms(), 60_000);
-        assert_eq!(cfg.current_grace_period_window_ms(), 30_000);
-        assert_eq!(cfg.current_block_size_limit(), 2016);
-        assert_eq!(cfg.current_max_utxo_outputs(), 255);
-        assert_eq!(cfg.current_max_aggregated_signatures(), 50);
-        assert_eq!(cfg.current_vote_scale().get(), 1000);
-        assert_eq!(cfg.current_vote_interest(), 5);
+        assert_eq!(cfg.inter_block_interval_ms(), 60_000);
+        assert_eq!(cfg.grace_period_window_ms(), 30_000);
+        assert_eq!(cfg.block_size_limit(), 2016);
+        assert_eq!(cfg.max_utxo_outputs(), 255);
+        assert_eq!(cfg.max_aggregated_signatures(), 50);
+        assert_eq!(cfg.vote_scale().get(), 1000);
+        assert_eq!(cfg.vote_interest(), 5);
         assert!(cfg.is_durable_locked());
         assert_eq!(cfg.parent_recovery_per_head_retry_interval_ms(), 120_000);
         assert_eq!(cfg.parent_recovery_min_emit_interval_ms(), 10_000);

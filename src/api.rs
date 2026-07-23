@@ -563,8 +563,8 @@ impl<
     ) {
         // Read the FR37 vote parameters from the config before it is moved into
         // `dst` (the config is still owned here; no field is read before write).
-        let vote_scale = chain_config.current_vote_scale();
-        let vote_interest = chain_config.current_vote_interest();
+        let vote_scale = chain_config.vote_scale();
+        let vote_interest = chain_config.vote_interest();
         unsafe {
             core::ptr::addr_of_mut!((*dst).crypto).write(crypto);
             core::ptr::addr_of_mut!((*dst).storage).write(storage);
@@ -988,7 +988,7 @@ impl<
         hash: &[u8; 32],
         now: u64,
     ) -> Result<u32, AdmitError> {
-        let block_size_limit = self.chain_config.current_block_size_limit();
+        let block_size_limit = self.chain_config.block_size_limit();
         tier1_gate(
             block,
             &self.node_zero_public_key,
@@ -1127,8 +1127,8 @@ impl<
     /// field is a plain integer / array with no `Drop`, and `.write` does not
     /// read the prior value.
     fn reset_vote_engine(&mut self) {
-        let vote_scale = self.chain_config.current_vote_scale();
-        let vote_interest = self.chain_config.current_vote_interest();
+        let vote_scale = self.chain_config.vote_scale();
+        let vote_interest = self.chain_config.vote_interest();
         // SAFETY: `self.vote_engine` is a live, initialized POD value; re-init
         // overwrites it field-by-field with no drop and no read-before-write.
         unsafe {
