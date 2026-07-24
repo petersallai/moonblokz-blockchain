@@ -470,7 +470,7 @@ pub(crate) enum ValidationReason {
     /// A balance-only complex transaction's total balance inputs are less than its
     /// total balance outputs (money creation). The UTXO-value side of this
     /// invariant is validated with the Story-7.1 UTXO cache (see Dev Notes).
-    InsufficientInputs,
+    InsufficientTransactionInputs,
 }
 
 // Fields are consumed by the state-changing methods landing in Story 1.4+;
@@ -1630,7 +1630,7 @@ impl<
                         // input, `in_sum` omits the UTXO-side value (Story 7.1), so
                         // the full inputs≥outputs check lands with that value cache.
                         if !has_utxo_input && cx.input_count() > 0 && out_sum > in_sum {
-                            return Err(invalid(ValidationReason::InsufficientInputs));
+                            return Err(invalid(ValidationReason::InsufficientTransactionInputs));
                         }
                         total_fees = total_fees.saturating_add(in_sum.saturating_sub(out_sum));
                     } else {
