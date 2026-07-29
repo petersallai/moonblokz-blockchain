@@ -642,6 +642,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tier1_rejects_registration_self_vote() {
+        // A registration whose initializer (5) votes for itself (vote == 5) — the
+        // no-self-vote invariant is intrinsic and owned by Tier 1 for every tx
+        // shape, registrations included.
+        let c = crypto(1);
+        let reg = Registration::new_signed(
+            5, /*vote*/
+            5, /*initializer*/
+            6,
+            0,
+            0,
+            &[0xC1; 32],
+            &c,
+        );
+        let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
+        builder
+            .add_registration(&reg)
+            .ok()
+            .expect("add registration");
+        let block = builder.build_signed(&c).ok().expect("build signed");
+        assert_eq!(
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            Err(Tier1Failure::SelfVote)
+        );
+    }
+
     fn registration_block(seq: u32, new_node_id: u32, new_pk: &[u8; 32], signer: &Crypto) -> Block {
         let reg = Registration::new_signed(
             3, /*vote*/

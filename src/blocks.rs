@@ -69,7 +69,8 @@ const SPENT_BITS_BYTES: usize = 32;
 
 /// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2
 /// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
-/// bits 3-7 are unused.
+/// bits 3-4 carry the block's `payload_type` (Story 5.4 review, see
+/// [`FLAG_PAYLOAD_TYPE_MASK`]); bits 5-7 are unused.
 const FLAG_ON_ACTIVE_CHAIN: u8 = 0b0000_0001;
 
 /// FR9 status bits (bits 1-2 of `flags`). Story 4.1 reserved these; Story 4.2
@@ -82,6 +83,19 @@ const FLAG_ON_ACTIVE_CHAIN: u8 = 0b0000_0001;
 /// is the FR9 validation tier. Never conflate them.
 const FLAG_STATUS_SHIFT: u8 = 1;
 const FLAG_STATUS_MASK: u8 = 0b0000_0110;
+
+/// Block `payload_type` cached in `flags` bits 3-4 (Story 5.4 review): the four
+/// payload types (`transaction = 1`, `balance = 2`, `chain-config = 3`,
+/// `approval = 4`) are stored as `payload_type - 1` (a 2-bit `0..=3` code) so the
+/// processing-pass backward mark can locate the earliest balance block — the FR3
+/// existence-floor seed source (`max_known_node_id` at the window tail) — without
+/// a storage read per block. Costs no extra memory (reuses free flag bits).
+/// Default `flags == 0` decodes to code 0 ⇒ `transaction`; the admission path
+/// stamps the true type via [`BlockEntry::set_payload_type`] before insertion, so
+/// only an explicitly-stamped entry is authoritative (unstamped test entries read
+/// as `transaction`, which the balance-only floor scan simply skips).
+const FLAG_PAYLOAD_TYPE_SHIFT: u8 = 3;
+const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
 
 /// Per-block ancestry and status metadata (FR18).
 ///
@@ -161,6 +175,22 @@ impl BlockEntry {
 
     fn is_empty_slot(&self) -> bool {
         self.sequence == NONE_REF
+    }
+
+    /// Stamps the block's `payload_type` (1..=4) into `flags` bits 3-4 **before**
+    /// insertion (Story 5.4 review), stored as `payload_type - 1`. A value outside
+    /// 1..=4 is clamped into the 2-bit field; the admission path only ever passes a
+    /// Tier-1-validated type. See [`FLAG_PAYLOAD_TYPE_MASK`].
+    pub(crate) fn set_payload_type(&mut self, payload_type: u8) {
+        let code = payload_type.wrapping_sub(1) & 0b11;
+        self.flags = (self.flags & !FLAG_PAYLOAD_TYPE_MASK)
+            | ((code << FLAG_PAYLOAD_TYPE_SHIFT) & FLAG_PAYLOAD_TYPE_MASK);
+    }
+
+    /// The cached `payload_type` (1..=4) from `flags` bits 3-4. An unstamped entry
+    /// (default `flags == 0`) reads as `1` (transaction).
+    pub(crate) fn payload_type(&self) -> u8 {
+        ((self.flags & FLAG_PAYLOAD_TYPE_MASK) >> FLAG_PAYLOAD_TYPE_SHIFT) + 1
     }
 
     pub(crate) fn is_on_active_chain(&self) -> bool {

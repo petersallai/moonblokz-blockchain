@@ -425,14 +425,10 @@ pub(crate) enum ValidationReason {
     MalformedPayload,
     /// `previous_hash` does not link to the immediately-preceding candidate block.
     PreviousHashMismatch,
-    /// A `payload_type=1` block carries both a registration and a complex tx.
-    RegistrationComplexMutualExclusion,
     /// Block-creator signature invalid against the creator's derived key.
     CreatorSignatureInvalid,
     /// A node-transfer / registration transaction signature is invalid.
     TransactionSignatureInvalid,
-    /// A node-transfer / balance-input `anchor_sequence` is not before the block.
-    AnchorNotBeforeBlock,
     /// A debit (transfer amount+fee, registration price+fee, balance input)
     /// exceeds the initializer's derived balance (negative-balance outcome).
     InsufficientBalance,
@@ -442,9 +438,11 @@ pub(crate) enum ValidationReason {
     /// A transaction's `vote` names a node absent from the candidate roster at
     /// its inclusion point.
     VoteTargetUnknown,
-    /// A transaction's `initializer` equals its `vote` (outside the node-#0 /
-    /// block-#0 exceptions).
-    SelfVote,
+    /// A transaction references a node id (initializer / receiver) beyond
+    /// `max_known_node_id`. Node ids are contiguous, so such an id cannot name any
+    /// node that exists — exact evidence of invalidity even for a not-yet-seeded
+    /// (pre-window) actor, whose *existence* is thereby still bounded-checkable.
+    NodeIdOutOfRange,
     /// A complex tx UTXO input does not resolve against the candidate window
     /// (no matching transaction, or `output_index` out of bounds).
     UtxoUnresolvable,
@@ -837,6 +835,7 @@ impl<
         let mut entry_0 = BlockEntry::new(block_0.hash(), NONE_REF, 0);
         entry_0.set_on_active_chain(true);
         entry_0.set_len(block_0.len() as u16);
+        entry_0.set_payload_type(block_0.payload_type());
         self.blocks.insert_at(0, entry_0);
         self.active_chain_head_idx = 0;
         let active_head = self.active_chain_head_idx;
@@ -851,6 +850,7 @@ impl<
         let mut entry_1 = BlockEntry::new(block_1.hash(), 0, 1);
         entry_1.set_on_active_chain(true);
         entry_1.set_len(block_1.len() as u16);
+        entry_1.set_payload_type(block_1.payload_type());
         self.blocks.insert_at(1, entry_1);
         self.active_chain_head_idx = 1;
         let active_head = self.active_chain_head_idx;
@@ -1119,6 +1119,7 @@ impl<
         let mut entry = BlockEntry::new(*hash, parent.unwrap_or(NONE_REF), block.sequence());
         entry.set_status(BlockStatus::Stored);
         entry.set_len(block.len() as u16); // exact length for the FR6 byte-exact checks (Story 5.4)
+        entry.set_payload_type(block.payload_type()); // cached in flags for the FR3 floor scan (Story 5.4 review)
         if is_genesis {
             entry.set_on_active_chain(true);
         }
@@ -1258,6 +1259,14 @@ impl<
         let mut marked = [NONE_REF; MAX_BLOCKS];
         let mut count = 0usize;
         let mut cur = candidate_tip_idx;
+        // FR3 existence-floor source: the lowest-sequence balance block in the
+        // segment. The backward walk descends tip → anchor, so the *last* balance
+        // block it sees is the earliest; its `max_node_id` seeds `max_known_node_id`
+        // before the forward walk (below), so a vote-target range check for a block
+        // that precedes the first balance block is measured against the true window
+        // node count instead of 0. The payload type is read from the cached flag
+        // bits (`BlockEntry::payload_type`) — no storage read during the mark.
+        let mut floor_balance_idx = NONE_REF;
         loop {
             if count >= MAX_BLOCKS {
                 return Err(ProcessingError::MarkOverflow);
@@ -1265,6 +1274,9 @@ impl<
             marked[count] = cur;
             count += 1;
             let entry = self.blocks.get(cur).ok_or(ProcessingError::MissingBlock)?;
+            if entry.payload_type() == PAYLOAD_TYPE_BALANCE {
+                floor_balance_idx = cur;
+            }
             let parent = entry.parent_ref();
             if parent == NONE_REF {
                 break;
@@ -1304,6 +1316,42 @@ impl<
         // forward pass below; the byte-identical FR6 compliance verify and the
         // FR7/FR8 tentative-vs-durable commitment are Story 5.6 — the derive-only
         // 5.3 scope has no preload consumer, so no separate scan is built.
+
+        // FR3 existence-floor seed (window-anchored only). `max_known_node_id` is
+        // the node-existence bound for the vote-target range check *and* the
+        // registration-monotonicity reference. On a window-anchored candidate the
+        // segment's earliest balance block already carries the full node count
+        // (`max_node_id`, incl. pre-window nodes) — reading that single block
+        // up-front seeds the watermark so a block that *precedes* the first balance
+        // block is measured against the true count, not 0. Genesis-anchored
+        // candidates re-derive from block #0, so their watermark must build from 0
+        // (the floor would wrongly pre-inflate it); skipped for them. One extra
+        // storage read; the block is re-read (and re-validated) in the forward walk.
+        if !genesis_anchored
+            && floor_balance_idx != NONE_REF
+            && let Ok(floor_block) = self.storage.read_block(floor_balance_idx)
+        {
+            // Trim the zero-padded read-back to the exact stored length before
+            // parsing, exactly as the forward walk does.
+            let full = floor_block.serialized_bytes();
+            let n = match self.blocks.get(floor_balance_idx).map(|e| e.len() as usize) {
+                Some(len) if len > 0 && len <= full.len() => len,
+                _ => full.len(),
+            };
+            if let Ok(view) = BlockView::from_bytes(&full[..n])
+                && let Some(payload) = view.balances()
+            {
+                self.node_info.set_max_known_node_id(payload.max_node_id());
+            }
+        }
+
+        // `max_known_node_id` is an authoritative node-existence bound only once it
+        // is established: from block #0 on a genesis-anchored candidate, or from the
+        // floor (earliest balance block) on a window-anchored one. A window-anchored
+        // segment with no balance block has no reliable bound, so referenced-node-id
+        // range checks are trusted there (AC4) rather than measured against a 0
+        // watermark. Drives the FR6 `check_node_id_in_range` gate below.
+        let roster_bounded = genesis_anchored || floor_balance_idx != NONE_REF;
 
         // AC1/AC2-AC7 (Story 5.4): forward traversal anchor → tip, validating
         // each block against the FR6 invariant set at the point it becomes
@@ -1351,6 +1399,7 @@ impl<
                 &mut saw_balance_block,
                 &marked,
                 genesis_anchored,
+                roster_bounded,
             ) {
                 result = Err(e);
                 break;
@@ -1377,6 +1426,11 @@ impl<
     ///
     /// `marked` is the candidate segment (tip..anchor); the UTXO-input resolution
     /// (AC4) scans it to locate a referenced output's containing block.
+    // The per-block context (indices, the marked segment, and the two anchor-kind
+    // flags) is passed as flat parameters rather than bundled into a struct: they
+    // are all read-only scalars threaded straight through from `run_processing_pass`,
+    // and a wrapper would add indirection without clarifying the single call site.
+    #[allow(clippy::too_many_arguments)]
     fn validate_and_derive_block(
         &mut self,
         view: BlockView<'_>,
@@ -1385,6 +1439,7 @@ impl<
         saw_balance_block: &mut bool,
         marked: &[u32; MAX_BLOCKS],
         genesis_anchored: bool,
+        roster_bounded: bool,
     ) -> Result<(), ProcessingError> {
         // `view` is the block trimmed to its exact stored length. `bytes` re-views
         // it for the by-value `VoteEngine` calls (`BlockView` is not `Copy`).
@@ -1466,8 +1521,6 @@ impl<
                 let txs = view
                     .transactions()
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
-                let mut has_registration = false;
-                let mut has_complex = false;
 
                 for tx in txs.iter() {
                     let vote = tx.vote();
@@ -1479,14 +1532,24 @@ impl<
                         if genesis_anchored && !is_genesis_zero && !self.node_info.is_seeded(init) {
                             return Err(invalid(ValidationReason::UnseededActor));
                         }
+                        // FR6 node-existence bound: the initializer (input) and the
+                        // receiver (output) must name nodes that can exist
+                        // (`id <= max_known_node_id`) — checkable even when unseeded
+                        // (a pre-window node's *existence* is still range-bounded).
+                        if roster_bounded && !is_genesis_zero {
+                            self.check_node_id_in_range(init).map_err(&invalid)?;
+                            self.check_node_id_in_range(nt.receiver())
+                                .map_err(&invalid)?;
+                        }
                         // State-dependent FR6 checks apply once the initializer is
-                        // derivable (past its pre-seed zone).
+                        // derivable (past its pre-seed zone). The intrinsic
+                        // invariants (no-self-vote, anchor-before-block) are decided
+                        // from the block bytes alone and are owned by the Tier-1
+                        // intake gate (`staged_validation`), which every admitted
+                        // block passed before it could reach this pass — so they are
+                        // not re-checked here.
                         if !is_genesis_zero && self.node_info.is_seeded(init) {
-                            self.check_self_vote(init, vote).map_err(&invalid)?;
                             self.check_vote_target(vote).map_err(&invalid)?;
-                            if seq <= nt.anchor_sequence() {
-                                return Err(invalid(ValidationReason::AnchorNotBeforeBlock));
-                            }
                             if !self.verify_tx_signature(tx.as_bytes(), init) {
                                 return Err(invalid(ValidationReason::TransactionSignatureInvalid));
                             }
@@ -1516,7 +1579,6 @@ impl<
                         }
                         total_fees = total_fees.saturating_add(fee);
                     } else if let Some(reg) = tx.as_registration() {
-                        has_registration = true;
                         let node_id = reg.new_node_id();
                         let init = reg.initializer();
                         // [A] Genesis-anchored: the registering initializer must be
@@ -1525,18 +1587,33 @@ impl<
                         if genesis_anchored && !is_genesis_zero && !self.node_info.is_seeded(init) {
                             return Err(invalid(ValidationReason::UnseededActor));
                         }
+                        // FR6 node-existence bound: the registering initializer must
+                        // name an existing node (`id <= max_known_node_id`), checkable
+                        // even when unseeded. (`new_node_id` is the id being *created*
+                        // — bounded by the monotonicity check, not this range check.)
+                        if roster_bounded && !is_genesis_zero {
+                            self.check_node_id_in_range(init).map_err(&invalid)?;
+                        }
                         // FR6 registration monotonicity: `new_node_id ==
                         // pre-block-position watermark + 1`, checked against the
                         // running watermark so within-block registrations form a
                         // stride-1 sequence. Waived for genesis block #0
-                        // (`new_node_id == 0`, FR54(h)).
+                        // (`new_node_id == 0`, FR54(h)). Reads the incremental
+                        // watermark, which is authoritative only once established —
+                        // from block #0 on a genesis-anchored candidate, or from the
+                        // first balance block on a window-anchored one; before that
+                        // (window-anchored pre-first-balance region) it is trusted
+                        // (AC4), matching the vote-target existence floor.
                         if !is_genesis_zero {
-                            let expected = self.node_info.max_known_node_id().wrapping_add(1);
-                            if node_id != expected {
-                                return Err(invalid(ValidationReason::RegistrationWatermark));
+                            if genesis_anchored || *saw_balance_block {
+                                let expected = self.node_info.max_known_node_id().wrapping_add(1);
+                                if node_id != expected {
+                                    return Err(invalid(ValidationReason::RegistrationWatermark));
+                                }
                             }
+                            // No-self-vote is intrinsic and owned by the Tier-1 gate
+                            // (checked at admission); not re-checked here.
                             if self.node_info.is_seeded(init) {
-                                self.check_self_vote(init, vote).map_err(&invalid)?;
                                 self.check_vote_target(vote).map_err(&invalid)?;
                                 if !self.verify_tx_signature(tx.as_bytes(), init) {
                                     return Err(invalid(
@@ -1571,7 +1648,6 @@ impl<
                         self.node_info
                             .register_node(node_id, reg.new_public_key(), idx);
                     } else if let Some(cx) = tx.as_complex() {
-                        has_complex = true;
                         let mut in_sum: u64 = 0;
                         let mut out_sum: u64 = 0;
                         let mut has_utxo_input = false;
@@ -1586,14 +1662,17 @@ impl<
                                 {
                                     return Err(invalid(ValidationReason::UnseededActor));
                                 }
+                                // FR6 node-existence bound: the balance-input
+                                // initializer (input side) must name an existing node,
+                                // checkable even when unseeded.
+                                if roster_bounded && !is_genesis_zero {
+                                    self.check_node_id_in_range(binit).map_err(&invalid)?;
+                                }
+                                // No-self-vote and anchor-before-block are intrinsic,
+                                // owned by the Tier-1 gate (checked at admission);
+                                // only the state-dependent checks run here.
                                 if !is_genesis_zero && self.node_info.is_seeded(binit) {
-                                    self.check_self_vote(binit, vote).map_err(&invalid)?;
                                     self.check_vote_target(vote).map_err(&invalid)?;
-                                    if seq <= bi.anchor_sequence() {
-                                        return Err(invalid(
-                                            ValidationReason::AnchorNotBeforeBlock,
-                                        ));
-                                    }
                                     if self.node_info.balance_of(binit) < bi.amount() {
                                         return Err(invalid(ValidationReason::InsufficientBalance));
                                     }
@@ -1618,6 +1697,13 @@ impl<
                         }
                         for output in cx.outputs() {
                             if let Some(bo) = output.as_balance() {
+                                // FR6 node-existence bound: the balance-output
+                                // receiver (output side) must name an existing node,
+                                // checkable even when unseeded.
+                                if roster_bounded && !is_genesis_zero {
+                                    self.check_node_id_in_range(bo.receiver())
+                                        .map_err(&invalid)?;
+                                }
                                 if self.node_info.is_seeded(bo.receiver()) {
                                     self.node_info.credit(bo.receiver(), bo.amount());
                                 }
@@ -1637,13 +1723,9 @@ impl<
                         return Err(invalid(ValidationReason::MalformedPayload));
                     }
                 }
-                // FR6 registration/complex mutual-exclusivity (also gated at Tier 1
-                // intake; re-affirmed here over the candidate).
-                if has_registration && has_complex {
-                    return Err(invalid(
-                        ValidationReason::RegistrationComplexMutualExclusion,
-                    ));
-                }
+                // FR6 registration/complex mutual-exclusivity is intrinsic (decided
+                // from block bytes) and owned by the Tier-1 intake gate, which every
+                // admitted block passed — not re-checked here.
             }
             PAYLOAD_TYPE_CHAIN_CONFIG => {
                 // AC6: every chain-config block must carry config content
@@ -1683,31 +1765,47 @@ impl<
         Ok(())
     }
 
-    /// FR6 no-self-vote (AC5): a transaction's `initializer` must not equal its
-    /// `vote`, with the permanent node-#0 self-vote exception. (Also enforced at
-    /// Tier 1 intake; re-affirmed here over the candidate.)
-    fn check_self_vote(&self, initializer: u32, vote: u32) -> Result<(), ValidationReason> {
-        if initializer == 0 && vote == 0 {
-            return Ok(());
-        }
-        if initializer == vote {
-            return Err(ValidationReason::SelfVote);
-        }
-        Ok(())
-    }
-
-    /// FR6 vote-target existence (AC5): the `vote` node id must be present on the
-    /// candidate roster at the transaction's inclusion point (a node is on the
-    /// roster once seeded/registered during the forward pass). Node #0 is the
-    /// permanent exception — it is established at genesis and exists on every
-    /// chain, so `vote == 0` is always a valid target (FR37/FR54 node-#0
-    /// vote-target exception), even for a window-anchored candidate that does not
-    /// itself contain block #0.
+    /// FR6 vote-target existence (AC5): the `vote` node id must name a node that
+    /// exists on the candidate. Node ids are contiguous — registration is stride-1
+    /// (`new_node_id == max_known_node_id + 1`) and ids are never renumbered — so a
+    /// node exists iff its id is within `[0, max_known_node_id]`. This is a **range
+    /// check against the watermark**, not a per-node `is_seeded` lookup, and that
+    /// distinction is what keeps a **window-anchored** candidate correct: the
+    /// watermark is set to the full node count (including pre-window nodes) by the
+    /// window's first balance block (`max_node_id`, api.rs `saw_balance_block`
+    /// branch), whereas a *specific* pre-window node's in-window balance-block
+    /// coverage (`is_seeded`) can fall later in the window than a transaction that
+    /// legitimately votes for it (FR50 seed-source replays are emitted head-ward),
+    /// which would produce a spurious `VoteTargetUnknown`. `vote == 0` is subsumed
+    /// (`0 <= max`), kept explicit as the permanent FR37/FR54 node-#0 target that is
+    /// valid even for a window-anchored candidate not containing block #0.
+    ///
+    /// The residual edge — a transaction validated *before* the window's first
+    /// balance block, when the watermark is still 0 — is the same ordering
+    /// assumption the FR6 registration-monotonicity check already relies on (it too
+    /// reads `max_known_node_id`), so this introduces no new dependency.
     fn check_vote_target(&self, vote: u32) -> Result<(), ValidationReason> {
-        if vote == 0 || self.node_info.is_seeded(vote) {
+        if vote == 0 || vote <= self.node_info.max_known_node_id() {
             Ok(())
         } else {
             Err(ValidationReason::VoteTargetUnknown)
+        }
+    }
+
+    /// FR6 node-existence bound (AC5) for a transaction-referenced node id (an
+    /// initializer/spender on the input side, or a receiver on the output side).
+    /// Contiguous ids ⇒ a node exists iff `id <= max_known_node_id`; an id beyond
+    /// the watermark cannot name any node. Unlike the balance/signature checks this
+    /// needs no per-node derived state, so it applies **even to a not-yet-seeded
+    /// (pre-window) node** — the existence of an unseeded actor/receiver is still
+    /// range-checkable. Callers gate it on the watermark being authoritative
+    /// (`roster_bounded`): a window-anchored candidate with no balance block in the
+    /// segment has no reliable bound and trusts the reference (AC4).
+    fn check_node_id_in_range(&self, node_id: u32) -> Result<(), ValidationReason> {
+        if node_id <= self.node_info.max_known_node_id() {
+            Ok(())
+        } else {
+            Err(ValidationReason::NodeIdOutOfRange)
         }
     }
 
@@ -3639,7 +3737,10 @@ mod tests {
     #[test]
     fn fr3_creator_credit_applied_to_seeded_creator() {
         let mut bc = new_test_chain();
-        let anchor = balance_block(100, [0xAB; 32], &[(3, 100, 0, 0xB3)], 3);
+        // max_node_id 9 so the transfer's (unseeded, pre-window) initializer 7 and
+        // receiver 9 are within the valid node-id range — only node 3 is
+        // individually seeded (partial FR50 coverage).
+        let anchor = balance_block(100, [0xAB; 32], &[(3, 100, 0, 0xB3)], 9);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let blk = credit_block(101, anchor.view().hash(), 3, 500, 7, 9, 0);
@@ -3698,10 +3799,12 @@ mod tests {
     #[test]
     fn fr6_rejects_unknown_vote_target() {
         let mut bc = new_test_chain();
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 1);
+        // max_node_id 8 so the transfer's initializer 1 and receiver 2 are in range;
+        // the vote target 9 is beyond the watermark → cannot exist.
+        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 8);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        // Vote target 9 is never seeded/registered on the candidate.
+        // Vote target 9 is beyond max_known_node_id (8) → not a possible node.
         let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 9);
         let ti = bc
             .tier1_admit(&tx.view(), &tx.view().hash(), 0)
@@ -3713,6 +3816,125 @@ mod tests {
                 reason: ValidationReason::VoteTargetUnknown,
             }),
             "FR6 rejects an unknown vote target"
+        );
+    }
+
+    /// FR6 node-existence bound — a transaction that references a node id beyond
+    /// `max_known_node_id` (contiguous ids ⇒ it cannot exist) is rejected on BOTH
+    /// sides: the initializer (input) and the receiver (output). This holds even for
+    /// an unseeded (pre-window) node — its existence is still range-checkable — so a
+    /// window-anchored candidate is not blindly trusted.
+    #[test]
+    fn fr6_rejects_out_of_range_referenced_node() {
+        let mut bc = new_test_chain();
+        // Window-anchored, watermark 5 (only node 1 individually seeded).
+        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 5);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        // Output side: receiver 99 is beyond the watermark.
+        let out = transfer_block(101, anchor.view().hash(), 1, 99, 100, 1, 0);
+        let oi = bc
+            .tier1_admit(&out.view(), &out.view().hash(), 0)
+            .expect("out admitted");
+        assert_eq!(
+            bc.run_processing_pass(oi),
+            Err(ProcessingError::Invalid {
+                block_idx: oi,
+                reason: ValidationReason::NodeIdOutOfRange,
+            }),
+            "a transfer TO a node beyond the watermark is rejected (output side)"
+        );
+        // Input side: an (unseeded) initializer 88 is beyond the watermark — normally
+        // an unseeded initializer is trusted on a window-anchored candidate, but its
+        // existence is still range-bounded.
+        let inp = transfer_block(101, anchor.view().hash(), 88, 2, 100, 1, 0);
+        let ii = bc
+            .tier1_admit(&inp.view(), &inp.view().hash(), 0)
+            .expect("inp admitted");
+        assert_eq!(
+            bc.run_processing_pass(ii),
+            Err(ProcessingError::Invalid {
+                block_idx: ii,
+                reason: ValidationReason::NodeIdOutOfRange,
+            }),
+            "a transfer FROM a node beyond the watermark is rejected (input side)"
+        );
+    }
+
+    /// FR6 vote-target existence is a WATERMARK RANGE check, not a per-node
+    /// `is_seeded` lookup. A balance block covers only a subset of nodes (FR50) but
+    /// declares the full `max_node_id`; a transaction may legitimately vote for a
+    /// node that exists (id ≤ watermark) yet whose own balance-block coverage is
+    /// not present earlier in the window. This must be ACCEPTED — the pre-fix
+    /// `is_seeded(vote)` check would have falsely rejected it as `VoteTargetUnknown`.
+    #[test]
+    fn fr6_vote_target_in_range_but_not_individually_seeded_is_accepted() {
+        let mut bc = new_test_chain();
+        // Partial-coverage balance block: seeds only node 1, but declares
+        // max_node_id = 10 (nodes 2..=10 exist pre-window / elsewhere in the window
+        // but are not individually seeded by THIS block).
+        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 10);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        // Node 1 (seeded) votes for node 5: 5 ∉ seeded-set but 5 ≤ watermark(10).
+        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 5);
+        let ti = bc
+            .tier1_admit(&tx.view(), &tx.view().hash(), 0)
+            .expect("tx admitted");
+        assert_eq!(
+            bc.run_processing_pass(ti),
+            Ok(()),
+            "a vote for an in-range node is accepted even if not individually seeded"
+        );
+        // Boundary: a vote for node 11 (> watermark 10) is still exact-evidence invalid.
+        let tx2 = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 11);
+        let ti2 = bc
+            .tier1_admit(&tx2.view(), &tx2.view().hash(), 0)
+            .expect("tx2 admitted");
+        assert_eq!(
+            bc.run_processing_pass(ti2),
+            Err(ProcessingError::Invalid {
+                block_idx: ti2,
+                reason: ValidationReason::VoteTargetUnknown,
+            }),
+            "a vote for a node beyond the watermark is still rejected"
+        );
+    }
+
+    /// FR3/FR6 — on a WINDOW-anchored candidate the incremental watermark is only
+    /// authoritative once the first balance block establishes it. A registration
+    /// that precedes the first balance block is in the trusted pre-window region
+    /// (AC4): its monotonicity is NOT re-checked (it would otherwise be measured
+    /// against a still-0 watermark and falsely rejected). The earliest balance
+    /// block's `max_node_id` (read once at the end of the backward mark) seeds the
+    /// existence floor. Genesis-anchored candidates are unaffected — they re-derive
+    /// the watermark from block #0, so their registrations ARE monotonicity-checked
+    /// (covered by `fr6_rejects_out_of_sequence_registration`).
+    #[test]
+    fn fr6_window_anchored_registration_before_first_balance_is_trusted() {
+        let mut bc = new_test_chain();
+        // Orphan anchor (seq 100, window-anchored): a registration for node 7 —
+        // stride-1 against a 0 watermark would demand id 1, so the OLD per-0 check
+        // would reject it. It precedes the segment's only balance block (seq 101).
+        let reg = registration_block(100, [0xAB; 32], 1, 7, 0xC7);
+        bc.tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+        // Balance block at seq 101: declares the full count (max_node_id 10) — the
+        // existence floor — and seeds node 1.
+        let bal = balance_block(101, reg.view().hash(), &[(1, 100, 0, 0xB1)], 10);
+        let bi = bc
+            .tier1_admit(&bal.view(), &bal.view().hash(), 0)
+            .expect("balance admitted");
+        assert_eq!(
+            bc.run_processing_pass(bi),
+            Ok(()),
+            "a window-anchored pre-first-balance registration is trusted, not \
+             rejected against a 0 watermark"
+        );
+        // The registered node is on the roster afterwards.
+        assert!(
+            bc.node_info.is_seeded(7),
+            "node 7 registered during the pass"
         );
     }
 
