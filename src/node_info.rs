@@ -140,6 +140,16 @@ impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
         }
     }
 
+    /// Whether any already-seeded node holds `public_key` — the FR6 registration
+    /// `new_public_key` global-uniqueness check (Story 5.4). Scans only seeded
+    /// slots (`seed_source_idx != NONE_REF`); O(MAX_NODES), bounded.
+    pub(crate) fn key_is_registered(&self, public_key: &[u8]) -> bool {
+        let n = public_key.len().min(PUBLIC_KEY_SIZE);
+        (0..MAX_NODES).any(|slot| {
+            self.seed_source_idx[slot] != NONE_REF && self.public_keys[slot][..n] == public_key[..n]
+        })
+    }
+
     /// FR34 registration-sequence watermark.
     /// Read surface for the FR6 registration-monotonicity validation (Story 5.4);
     /// exercised by the Story-5.3 watermark tests today.

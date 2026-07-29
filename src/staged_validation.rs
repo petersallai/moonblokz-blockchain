@@ -171,7 +171,7 @@ pub(crate) enum Tier1Failure {
 /// the residual same-object Tier 1 → Tier 3 / chain-switch re-verification is
 /// expected-rare given deterministic creator selection, so a ~3.6 KB
 /// content-addressed cache did not earn its keep against the RAM budget.)
-fn verify_signature_bytes<C: CryptoTrait>(
+pub(crate) fn verify_signature_bytes<C: CryptoTrait>(
     crypto: &C,
     preimage: &[u8],
     signature_bytes: &[u8],
@@ -639,6 +639,33 @@ mod tests {
         assert_eq!(
             tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Err(Tier1Failure::AnchorSequenceNotBeforeBlock)
+        );
+    }
+
+    #[test]
+    fn tier1_rejects_registration_self_vote() {
+        // A registration whose initializer (5) votes for itself (vote == 5) — the
+        // no-self-vote invariant is intrinsic and owned by Tier 1 for every tx
+        // shape, registrations included.
+        let c = crypto(1);
+        let reg = Registration::new_signed(
+            5, /*vote*/
+            5, /*initializer*/
+            6,
+            0,
+            0,
+            &[0xC1; 32],
+            &c,
+        );
+        let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
+        builder
+            .add_registration(&reg)
+            .ok()
+            .expect("add registration");
+        let block = builder.build_signed(&c).ok().expect("build signed");
+        assert_eq!(
+            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            Err(Tier1Failure::SelfVote)
         );
     }
 
