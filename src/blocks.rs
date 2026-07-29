@@ -224,8 +224,12 @@ impl BlockEntry {
         self.parent_ref
     }
 
-    /// FR19 shared-ancestry reference count (number of `chain_heads` entries
-    /// whose ancestry path includes this block).
+    /// FR19 shared-ancestry reference count: the number of distinct child-edges
+    /// of this block that lead toward a `chain_heads` entry — a tip counts its
+    /// own edge — i.e. the block's out-degree toward heads (PRD FR19, ratified
+    /// 2026-07-12; *not* a path-count of "how many heads' ancestry passes
+    /// through this block", which the eviction back-walk cannot use — see the
+    /// `chain_heads` module doc).
     pub(crate) fn head_ref_count(&self) -> u8 {
         self.head_ref_count
     }
@@ -652,10 +656,86 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         }
     }
 
+    /// FR19 `head_ref_count` **value** setter on an already-inserted block, the
+    /// counterpart of the relative [`Self::adjust_head_ref_count`]. Returns
+    /// `false` for an empty/out-of-bounds slot.
+    ///
+    /// Exists for the FR5 recovery's `head_ref_count` **recompute** (Story 5.5):
+    /// after a subtree deletion the surviving counts are re-derived from the
+    /// post-deletion tree rather than unwound incrementally, which needs an
+    /// absolute write (zero, then re-derive). Same structural-not-identity
+    /// rationale as `adjust_head_ref_count`.
+    pub(crate) fn set_head_ref_count(&mut self, idx: u32, count: u8) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.head_ref_count = count;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// FR5 (Story 5.5) deletion-target discovery: writes `root` plus **every
+    /// transitive descendant** — every occupied slot whose `parent_ref` chain
+    /// passes through `root` — into `out`, returning how many entries were
+    /// written. Ascending slot order, so the result is a pure function of the
+    /// tree (FR63 determinism). Returns `0` for an empty/out-of-bounds `root`.
+    ///
+    /// `parent_ref` is the tree's only ancestry link and there is **no child
+    /// index** in the crate, so descendants are found by walking *upward* from
+    /// every candidate slot — the established bounded-walk pattern of
+    /// [`Self::walks_to_active_chain`] / `ChainHeadsTable::locate_anchor`. A
+    /// child index would cost permanent RAM for a once-per-recovery walk
+    /// (embedded minimalism), so it is deliberately not built.
+    ///
+    /// Each walk is bounded by `MAX_BLOCKS` steps for the same two reasons as
+    /// [`Self::walks_to_active_chain`]: a well-formed chain cannot visit more
+    /// distinct entries than the table holds, and a malformed/cyclic
+    /// `parent_ref` chain is exited by the step bound rather than spinning.
+    ///
+    /// The caller must collect first and delete second, so every walk runs
+    /// against the pre-deletion tree. The result is closed under the
+    /// child relation: a *survivor's* parent can never be in the returned set
+    /// (if it were, the survivor's own walk would reach `root` too), which is
+    /// why deletion leaves no dangling `parent_ref` behind.
+    pub(crate) fn mark_subtree(&self, root: u32, out: &mut [u32; MAX_BLOCKS]) -> usize {
+        if self.get(root).is_none() {
+            return 0;
+        }
+        let mut count = 0usize;
+        for slot in 0..MAX_BLOCKS {
+            let idx = slot as u32;
+            if self.get(idx).is_none() {
+                continue;
+            }
+            let mut current = idx;
+            let mut reaches_root = false;
+            for _ in 0..MAX_BLOCKS {
+                if current == root {
+                    reaches_root = true;
+                    break;
+                }
+                let Some(entry) = self.get(current) else {
+                    break;
+                };
+                if entry.parent_ref == NONE_REF {
+                    break;
+                }
+                current = entry.parent_ref;
+            }
+            if reaches_root {
+                out[count] = idx;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// FR19 eviction: free the slot at `idx` (reset to the empty-slot sentinel),
     /// returning whether an occupied block was removed. This is the block-tree's
     /// **first** deletion path (Story 4.1 deferred it here) — an authorized
-    /// removal complementing FR16/FR17 (FR5/FR57 later). Because
+    /// removal complementing FR16/FR17 (the FR5 recovery is the second driver,
+    /// Story 5.5; FR57 capacity pressure comes with Epic 9). Because
     /// `blocks[i] ⟷ storage_index = i`, freeing the slot releases `storage_index
     /// = idx` for reuse; the durable bytes are overwritten by the next
     /// `save_block(idx, …)` (no eager flash erase — `StorageTrait` exposes no
@@ -902,5 +982,118 @@ mod tests {
             table.insert(BlockEntry::new(hash_of(99), NONE_REF, 99)),
             Err(BlockTableError::Full)
         );
+    }
+
+    // --- Story 5.5 (FR5): subtree discovery ---------------------------------
+
+    /// Insert a metadata-only block, returning its index (the subtree walk is
+    /// over the ancestry graph, so no signed block content is needed).
+    fn put<const N: usize>(t: &mut BlockTable<N>, byte: u8, parent: u32, seq: u32) -> u32 {
+        t.insert(BlockEntry::new(hash_of(byte), parent, seq))
+            .unwrap()
+    }
+
+    #[test]
+    fn mark_subtree_root_only_when_childless() {
+        let mut table = empty_table::<8>();
+        let a = put(&mut table, 1, NONE_REF, 5);
+        let mut out = [NONE_REF; 8];
+        let n = table.mark_subtree(a, &mut out);
+        assert_eq!(n, 1, "a childless root marks only itself");
+        assert_eq!(out[0], a);
+    }
+
+    #[test]
+    fn mark_subtree_covers_linear_descendants() {
+        let mut table = empty_table::<8>();
+        let a = put(&mut table, 1, NONE_REF, 5);
+        let b = put(&mut table, 2, a, 6);
+        let c = put(&mut table, 3, b, 7);
+        let mut out = [NONE_REF; 8];
+        let n = table.mark_subtree(b, &mut out);
+        assert_eq!(n, 2, "B and its transitive descendant C");
+        assert_eq!(&out[..n], &[b, c], "ascending slot order (deterministic)");
+        assert!(
+            !out[..n].contains(&a),
+            "the root's own ancestor is never marked"
+        );
+    }
+
+    #[test]
+    fn mark_subtree_leaves_sibling_subtree_untouched() {
+        let mut table = empty_table::<8>();
+        // R ← {X ← X2, Y ← Y2}
+        let r = put(&mut table, 1, NONE_REF, 5);
+        let x = put(&mut table, 2, r, 6);
+        let x2 = put(&mut table, 3, x, 7);
+        let y = put(&mut table, 4, r, 6);
+        let y2 = put(&mut table, 5, y, 7);
+        let mut out = [NONE_REF; 8];
+        let n = table.mark_subtree(x, &mut out);
+        assert_eq!(&out[..n], &[x, x2], "only the X arm");
+        for untouched in [r, y, y2] {
+            assert!(!out[..n].contains(&untouched));
+        }
+        // The whole tree from R is the closed set (every block descends from R).
+        let n_all = table.mark_subtree(r, &mut out);
+        assert_eq!(n_all, 5);
+        assert_eq!(&out[..n_all], &[r, x, x2, y, y2]);
+    }
+
+    #[test]
+    fn mark_subtree_of_empty_or_out_of_range_root_is_empty() {
+        let mut table = empty_table::<8>();
+        let a = put(&mut table, 1, NONE_REF, 5);
+        let b = put(&mut table, 2, a, 6);
+        let mut out = [NONE_REF; 8];
+        assert_eq!(
+            table.mark_subtree(7, &mut out),
+            0,
+            "an unoccupied slot marks nothing"
+        );
+        assert_eq!(
+            table.mark_subtree(NONE_REF, &mut out),
+            0,
+            "an out-of-range root marks nothing"
+        );
+        // A deleted root marks nothing either (idempotent re-run).
+        table.delete(a);
+        assert_eq!(table.mark_subtree(a, &mut out), 0);
+        assert_eq!(
+            table.mark_subtree(b, &mut out),
+            1,
+            "the orphaned child is still its own subtree root"
+        );
+    }
+
+    /// An unresolved-parent branch (`parent_ref == NONE_REF`) is not a
+    /// descendant of anything: FR19 parent recovery has not linked it yet.
+    #[test]
+    fn mark_subtree_excludes_unresolved_branches() {
+        let mut table = empty_table::<8>();
+        let a = put(&mut table, 1, NONE_REF, 5);
+        let _child = put(&mut table, 2, a, 6);
+        let orphan = put(&mut table, 3, NONE_REF, 9);
+        let mut out = [NONE_REF; 8];
+        let n = table.mark_subtree(a, &mut out);
+        assert!(
+            !out[..n].contains(&orphan),
+            "an orphan is not swept in with the subtree"
+        );
+    }
+
+    #[test]
+    fn set_head_ref_count_writes_absolute_value() {
+        let mut table = empty_table::<4>();
+        let a = put(&mut table, 1, NONE_REF, 5);
+        assert!(table.set_head_ref_count(a, 3));
+        assert_eq!(table.head_ref_count(a), Some(3));
+        assert!(table.set_head_ref_count(a, 0));
+        assert_eq!(table.head_ref_count(a), Some(0));
+        assert!(
+            !table.set_head_ref_count(2, 1),
+            "an empty slot is not written"
+        );
+        assert!(!table.set_head_ref_count(NONE_REF, 1));
     }
 }

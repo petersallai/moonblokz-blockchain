@@ -9,8 +9,9 @@
 //! (i) new-block admission and (ii) tail-pointing parent admission, the FR19/FR46
 //! parent-recovery scheduler (deterministic selection + tie-breaks), and the
 //! FR19 bounded eviction (the block-tree's first authorized deletion path).
-//! Events (iii) FR23 chain-switch and (iv) FR5 deletion are **specified**
-//! (documented on the relevant helpers) but **driven** by Epic 6 / Epic 5.
+//! Event (iv) FR5 deletion is driven by [`ChainHeadsTable::on_blocks_deleted`]
+//! (Story 5.5, the FR5 atomic recovery); event (iii) FR23 chain-switch remains
+//! **specified** (documented below) but **driven** by Epic 6.
 //! `branch_value` (FR21) is present but unpopulated (Epic 6).
 //!
 //! ## head_ref_count is a branch-count, not a path-count (KEY DECISION)
@@ -18,9 +19,12 @@
 //! FR19's safety-critical eviction rule — "walking back from the evicted head
 //! …for each block visited, `head_ref_count` is decremented by 1; …if the
 //! resulting count remains > 0 …the walk terminates" — is only correct if
-//! `head_ref_count[b]` is the number of **distinct head-bearing branches that
-//! pass through `b`** (its out-degree toward heads), NOT the number of heads in
-//! `b`'s subtree. Under the branch-count model the eviction walk decrements the
+//! `head_ref_count[b]` is the number of **distinct child-edges of `b` that lead
+//! toward a head** — a tip counts its own edge — i.e. `b`'s out-degree toward
+//! heads (PRD FR19's ratified wording), NOT the number of heads in `b`'s subtree
+//! and NOT a path-count of the heads whose ancestry passes through `b`
+//! (`g ← a ← {a2, a3}` leaves `g` at 1, not 2: only one child-edge of `g` leads
+//! toward heads). Under the branch-count model the eviction walk decrements the
 //! evicted head's branch and stops at the first block still shared by another
 //! branch — exactly FR19's "stop at count > 0." Maintenance:
 //!
@@ -604,7 +608,7 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         }
     }
 
-    // -- Events (iii)/(iv): specified, not driven (AC8) -----------------------
+    // -- Event (iii): specified, not driven (Story 4.4 AC8) -------------------
     //
     // (iii) FR23 chain-switch reconciliation (Epic 6): on an active-chain switch
     //       every Connected/Active head's `connected` flag + connection-point are
@@ -612,10 +616,162 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     //       active chain demotes to Stored (tail-point populated,
     //       `last_request_timestamp` reset to 0, `branch_value` cleared), and
     //       `head_ref_count` is unaffected (structural). Driver owned by Epic 6.
-    // (iv)  FR5 atomic recovery deletion (Epic 5): a chain_heads entry whose head
-    //       is deleted is removed; survivors whose ancestry passed through a
-    //       deleted block have caches recomputed; a Connected head that loses its
-    //       connection demotes to Stored. Driver owned by Epic 5.
+
+    // -- FR19 mutation event (iv): block deletion (Story 5.5) -----------------
+
+    /// FR19 mutation event (iv) — the tip-table follow-up to an authorized
+    /// deletion of `deleted` (the FR5 recovery's subtree, Story 5.5). Called
+    /// **after** the blocks have been freed from `blocks`, so every walk here
+    /// sees the post-deletion tree:
+    ///
+    /// - (a) an entry whose `head_idx` was deleted is **removed** (empty
+    ///   sentinel) — the branch it tracked no longer exists — except that the
+    ///   **first** such entry is instead *retargeted* to `reattach_idx` when
+    ///   that block became a childless tip (see below);
+    /// - (b) every surviving entry's caches are **recomputed** through
+    ///   [`Self::recompute_caches`], which is also the demotion path FR5
+    ///   requires: a head that lost its connection to the active chain flips
+    ///   Connected→Stored, repopulates `tail_or_connection_idx` +
+    ///   `missing_parent_hash`, and (for the reverse edge) a newly-Connected
+    ///   head has `last_request_timestamp` reset to 0 so parent recovery
+    ///   reschedules from scratch;
+    /// - (c) `head_ref_count` is **recomputed** for every surviving block
+    ///   (see [`Self::recompute_head_ref_counts`]).
+    ///
+    /// No `now` and no PRNG — the whole event is a pure function of the
+    /// post-deletion tree plus `deleted` (FR63/NFR5/NFR18 determinism), and it
+    /// performs no durable-storage access (FR5 recovery does no I/O).
+    ///
+    /// `reattach_idx` is the deleted subtree root's **surviving parent** (the
+    /// FR5 caller's `parent_ref(target)`, or [`NONE_REF`] when the root had
+    /// none). Deleting a subtree makes that parent a childless tip — a tip with
+    /// no `chain_heads` entry would be invisible to FR2 candidate selection, to
+    /// FR19 parent recovery, and to FR19 eviction, i.e. the shortened branch
+    /// could neither be retried (FR5's "re-evaluate against the now-smaller
+    /// tree") nor ever reclaimed. So one of the removed entries is *retargeted*
+    /// to it instead of being emptied, which is strictly better than inserting a
+    /// fresh entry: the branch is the same branch, so its cached
+    /// `missing_parent_hash`, its FR19 recovery schedule
+    /// (`last_request_timestamp`) and its FR18 `arrival_timestamp` all remain
+    /// valid and are preserved — no durable read and no `now` needed. The
+    /// retarget is skipped when the parent is gone, still has other children (it
+    /// is not a tip, and its other branches carry their own entries), or already
+    /// has an entry.
+    ///
+    /// **This retarget is an addition to the Story-4.4 event-(iv) specification**
+    /// (which lists only remove / recompute / demote); without it FR5's
+    /// re-evaluation requirement is unreachable in the common
+    /// delete-exactly-the-candidate-head case.
+    ///
+    /// Note on (b) under an **FR5** delete-set: that set is closed under the
+    /// child relation (`BlockTable::mark_subtree`), so a survivor's ancestry
+    /// cannot contain a deleted block — the recompute is therefore idempotent
+    /// for FR5's own callers, and is kept because it is what makes the event
+    /// correct for *any* authorized delete-set (and is asserted by the
+    /// module's unit tests through a narrower one).
+    pub(crate) fn on_blocks_deleted<const MAX_BLOCKS: usize>(
+        &mut self,
+        blocks: &mut BlockTable<MAX_BLOCKS>,
+        deleted: &[u32],
+        reattach_idx: u32,
+    ) {
+        // Is the deleted root's parent now a childless, untracked tip?
+        let reattach = blocks.get(reattach_idx).is_some()
+            && self.slot_of_head(reattach_idx).is_none()
+            && !(0..MAX_BLOCKS).any(|i| {
+                blocks
+                    .get(i as u32)
+                    .is_some_and(|e| e.parent_ref() == reattach_idx)
+            });
+        let mut reattached = false;
+
+        // (a) Remove the entries whose head block is gone — retargeting the
+        // first of them to the new tip when there is one.
+        for slot in 0..MAX_BRANCH_COUNT {
+            if self.heads[slot].is_empty() {
+                continue;
+            }
+            if !deleted.contains(&self.heads[slot].head_idx) {
+                continue;
+            }
+            if reattach && !reattached {
+                self.heads[slot].head_idx = reattach_idx;
+                reattached = true;
+            } else {
+                self.heads[slot] = ChainHeadEntry::new_empty();
+            }
+        }
+
+        // (b) Recompute the survivors' caches. There is no just-processed block
+        // on this path, so the `anchor_block_idx` shortcut is disabled with
+        // `NONE_REF` + a zero hash: `recompute_caches` then falls back to a
+        // sibling head's cached missing-parent hash for the same tail-point, or
+        // retains the entry's current one. Reading the hash from durable
+        // storage instead is deliberately not done — FR5 recovery performs zero
+        // block reads.
+        for slot in 0..MAX_BRANCH_COUNT {
+            if self.heads[slot].is_empty() {
+                continue;
+            }
+            self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
+        }
+
+        // (c) Restore the FR19 structural ref-counts.
+        Self::recompute_head_ref_counts(blocks);
+    }
+
+    /// Recompute every surviving block's FR19 `head_ref_count` from the
+    /// post-deletion tree (Story 5.5, ratified: recompute — not incremental
+    /// unwinding — because several branches can vanish at once and heads may
+    /// share fork points *inside* the deleted subtree, which per-branch `-1`
+    /// unwinding gets subtly wrong).
+    ///
+    /// `head_ref_count[b]` is the module's branch-count (see the module doc):
+    /// the number of distinct head-bearing branches leaving `b` — i.e. `b`'s
+    /// **out-degree** in the block tree, with a tip (out-degree 0) counting 1
+    /// for its own branch. That is exactly what the event-(i) maintenance
+    /// builds: a new block gets 1, an *extend* leaves the parent at 1 (one
+    /// child edge replaces its former tip edge), a *fork* raises the fork-point
+    /// to 2 while "the ancestors above the fork-point retain their existing
+    /// ref-counts" — and it is exactly what the eviction walk needs, since a
+    /// block is exclusive to the branch being evicted iff removing that child
+    /// edge drops its count to 0.
+    ///
+    /// **Deliberate deviation from the story's literal recipe** ("walk each
+    /// surviving head to its anchor incrementing the blocks it passes"): that
+    /// counts *branches passing through* `b` rather than `b`'s out-degree, so
+    /// with two forks stacked above one block (`g ← a ← {a2, a3}`) it would
+    /// leave `g` at 2 where the maintained invariant is 1 — and an inflated
+    /// count below a fork point terminates a later eviction walk early, leaking
+    /// blocks that are in fact exclusive to the evicted branch. The out-degree
+    /// recompute below is still a full recompute from the surviving tree (so it
+    /// keeps the shared-fork-point immunity the decision was made for) while
+    /// reproducing the invariant bit-for-bit; `recompute_matches_incremental_maintenance`
+    /// pins that equality against the event-(i) maintenance itself.
+    ///
+    /// Three bounded linear passes over the table (no nested walk): zero, count
+    /// child edges, then floor tips at 1.
+    /// Takes no `&self`: the counts are a function of the block-tree's edges
+    /// alone, so the tip table is deliberately not consulted.
+    fn recompute_head_ref_counts<const MAX_BLOCKS: usize>(blocks: &mut BlockTable<MAX_BLOCKS>) {
+        for idx in 0..MAX_BLOCKS {
+            blocks.set_head_ref_count(idx as u32, 0);
+        }
+        for idx in 0..MAX_BLOCKS {
+            let parent = match blocks.get(idx as u32) {
+                Some(entry) => entry.parent_ref(),
+                None => continue,
+            };
+            if parent != NONE_REF {
+                blocks.adjust_head_ref_count(parent, 1);
+            }
+        }
+        for idx in 0..MAX_BLOCKS {
+            if blocks.head_ref_count(idx as u32) == Some(0) {
+                blocks.set_head_ref_count(idx as u32, 1);
+            }
+        }
+    }
 
     #[cfg(test)]
     fn head_at(&self, slot: usize) -> &ChainHeadEntry {
@@ -1045,5 +1201,256 @@ mod tests {
             "connection-point is the active block"
         );
         assert!(!ch.has_stored_head());
+    }
+
+    // --- Story 5.5: FR19 mutation event (iv) — block deletion ---------------
+
+    /// (a) An entry whose head block was deleted is removed; (c) the surviving
+    /// blocks' `head_ref_count` is restored to the fork-free value.
+    #[test]
+    fn event_iv_removes_entry_of_deleted_head() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        // A (orphan) ← B, and a fork A ← C.
+        let a = put(&mut blocks, 1, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, a, None, hash_of(9), 1, NONE_REF);
+        let b = put(&mut blocks, 2, a, 6);
+        ch.on_block_admitted(&mut blocks, b, Some(a), hash_of(1), 2, NONE_REF);
+        let c = put(&mut blocks, 3, a, 6);
+        ch.on_block_admitted(&mut blocks, c, Some(a), hash_of(1), 3, NONE_REF);
+        assert_eq!(ch.count(), 2);
+        assert_eq!(blocks.head_ref_count(a), Some(2), "A forks to B and C");
+
+        // Delete branch C (as the FR5 recovery does: free the slots, then drive
+        // event (iv) with the deleted set).
+        blocks.delete(c);
+        ch.on_blocks_deleted(&mut blocks, &[c], a);
+
+        assert_eq!(ch.count(), 1, "C's entry is removed");
+        assert_eq!(
+            ch.head_at((0..4).find(|&s| !ch.head_at(s).is_empty()).unwrap())
+                .head_idx,
+            b,
+            "B's entry survives untouched"
+        );
+        assert_eq!(
+            blocks.head_ref_count(a),
+            Some(1),
+            "A is back to a single branch after the fork arm is gone"
+        );
+        assert_eq!(blocks.head_ref_count(b), Some(1));
+    }
+
+    /// (b) A surviving head that lost its connection to the active chain is
+    /// demoted Connected→Stored with `last_request_timestamp == 0`, while an
+    /// unrelated head is untouched. Driven with a delete-set narrower than an
+    /// FR5 subtree (only the connection point) so the demotion arm is reached —
+    /// the driver's contract is defined for any authorized delete-set.
+    #[test]
+    fn event_iv_demotes_head_that_lost_its_connection() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        // Active genesis G (seq 0) ← H (seq 1, Connected head).
+        let mut ge = BlockEntry::new(hash_of(7), NONE_REF, 0);
+        ge.set_on_active_chain(true);
+        let g = blocks.insert(ge).unwrap();
+        ch.on_block_admitted(&mut blocks, g, None, [0; 32], 1, g);
+        let h = put(&mut blocks, 6, g, 1);
+        ch.on_block_admitted(&mut blocks, h, Some(g), hash_of(7), 2, g);
+        // An unrelated Stored branch (orphan S, waiting for hash 9).
+        let s = put(&mut blocks, 8, NONE_REF, 40);
+        ch.on_block_admitted(&mut blocks, s, None, hash_of(9), 3, g);
+        let h_slot = (0..4).find(|&sl| ch.head_at(sl).head_idx == h).unwrap();
+        let s_slot = (0..4).find(|&sl| ch.head_at(sl).head_idx == s).unwrap();
+        assert!(!ch.head_at(h_slot).is_stored(), "H starts Connected");
+        // Give S a request stamp so "untouched" is observable.
+        ch.mark_requested(s_slot, 5_000);
+
+        blocks.delete(g);
+        ch.on_blocks_deleted(&mut blocks, &[g], NONE_REF);
+
+        assert!(
+            ch.head_at(h_slot).is_stored(),
+            "H lost its connection → demoted to Stored"
+        );
+        assert_eq!(
+            ch.head_at(h_slot).tail_or_connection_idx,
+            h,
+            "H itself is now the tail-point (its parent slot is gone)"
+        );
+        assert_eq!(
+            ch.head_at(h_slot).last_request_timestamp,
+            0,
+            "a demoted head reschedules parent recovery from scratch"
+        );
+        assert_eq!(ch.head_at(s_slot).head_idx, s, "unrelated head survives");
+        assert!(ch.head_at(s_slot).is_stored());
+        assert_eq!(
+            ch.head_at(s_slot).tail_or_connection_idx,
+            s,
+            "unrelated head's tail-point is unchanged"
+        );
+        assert_eq!(
+            ch.head_at(s_slot).missing_parent_hash,
+            hash_of(9),
+            "unrelated head still requests its own missing parent"
+        );
+        assert_eq!(
+            ch.head_at(s_slot).last_request_timestamp,
+            5_000,
+            "unrelated head's recovery schedule is untouched"
+        );
+    }
+
+    /// (c) The `head_ref_count` recompute reproduces the event-(i) incremental
+    /// maintenance **exactly**, including the case the recompute exists for —
+    /// two heads sharing a fork point. Runs the recompute over a tree with no
+    /// deletion at all and asserts every count is unchanged: the recompute is
+    /// the invariant, not a second approximation of it. Covers a stacked fork
+    /// (`g ← a ← {a2, a3}`), where a "branches passing through b" recompute
+    /// would wrongly inflate `g` to 2.
+    #[test]
+    fn recompute_matches_incremental_maintenance() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        let g = put(&mut blocks, 1, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, g, None, hash_of(9), 1, NONE_REF);
+        let a = put(&mut blocks, 2, g, 6);
+        ch.on_block_admitted(&mut blocks, a, Some(g), hash_of(1), 2, NONE_REF);
+        let a2 = put(&mut blocks, 3, a, 7);
+        ch.on_block_admitted(&mut blocks, a2, Some(a), hash_of(2), 3, NONE_REF);
+        let a3 = put(&mut blocks, 4, a, 7);
+        ch.on_block_admitted(&mut blocks, a3, Some(a), hash_of(2), 4, NONE_REF);
+        let g2 = put(&mut blocks, 5, g, 6);
+        ch.on_block_admitted(&mut blocks, g2, Some(g), hash_of(1), 5, NONE_REF);
+        let before: [Option<u8>; 5] = [g, a, a2, a3, g2].map(|i| blocks.head_ref_count(i));
+        assert_eq!(
+            before,
+            [Some(2), Some(2), Some(1), Some(1), Some(1)],
+            "maintained counts: g forks to a and g2; a forks to a2 and a3"
+        );
+
+        ChainHeadsTable::<4>::recompute_head_ref_counts(&mut blocks);
+
+        assert_eq!(
+            [g, a, a2, a3, g2].map(|i| blocks.head_ref_count(i)),
+            before,
+            "recompute reproduces the maintained FR19 branch-count exactly"
+        );
+    }
+
+    /// (c) After a subtree deletion the recompute agrees with what the
+    /// incremental maintenance would have produced for the surviving shape,
+    /// even when the two deleted heads shared a fork point *inside* the deleted
+    /// subtree — the case per-branch `-1` unwinding gets wrong.
+    #[test]
+    fn event_iv_recomputes_shared_fork_point_inside_deleted_subtree() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        // R ← keep, and R ← d1 ← {d2, d3}: the deleted heads d2/d3 share the
+        // fork point d1, which is itself inside the deleted subtree.
+        let r = put(&mut blocks, 1, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, r, None, hash_of(9), 1, NONE_REF);
+        let keep = put(&mut blocks, 2, r, 6);
+        ch.on_block_admitted(&mut blocks, keep, Some(r), hash_of(1), 2, NONE_REF);
+        let d1 = put(&mut blocks, 3, r, 6);
+        ch.on_block_admitted(&mut blocks, d1, Some(r), hash_of(1), 3, NONE_REF);
+        let d2 = put(&mut blocks, 4, d1, 7);
+        ch.on_block_admitted(&mut blocks, d2, Some(d1), hash_of(3), 4, NONE_REF);
+        let d3 = put(&mut blocks, 5, d1, 7);
+        ch.on_block_admitted(&mut blocks, d3, Some(d1), hash_of(3), 5, NONE_REF);
+        assert_eq!(blocks.head_ref_count(r), Some(2));
+        assert_eq!(blocks.head_ref_count(d1), Some(2));
+        assert_eq!(ch.count(), 3, "heads: keep, d2, d3");
+
+        // Delete the d1 subtree (as `mark_subtree` would return it).
+        for idx in [d1, d2, d3] {
+            blocks.delete(idx);
+        }
+        ch.on_blocks_deleted(&mut blocks, &[d1, d2, d3], r);
+
+        assert_eq!(ch.count(), 1, "both deleted heads' entries are removed");
+        assert_eq!(
+            blocks.head_ref_count(r),
+            Some(1),
+            "R loses exactly the one branch that passed through d1 — not two"
+        );
+        assert_eq!(blocks.head_ref_count(keep), Some(1));
+    }
+
+    /// (a, retarget) Deleting a branch's tip leaves its parent a childless tip:
+    /// the entry is retargeted to it — same branch, so the cached
+    /// missing-parent hash and the FR19 recovery schedule are preserved — so the
+    /// shortened branch stays visible to FR2 / the parent-recovery scheduler.
+    #[test]
+    fn event_iv_retargets_entry_to_the_new_tip() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        // Stored branch T(orphan, waiting for hash 9) ← U ← V (head V).
+        let t = put(&mut blocks, 1, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, t, None, hash_of(9), 1, NONE_REF);
+        let u = put(&mut blocks, 2, t, 6);
+        ch.on_block_admitted(&mut blocks, u, Some(t), hash_of(1), 2, NONE_REF);
+        let v = put(&mut blocks, 3, u, 7);
+        ch.on_block_admitted(&mut blocks, v, Some(u), hash_of(2), 3, NONE_REF);
+        let slot = (0..4).find(|&s| ch.head_at(s).head_idx == v).unwrap();
+        ch.mark_requested(slot, 7_000);
+
+        // FR5 head-fallback: delete exactly the tip V; U becomes the new tip.
+        blocks.delete(v);
+        ch.on_blocks_deleted(&mut blocks, &[v], u);
+
+        assert_eq!(ch.count(), 1, "the branch is still tracked");
+        assert_eq!(
+            ch.head_at(slot).head_idx,
+            u,
+            "entry retargeted to the new tip"
+        );
+        assert!(ch.head_at(slot).is_stored());
+        assert_eq!(
+            ch.head_at(slot).tail_or_connection_idx,
+            t,
+            "the branch's tail-point is unchanged"
+        );
+        assert_eq!(
+            ch.head_at(slot).missing_parent_hash,
+            hash_of(9),
+            "the cached missing-parent hash survives the retarget (no storage read)"
+        );
+        assert_eq!(
+            ch.head_at(slot).last_request_timestamp,
+            7_000,
+            "the same branch keeps its FR19 recovery schedule"
+        );
+        assert_eq!(blocks.head_ref_count(u), Some(1), "U is now a tip");
+        assert_eq!(blocks.head_ref_count(t), Some(1));
+        // The scheduler still targets the branch's missing parent.
+        let (_, req) = ch.select_parent_recovery(&blocks, 1_000_000, 1).unwrap();
+        assert_eq!(req.missing_parent_hash(), &hash_of(9));
+    }
+
+    /// (a, retarget) No retarget when the deleted root's parent still has other
+    /// children: it is not a tip, and its surviving branches carry their own
+    /// entries.
+    #[test]
+    fn event_iv_does_not_retarget_a_parent_with_other_children() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        let r = put(&mut blocks, 1, NONE_REF, 5);
+        ch.on_block_admitted(&mut blocks, r, None, hash_of(9), 1, NONE_REF);
+        let keep = put(&mut blocks, 2, r, 6);
+        ch.on_block_admitted(&mut blocks, keep, Some(r), hash_of(1), 2, NONE_REF);
+        let gone = put(&mut blocks, 3, r, 6);
+        ch.on_block_admitted(&mut blocks, gone, Some(r), hash_of(1), 3, NONE_REF);
+
+        blocks.delete(gone);
+        ch.on_blocks_deleted(&mut blocks, &[gone], r);
+
+        assert_eq!(ch.count(), 1, "only the surviving branch is tracked");
+        assert_eq!(
+            (0..4).filter(|&s| ch.head_at(s).head_idx == r).count(),
+            0,
+            "R keeps no entry of its own — it still has a child"
+        );
     }
 }

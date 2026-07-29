@@ -1190,19 +1190,15 @@ impl<
                     self.promote_candidate_active(candidate_tip_idx);
                     self.set_lifecycle_phase(LifecyclePhase::Ready);
                 }
-                Err(_) => {
-                    // FR6 failed (or FR3 could not derive). Discard the partial
-                    // working set and take the minimal FR5 phase-revert
-                    // (Processing→Collecting) so the node retries against the tree
-                    // on the next admission. `run_processing_pass` already rolled
-                    // back any spent-bit it flipped; reset the rest of the working
-                    // set here. The **durable deletion** of the offending block
-                    // (captured in the `Err`'s `block_idx`) + its transitive
-                    // descendants + the chain_heads mutation event (iv) is the
-                    // Story 5.5 (FR5) atomic recovery.
-                    self.node_info.reset();
-                    self.reset_vote_engine();
-                    self.set_lifecycle_phase(LifecyclePhase::Collecting);
+                Err(err) => {
+                    // FR6 failed (or FR3 could not derive) → the FR5 atomic
+                    // recovery (Story 5.5): discard the working set, delete the
+                    // offending block (or the candidate head) with its
+                    // descendants, follow up on `chain_heads`, and revert
+                    // Processing→Collecting. Exactly **one** full-chain pass runs
+                    // per `receive_block` call — the re-evaluation happens on the
+                    // next admission through the gate above.
+                    self.recover_from_failed_pass(err, candidate_tip_idx);
                 }
             }
         }
@@ -1226,6 +1222,149 @@ impl<
                 vote_interest,
             );
         }
+    }
+
+    /// FR5 atomic recovery from a failed full-chain pass (Story 5.5).
+    ///
+    /// Runs as **one** logical step at the single failure seam in
+    /// [`Self::receive_block`]: no caller can observe the working set discarded
+    /// but the blocks still present, or the blocks deleted but the phase not yet
+    /// reverted. `pub(crate)` and self-contained (no `now`, no PRNG, no durable
+    /// I/O) so the FR59 restart (Story 5.7) and the FR23 deep-zone
+    /// re-derivation (Epic 6) reuse it exactly as they reuse
+    /// [`Self::run_processing_pass`].
+    ///
+    /// **Step 1 — working-set rollback, full and unconditional** (FR5/FR34), for
+    /// every `ProcessingError` variant and before any deletion decision:
+    /// - `node_info.reset()` — balances, public keys, seed sources, and the
+    ///   `max_known_node_id` watermark;
+    /// - `reset_vote_engine()` — accumulated vote (incl. FR37 anti-capture
+    ///   interest) + the FR38 creator-order projection;
+    /// - the marked segment's UTXO spent-bits are **already** back at their
+    ///   clean baseline: [`Self::run_processing_pass`] zeroes them at pass entry
+    ///   and re-zeroes them on its abort path, which is the only place that
+    ///   still holds the marked set. Recovery deliberately does not sweep them a
+    ///   second time.
+    ///
+    /// Every FR34 projection that does not exist yet is a forward seam, not a
+    /// silent gap: the six Epic-7 derived projections and the `snake_chain`
+    /// bookkeeping (a stub today) MUST be reset here once they land. So must the
+    /// FR8 tentative chain-config unload when the deleted subtree contained the
+    /// tentatively-loaded chain-config block — Story 5.6 owns that lifecycle
+    /// (the AR14 stub reports `is_durable_locked() == true`, so there is nothing
+    /// to undo yet).
+    ///
+    /// **Step 2 — deletion target** (FR5 exact evidence):
+    /// `ProcessingError::Invalid { block_idx, .. }` is the only variant that
+    /// pins a block, and the forward walk guarantees `block_idx` is the
+    /// **earliest** offender. Every other variant (`MarkOverflow`,
+    /// `MissingBlock`, `StorageRead`, `Vote(_)`) is not evidence against a
+    /// specific block, so the target is the candidate head — FR5's explicit
+    /// "delete exactly one block, the candidate chain's head" fallback, which is
+    /// what makes `Vote(_)` carrying no `block_idx` safe. `ValidationReason` is
+    /// diagnostic only (the FR64 log, Epic 11) and is never a selection input.
+    ///
+    /// **Step 3 — transitive deletion** (FR5): the target and every transitive
+    /// descendant are freed via `BlockTable::delete`; sibling subtrees whose
+    /// ancestry does not pass through the target are untouched. Boundedness is
+    /// by construction — the delete-set comes from
+    /// [`BlockTable::mark_subtree`], which examines at most `MAX_BLOCKS` slots
+    /// with every walk step-bounded. Because `blocks[i] ⟷ storage_index = i`,
+    /// freeing the slot *is* the durable deletion (the bytes are overwritten by
+    /// the next `save_block`), so recovery performs zero storage writes and zero
+    /// block reads and therefore cannot fail on I/O. The **genesis pair is not
+    /// exempt**: if an `Invalid` failure pins block #0/#1 of a genesis-anchored
+    /// candidate they are deleted like any other block, because FR5 deletion is
+    /// forward progress — a node that cannot prove its genesis must re-acquire
+    /// it, and clearing `active_chain_head_idx` below is what lets it.
+    ///
+    /// **Step 4 — FR19 event (iv)** on `chain_heads`
+    /// ([`ChainHeadsTable::on_blocks_deleted`]) — which removes the deleted
+    /// heads' entries, retargets one of them to the target's now-childless
+    /// parent so the shortened branch stays selectable, recomputes the
+    /// survivors' caches (Connected→Stored demotion included) and restores the
+    /// FR19 `head_ref_count`s — plus clearing
+    /// `active_chain_head_idx` when its target was deleted. That clearing is not
+    /// cosmetic: the single-genesis guard keys on `active_chain_head_idx !=
+    /// NONE_REF`, so a stale value would refuse re-admission of the very genesis
+    /// this recovery just discarded.
+    ///
+    /// **Step 5 — phase reversion, and then stop.** `Processing→Collecting` (a
+    /// legal edge) is the last step. FR5's "re-evaluate the remaining
+    /// block-tree against the FR2 stopping conditions" needs **no code here**:
+    /// [`Self::receive_block`] already evaluates the stopping condition on every
+    /// Collecting admission, now against a strictly smaller tree. There is
+    /// deliberately **no** in-call retry loop and **no** tick-driven retry, so a
+    /// `receive_block` call performs at most one full-chain validation pass —
+    /// bounded radio-task work (the non-blocking rule) and a one-pass-per-call
+    /// FR63 replay trace. Accepted consequence: a node holding a
+    /// qualifying-but-unvalidated branch does not retry until *some* block is
+    /// next admitted; in practice its Stored heads keep emitting FR19
+    /// parent-recovery requests from [`Self::on_tick`] and the responses are
+    /// admissions. Do not "fix" the missing retry.
+    ///
+    /// **Reuse constraint** (inherited from [`Self::run_processing_pass`]): this
+    /// rollback is self-consistent only for a re-derivation over a candidate
+    /// whose blocks are **not shared** with an already-active chain (fresh join,
+    /// the Story-5.7 restart, an Epic-6 deep zone of a *new* branch). A
+    /// chain-switch that re-derives over shared blocks must work on a copy — a
+    /// failed re-derivation there would zero a shared block's *committed*
+    /// spent-bits instead of restoring them.
+    pub(crate) fn recover_from_failed_pass(
+        &mut self,
+        err: ProcessingError,
+        candidate_tip_idx: u32,
+    ) {
+        // Step 1 — unconditional working-set rollback (before any deletion
+        // decision, and regardless of which deletion path is taken).
+        self.node_info.reset();
+        self.reset_vote_engine();
+
+        // Step 2 — exact offender, else the candidate-head fallback.
+        let target = match err {
+            ProcessingError::Invalid { block_idx, .. } => block_idx,
+            ProcessingError::MarkOverflow
+            | ProcessingError::MissingBlock
+            | ProcessingError::StorageRead
+            | ProcessingError::Vote(_) => candidate_tip_idx,
+        };
+
+        // Step 3 — collect the subtree first, then delete, so every ancestry
+        // walk runs against the pre-deletion tree. A target naming an
+        // empty/out-of-range slot yields an empty set: the rollback and the
+        // phase reversion still happen, nothing is deleted, nothing panics.
+        //
+        // Stack: `[u32; MAX_BLOCKS]` is 2.4 KB at the default `MAX_BLOCKS = 600`
+        // on the 6 KB blockchain-task stack. It does not coexist with
+        // `run_processing_pass`'s equally-sized `marked` buffer — that is a local
+        // of *that* function, whose frame is already released at this seam. This
+        // must be re-checked if the recovery call ever moves inside the pass.
+        let mut delete_set = [NONE_REF; MAX_BLOCKS];
+        let deleted_count = self.blocks.mark_subtree(target, &mut delete_set);
+        // Captured before the deletion: the target's parent survives (the
+        // delete-set is closed under the child relation) and becomes a childless
+        // tip, which event (iv) re-tracks so the shortened branch stays visible
+        // to FR2 / FR19.
+        let parent_of_target = self
+            .blocks
+            .get(target)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
+        for idx in delete_set.iter().take(deleted_count) {
+            self.blocks.delete(*idx);
+        }
+
+        if deleted_count > 0 {
+            let deleted = &delete_set[..deleted_count];
+            // Step 4 — FR19 event (iv), then the active-anchor placeholder.
+            self.chain_heads
+                .on_blocks_deleted(&mut self.blocks, deleted, parent_of_target);
+            if deleted.contains(&self.active_chain_head_idx) {
+                self.active_chain_head_idx = NONE_REF;
+            }
+        }
+
+        // Step 5 — revert and stop; the next admission re-evaluates FR2.
+        self.set_lifecycle_phase(LifecyclePhase::Collecting);
     }
 
     /// FR3 processing-pass forward state reconstruction (Story 5.3).
@@ -3640,9 +3779,11 @@ mod tests {
         assert!(entry.is_on_active_chain(), "tip is on the active chain");
     }
 
-    /// AC10 (Story 5.4) — the FR6-failure path: a qualifying candidate that
-    /// violates an FR6 invariant reverts `Processing→Collecting` (never Ready),
-    /// with the derived working set reset. The candidate `[#0 genesis, #1
+    /// AC10 (Story 5.4) + AC11(c)/(f) (Story 5.5) — the FR6-failure path end to
+    /// end: a qualifying candidate that violates an FR6 invariant reverts
+    /// `Processing→Collecting` (never Ready) with the derived working set reset,
+    /// the offending block is deleted, and the node then retries on the **next**
+    /// admission — not inside the same call. The candidate `[#0 genesis, #1
     /// registration]` is continuous genesis-anchored (so FR2 qualifies on the
     /// genesis admission) but block #1's `new_node_id = 5 ≠ watermark + 1 = 1`
     /// violates the FR6 registration-monotonicity rule.
@@ -3654,17 +3795,298 @@ mod tests {
         let child = registration_block(1, genesis.view().hash(), 1, 5, 0xC5);
         // Admit the child first as an orphan (Stored, no FR2 — not yet anchored),
         // then the genesis so the continuous genesis-anchored candidate qualifies.
-        bc.receive_block(child.view(), 0);
+        let (outcome, _) = bc.receive_block(child.view(), 0);
+        assert_eq!(
+            outcome,
+            ReceiveBlockOutcome::AcceptedSilently,
+            "the orphan child is really admitted (the seam below is not vacuous)"
+        );
+        let child_idx = bc
+            .blocks
+            .find(1, &child.view().hash())
+            .expect("child in the tree");
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
-        bc.receive_block(genesis.view(), 0);
+        let (outcome, _) = bc.receive_block(genesis.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert!(
             bc.current_phase() == LifecyclePhase::Collecting,
             "invalid candidate reverts Processing→Collecting (FR5 phase-revert)"
         );
         assert!(!bc.is_ready(), "an invalid candidate never reaches Ready");
+        // AC11(c): the working set is back at its baseline.
         assert!(
             !bc.node_info.is_seeded(5),
             "the derived working set is reset after the failed pass"
+        );
+        assert_eq!(bc.node_info.max_known_node_id(), 0);
+        // AC11(a)/(f): the offender is gone, the genesis survives, and this call
+        // ran exactly ONE full-chain pass — had recovery retried in-call, the
+        // now-valid genesis-only candidate would already have reached Ready.
+        assert!(
+            bc.blocks.get(child_idx).is_none(),
+            "the offending block is deleted from the tree (and its durable slot freed)"
+        );
+        let genesis_idx = bc
+            .blocks
+            .find(0, &genesis.view().hash())
+            .expect("genesis survives");
+        assert_eq!(bc.blocks.len(), 1);
+        assert_eq!(
+            bc.active_chain_head_idx, genesis_idx,
+            "the anchor placeholder still points at the surviving genesis (AC7 'otherwise' half)"
+        );
+        // AC11(f) second half: the *next* admission re-evaluates FR2 against the
+        // now-smaller tree and picks up the shortened (genesis-only) candidate.
+        let unrelated = transfer_block(500, [0x77; 32], 1, 2, 100, 1, 0);
+        let (outcome, _) = bc.receive_block(unrelated.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert!(
+            bc.is_ready(),
+            "FR2 re-evaluation happens on the next admission (no retry loop needed)"
+        );
+    }
+
+    // --- Story 5.5: FR5 atomic recovery -------------------------------------
+
+    /// AC11(a) — an `Invalid` failure deletes the offending block **and** its
+    /// transitive descendants, and nothing else: a sibling subtree whose
+    /// ancestry does not pass through the target survives, as does the target's
+    /// own ancestor.
+    #[test]
+    fn fr5_deletes_offender_subtree_and_spares_sibling() {
+        let mut bc = new_test_chain();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let gi = bc
+            .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+            .expect("genesis admitted");
+        // Offending branch: genesis ← b1 ← b2.
+        let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+        let bi1 = bc
+            .tier1_admit(&b1.view(), &b1.view().hash(), 0)
+            .expect("b1 admitted");
+        let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+        let bi2 = bc
+            .tier1_admit(&b2.view(), &b2.view().hash(), 0)
+            .expect("b2 admitted");
+        // Sibling branch forking at the genesis (a different amount → a distinct
+        // hash, so it is a genuine second child, not an FR11 duplicate).
+        let c1 = transfer_block(1, genesis.view().hash(), 1, 2, 200, 1, 0);
+        let ci1 = bc
+            .tier1_admit(&c1.view(), &c1.view().hash(), 0)
+            .expect("c1 admitted");
+        assert_eq!(bc.blocks.len(), 4);
+
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        bc.recover_from_failed_pass(
+            ProcessingError::Invalid {
+                block_idx: bi1,
+                reason: ValidationReason::UnseededActor,
+            },
+            bi2,
+        );
+
+        assert!(
+            bc.blocks.get(bi1).is_none(),
+            "the earliest offender is deleted"
+        );
+        assert!(
+            bc.blocks.get(bi2).is_none(),
+            "its transitive descendant is deleted too"
+        );
+        assert!(
+            bc.blocks.get(gi).is_some(),
+            "the target's ancestor survives"
+        );
+        assert!(
+            bc.blocks.get(ci1).is_some(),
+            "the sibling subtree is untouched"
+        );
+        assert_eq!(bc.blocks.len(), 2);
+        // FR19 event (iv): only the sibling branch is still tracked, and the
+        // genesis keeps no entry of its own (it still has the sibling child).
+        assert_eq!(bc.chain_heads.count(), 1);
+        assert!(bc.chain_heads.occupied_heads().any(|(h, _)| h == ci1));
+        assert_eq!(bc.current_phase(), LifecyclePhase::Collecting);
+    }
+
+    /// AC11(b) — a non-`Invalid` failure is not exact evidence against any
+    /// specific block, so exactly **one** block is deleted: the candidate head.
+    /// Its parent becomes the new tip and stays tracked, so the shortened branch
+    /// remains an FR2 candidate.
+    #[test]
+    fn fr5_non_invalid_error_deletes_only_the_candidate_head() {
+        fn run(err: ProcessingError) -> (usize, bool, bool) {
+            let mut bc = new_test_chain();
+            let genesis = node_transfer_block(0, 0, 0, 0);
+            bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+                .expect("genesis admitted");
+            let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+            let bi1 = bc
+                .tier1_admit(&b1.view(), &b1.view().hash(), 0)
+                .expect("b1 admitted");
+            let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+            let bi2 = bc
+                .tier1_admit(&b2.view(), &b2.view().hash(), 0)
+                .expect("b2 admitted");
+            bc.set_lifecycle_phase(LifecyclePhase::Processing);
+            bc.recover_from_failed_pass(err, bi2);
+            (
+                bc.blocks.len(),
+                bc.blocks.get(bi2).is_none(),
+                // The retargeted entry tracks b1 as the new tip.
+                bc.chain_heads.occupied_heads().any(|(h, _)| h == bi1),
+            )
+        }
+        for err in [
+            ProcessingError::StorageRead,
+            ProcessingError::MissingBlock,
+            ProcessingError::MarkOverflow,
+        ] {
+            assert_eq!(
+                run(err),
+                (2, true, true),
+                "the head fallback deletes exactly the candidate head and keeps \
+                 the shortened branch tracked"
+            );
+        }
+    }
+
+    /// AC11(c) — the working set is fully rolled back: per-node projection
+    /// (balances, keys, watermark), accumulated vote, and the surviving blocks'
+    /// UTXO spent-bit vectors. Driven through the real
+    /// `run_processing_pass` → `recover_from_failed_pass` pair over a
+    /// window-anchored candidate that derives state *before* it fails.
+    #[test]
+    fn fr5_working_set_is_clean_after_recovery() {
+        let mut bc = new_test_chain();
+        // Window-anchored candidate: balance seed (watermark 5) → valid transfer
+        // → out-of-sequence registration (id 3, expected 6).
+        let anchor = balance_block(
+            100,
+            [0xAB; 32],
+            &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)],
+            5,
+        );
+        let ai = bc
+            .tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
+        let ti = bc
+            .tier1_admit(&tx.view(), &tx.view().hash(), 0)
+            .expect("tx admitted");
+        let reg = registration_block(102, tx.view().hash(), 1, 3, 0xC3);
+        let ri = bc
+            .tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+
+        let err = bc.run_processing_pass(ri).expect_err("watermark violation");
+        assert_eq!(
+            err,
+            ProcessingError::Invalid {
+                block_idx: ri,
+                reason: ValidationReason::RegistrationWatermark,
+            }
+        );
+        // The aborted pass leaves its partial derivation behind — that is exactly
+        // what the recovery has to discard.
+        assert!(bc.node_info.is_seeded(1));
+        assert_eq!(bc.node_info.max_known_node_id(), 5);
+
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        bc.recover_from_failed_pass(err, ri);
+
+        assert!(!bc.node_info.is_seeded(1), "roster reset");
+        assert!(!bc.node_info.is_seeded(2));
+        assert_eq!(bc.node_info.balance_of(1), 0, "balances reset");
+        assert_eq!(bc.node_info.balance_of(2), 0);
+        assert!(bc.node_info.public_key_of(1).is_none(), "key mapping reset");
+        assert_eq!(bc.node_info.max_known_node_id(), 0, "watermark reset");
+        assert_eq!(
+            bc.vote_engine.accumulated_vote_of(1),
+            0,
+            "accumulated vote reset"
+        );
+        assert_eq!(bc.vote_engine.accumulated_vote_of(2), 0);
+        // The surviving segment's spent-bits are at the clean all-zero baseline
+        // (owned by the pass's entry/abort handling — recovery does not sweep
+        // them a second time, and must not need to).
+        for idx in [ai, ti] {
+            for bit in 0..8 {
+                assert_eq!(
+                    bc.blocks.spent_bit(idx, bit),
+                    Some(false),
+                    "no spent-bit survives a failed candidate"
+                );
+            }
+        }
+        assert_eq!(bc.current_phase(), LifecyclePhase::Collecting);
+    }
+
+    /// AC11(d)/(e) — deleting the block `active_chain_head_idx` points at clears
+    /// the anchor placeholder (and empties `chain_heads`), which is what makes
+    /// re-acquisition of the discarded genesis possible: the single-genesis guard
+    /// keys on `active_chain_head_idx != NONE_REF`.
+    #[test]
+    fn fr5_clears_active_head_when_its_block_is_deleted() {
+        let mut bc = new_test_chain();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let gi = bc
+            .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+            .expect("genesis admitted");
+        let child = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+        let ci = bc
+            .tier1_admit(&child.view(), &child.view().hash(), 0)
+            .expect("child admitted");
+        assert_eq!(bc.active_chain_head_idx, gi);
+
+        // The genesis pair is not exempt: an `Invalid` pinned at block #0 deletes
+        // it and everything descending from it (FR5 deletion is forward progress).
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        bc.recover_from_failed_pass(
+            ProcessingError::Invalid {
+                block_idx: gi,
+                reason: ValidationReason::CreatorSignatureInvalid,
+            },
+            ci,
+        );
+
+        assert_eq!(bc.blocks.len(), 0, "the whole subtree is gone");
+        assert_eq!(
+            bc.active_chain_head_idx, NONE_REF,
+            "the anchor placeholder is cleared with its target"
+        );
+        assert_eq!(bc.chain_heads.count(), 0, "no tracked tip remains");
+        // Re-acquisition is now possible — the guard no longer refuses a genesis.
+        assert!(
+            bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+                .is_ok(),
+            "a node that discarded its genesis can re-acquire one"
+        );
+    }
+
+    /// AC11(g) — recovery is `now`-independent (FR63/NFR5): the same failing
+    /// candidate replayed under two wall-clocks produces the same deleted set,
+    /// the same tip table, the same phase, and the same anchor. Extends the
+    /// `receive_block_ignores_now` pattern of Stories 4.3/4.4/5.3.
+    #[test]
+    fn fr5_recovery_ignores_now() {
+        fn run(now: u64) -> (usize, usize, u32, bool) {
+            let mut bc = new_test_chain();
+            let genesis = node_transfer_block(0, 0, 0, 0);
+            let child = registration_block(1, genesis.view().hash(), 1, 5, 0xC5);
+            bc.receive_block(child.view(), now);
+            bc.receive_block(genesis.view(), now.saturating_add(9_000));
+            (
+                bc.blocks.len(),
+                bc.chain_heads.count(),
+                bc.active_chain_head_idx,
+                bc.current_phase() == LifecyclePhase::Collecting,
+            )
+        }
+        assert_eq!(
+            run(0),
+            run(1_000_000),
+            "the recovery outcome is identical across wall-clocks"
         );
     }
 
