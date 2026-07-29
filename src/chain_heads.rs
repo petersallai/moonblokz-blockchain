@@ -750,9 +750,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// pins that equality against the event-(i) maintenance itself.
     ///
     /// Three bounded linear passes over the table (no nested walk): zero, count
-    /// child edges, then floor tips at 1.
-    /// Takes no `&self`: the counts are a function of the block-tree's edges
-    /// alone, so the tip table is deliberately not consulted.
+    /// child edges, then floor tips at 1. Takes no `&self`: the counts are a
+    /// function of the block-tree's edges alone, so the tip table is
+    /// deliberately not consulted.
     fn recompute_head_ref_counts<const MAX_BLOCKS: usize>(blocks: &mut BlockTable<MAX_BLOCKS>) {
         for idx in 0..MAX_BLOCKS {
             blocks.set_head_ref_count(idx as u32, 0);
