@@ -151,6 +151,19 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// reading or dropping the old value, correct only because `dst` is not yet
     /// initialized.
     pub(crate) unsafe fn init_in_place(dst: *mut Self) {
+        // The FR19 branch-count is a `u8`, and it cannot overflow while the tip
+        // table is smaller than that: each of a block's child edges heads a
+        // disjoint subtree containing at least one tip, and FR19 indexes every
+        // tip, so a block's out-degree is bounded by the number of `chain_heads`
+        // entries. Raising `chain_heads_max_capacity` past `u8::MAX` is therefore
+        // the only way to break it — and the failure would be silent, since
+        // `adjust_head_ref_count` saturates in release and an inflated-then-capped
+        // count stops the FR19 eviction walk early, leaking blocks that were
+        // exclusive to the evicted branch. Compile-time so that raise has to be a
+        // conscious decision, matching the `MAX_BLOCK_SIZE` assertions in
+        // `api.rs` / `chain_config.rs`. Inline `const` rather than a module-level
+        // `const _`, because `MAX_BRANCH_COUNT` is a const-generic parameter.
+        const { assert!(MAX_BRANCH_COUNT <= u8::MAX as usize) };
         let heads_ptr = unsafe { core::ptr::addr_of_mut!((*dst).heads) } as *mut ChainHeadEntry;
         for i in 0..MAX_BRANCH_COUNT {
             unsafe {
