@@ -710,19 +710,33 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
             }
             let mut current = idx;
             let mut reaches_root = false;
+            let mut terminated = false;
             for _ in 0..MAX_BLOCKS {
                 if current == root {
                     reaches_root = true;
+                    terminated = true;
                     break;
                 }
                 let Some(entry) = self.get(current) else {
+                    terminated = true;
                     break;
                 };
                 if entry.parent_ref == NONE_REF {
+                    terminated = true;
                     break;
                 }
                 current = entry.parent_ref;
             }
+            // Exhausting the step bound without terminating means a corrupt
+            // `parent_ref` cycle: every legal ancestry reaches `root`, an empty
+            // slot, or `NONE_REF` within `MAX_BLOCKS - 1` hops (a fully occupied
+            // linear chain is the worst case). The block is then treated as
+            // *not* in the subtree — the safe direction, since marking on a
+            // corrupt walk would widen the deletion beyond the target (Task 3).
+            debug_assert!(
+                terminated,
+                "mark_subtree: parent_ref cycle — ancestry walk exceeded MAX_BLOCKS steps"
+            );
             if reaches_root {
                 out[count] = idx;
                 count += 1;

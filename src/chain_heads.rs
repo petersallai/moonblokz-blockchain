@@ -675,6 +675,16 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         deleted: &[u32],
         reattach_idx: u32,
     ) {
+        // Ordering contract: every decision below — the childless-tip scan,
+        // `recompute_caches`, `recompute_head_ref_counts` — reads the
+        // *post-deletion* tree. Called before the slots are freed it would
+        // silently produce inflated ref-counts and suppress the retarget, with
+        // no error anywhere. Free in release.
+        debug_assert!(
+            deleted.iter().all(|idx| blocks.get(*idx).is_none()),
+            "on_blocks_deleted runs after the blocks have been freed"
+        );
+
         // Is the deleted root's parent now a childless, untracked tip?
         let reattach = blocks.get(reattach_idx).is_some()
             && self.slot_of_head(reattach_idx).is_none()
@@ -746,8 +756,19 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// blocks that are in fact exclusive to the evicted branch. The out-degree
     /// recompute below is still a full recompute from the surviving tree (so it
     /// keeps the shared-fork-point immunity the decision was made for) while
-    /// reproducing the invariant bit-for-bit; `recompute_matches_incremental_maintenance`
+    /// reproducing the invariant; `recompute_matches_incremental_maintenance`
     /// pins that equality against the event-(i) maintenance itself.
+    ///
+    /// **Scope of that equality:** it holds over trees built by admission
+    /// (events (i)/(ii)). It is *not* universal — `evict_one`'s active-chain
+    /// guard decrements and then breaks, so an eviction can telescope an active
+    /// block's maintained count to 0 while the block is still a legitimate tip.
+    /// The recompute then reports 1 (the FR19 tip floor), i.e. it **repairs**
+    /// the maintained value rather than reproducing it. That is safe in both
+    /// directions — the eviction walk tests `is_on_active_chain` *before* the
+    /// count, so a 0 on an active block never authorized a deletion — but the
+    /// recompute must not be described as bit-for-bit equal in general.
+    /// `recompute_repairs_eviction_telescoped_count` pins the actual relation.
     ///
     /// Three bounded linear passes over the table (no nested walk): zero, count
     /// child edges, then floor tips at 1. Takes no `&self`: the counts are a
@@ -1263,8 +1284,11 @@ mod tests {
         let h_slot = (0..4).find(|&sl| ch.head_at(sl).head_idx == h).unwrap();
         let s_slot = (0..4).find(|&sl| ch.head_at(sl).head_idx == s).unwrap();
         assert!(!ch.head_at(h_slot).is_stored(), "H starts Connected");
-        // Give S a request stamp so "untouched" is observable.
+        // Stamp BOTH heads: S so "untouched" is observable, and H so the claim
+        // about the demoted head's schedule is asserted against a value that
+        // was not already 0 before the event ran.
         ch.mark_requested(s_slot, 5_000);
+        ch.mark_requested(h_slot, 4_242);
 
         blocks.delete(g);
         ch.on_blocks_deleted(&mut blocks, &[g], NONE_REF);
@@ -1278,10 +1302,33 @@ mod tests {
             h,
             "H itself is now the tail-point (its parent slot is gone)"
         );
+        // Pins the ACTUAL behaviour, not the intended one: `last_request_timestamp
+        // = 0` lives in `recompute_caches`' *Connection* arm, so the demotion
+        // (Tail) arm leaves the stamp alone. Harmless today only because
+        // `mark_requested` is reachable only from `select_parent_recovery`,
+        // which skips Connected heads — so a real Connected head's stamp is
+        // always already 0. Under review decision: reset on the Connected→Stored
+        // transition (a blanket reset in the Tail arm would also erase a
+        // legitimate schedule on the Stored-branch-extend path), or keep this
+        // and correct AC6(b)/the doc, which currently claim the reset happens.
         assert_eq!(
             ch.head_at(h_slot).last_request_timestamp,
-            0,
-            "a demoted head reschedules parent recovery from scratch"
+            4_242,
+            "the demotion arm does not reset the recovery schedule"
+        );
+        // The value actually at risk, and the reason this arm is under review:
+        // the Connection arm zeroed H's `missing_parent_hash`, and the Tail arm's
+        // `cached_missing_hash_for_tail` fallback matches H's own slot (the flag
+        // and tail-point are written before the hash is resolved), so H comes out
+        // with the all-zero sentinel and `select_parent_recovery` would request
+        // hash 0x00…00 forever. NOT reachable through FR5 — a `mark_subtree`
+        // delete-set is child-closed, so no survivor can lose its connection —
+        // but reachable through the Epic-6 event-(iii) driver this arm is kept
+        // for. Pinned so the fix flips this assertion instead of passing silently.
+        assert_eq!(
+            ch.head_at(h_slot).missing_parent_hash,
+            [0u8; 32],
+            "KNOWN GAP (Epic 6): a demoted head has no recoverable missing-parent hash"
         );
         assert_eq!(ch.head_at(s_slot).head_idx, s, "unrelated head survives");
         assert!(ch.head_at(s_slot).is_stored());
@@ -1336,6 +1383,46 @@ mod tests {
             [g, a, a2, a3, g2].map(|i| blocks.head_ref_count(i)),
             before,
             "recompute reproduces the maintained FR19 branch-count exactly"
+        );
+    }
+
+    /// (c) The bound on the equality above: over an **eviction**-produced tree
+    /// the recompute does not reproduce the maintained count, it repairs it.
+    /// `evict_one`'s active-chain guard decrements and then breaks, so an
+    /// active block can be left at 0 while it is still a legitimate (here:
+    /// childless) tip; the recompute restores the FR19 tip floor of 1. Pinned
+    /// so the "recompute == maintenance" claim is never read as universal —
+    /// it holds for admission-built trees only.
+    #[test]
+    fn recompute_repairs_eviction_telescoped_count() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        // Active genesis G, extended by B — the extend leaves G at 1.
+        let mut ge = BlockEntry::new(hash_of(7), NONE_REF, 0);
+        ge.set_on_active_chain(true);
+        let g = blocks.insert(ge).unwrap();
+        ch.on_block_admitted(&mut blocks, g, None, [0; 32], 1, g);
+        let b = put(&mut blocks, 6, g, 1);
+        ch.on_block_admitted(&mut blocks, b, Some(g), hash_of(7), 2, g);
+        assert_eq!(blocks.head_ref_count(g), Some(1), "extend leaves G at 1");
+
+        // Evicting the (non-active) head B walks B → G: B drops to 0 and is
+        // deleted, then the active-chain guard decrements G and stops.
+        ch.evict_one(&mut blocks, g);
+        assert!(blocks.get(b).is_none(), "the evicted head is deleted");
+        assert_eq!(
+            blocks.head_ref_count(g),
+            Some(0),
+            "the guard telescoped the surviving active tip to 0"
+        );
+
+        ChainHeadsTable::<4>::recompute_head_ref_counts(&mut blocks);
+
+        assert_eq!(
+            blocks.head_ref_count(g),
+            Some(1),
+            "the recompute repairs it to the FR19 tip floor — it does not \
+             reproduce the maintained 0"
         );
     }
 
