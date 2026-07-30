@@ -1320,20 +1320,29 @@ impl<
     /// forward progress — a node that cannot prove its genesis must re-acquire
     /// it, and clearing `active_chain_head_idx` below is what lets it.
     ///
-    /// **Step 4 — FR19 event (iv)** on `chain_heads`
+    /// **Step 4 — restore the pre-acquisition active-chain marking**
+    /// (ratified 2026-07-30): every block's `is_on_active_chain` bit is cleared
+    /// **and** `active_chain_head_idx` is reset, then the FR19 genesis bootstrap
+    /// is re-established if block #0 survived. Clearing only the anchor index
+    /// (the original behaviour) left the per-block bits behind, so a caller that
+    /// had promoted a chain would keep blocks claiming to be on an active chain
+    /// that no longer has a head. Re-establishing the genesis matters just as
+    /// much as the clearing: that marking is an *admission*-time artefact, and
+    /// without it a surviving genesis-anchored head would be classified `Tail`
+    /// instead of `Connection` — a demotion, whose all-zero `missing_parent_hash`
+    /// `select_parent_recovery` would then request forever — while the
+    /// single-genesis guard would also disarm and let a second block #0 in. See
+    /// the inline comment for why the demotion stays unreachable in both
+    /// directions.
+    ///
+    /// **Step 5 — FR19 event (iv)** on `chain_heads`
     /// ([`ChainHeadsTable::on_blocks_deleted`]) — which removes the deleted
     /// heads' entries, retargets one of them to the target's now-childless
     /// parent so the shortened branch stays selectable, recomputes the
-    /// survivors' caches (Connected→Stored demotion included) and restores the
-    /// FR19 `head_ref_count`s. `active_chain_head_idx` is then cleared **here**,
-    /// by this function, when its target was deleted — the tip table has no
-    /// access to that field, so the two together (not `on_blocks_deleted`
-    /// alone) are what makes step 4 indivisible. That clearing is not
-    /// cosmetic: the single-genesis guard keys on `active_chain_head_idx !=
-    /// NONE_REF`, so a stale value would refuse re-admission of the very genesis
-    /// this recovery just discarded.
+    /// survivors' caches and restores the FR19 `head_ref_count`s. It runs after
+    /// step 4 so the recompute sees the final marking, not a transient mix.
     ///
-    /// **Step 5 — phase reversion.** `Processing→Collecting` (a legal edge) is
+    /// **Step 6 — phase reversion.** `Processing→Collecting` (a legal edge) is
     /// this function's last step; it does **not** itself re-evaluate FR2. FR5's
     /// "re-evaluate the remaining block-tree against the FR2 stopping
     /// conditions" is the caller's, and [`Self::receive_block`] does it
@@ -1413,17 +1422,61 @@ impl<
             self.blocks.delete(*idx);
         }
 
-        if deleted_count > 0 {
-            let deleted = &delete_set[..deleted_count];
-            // Step 4 — FR19 event (iv), then the active-anchor placeholder.
-            self.chain_heads
-                .on_blocks_deleted(&mut self.blocks, deleted, parent_of_target);
-            if deleted.contains(&self.active_chain_head_idx) {
-                self.active_chain_head_idx = NONE_REF;
+        // Step 4 — restore the pre-acquisition active-chain marking, so recovery
+        // really returns the node to its baseline instead of only clearing the
+        // anchor index (ratified 2026-07-30). Both halves of the marking are
+        // reset — every block's `is_on_active_chain` bit *and*
+        // `active_chain_head_idx` — and then the FR19 genesis bootstrap is
+        // re-established if block #0 survived, because that marking is an
+        // *admission*-time artefact (`receive_block`'s `is_genesis` arm), not
+        // something the failed acquisition produced. The result is exactly the
+        // state the node would be in had the blocks been admitted and no
+        // acquisition attempted.
+        //
+        // Re-establishing the genesis is load-bearing, not cosmetic. Leaving
+        // every bit cleared would make `ChainHeadsTable::locate_anchor` classify
+        // a genesis-anchored head as `Tail` rather than `Connection`, i.e.
+        // *demote* it — and a demoted head's `missing_parent_hash` is the
+        // all-zero sentinel it was given when it became Connected, which
+        // `select_parent_recovery` would then request forever. It also keeps the
+        // single-genesis guard armed, so a *second* genesis cannot be admitted
+        // alongside the surviving one.
+        //
+        // When the genesis does *not* survive, no surviving head can have been
+        // Connected: the delete-set is closed under the child relation, so
+        // deleting block #0 deletes everything descending from it, and in
+        // collecting state block #0 is the only block that is ever marked. The
+        // demotion above is therefore unreachable in both directions. A caller
+        // that recovers after a *successful* promotion (the Story-5.7 restart,
+        // an Epic-6 chain switch) breaks that premise — `promote_candidate_active`
+        // marks a whole chain — and must re-derive the survivors' caches itself.
+        for idx in 0..MAX_BLOCKS {
+            self.blocks.set_on_active_chain(idx as u32, false);
+        }
+        self.active_chain_head_idx = NONE_REF;
+        for idx in 0..MAX_BLOCKS {
+            let idx = idx as u32;
+            if self
+                .blocks
+                .get(idx)
+                .is_some_and(|entry| entry.sequence() == 0)
+            {
+                self.blocks.set_on_active_chain(idx, true);
+                self.active_chain_head_idx = idx;
+                break; // the single-genesis guard admits at most one block #0
             }
         }
 
-        // Step 5 — revert and stop; the next admission re-evaluates FR2.
+        if deleted_count > 0 {
+            // Step 5 — FR19 event (iv). Runs *after* the marking is restored so
+            // `recompute_caches` classifies every survivor against the final
+            // flags rather than a transient mix.
+            let deleted = &delete_set[..deleted_count];
+            self.chain_heads
+                .on_blocks_deleted(&mut self.blocks, deleted, parent_of_target);
+        }
+
+        // Step 6 — revert. The caller re-evaluates FR2 (see step 6 in the doc).
         self.set_lifecycle_phase(LifecyclePhase::Collecting);
     }
 
@@ -4189,6 +4242,72 @@ mod tests {
             bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
                 .is_ok(),
             "a node that discarded its genesis can re-acquire one"
+        );
+    }
+
+    /// AC7, amended 2026-07-30 — recovery restores the **whole** pre-acquisition
+    /// active-chain marking, not just the anchor index: every block's
+    /// `is_on_active_chain` bit is cleared, and the FR19 genesis bootstrap is
+    /// re-established on the surviving block #0. The pre-marked survivors here
+    /// stand in for a `promote_candidate_active` that ran before this recovery
+    /// (the Story-5.7 / Epic-6 reuse) — without the clearing they would keep
+    /// claiming to be on an active chain that no longer has a head.
+    #[test]
+    fn fr5_restores_active_chain_marking_and_keeps_the_genesis_bootstrap() {
+        let mut bc = new_test_chain();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let gi = bc
+            .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+            .expect("genesis admitted");
+        let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+        let bi1 = bc
+            .tier1_admit(&b1.view(), &b1.view().hash(), 0)
+            .expect("b1 admitted");
+        let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+        let bi2 = bc
+            .tier1_admit(&b2.view(), &b2.view().hash(), 0)
+            .expect("b2 admitted");
+        // Stand in for a prior promotion: mark the whole chain and move the
+        // anchor to the tip, exactly as `promote_candidate_active` would.
+        for idx in [gi, bi1, bi2] {
+            bc.blocks.set_on_active_chain(idx, true);
+        }
+        bc.active_chain_head_idx = bi2;
+
+        // Fail at b2 → only b2 is deleted; the genesis and b1 survive marked.
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        bc.recover_from_failed_pass(
+            ProcessingError::Invalid {
+                block_idx: bi2,
+                reason: ValidationReason::CreatorSignatureInvalid,
+            },
+            bi2,
+        );
+
+        assert!(bc.blocks.get(bi2).is_none(), "the offender is deleted");
+        assert!(
+            !bc.blocks
+                .get(bi1)
+                .expect("b1 survives")
+                .is_on_active_chain(),
+            "a surviving non-genesis block no longer claims to be on the active chain"
+        );
+        assert!(
+            bc.blocks
+                .get(gi)
+                .expect("genesis survives")
+                .is_on_active_chain(),
+            "the FR19 genesis bootstrap is re-established on the surviving block #0"
+        );
+        assert_eq!(
+            bc.active_chain_head_idx, gi,
+            "the anchor is restored to the genesis, not left at the deleted tip"
+        );
+        // The bootstrap is what keeps the shortened branch Connected: a demoted
+        // head would carry the all-zero missing-parent hash and request it forever.
+        assert!(
+            bc.chain_heads.occupied_heads().any(|(head, _)| head == bi1),
+            "the shortened branch is still tracked"
         );
     }
 
