@@ -1321,9 +1321,14 @@ impl<
     /// it, and clearing `active_chain_head_idx` below is what lets it.
     ///
     /// **Step 4 — restore the pre-acquisition active-chain marking**
-    /// (ratified 2026-07-30): every block's `is_on_active_chain` bit is cleared
-    /// **and** `active_chain_head_idx` is reset, then the FR19 genesis bootstrap
-    /// is re-established if block #0 survived. Clearing only the anchor index
+    /// (ratified 2026-07-30): every block's `is_on_active_chain` bit is cleared,
+    /// every block's FR9 status is reset to `Stored` (FR9: "in collecting state
+    /// every retained block remains in the Stored status" — never `Connected`,
+    /// which has no meaning without an active chain), **and**
+    /// `active_chain_head_idx` is reset; then the FR19 genesis bootstrap
+    /// is re-established if block #0 survived. The status travels with the bit
+    /// because [`Self::promote_candidate_active`] writes the two together.
+    /// Clearing only the anchor index
     /// (the original behaviour) left the per-block bits behind, so a caller that
     /// had promoted a chain would keep blocks claiming to be on an active chain
     /// that no longer has a head. Re-establishing the genesis matters just as
@@ -1450,8 +1455,20 @@ impl<
         // that recovers after a *successful* promotion (the Story-5.7 restart,
         // an Epic-6 chain switch) breaks that premise — `promote_candidate_active`
         // marks a whole chain — and must re-derive the survivors' caches itself.
+        // The FR9 status is the other half of the same promotion and is reset
+        // with it: `promote_candidate_active` writes `Active` *and* the bit
+        // together, so undoing one without the other would leave a block claiming
+        // `Active` while off the active chain. FR9 settles the target value —
+        // "in collecting state every retained block remains in the Stored status
+        // (no Connected or Active status is assigned because no active chain
+        // exists)" — so it is `Stored`, never `Connected`. This is the caller
+        // `BlockTable::set_status`'s Story-5.4 doc already anticipated. Idempotent
+        // today: nothing on the FR5 path is ever promoted, since the promotion
+        // runs only on the success branch.
         for idx in 0..MAX_BLOCKS {
-            self.blocks.set_on_active_chain(idx as u32, false);
+            let idx = idx as u32;
+            self.blocks.set_on_active_chain(idx, false);
+            self.blocks.set_status(idx, BlockStatus::Stored);
         }
         self.active_chain_head_idx = NONE_REF;
         for idx in 0..MAX_BLOCKS {
@@ -4267,9 +4284,11 @@ mod tests {
         let bi2 = bc
             .tier1_admit(&b2.view(), &b2.view().hash(), 0)
             .expect("b2 admitted");
-        // Stand in for a prior promotion: mark the whole chain and move the
-        // anchor to the tip, exactly as `promote_candidate_active` would.
+        // Stand in for a prior promotion: mark the whole chain Active and move
+        // the anchor to the tip, exactly as `promote_candidate_active` would —
+        // it writes the status and the bit together, so recovery must undo both.
         for idx in [gi, bi1, bi2] {
+            bc.blocks.set_status(idx, BlockStatus::Active);
             bc.blocks.set_on_active_chain(idx, true);
         }
         bc.active_chain_head_idx = bi2;
@@ -4299,6 +4318,16 @@ mod tests {
                 .is_on_active_chain(),
             "the FR19 genesis bootstrap is re-established on the surviving block #0"
         );
+        // FR9: collecting state holds every retained block at `Stored` — the
+        // promotion's status half is undone with its flag half, and the genesis
+        // is no exception (its bootstrap marking is not an FR9 promotion).
+        for idx in [gi, bi1] {
+            assert_eq!(
+                bc.blocks.get(idx).expect("survivor").status(),
+                BlockStatus::Stored,
+                "every surviving block is back at Stored (FR9 collecting-state rule)"
+            );
+        }
         assert_eq!(
             bc.active_chain_head_idx, gi,
             "the anchor is restored to the genesis, not left at the deleted tip"
