@@ -242,6 +242,19 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// `new_block_prev_hash` is a just-processed block's `previous_hash`, used
     /// when this head's tail-point *is* that block (so the hash is in hand
     /// without a storage read).
+    ///
+    /// **Direction of travel.** Every reachable caller either grows a head's
+    /// ancestry (event (i) extend, event (ii) tail resolution) or builds a
+    /// fresh entry (`insert_head`), so the only reachable transition is
+    /// Stored→Connected. The `Anchor::Tail` arm serves new Stored heads,
+    /// extended Stored branches and deepened tail-points — but it never fires
+    /// on an entry that *was* Connected: see
+    /// [`Self::on_blocks_deleted`] for why the reverse transition is
+    /// unreachable by construction (child-closed delete-sets, and FR23's
+    /// common ancestor staying on the active chain). Read the
+    /// `last_request_timestamp = 0` below as belonging to the Connection arm
+    /// only — it is the *promotion* rule (a connected branch has nothing left
+    /// to request), not a demotion rule.
     fn recompute_caches<const MAX_BLOCKS: usize>(
         &mut self,
         slot: usize,
@@ -629,12 +642,10 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     ///   **first** such entry is instead *retargeted* to `reattach_idx` when
     ///   that block became a childless tip (see below);
     /// - (b) every surviving entry's caches are **recomputed** through
-    ///   [`Self::recompute_caches`], which is also the demotion path FR5
-    ///   requires: a head that lost its connection to the active chain flips
-    ///   Connected→Stored, repopulates `tail_or_connection_idx` +
-    ///   `missing_parent_hash`, and (for the reverse edge) a newly-Connected
-    ///   head has `last_request_timestamp` reset to 0 so parent recovery
-    ///   reschedules from scratch;
+    ///   [`Self::recompute_caches`]. Its live purpose is the **retargeted**
+    ///   entry, which names a different block afterwards and so genuinely needs
+    ///   a fresh tail/connection point; for every other survivor it is a no-op
+    ///   (see the note at the end);
     /// - (c) `head_ref_count` is **recomputed** for every surviving block
     ///   (see [`Self::recompute_head_ref_counts`]).
     ///
@@ -663,12 +674,26 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// re-evaluation requirement is unreachable in the common
     /// delete-exactly-the-candidate-head case.
     ///
-    /// Note on (b) under an **FR5** delete-set: that set is closed under the
-    /// child relation (`BlockTable::mark_subtree`), so a survivor's ancestry
-    /// cannot contain a deleted block — the recompute is therefore idempotent
-    /// for FR5's own callers, and is kept because it is what makes the event
-    /// correct for *any* authorized delete-set (and is asserted by the
-    /// module's unit tests through a narrower one).
+    /// **Why (b) is a no-op for untouched survivors, and why there is no
+    /// Connected→Stored demotion here.** The Story-4.4 specification lists
+    /// demotion as one of event (iv)'s duties, but that transition is
+    /// unreachable **by construction**, not merely undriven:
+    /// - an FR5 delete-set is closed under the child relation
+    ///   ([`BlockTable::mark_subtree`]), so a survivor's ancestry can never
+    ///   contain a deleted block and no survivor's anchor can move; and
+    /// - the only other way to lose a connection would be the active-chain
+    ///   flag set shrinking under a branch — but FR23 defines the chain switch
+    ///   as a backward walk *to the common ancestor* followed by a forward walk
+    ///   *from* it, so the common ancestor stays on the active chain.
+    ///   [`Self::locate_anchor`] walks up to the **first** flagged block, so a
+    ///   head that reached the old active chain still reaches the new one
+    ///   through that common ancestor, at worst via a deeper connection point.
+    ///
+    /// The `flags &= !FLAG_CONNECTED` in `recompute_caches`' `Anchor::Tail` arm
+    /// is therefore an idempotent write on this path, not a demotion. That arm
+    /// itself is very much live — it serves a brand-new Stored head, the
+    /// extension of a Stored branch, and a deepened tail-point in event (ii) —
+    /// so there is nothing here to remove; only the transition is impossible.
     pub(crate) fn on_blocks_deleted<const MAX_BLOCKS: usize>(
         &mut self,
         blocks: &mut BlockTable<MAX_BLOCKS>,
@@ -1226,8 +1251,20 @@ mod tests {
 
     // --- Story 5.5: FR19 mutation event (iv) — block deletion ---------------
 
-    /// (a) An entry whose head block was deleted is removed; (c) the surviving
-    /// blocks' `head_ref_count` is restored to the fork-free value.
+    /// (a) An entry whose head block was deleted is removed; (b) an untouched
+    /// survivor's caches come through the recompute loop unchanged; (c) the
+    /// surviving blocks' `head_ref_count` is restored to the fork-free value.
+    ///
+    /// (b) is the loop's *reachable* half. Its live purpose is the retargeted
+    /// entry (which names a different block afterwards and genuinely needs new
+    /// caches — see `event_iv_retargets_entry_to_the_new_tip`); for every other
+    /// survivor it must be a no-op, which is what the cache assertions here
+    /// pin. There is deliberately no demotion test: an FR5 delete-set is closed
+    /// under the child relation, so no survivor's ancestry can contain a deleted
+    /// block, and the FR23 chain switch reconciles *to a common ancestor* that
+    /// stays on the active chain — so a Connected head always still reaches the
+    /// active chain through it. The Connected→Stored transition is unreachable
+    /// by construction, not merely undriven.
     #[test]
     fn event_iv_removes_entry_of_deleted_head() {
         let mut blocks = empty_blocks::<8>();
@@ -1241,6 +1278,10 @@ mod tests {
         ch.on_block_admitted(&mut blocks, c, Some(a), hash_of(1), 3, NONE_REF);
         assert_eq!(ch.count(), 2);
         assert_eq!(blocks.head_ref_count(a), Some(2), "A forks to B and C");
+        // Give B a recovery schedule so "untouched" is observable through the
+        // recompute loop rather than assumed.
+        let b_slot = (0..4).find(|&s| ch.head_at(s).head_idx == b).unwrap();
+        ch.mark_requested(b_slot, 7_000);
 
         // Delete branch C (as the FR5 recovery does: free the slots, then drive
         // event (iv) with the deleted set).
@@ -1254,99 +1295,28 @@ mod tests {
             b,
             "B's entry survives untouched"
         );
+        assert!(ch.head_at(b_slot).is_stored(), "B is still Stored");
+        assert_eq!(
+            ch.head_at(b_slot).tail_or_connection_idx,
+            a,
+            "B's tail-point is unchanged by the recompute"
+        );
+        assert_eq!(
+            ch.head_at(b_slot).missing_parent_hash,
+            hash_of(9),
+            "B still requests its own missing parent"
+        );
+        assert_eq!(
+            ch.head_at(b_slot).last_request_timestamp,
+            7_000,
+            "B's recovery schedule survives the recompute loop"
+        );
         assert_eq!(
             blocks.head_ref_count(a),
             Some(1),
             "A is back to a single branch after the fork arm is gone"
         );
         assert_eq!(blocks.head_ref_count(b), Some(1));
-    }
-
-    /// (b) A surviving head that lost its connection to the active chain is
-    /// demoted Connected→Stored with `last_request_timestamp == 0`, while an
-    /// unrelated head is untouched. Driven with a delete-set narrower than an
-    /// FR5 subtree (only the connection point) so the demotion arm is reached —
-    /// the driver's contract is defined for any authorized delete-set.
-    #[test]
-    fn event_iv_demotes_head_that_lost_its_connection() {
-        let mut blocks = empty_blocks::<8>();
-        let mut ch = empty_chain_heads::<4>();
-        // Active genesis G (seq 0) ← H (seq 1, Connected head).
-        let mut ge = BlockEntry::new(hash_of(7), NONE_REF, 0);
-        ge.set_on_active_chain(true);
-        let g = blocks.insert(ge).unwrap();
-        ch.on_block_admitted(&mut blocks, g, None, [0; 32], 1, g);
-        let h = put(&mut blocks, 6, g, 1);
-        ch.on_block_admitted(&mut blocks, h, Some(g), hash_of(7), 2, g);
-        // An unrelated Stored branch (orphan S, waiting for hash 9).
-        let s = put(&mut blocks, 8, NONE_REF, 40);
-        ch.on_block_admitted(&mut blocks, s, None, hash_of(9), 3, g);
-        let h_slot = (0..4).find(|&sl| ch.head_at(sl).head_idx == h).unwrap();
-        let s_slot = (0..4).find(|&sl| ch.head_at(sl).head_idx == s).unwrap();
-        assert!(!ch.head_at(h_slot).is_stored(), "H starts Connected");
-        // Stamp BOTH heads: S so "untouched" is observable, and H so the claim
-        // about the demoted head's schedule is asserted against a value that
-        // was not already 0 before the event ran.
-        ch.mark_requested(s_slot, 5_000);
-        ch.mark_requested(h_slot, 4_242);
-
-        blocks.delete(g);
-        ch.on_blocks_deleted(&mut blocks, &[g], NONE_REF);
-
-        assert!(
-            ch.head_at(h_slot).is_stored(),
-            "H lost its connection → demoted to Stored"
-        );
-        assert_eq!(
-            ch.head_at(h_slot).tail_or_connection_idx,
-            h,
-            "H itself is now the tail-point (its parent slot is gone)"
-        );
-        // Pins the ACTUAL behaviour, not the intended one: `last_request_timestamp
-        // = 0` lives in `recompute_caches`' *Connection* arm, so the demotion
-        // (Tail) arm leaves the stamp alone. Harmless today only because
-        // `mark_requested` is reachable only from `select_parent_recovery`,
-        // which skips Connected heads — so a real Connected head's stamp is
-        // always already 0. Under review decision: reset on the Connected→Stored
-        // transition (a blanket reset in the Tail arm would also erase a
-        // legitimate schedule on the Stored-branch-extend path), or keep this
-        // and correct AC6(b)/the doc, which currently claim the reset happens.
-        assert_eq!(
-            ch.head_at(h_slot).last_request_timestamp,
-            4_242,
-            "the demotion arm does not reset the recovery schedule"
-        );
-        // The value actually at risk, and the reason this arm is under review:
-        // the Connection arm zeroed H's `missing_parent_hash`, and the Tail arm's
-        // `cached_missing_hash_for_tail` fallback matches H's own slot (the flag
-        // and tail-point are written before the hash is resolved), so H comes out
-        // with the all-zero sentinel and `select_parent_recovery` would request
-        // hash 0x00…00 forever. NOT reachable through FR5 — a `mark_subtree`
-        // delete-set is child-closed, so no survivor can lose its connection —
-        // but reachable through the Epic-6 event-(iii) driver this arm is kept
-        // for. Pinned so the fix flips this assertion instead of passing silently.
-        assert_eq!(
-            ch.head_at(h_slot).missing_parent_hash,
-            [0u8; 32],
-            "KNOWN GAP (Epic 6): a demoted head has no recoverable missing-parent hash"
-        );
-        assert_eq!(ch.head_at(s_slot).head_idx, s, "unrelated head survives");
-        assert!(ch.head_at(s_slot).is_stored());
-        assert_eq!(
-            ch.head_at(s_slot).tail_or_connection_idx,
-            s,
-            "unrelated head's tail-point is unchanged"
-        );
-        assert_eq!(
-            ch.head_at(s_slot).missing_parent_hash,
-            hash_of(9),
-            "unrelated head still requests its own missing parent"
-        );
-        assert_eq!(
-            ch.head_at(s_slot).last_request_timestamp,
-            5_000,
-            "unrelated head's recovery schedule is untouched"
-        );
     }
 
     /// (c) The `head_ref_count` recompute reproduces the event-(i) incremental
