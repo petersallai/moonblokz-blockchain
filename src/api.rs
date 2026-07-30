@@ -1172,33 +1172,70 @@ impl<
         // under them would miss the transition).
         if outcome == ReceiveBlockOutcome::AcceptedSilently
             && self.lifecycle_phase == LifecyclePhase::Collecting
-            && let Some(candidate_tip_idx) = self.evaluate_stopping_condition()
         {
-            self.set_lifecycle_phase(LifecyclePhase::Processing);
-            // Story 5.3 (FR3) + Story 5.4 (FR6/FR4): reconstruct AND validate the
-            // derived projection for the FR2 candidate in one forward pass. A
-            // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
-            // the Ready transition below overwrites; it does not pre-empt selection.
-            match self.run_processing_pass(candidate_tip_idx) {
-                Ok(()) => {
-                    // FR6 passed over the full candidate → FR4 Ready transition:
-                    // atomically promote every candidate block Stored→Active
-                    // (the Epic-4-deferred FR9 Tier-3 driver), establish the active
-                    // head, and move Processing→Ready. The FR40-series ready-only
-                    // surface becomes live (its query bodies remain Epic 7/10
-                    // `todo!()` — reachable, but this story wires no caller).
-                    self.promote_candidate_active(candidate_tip_idx);
-                    self.set_lifecycle_phase(LifecyclePhase::Ready);
-                }
-                Err(err) => {
-                    // FR6 failed (or FR3 could not derive) → the FR5 atomic
-                    // recovery (Story 5.5): discard the working set, delete the
-                    // offending block (or the candidate head) with its
-                    // descendants, follow up on `chain_heads`, and revert
-                    // Processing→Collecting. Exactly **one** full-chain pass runs
-                    // per `receive_block` call — the re-evaluation happens on the
-                    // next admission through the gate above.
-                    self.recover_from_failed_pass(err, candidate_tip_idx);
+            // At most **two** full-chain passes per call. The second one runs
+            // only after an `Invalid` recovery — see the `Err` arm — so the loop
+            // cannot iterate further: `retries_left` is never replenished.
+            let mut retries_left = 1u8;
+            while let Some(candidate_tip_idx) = self.evaluate_stopping_condition() {
+                self.set_lifecycle_phase(LifecyclePhase::Processing);
+                // Story 5.3 (FR3) + Story 5.4 (FR6/FR4): reconstruct AND validate the
+                // derived projection for the FR2 candidate in one forward pass. A
+                // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
+                // the Ready transition below overwrites; it does not pre-empt selection.
+                match self.run_processing_pass(candidate_tip_idx) {
+                    Ok(()) => {
+                        // FR6 passed over the full candidate → FR4 Ready transition:
+                        // atomically promote every candidate block Stored→Active
+                        // (the Epic-4-deferred FR9 Tier-3 driver), establish the active
+                        // head, and move Processing→Ready. The FR40-series ready-only
+                        // surface becomes live (its query bodies remain Epic 7/10
+                        // `todo!()` — reachable, but this story wires no caller).
+                        self.promote_candidate_active(candidate_tip_idx);
+                        self.set_lifecycle_phase(LifecyclePhase::Ready);
+                        break;
+                    }
+                    Err(err) => {
+                        // FR6 failed (or FR3 could not derive) → the FR5 atomic
+                        // recovery (Story 5.5): discard the working set, delete the
+                        // offending block (or the candidate head) with its
+                        // descendants, follow up on `chain_heads`, and revert
+                        // Processing→Collecting.
+                        //
+                        // **Re-evaluate immediately, but only after `Invalid`**
+                        // (ratified 2026-07-30, superseding the original
+                        // revert-only Decision #1). The shortened branch validates
+                        // **iff** the deletion removed the *first* failing block:
+                        // the anchor does not move and the forward derivation is
+                        // deterministic, so the retry recomputes exactly the prefix
+                        // of the run that just failed. `Invalid` carries that block
+                        // by construction — `block_idx` is the earliest offender, so
+                        // the surviving prefix was already proved valid by the very
+                        // pass that failed, and a retry over it succeeds. FR2 admits
+                        // it as a candidate: a genesis-anchored segment qualifies at
+                        // any length, and a window-anchored one that was well above
+                        // `SNAKE_CHAIN_LENGTH` (a large piece having just connected)
+                        // still clears the threshold after losing its tip.
+                        //
+                        // The other variants get **no** retry, because for them the
+                        // one-block head deletion is a guess, not evidence:
+                        // `MarkOverflow` means a `parent_ref` cycle (a legal ancestry
+                        // cannot exceed `MAX_BLOCKS`, the table's own capacity) and
+                        // `MissingBlock` a `parent_ref` into a freed slot — both
+                        // always *deeper* than the tip, so dropping the tip cannot
+                        // remove them and the retry is structurally certain to fail
+                        // while eating a second good block off the branch.
+                        // `StorageRead` and `Vote(_)` *could* succeed (the fault may
+                        // sit at the tip, and a transient read may simply re-read
+                        // clean), but the Project Lead ruled retry-on-`Invalid`-only:
+                        // spend the second pass only where success is derivable.
+                        let retryable = matches!(err, ProcessingError::Invalid { .. });
+                        self.recover_from_failed_pass(err, candidate_tip_idx);
+                        if !retryable || retries_left == 0 {
+                            break;
+                        }
+                        retries_left -= 1;
+                    }
                 }
             }
         }
@@ -1296,19 +1333,26 @@ impl<
     /// NONE_REF`, so a stale value would refuse re-admission of the very genesis
     /// this recovery just discarded.
     ///
-    /// **Step 5 — phase reversion, and then stop.** `Processing→Collecting` (a
-    /// legal edge) is the last step. FR5's "re-evaluate the remaining
-    /// block-tree against the FR2 stopping conditions" needs **no code here**:
-    /// [`Self::receive_block`] already evaluates the stopping condition on every
-    /// Collecting admission, now against a strictly smaller tree. There is
-    /// deliberately **no** in-call retry loop and **no** tick-driven retry, so a
-    /// `receive_block` call performs at most one full-chain validation pass —
-    /// bounded radio-task work (the non-blocking rule) and a one-pass-per-call
-    /// FR63 replay trace. Accepted consequence: a node holding a
-    /// qualifying-but-unvalidated branch does not retry until *some* block is
-    /// next admitted; in practice its Stored heads keep emitting FR19
-    /// parent-recovery requests from [`Self::on_tick`] and the responses are
-    /// admissions. Do not "fix" the missing retry.
+    /// **Step 5 — phase reversion.** `Processing→Collecting` (a legal edge) is
+    /// this function's last step; it does **not** itself re-evaluate FR2. FR5's
+    /// "re-evaluate the remaining block-tree against the FR2 stopping
+    /// conditions" is the caller's, and [`Self::receive_block`] does it
+    /// immediately after an `Invalid` recovery rather than waiting for the next
+    /// admission (ratified 2026-07-30, superseding the original revert-only
+    /// Decision #1 — see the rationale at that seam). A `receive_block` call
+    /// therefore performs **at most two** full-chain passes: still bounded
+    /// radio-task work under the non-blocking rule, and still a deterministic
+    /// FR63 replay trace.
+    ///
+    /// Why the original revert-only rule was wrong: it rested on the mitigation
+    /// that a node holding a qualifying-but-unvalidated branch would be poked by
+    /// its Stored heads' FR19 parent-recovery requests. That mitigation is
+    /// inverted. A genesis-anchored shortened branch is *Connected*, so it emits
+    /// no requests at all — and it is exactly the branch that still qualifies,
+    /// because FR2 accepts a genesis-anchored segment at any length. The node
+    /// would sit in Collecting holding a candidate whose validity the failed pass
+    /// had *already computed* (`block_idx` is the earliest offender, so every
+    /// block below it passed) and then discarded with the rollback.
     ///
     /// **Reuse constraint** (inherited from [`Self::run_processing_pass`]): this
     /// rollback is self-consistent only for a re-derivation over a candidate
@@ -3795,16 +3839,21 @@ mod tests {
         assert!(entry.is_on_active_chain(), "tip is on the active chain");
     }
 
-    /// AC10 (Story 5.4) + AC11(c)/(f) (Story 5.5) — the FR6-failure path end to
-    /// end: a qualifying candidate that violates an FR6 invariant reverts
-    /// `Processing→Collecting` (never Ready) with the derived working set reset,
-    /// the offending block is deleted, and the node then retries on the **next**
-    /// admission — not inside the same call. The candidate `[#0 genesis, #1
-    /// registration]` is continuous genesis-anchored (so FR2 qualifies on the
-    /// genesis admission) but block #1's `new_node_id = 5 ≠ watermark + 1 = 1`
-    /// violates the FR6 registration-monotonicity rule.
+    /// AC10 (Story 5.4) + AC11(c)/(f) (Story 5.5, amended 2026-07-30) — the
+    /// FR6-failure path end to end, *including the immediate retry*: a
+    /// qualifying candidate that violates an FR6 invariant has its offender
+    /// deleted, and the shortened branch is re-evaluated and validated **inside
+    /// the same call**, so the node reaches Ready without waiting for another
+    /// admission. That is the whole point of the retry-on-`Invalid` rule: the
+    /// failed pass had already proved every block below the offender, and
+    /// `block_idx` names the earliest one.
+    ///
+    /// The candidate `[#0 genesis, #1 registration]` is continuous
+    /// genesis-anchored (so FR2 qualifies on the genesis admission) but block
+    /// #1's `new_node_id = 5 ≠ watermark + 1 = 1` violates the FR6
+    /// registration-monotonicity rule.
     #[test]
-    fn fr5_seam_reverts_to_collecting_on_invalid_candidate() {
+    fn fr5_seam_recovers_and_retries_invalid_candidate_in_one_call() {
         let mut bc = new_test_chain();
         let genesis = node_transfer_block(0, 0, 0, 0);
         // Out-of-sequence registration child (new_node_id 5, expected 1).
@@ -3824,20 +3873,7 @@ mod tests {
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
         let (outcome, _) = bc.receive_block(genesis.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert!(
-            bc.current_phase() == LifecyclePhase::Collecting,
-            "invalid candidate reverts Processing→Collecting (FR5 phase-revert)"
-        );
-        assert!(!bc.is_ready(), "an invalid candidate never reaches Ready");
-        // AC11(c): the working set is back at its baseline.
-        assert!(
-            !bc.node_info.is_seeded(5),
-            "the derived working set is reset after the failed pass"
-        );
-        assert_eq!(bc.node_info.max_known_node_id(), 0);
-        // AC11(a)/(f): the offender is gone, the genesis survives, and this call
-        // ran exactly ONE full-chain pass — had recovery retried in-call, the
-        // now-valid genesis-only candidate would already have reached Ready.
+        // AC11(a): the offender and its descendants are gone, the genesis survives.
         assert!(
             bc.blocks.get(child_idx).is_none(),
             "the offending block is deleted from the tree (and its durable slot freed)"
@@ -3847,19 +3883,32 @@ mod tests {
             .find(0, &genesis.view().hash())
             .expect("genesis survives");
         assert_eq!(bc.blocks.len(), 1);
-        assert_eq!(
-            bc.active_chain_head_idx, genesis_idx,
-            "the anchor placeholder still points at the surviving genesis (AC7 'otherwise' half)"
-        );
-        // AC11(f) second half: the *next* admission re-evaluates FR2 against the
-        // now-smaller tree and picks up the shortened (genesis-only) candidate.
-        let unrelated = transfer_block(500, [0x77; 32], 1, 2, 100, 1, 0);
-        let (outcome, _) = bc.receive_block(unrelated.view(), 0);
-        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        // AC11(f), amended: the shortened branch is re-evaluated in this very
+        // call and validates, so the node is Ready on return — no second
+        // admission, no tick, no wait for ambient traffic.
         assert!(
             bc.is_ready(),
-            "FR2 re-evaluation happens on the next admission (no retry loop needed)"
+            "the retry validates the shortened genesis-anchored candidate in-call"
         );
+        assert_eq!(
+            bc.active_chain_head_idx, genesis_idx,
+            "the retry's Ready transition establishes the surviving genesis as the active head"
+        );
+        assert_eq!(
+            bc.blocks
+                .get(genesis_idx)
+                .expect("genesis present")
+                .status(),
+            BlockStatus::Active,
+            "the surviving candidate is promoted Stored→Active by the retry"
+        );
+        // AC11(c): the offender's derived effect is gone — the retry re-derived
+        // from the surviving segment alone, it did not resume the failed pass.
+        assert!(
+            !bc.node_info.is_seeded(5),
+            "the offending registration's effect is absent from the working set"
+        );
+        assert_eq!(bc.node_info.max_known_node_id(), 0);
     }
 
     // --- Story 5.5: FR5 atomic recovery -------------------------------------
@@ -4160,7 +4209,7 @@ mod tests {
             occupied: [bool; 16],
             heads: [(u32, u32); 4],
             active: u32,
-            collecting: bool,
+            ready: bool,
             outcomes: [ReceiveBlockOutcome; 2],
         }
         fn run(now: u64) -> Snapshot {
@@ -4182,7 +4231,7 @@ mod tests {
                 occupied,
                 heads,
                 active: bc.active_chain_head_idx,
-                collecting: bc.current_phase() == LifecyclePhase::Collecting,
+                ready: bc.is_ready(),
                 outcomes: [first, second],
             }
         }
@@ -4204,8 +4253,8 @@ mod tests {
             "both admissions succeeded, so the failing pass was actually reached"
         );
         assert!(
-            baseline.collecting,
-            "the failed pass reverted the phase to Collecting"
+            baseline.ready,
+            "the failed pass recovered and its in-call retry validated the shortened candidate"
         );
         assert_eq!(
             baseline.occupied.iter().filter(|slot| **slot).count(),
