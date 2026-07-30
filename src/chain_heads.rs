@@ -692,6 +692,17 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// is not a tip, and its other branches carry their own entries), or already
     /// has an entry.
     ///
+    /// **There is always an entry to retarget, so no fallback insert is needed**
+    /// (ratified 2026-07-30 — do not add a "no removed entry available" branch).
+    /// `deleted` is a whole subtree ([`BlockTable::mark_subtree`]), a subtree
+    /// always has at least one leaf, a leaf is by definition a tip, and FR19
+    /// indexes **every** tip — so at least one removed entry is available for the
+    /// loop below to reuse. The one path that could leave a tip untracked is
+    /// [`Self::insert_head`]'s capacity early-return, which needs *every* slot to
+    /// hold the active head, i.e. `MAX_BRANCH_COUNT == 1`; and eviction cannot
+    /// strand one either, since [`Self::evict_one`] drops the victim's own tip
+    /// block to a zero ref-count and deletes it.
+    ///
     /// **This retarget is an addition to the Story-4.4 event-(iv) specification**
     /// (which lists only remove / recompute / demote); without it FR5's
     /// re-evaluation requirement is unreachable in the common
