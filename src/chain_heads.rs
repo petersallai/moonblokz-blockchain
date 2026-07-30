@@ -662,9 +662,32 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// tree") nor ever reclaimed. So one of the removed entries is *retargeted*
     /// to it instead of being emptied, which is strictly better than inserting a
     /// fresh entry: the branch is the same branch, so its cached
-    /// `missing_parent_hash`, its FR19 recovery schedule
-    /// (`last_request_timestamp`) and its FR18 `arrival_timestamp` all remain
-    /// valid and are preserved — no durable read and no `now` needed. The
+    /// `missing_parent_hash` and its FR19 recovery schedule
+    /// (`last_request_timestamp`) remain valid and are preserved — no durable
+    /// read and no `now` needed.
+    ///
+    /// **The inherited FR18 `arrival_timestamp` is a deliberate, bounded
+    /// approximation** (ratified 2026-07-30). It is the *deleted head's* local
+    /// arrival time while the entry now names an older block, and `reattach_idx`'s
+    /// own arrival time is not recoverable: the field is head-scoped, not
+    /// per-block (`blocks.rs` module doc — per-block would cost +7.2 KB at
+    /// `MAX_BLOCKS = 600`, which the BLS backend's margin cannot absorb), and
+    /// stamping `now` is forbidden by the FR63 determinism rule. It is safe
+    /// because the substitution can only err toward **strictness**, never
+    /// leniency: the stamp is the arrival time of a *descendant* of
+    /// `reattach_idx`, so it witnesses a moment at which that block demonstrably
+    /// already existed — it can never be earlier than the truth, and in the FR9
+    /// Tier-3 pacing rule `current.arrival − parent.arrival` a later parent stamp
+    /// yields a smaller difference, i.e. a stricter check. A too-fast block
+    /// therefore cannot slip through because of this. Under *reverse* arrival
+    /// (the parent-recovery case: the descendant arrived first) the inherited
+    /// stamp is in fact the **closer** estimate — the literal
+    /// `arrival(reattach_idx)` is then a late-reception artifact that would
+    /// penalise a block for *our* delay in obtaining its parent. The residual
+    /// error, under forward arrival, is one spuriously `Deferred` block — exactly
+    /// the soft-fail FR4's timer-and-re-evaluate path exists to absorb — bounded
+    /// by the parent-to-deleted-tip arrival gap and cleared by the first extend,
+    /// which overwrites the stamp. The
     /// retarget is skipped when the parent is gone, still has other children (it
     /// is not a tip, and its other branches carry their own entries), or already
     /// has an entry.
