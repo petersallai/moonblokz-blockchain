@@ -63,8 +63,14 @@ pub(crate) const NONE_REF: u32 = u32::MAX;
 /// unstable `generic_const_exprs` feature, which this workspace does not
 /// enable (the same constraint already documented for
 /// `moonblokz-crypto-lib`'s fixed-size array API). `spent_bits` is reserved
-/// storage only in this story (populated by Epic 7) — Epic 7 resolves the
-/// generic sizing question when it gives the field real semantics.
+/// storage only in this story (populated by Epic 7).
+///
+/// **Story 5.8 resolves this** (ratified 2026-08-19), not Epic 7: the const
+/// generic becomes the spent-bit *byte* width, this field is sized `[u8; N]`
+/// directly from it — an array length taken straight from a const generic is
+/// stable, only arithmetic over one is not — and the bit capacity is `N * 8`.
+/// That is what lets the configuration crate's `UTXO_UNSPENT_BITS` be pinned to
+/// a width the build actually chose instead of to a second hand-written literal.
 const SPENT_BITS_BYTES: usize = 32;
 
 /// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2

@@ -543,8 +543,9 @@ pub struct Blockchain<
     //   (Story 4.1 fixes that field at a 32-byte constant — see
     //   `blocks::SPENT_BITS_BYTES` — because deriving an array length from a
     //   generic const parameter via division requires the unstable
-    //   `generic_const_exprs` feature). Epic 7 resolves this when it gives
-    //   `spent_bits` real semantics.
+    //   `generic_const_exprs` feature). **Story 5.8** resolves it by making the
+    //   generic the byte width instead of the bit count, which needs no unstable
+    //   feature; Epic 7 then only gives `spent_bits` its semantics.
 }
 
 impl<
