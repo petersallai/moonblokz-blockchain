@@ -107,6 +107,7 @@ const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
 // consume them); silencing dead_code keeps the struct clean until those
 // callers land, matching Story 1.2's scaffold convention.
 #[allow(dead_code)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct BlockEntry {
     hash: [u8; 32],
     parent_ref: u32,
@@ -335,49 +336,66 @@ pub(crate) enum BlockTableError {
 /// array. `blocks[i] ⟷ storage_index = i` — no separate `storage_index`
 /// field (architecture §6.2).
 #[allow(dead_code)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct BlockTable<const MAX_BLOCKS: usize> {
     blocks: [BlockEntry; MAX_BLOCKS],
 }
 
 // `find`/`insert`/`get`/`walks_to_active_chain` are consumed starting with
-// Story 4.2/4.3/4.4; `init_in_place` is already called from `api.rs`.
+// Story 4.2/4.3/4.4; `init` is already called from `api.rs`.
 // Story 4.1's tests exercise every method directly.
 #[allow(dead_code)]
 impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
-    /// Initializes `*dst` in place for embedded/task use: writes each
-    /// `BlockEntry` directly to its final address through a raw pointer,
-    /// one at a time, so no value the size of the whole `[BlockEntry;
-    /// MAX_BLOCKS]` array (~45.6 KB at the default `MAX_BLOCKS = 600`)
-    /// ever exists anywhere in this function. This is the table's only
-    /// constructor.
+    /// Constructs the empty table in place, inside caller-provided storage,
+    /// and hands back a `&mut` to it: each `BlockEntry` is written directly
+    /// to its final address, one at a time, so no value the size of the
+    /// whole `[BlockEntry; MAX_BLOCKS]` array (~45.6 KB at the default
+    /// `MAX_BLOCKS = 600`) ever exists anywhere in this function — and, as a
+    /// side effect, no whole-table constant exists for the compiler to bake
+    /// into flash either. This is the table's only constructor.
     ///
     /// **An earlier by-value `new()` existed**, backed by a compile-time
     /// `const EMPTY: Self = Self { blocks: [BlockEntry::new_empty(); MAX_BLOCKS] }`.
     /// It was removed once every caller was confirmed able to use this
-    /// constructor instead — see [`crate::api::Blockchain::init_in_place`]'s
-    /// doc comment for why returning `Self` by value can't be made
-    /// stack-cheap no matter how it's assembled internally. The
-    /// const-bake-vs-runtime-loop stack measurement that justified `EMPTY`'s
-    /// design while it existed (111 KiB for a mutated-local loop vs. 66.6 KiB
-    /// for the const bulk-copy, both still 11-18× the 6 KiB task stack
-    /// budget) is preserved in Story 4.1's code-review discussion /
-    /// `deferred-work.md` for reference; it no longer applies to any code
-    /// path here, since this function never materializes the whole array at
-    /// all — each iteration writes one 76 B `BlockEntry` directly to its
-    /// final address. Used by [`crate::api::Blockchain::init_in_place`]; see
-    /// that method's doc comment for why and how to call it from a task.
+    /// constructor instead — see [`crate::api::Blockchain::init`]'s doc
+    /// comment for why returning `Self` by value can't be made stack-cheap
+    /// no matter how it's assembled internally. The const-bake-vs-runtime-loop
+    /// stack measurement that justified `EMPTY`'s design while it existed
+    /// (111 KiB for a mutated-local loop vs. 66.6 KiB for the const
+    /// bulk-copy, both still 11-18× the 6 KiB task stack budget) is preserved
+    /// in Story 4.1's code-review discussion / `deferred-work.md` for
+    /// reference; it no longer applies to any code path here.
     ///
-    /// # Safety
-    /// `dst` must be valid for writes of `Self` and non-overlapping with
-    /// any other live reference. Writes over possibly-uninitialized memory
-    /// without reading or dropping the old value, which is correct only
-    /// because `dst` is not yet initialized.
-    pub(crate) unsafe fn init_in_place(dst: *mut Self) {
-        let blocks_ptr = unsafe { core::ptr::addr_of_mut!((*dst).blocks) } as *mut BlockEntry;
+    /// Safe to call: the `&mut MaybeUninit<Self>` guarantees a valid,
+    /// exclusive destination, and the `&mut Self` is only handed out once
+    /// every entry has been written. The by-value [`Self::new`] is the
+    /// test-only executable specification this is checked against.
+    pub(crate) fn init(slot: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
+        // SAFETY: `slot.as_mut_ptr()` is derived from a live `&mut
+        // MaybeUninit<Self>`; taking the raw address of a field through it
+        // neither reads nor creates a reference to uninitialized memory.
+        let blocks_ptr = unsafe { &raw mut (*slot.as_mut_ptr()).blocks }.cast::<BlockEntry>();
         for i in 0..MAX_BLOCKS {
+            // SAFETY: `blocks_ptr` is derived from a live `&mut
+            // MaybeUninit<Self>` and `i < MAX_BLOCKS`, so every write lands
+            // inside the `blocks` array; nothing is read or dropped.
             unsafe {
                 blocks_ptr.add(i).write(BlockEntry::new_empty());
             }
+        }
+        // SAFETY: all `MAX_BLOCKS` entries — the table's only field — were
+        // written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// The by-value constructor, kept as the **executable specification** of
+    /// [`Self::init`]: a struct literal the language forces to be exhaustive.
+    /// Test-only — it materializes the whole ~45.6 KB array by value, which
+    /// is exactly what `init` exists to avoid on the embedded stack.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            blocks: [const { BlockEntry::new_empty() }; MAX_BLOCKS],
         }
     }
 
@@ -774,15 +792,28 @@ mod tests {
         [byte; 32]
     }
 
-    /// Test-only stand-in for the deleted by-value `BlockTable::new()`:
-    /// wraps the `MaybeUninit` + `init_in_place` + `assume_init()` calling
-    /// convention once so individual tests don't each repeat `unsafe` code.
+    /// Test-only stand-in for the deleted by-value `BlockTable::new()`: runs
+    /// the safe `init` into a local slot and moves the finished table out.
     fn empty_table<const N: usize>() -> BlockTable<N> {
         let mut table = core::mem::MaybeUninit::<BlockTable<N>>::uninit();
-        unsafe {
-            BlockTable::init_in_place(table.as_mut_ptr());
-            table.assume_init()
-        }
+        BlockTable::init(&mut table);
+        // SAFETY: `init` returned, so every entry of `table` is initialized.
+        unsafe { table.assume_init() }
+    }
+
+    /// `init` must produce exactly what the by-value specification `new()`
+    /// produces (field-by-field `PartialEq`, never a byte compare — padding
+    /// is uninitialized and Miri rejects reading it).
+    #[test]
+    fn init_is_equivalent_to_new() {
+        let mut slot = core::mem::MaybeUninit::<BlockTable<16>>::uninit();
+        let built = BlockTable::init(&mut slot);
+        let spec = BlockTable::<16>::new();
+        let BlockTable { blocks } = &*built;
+        let BlockTable {
+            blocks: spec_blocks,
+        } = &spec;
+        assert!(blocks[..] == spec_blocks[..]);
     }
 
     #[test]

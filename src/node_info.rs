@@ -21,6 +21,7 @@ use moonblokz_crypto::PUBLIC_KEY_SIZE;
 
 /// Per-node derived projection (SoA). See the module doc for the field roles
 /// and the Story-5.3-vs-7.1/9.3 scope split.
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct NodeInfoState<const MAX_NODES: usize> {
     public_keys: [[u8; PUBLIC_KEY_SIZE]; MAX_NODES],
     balances: [u64; MAX_NODES],
@@ -29,31 +30,50 @@ pub(crate) struct NodeInfoState<const MAX_NODES: usize> {
 }
 
 impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
-    /// In-place construction of the empty baseline, mirroring
-    /// `Blockchain::init_in_place` / `VoteEngine::init_in_place`: writes
-    /// directly into `dst` with `write_bytes` (memset) for the arrays so a
-    /// `MAX_NODES`-scaled value is **never materialized on the stack** (the
-    /// Epic-4-retro §8 RAM watch-item for this SoA).
+    /// Constructs the empty baseline in place, inside caller-provided
+    /// storage, mirroring `Blockchain::init` / `VoteEngine::init`: the arrays
+    /// are filled with `write_bytes` (memset) straight at their final address,
+    /// so a `MAX_NODES`-scaled value is **never materialized on the stack**
+    /// (the Epic-4-retro §8 RAM watch-item for this SoA).
     ///
-    /// # Safety
-    /// `dst` must be valid for writes of `Self` and not yet initialized.
-    /// Every field is written exactly once; no field is read before its write.
-    pub(crate) unsafe fn init_in_place(dst: *mut Self) {
+    /// Safe to call: the `&mut MaybeUninit<Self>` guarantees a valid,
+    /// exclusive destination, and the `&mut Self` is only handed out once
+    /// every field has been written.
+    pub(crate) fn init(slot: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
+        let p = slot.as_mut_ptr();
+        // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it
+        // is non-null, aligned, valid for writes of `Self` and not aliased.
+        // Every field is written below; none is read before its write.
         unsafe {
             // Empty-slot sentinel is the all-zero public key (FR67/FR69: the
             // trust anchor at slot 0 is non-zero once seeded).
-            let public_keys_ptr = core::ptr::addr_of_mut!((*dst).public_keys) as *mut u8;
+            let public_keys_ptr = (&raw mut (*p).public_keys).cast::<u8>();
             public_keys_ptr.write_bytes(0u8, MAX_NODES * PUBLIC_KEY_SIZE);
 
-            let balances_ptr = core::ptr::addr_of_mut!((*dst).balances) as *mut u64;
+            let balances_ptr = (&raw mut (*p).balances).cast::<u64>();
             balances_ptr.write_bytes(0u8, MAX_NODES);
 
             // `seed_source_idx` sentinel is `NONE_REF == u32::MAX == 0xFFFF_FFFF`
             // → a `0xFF` byte-fill yields `u32::MAX` in every element.
-            let seed_ptr = core::ptr::addr_of_mut!((*dst).seed_source_idx) as *mut u32;
+            let seed_ptr = (&raw mut (*p).seed_source_idx).cast::<u32>();
             seed_ptr.write_bytes(0xFFu8, MAX_NODES);
 
-            core::ptr::addr_of_mut!((*dst).max_known_node_id).write(0);
+            (&raw mut (*p).max_known_node_id).write(0);
+        }
+        // SAFETY: every field of `Self` was written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// The by-value constructor, kept as the **executable specification** of
+    /// [`Self::init`]: a struct literal the language forces to be exhaustive.
+    /// Test-only — never a production code path.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            public_keys: [[0u8; PUBLIC_KEY_SIZE]; MAX_NODES],
+            balances: [0u64; MAX_NODES],
+            seed_source_idx: [NONE_REF; MAX_NODES],
+            max_known_node_id: 0,
         }
     }
 
@@ -175,21 +195,36 @@ impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
 mod tests {
     use super::*;
 
-    /// Constructs a `NodeInfoState<16>` through the `unsafe` in-place path (the
-    /// raw-pointer / `write_bytes` init this story introduces). Crypto-free, so
-    /// this is the tractable Miri target for the new `unsafe` (schnorr-bigint
-    /// under the Miri interpreter is impractically slow — the full FR3 tests are
+    /// Constructs a `NodeInfoState<16>` through the in-place path (the
+    /// raw-pointer / `write_bytes` writes inside `init`). Crypto-free, so this
+    /// is the tractable Miri target for that `unsafe` (schnorr-bigint under
+    /// the Miri interpreter is impractically slow — the full FR3 tests are
     /// covered by the ordinary `cargo test` run instead).
     fn make() -> NodeInfoState<16> {
         let mut slot = core::mem::MaybeUninit::<NodeInfoState<16>>::uninit();
-        unsafe {
-            NodeInfoState::init_in_place(slot.as_mut_ptr());
-            slot.assume_init()
-        }
+        NodeInfoState::init(&mut slot);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        unsafe { slot.assume_init() }
     }
 
+    /// Exhaustive destructuring (no `..`): a new field is a compile error
+    /// here until it is initialized and asserted. Never compare two values
+    /// byte-for-byte for this — padding is uninitialized and Miri rejects it.
     #[test]
-    fn init_in_place_sets_empty_baseline() {
+    fn init_sets_empty_baseline() {
+        let mut slot = core::mem::MaybeUninit::<NodeInfoState<16>>::uninit();
+        let ni = NodeInfoState::init(&mut slot);
+        let NodeInfoState {
+            public_keys,
+            balances,
+            seed_source_idx,
+            max_known_node_id,
+        } = &*ni;
+        assert!(public_keys.iter().all(|k| *k == [0u8; PUBLIC_KEY_SIZE]));
+        assert!(balances.iter().all(|&b| b == 0));
+        assert!(seed_source_idx.iter().all(|&s| s == NONE_REF));
+        assert_eq!(*max_known_node_id, 0);
+
         let ni = make();
         assert_eq!(ni.max_known_node_id(), 0);
         assert!(
@@ -202,6 +237,31 @@ mod tests {
             ni.public_key_of(7).is_none(),
             "empty-slot sentinel is all-zero key"
         );
+    }
+
+    /// `init` must produce exactly what the by-value specification `new()`
+    /// produces; both sides destructured exhaustively (no `..`).
+    #[test]
+    fn init_is_equivalent_to_new() {
+        let mut slot = core::mem::MaybeUninit::<NodeInfoState<16>>::uninit();
+        let built = NodeInfoState::init(&mut slot);
+        let spec = NodeInfoState::<16>::new();
+        let NodeInfoState {
+            public_keys,
+            balances,
+            seed_source_idx,
+            max_known_node_id,
+        } = &*built;
+        let NodeInfoState {
+            public_keys: spec_public_keys,
+            balances: spec_balances,
+            seed_source_idx: spec_seed_source_idx,
+            max_known_node_id: spec_max_known_node_id,
+        } = &spec;
+        assert!(public_keys[..] == spec_public_keys[..]);
+        assert!(balances[..] == spec_balances[..]);
+        assert!(seed_source_idx[..] == spec_seed_source_idx[..]);
+        assert_eq!(max_known_node_id, spec_max_known_node_id);
     }
 
     #[test]

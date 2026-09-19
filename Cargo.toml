@@ -19,6 +19,13 @@ moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false 
 moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
 
+# Test-only: turns on `moonblokz-vote`'s by-value `VoteEngine::new()` oracle
+# and its `PartialEq`, so `Blockchain::new()` (the executable specification of
+# `Blockchain::init`) can be written as a plain struct literal and compared
+# field by field. Never part of a production build.
+[dev-dependencies]
+moonblokz-vote = { path = "../moonblokz-vote", default-features = false, features = ["test-oracle"] }
+
 [features]
 # The single Schnorr crypto backend for the whole stack is selected here at the
 # top of the graph and forwarded to every crate that carries one (vote,
