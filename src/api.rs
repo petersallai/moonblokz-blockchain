@@ -861,17 +861,17 @@ impl<
             .copy_from_slice(self.crypto.sign(initial_chain_config_bytes).serialize());
         let chain_config_payload = &payload[..payload_len];
 
-        // Acceptance runs inside the load and before anything is retained, so a
-        // refusal leaves the module exactly as it was and this call writes
-        // nothing. Durable straight away: FR54's genesis configuration is the
-        // chain's lock, not a tentative the ready transition still has to
-        // confirm.
+        // Tentative first: acceptance runs inside the load and before anything
+        // is retained, so a content refusal leaves the module exactly as it was
+        // and this call writes nothing. The **durable** lock is engaged only
+        // after the last storage write succeeds (below) — FR54's lock is
+        // set-once, and a module locked by a call that then failed on storage
+        // would refuse every retry, with `StorageNotEmpty`, for the life of the
+        // process. A tentative left behind by a failed genesis is harmless: the
+        // next attempt replaces it.
         self.chain_config
-            .load_durable(chain_config_payload)
+            .load_tentative(chain_config_payload)
             .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
-        // The engine was constructed on the inert baseline while the module held
-        // no configuration (see `vote_parameters`); it now has FR37 values.
-        self.reset_vote_engine();
 
         // Assemble signed Block #0: registration of node #0 + a self-transfer
         // of the initial total network currency.
@@ -992,6 +992,16 @@ impl<
         self.storage
             .set_chain_configuration(&block_1)
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+        // Every durable write has succeeded: promote the tentative to FR54's
+        // set-once lock. `promote_durable` can only fail with `NotLoaded` or
+        // `DurableLocked`, and the load above plus the guard at the top of this
+        // method rule both out.
+        self.chain_config
+            .promote_durable()
+            .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
+        // The engine was constructed on the inert baseline while the module held
+        // no configuration (see `vote_parameters`); it now has FR37 values.
+        self.reset_vote_engine();
         let block_1_prev_hash = block_0.hash();
         let mut entry_1 = BlockEntry::new(block_1.hash(), 0, 1);
         entry_1.set_on_active_chain(true);
@@ -1316,8 +1326,21 @@ impl<
         // currently the sole accept outcome; when Epic 6/8 add `AcceptedAndSend*`
         // accept variants they must be included in this gate (else a block admitted
         // under them would miss the transition).
+        //
+        // The configuration is part of the gate (Story 5.8): the FR3 derivation
+        // reads the FR37 vote parameters, so without a loaded configuration the
+        // pass would run on `vote_parameters`' inert baseline and produce a
+        // projection the node would then go `Ready` on. Specification §5.2: the
+        // block is simply not advanced past the last stage that needs no
+        // configuration-derived parameter — it stays admitted, the node stays
+        // `Collecting`, and the next admission after a configuration loads
+        // re-evaluates FR2 over the same tree. Gated here rather than inside
+        // `run_processing_pass`, because a refusal there is a `ProcessingError`
+        // and would trigger the FR5 recovery's block deletion — punishing a block
+        // for the node's own missing configuration.
         if outcome == ReceiveBlockOutcome::AcceptedSilently
             && self.lifecycle_phase == LifecyclePhase::Collecting
+            && self.chain_config.active_configuration().is_some()
         {
             // At most **two** full-chain passes per call. The second one runs
             // only after an `Invalid` recovery — see the `Err` arm — so the loop
@@ -3222,6 +3245,18 @@ mod tests {
             Err(_) => panic!("expected StorageSaveFailed refusal"),
             Ok(_) => panic!("genesis must not succeed when a genesis block cannot be persisted"),
         }
+        // FR54's lock is set-once, so a refusal that engaged it would refuse
+        // every retry for the life of the process. The content is held
+        // tentatively until the last durable write succeeds, so a storage
+        // failure leaves the node able to bootstrap again.
+        assert!(
+            !bc.chain_config.is_durable_locked(),
+            "a genesis that failed on storage must not leave the configuration locked"
+        );
+        assert!(
+            bc.chain_config.tentative_content().is_some(),
+            "the accepted content is held tentatively, ready to be replaced by a retry"
+        );
     }
 
     /// AC3 — read-only queries are typed to **not** carry `NextCall`.
@@ -3773,6 +3808,33 @@ mod tests {
         );
     }
 
+    /// AC3 — a node holding no configuration does not enter Processing, even
+    /// when the FR2 stopping condition is met: the FR3 derivation reads the FR37
+    /// vote parameters, and running it on `vote_parameters`' inert baseline
+    /// would produce a projection the node then goes `Ready` on. The block is
+    /// admitted; only the stage that needs the configuration is withheld
+    /// (specification §5.2). Compare `fr2_genesis_anchored_triggers_processing`,
+    /// which is the same submission against a configured node.
+    #[test]
+    fn fr2_stays_collecting_without_configuration() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+        let genesis = node_transfer_block(0, 7, 0, 7);
+
+        let (outcome, _) = bc.receive_block(genesis.view(), 100);
+
+        assert_eq!(
+            outcome,
+            ReceiveBlockOutcome::AcceptedSilently,
+            "the block itself is still admitted"
+        );
+        assert!(
+            bc.current_phase() == LifecyclePhase::Collecting,
+            "no configuration → no FR3 derivation, so no Processing and no Ready"
+        );
+        assert!(!bc.is_ready());
+    }
+
     /// A test chain with a small active-chain window (`SNAKE_CHAIN_LENGTH = 4`) so
     /// an active-length segment fits the test harness's block storage. Same shape
     /// as `new_test_chain` otherwise (local_node_id 5, join/Collecting).
@@ -3787,7 +3849,8 @@ mod tests {
         4,
         16,
     > {
-        let (crypto, storage, chain_config) = test_backends();
+        let (crypto, storage, _) = test_backends();
+        let chain_config = locked_chain_config(&crypto);
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
         Blockchain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
