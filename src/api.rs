@@ -18,8 +18,6 @@
 //! takes no timestamp. The same construction inputs + the same event sequence
 //! therefore yield identical state (FR62 / FR63 precondition).
 
-use core::num::NonZeroU16;
-
 use moonblokz_chain_types::{
     Block, BlockBuilder, BlockHeader, BlockView, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
     NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
@@ -560,25 +558,6 @@ pub struct Blockchain<
     //   semantics.
 }
 
-/// FR37 vote parameters for [`VoteEngine`] construction: the chain's values
-/// once a configuration is loaded, and an inert baseline until then.
-///
-/// The engine is a field, not an `Option`, so it has to be parameterized with
-/// *something* before any configuration exists (a joining node holds none until
-/// Story 5.9's tentative load). The baseline is chosen to be arithmetically
-/// inert rather than plausible: a scale of `1` with an interest of `1` — the
-/// smallest values the engine's own arithmetic accepts, since
-/// `compute_cap_threshold` divides by the interest. It is never a policy value;
-/// [`Blockchain::reset_vote_engine`] re-parameterizes the engine from the real
-/// configuration the moment one is loaded, which `process_genesis` does for node
-/// #0 and Story 5.9's tentative load must do for a joining node.
-fn vote_parameters<Config: ChainConfigTrait>(chain_config: &Config) -> (NonZeroU16, u8) {
-    match chain_config.active_configuration() {
-        Some(config) => (config.vote_scale(), config.vote_interest()),
-        None => (NonZeroU16::MIN, 1),
-    }
-}
-
 impl<
     Crypto: CryptoTrait,
     Storage: StorageTrait,
@@ -707,9 +686,6 @@ impl<
         // while it passes.
         const { assert!(limits_are_expressible(Self::BUILD_LIMITS)) };
 
-        // Read the FR37 vote parameters from the config before it is moved into
-        // the slot (the config is still owned here; no field is read before write).
-        let (vote_scale, vote_interest) = vote_parameters(&chain_config);
         let p = slot.as_mut_ptr();
         // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it
         // is non-null, aligned, valid for writes of `Self` and not aliased.
@@ -729,11 +705,11 @@ impl<
             // SoA + vote registry init in place (never a MAX_NODES-scaled stack
             // temporary — Epic-4-retro §8 RAM watch-item).
             NodeInfoState::init(field_slot(&raw mut (*p).node_info));
-            VoteEngine::init(
-                field_slot(&raw mut (*p).vote_engine),
-                vote_scale,
-                vote_interest,
-            );
+            // Unparameterized: the FR37 values are chain configuration, which a
+            // node need not hold yet. `reset_vote_engine` supplies them the
+            // moment one is loaded; until then every vote effect refuses with
+            // `VoteEngineError::NotParameterized`.
+            VoteEngine::init(field_slot(&raw mut (*p).vote_engine));
             (&raw mut (*p).last_parent_request_emit_timestamp).write(0);
             (&raw mut (*p).active_chain_head_idx).write(NONE_REF);
             (&raw mut (*p)._snake_chain_tail_idx).write(0);
@@ -760,7 +736,6 @@ impl<
         node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
         prng_seed: u64,
     ) -> Self {
-        let (vote_scale, vote_interest) = vote_parameters(&chain_config);
         Self {
             crypto,
             storage,
@@ -772,7 +747,7 @@ impl<
             blocks: BlockTable::new(),
             chain_heads: ChainHeadsTable::new(),
             node_info: NodeInfoState::new(),
-            vote_engine: VoteEngine::new(vote_scale, vote_interest),
+            vote_engine: VoteEngine::new(),
             last_parent_request_emit_timestamp: 0,
             active_chain_head_idx: NONE_REF,
             _snake_chain_tail_idx: 0,
@@ -1416,8 +1391,17 @@ impl<
     /// engine's own safe [`VoteEngine::reset`] — the same field writes as its
     /// constructor, applied over the live value with no stack temporary.
     fn reset_vote_engine(&mut self) {
-        let (vote_scale, vote_interest) = vote_parameters(&self.chain_config);
-        self.vote_engine.reset(vote_scale, vote_interest);
+        match self.chain_config.active_configuration() {
+            // FR37 parameters from the chain, and an empty working set.
+            Some(config) => self
+                .vote_engine
+                .reset(config.vote_scale(), config.vote_interest()),
+            // No configuration to parameterize with — but the working set must
+            // still be clean (FR3 / FR5), and the engine stays unparameterized,
+            // so a vote effect reached from here refuses rather than computing
+            // on a value nobody chose.
+            None => self.vote_engine.clear(),
+        }
     }
 
     /// FR5 atomic recovery from a failed full-chain pass (Story 5.5).
@@ -3843,6 +3827,27 @@ mod tests {
             "no configuration → no FR3 derivation, so no Processing and no Ready"
         );
         assert!(!bc.is_ready());
+    }
+
+    /// Defence in depth behind the FR2 gate: if a caller ever reaches the FR3
+    /// derivation without a configuration, the vote engine refuses rather than
+    /// accumulating on parameters nobody chose. Epic 6's deep-zone
+    /// re-derivation and Story 5.10's restart are the callers this protects.
+    #[test]
+    fn processing_pass_refuses_without_configuration() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+        let genesis = node_transfer_block(0, 7, 0, 7);
+        let (outcome, _) = bc.receive_block(genesis.view(), 100);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+
+        // The same candidate a configured node validates all the way to Ready
+        // (see `fr2_genesis_anchored_triggers_processing`).
+        assert_eq!(
+            bc.run_processing_pass(0),
+            Err(ProcessingError::Vote(VoteEngineError::NotParameterized)),
+            "no FR37 parameters -> the derivation refuses, it does not guess"
+        );
     }
 
     /// A test chain with a small active-chain window (`SNAKE_CHAIN_LENGTH = 4`) so
