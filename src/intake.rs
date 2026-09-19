@@ -237,18 +237,17 @@ mod tests {
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
         let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
-        unsafe {
-            TestChain::init_in_place(
-                bc_slot.as_mut_ptr(),
-                c,
-                storage,
-                FixedChainConfig::new(),
-                5,
-                node_zero,
-                0,
-            );
-            bc_slot.assume_init()
-        }
+        TestChain::init(
+            &mut bc_slot,
+            c,
+            storage,
+            FixedChainConfig::new(),
+            5,
+            node_zero,
+            0,
+        );
+        // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
+        unsafe { bc_slot.assume_init() }
     }
 
     /// A durably-locked chain with `initial_chain_config_bytes == payload`.
@@ -261,18 +260,9 @@ mod tests {
             .store_initial_chain_config_bytes(config_payload)
             .expect("store initial chain config");
         let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
-        unsafe {
-            TestChain::init_in_place(
-                bc_slot.as_mut_ptr(),
-                c,
-                storage,
-                chain_config,
-                5,
-                node_zero,
-                0,
-            );
-            bc_slot.assume_init()
-        }
+        TestChain::init(&mut bc_slot, c, storage, chain_config, 5, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
+        unsafe { bc_slot.assume_init() }
     }
 
     /// A well-formed Tier-1-passing transaction block (`seq > anchor`, no
@@ -494,18 +484,15 @@ mod tests {
         let storage = MemoryBackend::<0>::new();
         let mut bc_slot =
             core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let mut bc = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
-                bc_slot.as_mut_ptr(),
-                c,
-                storage,
-                FixedChainConfig::new(),
-                5,
-                node_zero,
-                0,
-            );
-            bc_slot.assume_init()
-        };
+        let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            &mut bc_slot,
+            c,
+            storage,
+            FixedChainConfig::new(),
+            5,
+            node_zero,
+            0,
+        );
         let block = node_transfer_block(5, 3, 4, 7);
         let (outcome, _) = bc.receive_block(block.view(), 0);
         assert_eq!(

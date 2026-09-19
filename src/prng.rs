@@ -28,6 +28,7 @@ use rand_xoshiro::rand_core::{RngCore, SeedableRng};
 /// Inner algorithm: Xoshiro256PlusPlus (Blackman & Vigna, 2018).
 /// State: 32 B (4 × `u64`). Cached construction-time `seed: u64` is retained
 /// so `derive_subseed` remains a pure function across the `Prng`'s lifetime.
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct Prng {
     inner: Xoshiro256PlusPlus,
     seed: u64,

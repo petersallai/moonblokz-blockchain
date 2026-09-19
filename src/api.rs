@@ -35,6 +35,7 @@ use crate::node_info::NodeInfoState;
 use crate::prng::Prng;
 use crate::spent_bits::resolve_utxo_bit;
 use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate, verify_signature_bytes};
+use crate::uninit::field_slot;
 
 // `LifecyclePhase` is owned by `lifecycle.rs` (architecture §4.2) and
 // re-exported here so the crate's public surface (`api::LifecyclePhase`, and in
@@ -113,10 +114,10 @@ pub struct GenesisBlocks {
 
 /// Outcome of the join/restart init follow-up [`Blockchain::initialize_from_storage`].
 ///
-/// A node is constructed once via the single `unsafe` [`Blockchain::init_in_place`]
-/// (which lands it in `Collecting` with an empty tree) and then reads durable
-/// storage through this **safe** follow-up — the split keeps the `unsafe`
-/// raw-pointer construction isolated from the safe storage-reading business
+/// A node is constructed once via the single in-place constructor
+/// [`Blockchain::init`] (which lands it in `Collecting` with an empty tree) and
+/// then reads durable storage through this follow-up — the split keeps the
+/// raw-pointer construction isolated from the storage-reading business
 /// logic (architecture §3.6 "in-place constructor + role-specific follow-up").
 ///
 /// Story 5.1 realizes only the empty-storage (fresh-join) outcome
@@ -571,9 +572,9 @@ impl<
         MAX_BLOCK_UTXO_OUTPUT,
     >
 {
-    /// In-place construction for embedded/task use, and this type's **only**
-    /// constructor: writes directly into caller-provided `dst` instead of
-    /// returning `Self` by value.
+    /// Constructs the node in place, inside caller-provided storage, and
+    /// hands back a `&mut` to the initialized value. This is the type's
+    /// **only** constructor.
     ///
     /// `Self` is large (dominated by `blocks: BlockTable<MAX_BLOCKS>`, e.g.
     /// ~45.6 KB at the default `MAX_BLOCKS = 600`) — large enough that no
@@ -585,84 +586,135 @@ impl<
     /// the same floor). A by-value `new()` existed earlier and was fine for
     /// the desktop simulator (architecture §10 / FR62 — plain owned value,
     /// no `'static`/global state, and no tight stack budget there) and for
-    /// tests, but it was removed once every caller was confirmed able to use
-    /// this constructor instead: a plain owned `Blockchain` is still
-    /// reachable anywhere it's needed via a local `MaybeUninit` +
-    /// `assume_init()` (exactly as this crate's own tests do), it just
-    /// always goes through an in-place write rather than a by-value return.
+    /// tests, but it was removed from the production surface once every
+    /// caller was confirmed able to use this constructor instead: a plain
+    /// owned `Blockchain` is still reachable anywhere it's needed via a local
+    /// `MaybeUninit` + `assume_init()` (exactly as this crate's own tests
+    /// do), it just always goes through an in-place write rather than a
+    /// by-value return. `new()` survives only under `cfg(test)`, as the
+    /// executable specification `init` is checked against ([`Self::new`]).
     /// This is the single constructor for every node; node zero then runs
     /// [`Self::process_genesis`] on the constructed instance to bootstrap the
     /// chain (FR54).
     ///
     /// For embedded firmware, use this from *inside* a
-    /// `#[embassy_executor::task]` fn:
+    /// `#[embassy_executor::task]` fn — no `unsafe` is needed at the call
+    /// site:
     ///
     /// ```ignore
     /// #[embassy_executor::task]
     /// async fn blockchain_task(/* ... */) {
-    ///     let mut storage = core::mem::MaybeUninit::<BlockchainT>::uninit();
-    ///     unsafe { BlockchainT::init_in_place(storage.as_mut_ptr(), /* ... */); }
+    ///     let mut slot = core::mem::MaybeUninit::<BlockchainT>::uninit();
+    ///     let bc = BlockchainT::init(&mut slot, /* ... */);
     ///
-    ///     // Load-bearing: `storage` must be referenced again after an
-    ///     // `.await`, or the compiler has no reason to place it in the
-    ///     // task's Future state rather than a transient local within
-    ///     // this poll segment — measured to make the difference between
-    ///     // ~66.6 KiB in the shared poll-time call stack and ~66.6 KiB in
-    ///     // the task's own statically-sized `TaskStorage` instead
-    ///     // (moonblokz-node round-7 stack investigation, Story 4.1
-    ///     // deferred-work follow-up).
+    ///     // Load-bearing: `slot` must stay live across an `.await`, or the
+    ///     // compiler has no reason to place it in the task's Future state
+    ///     // rather than a transient local within this poll segment —
+    ///     // measured to make the difference between ~66.6 KiB in the shared
+    ///     // poll-time call stack and ~66.6 KiB in the task's own
+    ///     // statically-sized `TaskStorage` instead (moonblokz-node round-7
+    ///     // stack investigation, Story 4.1 deferred-work follow-up).
     ///     embassy_futures::yield_now().await;
     ///
-    ///     let bc = unsafe { storage.assume_init_mut() };
     ///     // ... use `bc` ...
     /// }
     /// ```
     ///
-    /// Declaring `storage` as a plain local of a synchronous function (or
+    /// Declaring `slot` as a plain local of a synchronous function (or
     /// never crossing an `.await` while it's live) gets none of this
     /// benefit — the ~66.6 KB then sits in that function's own transient
     /// stack frame regardless of how carefully it's written.
     ///
-    /// # Safety
-    /// `dst` must be valid for writes of `Self` and not yet initialized.
-    /// Every field is written exactly once; no field is read before its
-    /// write; no panic can occur between the first write and the last.
-    pub unsafe fn init_in_place(
-        dst: *mut Self,
+    /// This function is **safe**: a `&mut MaybeUninit<Self>` already
+    /// guarantees a non-null, aligned, exclusively borrowed destination that
+    /// is valid for writes, and the caller only receives the `&mut Self` once
+    /// every field has been written — a panic before that point leaves `slot`
+    /// uninitialized, which is a safe state (nothing is dropped). The single
+    /// obligation the type system cannot check — every field is written, none
+    /// is read before its write — lives inside the `unsafe` block below and is
+    /// pinned by `init_is_equivalent_to_new`: the test-only [`Self::new`]
+    /// struct literal is the specification (the language forces it to name
+    /// every field), and the test holds `init` to it field by field.
+    pub fn init(
+        slot: &mut core::mem::MaybeUninit<Self>,
         crypto: Crypto,
         storage: Storage,
         chain_config: Config,
         local_node_id: u32,
         node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
         prng_seed: u64,
-    ) {
+    ) -> &mut Self {
         // Read the FR37 vote parameters from the config before it is moved into
-        // `dst` (the config is still owned here; no field is read before write).
+        // the slot (the config is still owned here; no field is read before write).
         let vote_scale = chain_config.vote_scale();
         let vote_interest = chain_config.vote_interest();
+        let p = slot.as_mut_ptr();
+        // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it
+        // is non-null, aligned, valid for writes of `Self` and not aliased.
+        // Every field is written exactly once below and none is read before
+        // its write; the nested tables are initialized through their own safe
+        // `init`, each handed a `&mut MaybeUninit<_>` view of its field.
         unsafe {
-            core::ptr::addr_of_mut!((*dst).crypto).write(crypto);
-            core::ptr::addr_of_mut!((*dst).storage).write(storage);
-            core::ptr::addr_of_mut!((*dst).chain_config).write(chain_config);
-            core::ptr::addr_of_mut!((*dst).local_node_id).write(local_node_id);
-            core::ptr::addr_of_mut!((*dst).node_zero_public_key).write(node_zero_public_key);
-            core::ptr::addr_of_mut!((*dst).prng).write(Prng::new(prng_seed));
-            core::ptr::addr_of_mut!((*dst).lifecycle_phase).write(LifecyclePhase::Collecting);
-            let blocks_ptr = core::ptr::addr_of_mut!((*dst).blocks);
-            BlockTable::init_in_place(blocks_ptr);
-            let chain_heads_ptr = core::ptr::addr_of_mut!((*dst).chain_heads);
-            ChainHeadsTable::init_in_place(chain_heads_ptr);
+            (&raw mut (*p).crypto).write(crypto);
+            (&raw mut (*p).storage).write(storage);
+            (&raw mut (*p).chain_config).write(chain_config);
+            (&raw mut (*p).local_node_id).write(local_node_id);
+            (&raw mut (*p).node_zero_public_key).write(node_zero_public_key);
+            (&raw mut (*p).prng).write(Prng::new(prng_seed));
+            (&raw mut (*p).lifecycle_phase).write(LifecyclePhase::Collecting);
+            BlockTable::init(field_slot(&raw mut (*p).blocks));
+            ChainHeadsTable::init(field_slot(&raw mut (*p).chain_heads));
             // SoA + vote registry init in place (never a MAX_NODES-scaled stack
             // temporary — Epic-4-retro §8 RAM watch-item).
-            NodeInfoState::init_in_place(core::ptr::addr_of_mut!((*dst).node_info));
-            VoteEngine::init_in_place(
-                core::ptr::addr_of_mut!((*dst).vote_engine),
+            NodeInfoState::init(field_slot(&raw mut (*p).node_info));
+            VoteEngine::init(
+                field_slot(&raw mut (*p).vote_engine),
                 vote_scale,
                 vote_interest,
             );
-            core::ptr::addr_of_mut!((*dst).last_parent_request_emit_timestamp).write(0);
-            core::ptr::addr_of_mut!((*dst).active_chain_head_idx).write(NONE_REF);
-            core::ptr::addr_of_mut!((*dst)._snake_chain_tail_idx).write(0);
+            (&raw mut (*p).last_parent_request_emit_timestamp).write(0);
+            (&raw mut (*p).active_chain_head_idx).write(NONE_REF);
+            (&raw mut (*p)._snake_chain_tail_idx).write(0);
+        }
+        // SAFETY: every field of `Self` was written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// The by-value constructor, kept as the **executable specification** of
+    /// [`Self::init`]: a plain struct literal, which the language forces to
+    /// name every field, so adding a field to `Blockchain` is a compile error
+    /// here until the literal — and therefore the specification — is updated.
+    /// `init_is_equivalent_to_new` then holds `init` to it field by field.
+    ///
+    /// Test-only: returning `Self` by value costs a `size_of::<Self>()`-sized
+    /// transient (~66 KB), which is exactly what `init` exists to avoid on
+    /// the embedded stack. Never a production code path.
+    #[cfg(test)]
+    pub(crate) fn new(
+        crypto: Crypto,
+        storage: Storage,
+        chain_config: Config,
+        local_node_id: u32,
+        node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
+        prng_seed: u64,
+    ) -> Self {
+        let vote_scale = chain_config.vote_scale();
+        let vote_interest = chain_config.vote_interest();
+        Self {
+            crypto,
+            storage,
+            chain_config,
+            local_node_id,
+            node_zero_public_key,
+            prng: Prng::new(prng_seed),
+            lifecycle_phase: LifecyclePhase::Collecting,
+            blocks: BlockTable::new(),
+            chain_heads: ChainHeadsTable::new(),
+            node_info: NodeInfoState::new(),
+            vote_engine: VoteEngine::new(vote_scale, vote_interest),
+            last_parent_request_emit_timestamp: 0,
+            active_chain_head_idx: NONE_REF,
+            _snake_chain_tail_idx: 0,
         }
     }
 
@@ -679,10 +731,10 @@ impl<
     ///   canonical content via [`BlockBuilder::set_chain_config_payload`].
     ///
     /// This is a plain `&mut self` state transition, not a constructor: the node
-    /// is built once through [`Self::init_in_place`], then genesis runs against
+    /// is built once through [`Self::init`], then genesis runs against
     /// it. That keeps the single infallible in-place constructor and lets genesis
     /// use ordinary fallible control flow. (Non-zero nodes never call this; they
-    /// construct via `init_in_place` and receive the chain over the mesh.)
+    /// construct via `init` and receive the chain over the mesh.)
     ///
     /// Refusal (`Err(GenesisRejectReason::_)`, `self` left unchanged): the local
     /// node id is not `0`; the chain is not empty (`StorageNotEmpty` — already
@@ -986,12 +1038,12 @@ impl<
         best.map(|(head_idx, _, _)| head_idx)
     }
 
-    /// Join/restart init follow-up (FR1/FR59): the **safe** counterpart to the
-    /// `unsafe` [`Self::init_in_place`] constructor. Construction writes raw
-    /// fields (unsafe) and lands the node in `Collecting`; this method then reads
-    /// durable storage (safe) — the deliberate unsafe/safe split (architecture
-    /// §3.6 "in-place constructor + role-specific follow-up"), so the raw-pointer
-    /// memory init stays isolated from safe storage-reading business logic.
+    /// Join/restart init follow-up (FR1/FR59): the storage-reading counterpart
+    /// to the [`Self::init`] constructor. Construction writes the fields in
+    /// place and lands the node in `Collecting`; this method then reads durable
+    /// storage — the deliberate construction/follow-up split (architecture §3.6
+    /// "in-place constructor + role-specific follow-up"), so the raw-pointer
+    /// memory init stays isolated from the storage-reading business logic.
     ///
     /// **Story 5.1 scope:** the empty-storage (fresh-join) path — no durable
     /// blocks → the node stays `Collecting` and returns `StartedCollecting`
@@ -1244,22 +1296,13 @@ impl<
     }
 
     /// Re-initializes the vote registry to its empty seeded baseline in place
-    /// (FR3 "not resumable — clean working set on re-entry", AC5). Re-running
-    /// `init_in_place` over the already-initialized POD field is sound: every
-    /// field is a plain integer / array with no `Drop`, and `.write` does not
-    /// read the prior value.
+    /// (FR3 "not resumable — clean working set on re-entry", AC5) through the
+    /// engine's own safe [`VoteEngine::reset`] — the same field writes as its
+    /// constructor, applied over the live value with no stack temporary.
     fn reset_vote_engine(&mut self) {
         let vote_scale = self.chain_config.vote_scale();
         let vote_interest = self.chain_config.vote_interest();
-        // SAFETY: `self.vote_engine` is a live, initialized POD value; re-init
-        // overwrites it field-by-field with no drop and no read-before-write.
-        unsafe {
-            VoteEngine::init_in_place(
-                core::ptr::addr_of_mut!(self.vote_engine),
-                vote_scale,
-                vote_interest,
-            );
-        }
+        self.vote_engine.reset(vote_scale, vote_interest);
     }
 
     /// FR5 atomic recovery from a failed full-chain pass (Story 5.5).
@@ -2438,11 +2481,95 @@ mod tests {
         ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
     };
     use moonblokz_chain_types::MAX_BLOCK_SIZE;
-    use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE, SignatureTrait};
+    use moonblokz_crypto::{
+        AggregatedSignature, Crypto, CryptoError, MultiSignature, PRIVATE_KEY_SIZE, PublicKey,
+        Signature, SignatureTrait,
+    };
     use moonblokz_storage::backend_memory::MemoryBackend;
 
     fn any_nonzero(bytes: &[u8]) -> bool {
         bytes.iter().any(|value| *value != 0)
+    }
+
+    /// The crypto seam for the construction tests — a stand-in that performs
+    /// no cryptography.
+    ///
+    /// `init` and `new` only *move* the backend into the node; neither ever
+    /// calls it. The Miri gate (`cargo +nightly miri test init_`) therefore
+    /// has no reason to pay for a real signature backend, whose `Crypto::new`
+    /// alone runs an EC scalar multiplication — interpreted, that dominates
+    /// the whole run. Every method past construction is `unimplemented!()`:
+    /// reaching one would mean a construction test had begun exercising
+    /// crypto, which is exactly what this type exists to prevent. Every other
+    /// test keeps the real backend, so the trait seam is still exercised
+    /// end-to-end.
+    struct NoCrypto;
+
+    impl CryptoTrait for NoCrypto {
+        fn new(_private_key_bytes: [u8; PRIVATE_KEY_SIZE]) -> Result<Self, CryptoError> {
+            Ok(Self)
+        }
+
+        fn public_key(&self) -> &PublicKey {
+            unimplemented!("construction never reads the public key")
+        }
+
+        fn sign(&self, _message: &[u8]) -> Signature {
+            unimplemented!("construction never signs")
+        }
+
+        fn multi_sign(&self, _message: &[u8]) -> MultiSignature {
+            unimplemented!("construction never signs")
+        }
+
+        fn verify_multi_signature(
+            &self,
+            _message: &[u8],
+            _multi_signature: &MultiSignature,
+            _public_key: &PublicKey,
+        ) -> bool {
+            unimplemented!("construction never verifies")
+        }
+
+        fn verify_signature(
+            &self,
+            _message: &[u8],
+            _signature: &Signature,
+            _public_key: &PublicKey,
+        ) -> bool {
+            unimplemented!("construction never verifies")
+        }
+
+        fn aggregate_signatures(
+            &self,
+            _signatures: &[&MultiSignature],
+            _message: &[u8],
+        ) -> Result<AggregatedSignature, CryptoError> {
+            unimplemented!("construction never aggregates")
+        }
+
+        fn verify_aggregated_signature(
+            &self,
+            _message: &[u8],
+            _aggregated_signature: &AggregatedSignature,
+            _public_keys: &[&PublicKey],
+        ) -> bool {
+            unimplemented!("construction never verifies")
+        }
+    }
+
+    /// Helper: the same triple as [`test_backends`] with [`NoCrypto`] in place
+    /// of the signature backend, for the two construction tests.
+    fn construction_backends() -> (
+        NoCrypto,
+        MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        FixedChainConfig,
+    ) {
+        (
+            NoCrypto,
+            MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new(),
+            FixedChainConfig::new(),
+        )
     }
 
     /// Helper: construct a (Crypto, MemoryBackend, FixedChainConfig) triple
@@ -2462,7 +2589,7 @@ mod tests {
         (crypto, storage, chain_config)
     }
 
-    /// Helper: build an empty node via `init_in_place` ready for a
+    /// Helper: build an empty node via `init` ready for a
     /// `process_genesis` call. Genesis is node-zero-only, so node zero's own
     /// key (derived from `crypto`) is stored as the trust anchor.
     fn new_chain(
@@ -2484,54 +2611,162 @@ mod tests {
     > {
         let node_zero = *crypto.public_key().serialize();
         let mut bc_slot = core::mem::MaybeUninit::uninit();
-        unsafe {
-            Blockchain::init_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                local_node_id,
-                node_zero,
-                prng_seed,
-            );
-            bc_slot.assume_init()
-        }
+        Blockchain::init(
+            &mut bc_slot,
+            crypto,
+            storage,
+            chain_config,
+            local_node_id,
+            node_zero,
+            prng_seed,
+        );
+        // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
+        unsafe { bc_slot.assume_init() }
     }
 
-    /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
-    /// `blocks` filled element-by-element via `BlockTable::init_in_place`)
-    /// must land every field in its correct default state — a wrong field
-    /// order, a skipped field, or an off-by-one in the `unsafe` block would
-    /// silently corrupt memory rather than panic, so this is verified
-    /// directly rather than trusted by construction.
+    /// `init`'s field writes (`blocks` / `chain_heads` filled
+    /// element-by-element through the nested tables' own `init`, the
+    /// scalars written one by one) must land every field in its correct
+    /// default state — a wrong field order, a skipped field, or an
+    /// off-by-one inside the `unsafe` block would silently corrupt memory
+    /// rather than panic, so this is verified directly rather than trusted
+    /// by construction.
+    ///
+    /// The destructuring is deliberately exhaustive (no `..`): adding a field
+    /// to `Blockchain` makes this test fail to *compile* until the new field
+    /// is both initialized in `init` and asserted here — the one obligation
+    /// the safe signature cannot enforce, pinned at compile time instead of
+    /// by a reviewer's eye. Never compare two nodes byte-for-byte for this
+    /// purpose: padding bytes are uninitialized, and Miri rejects reading them.
     #[test]
-    fn init_in_place_sets_expected_defaults() {
-        let (crypto, storage, chain_config) = test_backends();
+    fn init_sets_expected_defaults() {
+        let (crypto, storage, chain_config) = construction_backends();
         let mut bc_slot =
             core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let bc = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                7,
-                [3u8; PUBLIC_KEY_SIZE],
-                0xDEAD_BEEF,
-            );
-            bc_slot.assume_init()
-        };
+        let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            &mut bc_slot,
+            crypto,
+            storage,
+            chain_config,
+            7,
+            [3u8; PUBLIC_KEY_SIZE],
+            0xDEAD_BEEF,
+        );
 
-        assert_eq!(bc.local_node_id(), 7);
-        assert!(bc.current_phase() == LifecyclePhase::Collecting);
-        assert_eq!(bc.blocks.len(), 0);
-        assert_eq!(bc.node_zero_public_key, [3u8; PUBLIC_KEY_SIZE]);
+        let Blockchain {
+            crypto: _,       // moved in as given; opaque backend
+            storage: _,      // moved in as given; opaque backend
+            chain_config: _, // moved in as given
+            local_node_id,
+            node_zero_public_key,
+            prng: _, // seeded from `prng_seed`; its state is opaque by design
+            lifecycle_phase,
+            blocks,
+            chain_heads,
+            node_info,
+            vote_engine,
+            last_parent_request_emit_timestamp,
+            active_chain_head_idx,
+            _snake_chain_tail_idx,
+        } = &*bc;
+
+        assert_eq!(*local_node_id, 7);
+        assert!(*lifecycle_phase == LifecyclePhase::Collecting);
+        assert_eq!(*node_zero_public_key, [3u8; PUBLIC_KEY_SIZE]);
+        assert_eq!(blocks.len(), 0);
         // Story 4.4: the `chain_heads` table + scheduler state must init to
-        // their empty/sentinel values too (the unsafe
-        // `ChainHeadsTable::init_in_place` writes every entry element-by-element).
-        assert_eq!(bc.chain_heads.count(), 0);
-        assert_eq!(bc.active_chain_head_idx, NONE_REF);
-        assert_eq!(bc.last_parent_request_emit_timestamp, 0);
+        // their empty/sentinel values too (`ChainHeadsTable::init` writes
+        // every entry element-by-element).
+        assert_eq!(chain_heads.count(), 0);
+        assert_eq!(node_info.max_known_node_id(), 0);
+        assert!(!node_info.is_seeded(0));
+        // All-zero vote order is headed by node 0 (bootstrap rule).
+        assert_eq!(vote_engine.top_creator(), Some(0));
+        assert_eq!(*last_parent_request_emit_timestamp, 0);
+        assert_eq!(*active_chain_head_idx, NONE_REF);
+        assert_eq!(*_snake_chain_tail_idx, 0);
+        assert_eq!(bc.local_node_id(), 7);
+    }
+
+    /// `init` must produce exactly what the by-value specification `new()`
+    /// produces. Both sides are destructured exhaustively (no `..`): adding a
+    /// field to `Blockchain` is a compile error in `new()`'s literal *and*
+    /// here until it is initialized and compared. The opaque backends
+    /// (`crypto`, `storage`, `chain_config`) are moved in as given on both
+    /// sides and carry no `PartialEq`; every field this crate writes is
+    /// compared. Never compare the two byte-for-byte: padding is
+    /// uninitialized, and Miri rejects reading it.
+    #[test]
+    fn init_is_equivalent_to_new() {
+        let (crypto, storage, chain_config) = construction_backends();
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let built = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            &mut slot,
+            crypto,
+            storage,
+            chain_config,
+            7,
+            [3u8; PUBLIC_KEY_SIZE],
+            0xDEAD_BEEF,
+        );
+        let (crypto, storage, chain_config) = construction_backends();
+        let spec = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::new(
+            crypto,
+            storage,
+            chain_config,
+            7,
+            [3u8; PUBLIC_KEY_SIZE],
+            0xDEAD_BEEF,
+        );
+
+        let Blockchain {
+            crypto: _,
+            storage: _,
+            chain_config: _,
+            local_node_id,
+            node_zero_public_key,
+            prng,
+            lifecycle_phase,
+            blocks,
+            chain_heads,
+            node_info,
+            vote_engine,
+            last_parent_request_emit_timestamp,
+            active_chain_head_idx,
+            _snake_chain_tail_idx,
+        } = &*built;
+        let Blockchain {
+            crypto: _,
+            storage: _,
+            chain_config: _,
+            local_node_id: spec_local_node_id,
+            node_zero_public_key: spec_node_zero_public_key,
+            prng: spec_prng,
+            lifecycle_phase: spec_lifecycle_phase,
+            blocks: spec_blocks,
+            chain_heads: spec_chain_heads,
+            node_info: spec_node_info,
+            vote_engine: spec_vote_engine,
+            last_parent_request_emit_timestamp: spec_last_parent_request_emit_timestamp,
+            active_chain_head_idx: spec_active_chain_head_idx,
+            _snake_chain_tail_idx: spec_snake_chain_tail_idx,
+        } = &spec;
+
+        assert_eq!(local_node_id, spec_local_node_id);
+        assert_eq!(node_zero_public_key, spec_node_zero_public_key);
+        assert!(prng == spec_prng);
+        assert!(lifecycle_phase == spec_lifecycle_phase);
+        assert!(blocks == spec_blocks);
+        assert!(chain_heads == spec_chain_heads);
+        assert!(node_info == spec_node_info);
+        assert!(vote_engine == spec_vote_engine);
+        assert_eq!(
+            last_parent_request_emit_timestamp,
+            spec_last_parent_request_emit_timestamp
+        );
+        assert_eq!(active_chain_head_idx, spec_active_chain_head_idx);
+        assert_eq!(_snake_chain_tail_idx, spec_snake_chain_tail_idx);
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
@@ -2740,18 +2975,15 @@ mod tests {
 
         let mut bc_slot =
             core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let mut bc = unsafe {
-            Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                0,
-                node_zero,
-                0,
-            );
-            bc_slot.assume_init()
-        };
+        let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            &mut bc_slot,
+            crypto,
+            storage,
+            chain_config,
+            0,
+            node_zero,
+            0,
+        );
 
         let outcome = bc.process_genesis(1_000_000_000, &[]);
 
@@ -2802,18 +3034,9 @@ mod tests {
         let (crypto, storage, chain_config) = test_backends();
         let node_zero = *crypto.public_key().serialize();
         let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
-        unsafe {
-            TestChain::init_in_place(
-                bc_slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                5,
-                node_zero,
-                0,
-            );
-            bc_slot.assume_init()
-        }
+        TestChain::init(&mut bc_slot, crypto, storage, chain_config, 5, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
+        unsafe { bc_slot.assume_init() }
     }
 
     fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer: u32) -> Block {
@@ -3072,7 +3295,7 @@ mod tests {
 
     // --- Story 5.1: lifecycle state machine, init paths, not-ready gating -----
 
-    /// AC1/AC3 — a freshly constructed node (join path via `init_in_place`) is in
+    /// AC1/AC3 — a freshly constructed node (join path via `init`) is in
     /// `Collecting` and not ready.
     #[test]
     fn fresh_node_is_collecting_and_not_ready() {
@@ -3333,18 +3556,9 @@ mod tests {
         let (crypto, storage, chain_config) = test_backends();
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
-        unsafe {
-            Blockchain::init_in_place(
-                slot.as_mut_ptr(),
-                crypto,
-                storage,
-                chain_config,
-                5,
-                node_zero,
-                0,
-            );
-            slot.assume_init()
-        }
+        Blockchain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        unsafe { slot.assume_init() }
     }
 
     /// AC2 — an active-length segment (`>= W = 4`) that does NOT reach genesis

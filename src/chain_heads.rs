@@ -62,6 +62,7 @@ const FLAG_CONNECTED: u8 = 0b0000_0001;
 ///
 /// Empty-slot sentinel: `head_idx == u32::MAX` ([`NONE_REF`]).
 #[allow(dead_code)] // `arrival_timestamp`/`branch_value` are Epic-8/Epic-6 consumers.
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct ChainHeadEntry {
     /// Index into `blocks` of the head (tip) block. `head_sequence` /
     /// `head_block_id` (the FR63 tie-break keys) are read from `blocks[head_idx]`
@@ -121,6 +122,7 @@ impl ChainHeadEntry {
 /// FR19 bounded tip table over a fixed-capacity `MAX_BRANCH_COUNT` array
 /// (architecture §6.3). `chain_heads_max_capacity == MAX_BRANCH_COUNT`.
 #[allow(dead_code)] // methods are consumed by `api.rs` wiring; tests exercise each directly.
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct ChainHeadsTable<const MAX_BRANCH_COUNT: usize> {
     heads: [ChainHeadEntry; MAX_BRANCH_COUNT],
 }
@@ -136,21 +138,19 @@ enum Anchor {
 }
 
 impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
-    /// In-place construction for embedded/task use (mirrors
-    /// [`BlockTable::init_in_place`]), and this type's only constructor: each
-    /// `ChainHeadEntry` is written directly to its final address, so no
-    /// whole-array temporary is materialized. An earlier by-value `new()`
-    /// (backed by a compile-time `const EMPTY`, same rationale as
-    /// `BlockTable::EMPTY` used to have) was removed once every caller was
-    /// confirmed able to use this constructor instead — see
-    /// `Blockchain::init_in_place`'s doc comment for why.
+    /// Constructs the empty tip table in place, inside caller-provided
+    /// storage (mirrors [`BlockTable::init`]), and hands back a `&mut` to it:
+    /// each `ChainHeadEntry` is written directly to its final address, so no
+    /// whole-array temporary is materialized. This type's only constructor;
+    /// an earlier by-value `new()` (backed by a compile-time `const EMPTY`,
+    /// same rationale as `BlockTable::EMPTY` used to have) was removed once
+    /// every caller was confirmed able to use this constructor instead — see
+    /// `Blockchain::init`'s doc comment for why.
     ///
-    /// # Safety
-    /// `dst` must be valid for writes of `Self` and non-overlapping with any
-    /// other live reference. Writes over possibly-uninitialized memory without
-    /// reading or dropping the old value, correct only because `dst` is not yet
-    /// initialized.
-    pub(crate) unsafe fn init_in_place(dst: *mut Self) {
+    /// Safe to call: the `&mut MaybeUninit<Self>` guarantees a valid,
+    /// exclusive destination, and the `&mut Self` is only handed out once
+    /// every entry has been written.
+    pub(crate) fn init(slot: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
         // The FR19 branch-count is a `u8`, and it cannot overflow while the tip
         // table is smaller than that: each of a block's child edges heads a
         // disjoint subtree containing at least one tip, and FR19 indexes every
@@ -164,11 +164,30 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         // `api.rs` / `chain_config.rs`. Inline `const` rather than a module-level
         // `const _`, because `MAX_BRANCH_COUNT` is a const-generic parameter.
         const { assert!(MAX_BRANCH_COUNT <= u8::MAX as usize) };
-        let heads_ptr = unsafe { core::ptr::addr_of_mut!((*dst).heads) } as *mut ChainHeadEntry;
+        // SAFETY: `slot.as_mut_ptr()` is derived from a live `&mut
+        // MaybeUninit<Self>`; taking the raw address of a field through it
+        // neither reads nor creates a reference to uninitialized memory.
+        let heads_ptr = unsafe { &raw mut (*slot.as_mut_ptr()).heads }.cast::<ChainHeadEntry>();
         for i in 0..MAX_BRANCH_COUNT {
+            // SAFETY: `heads_ptr` is derived from a live `&mut
+            // MaybeUninit<Self>` and `i < MAX_BRANCH_COUNT`, so every write
+            // lands inside the `heads` array; nothing is read or dropped.
             unsafe {
                 heads_ptr.add(i).write(ChainHeadEntry::new_empty());
             }
+        }
+        // SAFETY: all `MAX_BRANCH_COUNT` entries — the table's only field —
+        // were written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// The by-value constructor, kept as the **executable specification** of
+    /// [`Self::init`]: a struct literal the language forces to be exhaustive.
+    /// Test-only — never a production code path.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            heads: [const { ChainHeadEntry::new_empty() }; MAX_BRANCH_COUNT],
         }
     }
 
@@ -889,25 +908,34 @@ mod tests {
             .unwrap()
     }
 
-    /// Test-only stand-in for the deleted by-value `BlockTable::new()`: wraps
-    /// the `MaybeUninit` + `init_in_place` + `assume_init()` calling
-    /// convention once so individual tests don't each repeat `unsafe` code.
+    /// Test-only stand-in for the deleted by-value `BlockTable::new()`: runs
+    /// the safe `init` into a local slot and moves the finished table out.
     fn empty_blocks<const N: usize>() -> BlockTable<N> {
         let mut table = core::mem::MaybeUninit::<BlockTable<N>>::uninit();
-        unsafe {
-            BlockTable::init_in_place(table.as_mut_ptr());
-            table.assume_init()
-        }
+        BlockTable::init(&mut table);
+        // SAFETY: `init` returned, so every entry of `table` is initialized.
+        unsafe { table.assume_init() }
     }
 
     /// Test-only stand-in for the deleted by-value `ChainHeadsTable::new()`:
     /// same rationale as [`empty_blocks`].
     fn empty_chain_heads<const N: usize>() -> ChainHeadsTable<N> {
         let mut table = core::mem::MaybeUninit::<ChainHeadsTable<N>>::uninit();
-        unsafe {
-            ChainHeadsTable::init_in_place(table.as_mut_ptr());
-            table.assume_init()
-        }
+        ChainHeadsTable::init(&mut table);
+        // SAFETY: `init` returned, so every entry of `table` is initialized.
+        unsafe { table.assume_init() }
+    }
+
+    /// `init` must produce exactly what the by-value specification `new()`
+    /// produces (field-by-field `PartialEq`, never a byte compare).
+    #[test]
+    fn init_is_equivalent_to_new() {
+        let mut slot = core::mem::MaybeUninit::<ChainHeadsTable<4>>::uninit();
+        let built = ChainHeadsTable::init(&mut slot);
+        let spec = ChainHeadsTable::<4>::new();
+        let ChainHeadsTable { heads } = &*built;
+        let ChainHeadsTable { heads: spec_heads } = &spec;
+        assert!(heads[..] == spec_heads[..]);
     }
 
     #[test]

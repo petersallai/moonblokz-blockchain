@@ -39,6 +39,7 @@ pub(crate) mod scheduler;
 pub(crate) mod snake_chain;
 pub(crate) mod spent_bits;
 pub(crate) mod staged_validation;
+pub(crate) mod uninit;
 
 pub use api::{
     BalanceQueryError, BlockQueryError, Blockchain, CallResult, GenesisBlocks, GenesisRejectReason,
