@@ -2612,6 +2612,16 @@ impl<
     /// a cadence is chain-governed through and through, so specification §5.2
     /// applies unchanged — the step that needs the configuration does not run,
     /// and the scheduler stays idle until one is loaded.
+    ///
+    /// **Do not "fix" this into a pre-configuration cadence.** The consequence
+    /// is understood and accepted (Project Lead, 2026-09-19): while unconfigured
+    /// both [`Self::on_tick`] and [`Self::receive_block`] answer
+    /// `NextCall::Idle`, so the bridge holds no deadline and recovery resumes
+    /// not on a timer but at the first admission after a configuration lands —
+    /// and a configuration must eventually arrive to move the node forward at
+    /// all, which is the same event that tips this. Inventing a cadence here
+    /// would be a per-build value standing in for a chain-governed one, which is
+    /// exactly what the configuration specification §6 forbids.
     fn parent_recovery_intervals(&self) -> Option<(u64, u64)> {
         self.chain_config.active_configuration().map(|config| {
             (
