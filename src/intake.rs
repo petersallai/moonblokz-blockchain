@@ -23,7 +23,7 @@ use moonblokz_crypto::CryptoTrait;
 use moonblokz_storage::StorageTrait;
 
 use crate::api::{AdmitError, Blockchain, ReceiveBlockOutcome, RejectReason};
-use crate::chain_config::ChainConfigTrait;
+use moonblokz_configuration::ChainConfigTrait;
 
 /// FR60 snake-chain-window position of an incoming block relative to the
 /// current active-chain `(S_tail, S_head)` bounds.
@@ -60,21 +60,27 @@ pub(crate) fn snake_chain_window_verdict(
     }
 }
 
-/// FR17 content match: `true` iff the incoming chain-config block's payload is
-/// byte-for-byte identical to the durable-locked configuration.
+/// FR17 content match: `true` iff the incoming chain-config block carries the
+/// **content region** the durable-locked configuration holds.
 ///
-/// The durable-locked configuration is `ChainConfigTrait::initial_chain_config_bytes()`,
-/// which architecture §3.6 defines as *the chain-config block's payload*. A
-/// block is `[header (HEADER_SIZE) | payload]`, so the comparison is a
-/// whole-payload equality — it needs no `payload_type=3` payload view (the
-/// content/signature split that blocks the FR69(iii) content-*signature* check
-/// is irrelevant to a whole-payload byte-equality) and is robust against a
-/// truncated block (`payload()` is empty when `len == HEADER_SIZE`).
-pub(crate) fn chain_config_content_matches(block: &BlockView<'_>, locked: &[u8]) -> bool {
+/// Content, not the whole payload: a chain-config payload is the content region
+/// followed by node #0's content signature (Story 5.7 envelope), and the module
+/// retains and returns the content. Comparing whole payloads would make a
+/// faithful replay of the locked configuration look like a mismatch as soon as
+/// the signature trailer exists. The signature itself is not this gate's
+/// business — it is the FR7 Tier-1 trust-anchor check (Story 5.9).
+///
+/// A payload whose envelope does not frame (truncated block, padding, a
+/// malformed entry) carries no content region and therefore cannot match.
+pub(crate) fn chain_config_content_matches(block: &BlockView<'_>, locked_content: &[u8]) -> bool {
     // `HEADER_SIZE` is referenced to anchor the "payload == bytes[HEADER_SIZE..]"
-    // contract this comparison depends on; `payload()` returns exactly that slice.
+    // contract this comparison depends on; the envelope view walks exactly that
+    // slice.
     debug_assert!(block.len() >= HEADER_SIZE);
-    block.payload() == locked
+    match block.chain_config() {
+        Some(view) => view.content() == locked_content,
+        None => false,
+    }
 }
 
 /// FR10 deterministic single-outcome block-intake classifier.
@@ -167,21 +173,20 @@ where
     }
 
     // 3. FR17 chain-config content-mismatch silent-discard. Only fires once the
-    //    config is durable-locked *and* a locked payload exists to compare
-    //    against; a matching replay falls through to Tier 1 and is stored.
-    if block.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG && bc.is_chain_config_durable_locked() {
-        // Mismatch only when a locked payload exists AND differs; no locked
-        // payload yet (pre-genesis) → not a mismatch, fall through to Tier 1.
-        let mismatch = match bc.locked_chain_config_bytes() {
-            Some(locked) => !chain_config_content_matches(block, locked),
-            None => false,
-        };
-        if mismatch {
-            // FR64 (Epic 11 `LogSink`): emit `chain-config-mismatch-discarded`
-            // carrying the discarded block hash, block.sequence(), and
-            // block.creator(). Deferred — see deferred-work.md.
-            return ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence);
-        }
+    //    configuration is durably locked; a matching replay falls through to
+    //    Tier 1 and is stored. The module answers with the locked content
+    //    exactly when the lock is held, so the lock state and the comparand are
+    //    one read, not two — before genesis, and on a joining node that holds
+    //    nothing, there is no lock and the gate stands down (unchanged
+    //    behaviour).
+    if block.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG
+        && let Some(locked_content) = bc.durable_chain_config_content()
+        && !chain_config_content_matches(block, locked_content)
+    {
+        // FR64 (Epic 11 `LogSink`): emit `chain-config-mismatch-discarded`
+        // carrying the discarded block hash, block.sequence(), and
+        // block.creator(). Deferred — see deferred-work.md.
+        return ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence);
     }
 
     // 4. Story 4.2 Tier 1 admission. `hash` (computed once in step 1) is
@@ -207,17 +212,22 @@ where
 mod tests {
     use super::*;
     use crate::api::NextCall;
-    use crate::chain_config::FixedChainConfig;
     use moonblokz_chain_types::{
-        Block, BlockBuilder, BlockHeader, MAX_BLOCK_SIZE, NodeTransfer, PAYLOAD_TYPE_TRANSACTION,
+        Block, BlockBuilder, BlockHeader, CONFIG_VALUE_COUNT_SIZE, MAX_BLOCK_SIZE, NodeTransfer,
+        PAYLOAD_TYPE_TRANSACTION,
     };
-    use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE, PublicKeyTrait};
+    use moonblokz_configuration::{ChainConfiguration, NoopConfigChangeSink, parameter};
+    use moonblokz_crypto::{
+        Crypto, PRIVATE_KEY_SIZE, PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
+    };
     use moonblokz_storage::backend_memory::MemoryBackend;
+
+    type TestConfig = ChainConfiguration<NoopConfigChangeSink>;
 
     type TestChain = Blockchain<
         Crypto,
         MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        FixedChainConfig,
+        TestConfig,
         16,
         16,
         4,
@@ -225,6 +235,37 @@ mod tests {
         4,
         16,
     >;
+
+    /// The empty override set as a **content region** — every parameter
+    /// resolves to its code-baked default.
+    const EMPTY_CONFIG_CONTENT: [u8; CONFIG_VALUE_COUNT_SIZE] = [0, 0];
+
+    /// A second content region, equally valid and distinct in bytes: one
+    /// literal entry declaring `vote_interest`'s own default value.
+    const OTHER_CONFIG_CONTENT: [u8; 5] = [1, 0, parameter::VOTE_INTEREST, 1, 5];
+
+    /// Frames `content` as a chain-config payload: the content region followed
+    /// by node #0's signature over it (the Story 5.7 envelope).
+    fn framed_config_payload(content: &[u8]) -> ([u8; CFG_PAYLOAD_BUF], usize) {
+        let mut payload = [0u8; CFG_PAYLOAD_BUF];
+        let payload_len = content.len() + SIGNATURE_SIZE;
+        payload[..content.len()].copy_from_slice(content);
+        payload[content.len()..payload_len].copy_from_slice(crypto().sign(content).serialize());
+        (payload, payload_len)
+    }
+
+    /// A configuration module, optionally already durably locked on `content`.
+    fn chain_config_module(content: Option<&[u8]>) -> TestConfig {
+        let mut config = ChainConfiguration::new(NoopConfigChangeSink, TestChain::BUILD_LIMITS);
+        if let Some(content) = content {
+            let (payload, len) = framed_config_payload(content);
+            config
+                .load_durable(&payload[..len])
+                .ok()
+                .expect("framed content is accepted");
+        }
+        config
+    }
     // W = SNAKE_CHAIN_LENGTH = 16 for these tests.
     const W: u32 = 16;
 
@@ -232,33 +273,28 @@ mod tests {
         Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
     }
 
+    /// A configured node: the configuration is durably locked on the empty
+    /// override set, which is the post-genesis state every classification test
+    /// but the join-path one assumes.
     fn new_test_chain() -> TestChain {
-        let c = crypto();
-        let node_zero = *c.public_key().serialize();
-        let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
-        let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
-        TestChain::init(
-            &mut bc_slot,
-            c,
-            storage,
-            FixedChainConfig::new(),
-            5,
-            node_zero,
-            0,
-        );
-        // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
-        unsafe { bc_slot.assume_init() }
+        chain_with_config(chain_config_module(Some(&EMPTY_CONFIG_CONTENT)))
     }
 
-    /// A durably-locked chain with `initial_chain_config_bytes == payload`.
-    fn locked_test_chain(config_payload: &[u8]) -> TestChain {
+    /// A durably-locked chain whose configuration content is `content`.
+    fn locked_test_chain(content: &[u8]) -> TestChain {
+        chain_with_config(chain_config_module(Some(content)))
+    }
+
+    /// A joining node that holds no configuration at all — the state before
+    /// Story 5.9's tentative load.
+    fn unconfigured_test_chain() -> TestChain {
+        chain_with_config(chain_config_module(None))
+    }
+
+    fn chain_with_config(chain_config: TestConfig) -> TestChain {
         let c = crypto();
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
-        let mut chain_config = FixedChainConfig::new();
-        chain_config
-            .store_initial_chain_config_bytes(config_payload)
-            .expect("store initial chain config");
         let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
         TestChain::init(&mut bc_slot, c, storage, chain_config, 5, node_zero, 0);
         // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
@@ -302,7 +338,10 @@ mod tests {
     /// Creator stays 0 (only read by the deferred FR64 log).
     // Fixed buffer + used length (const-generic `HEADER_SIZE + P` array sizing
     // would need the unstable `generic_const_exprs`). Callers parse `&buf[..len]`.
-    const CFG_BUF: usize = HEADER_SIZE + 16;
+    /// A framed chain-config payload: a small content region plus the
+    /// signature trailer.
+    const CFG_PAYLOAD_BUF: usize = 16 + SIGNATURE_SIZE;
+    const CFG_BUF: usize = HEADER_SIZE + CFG_PAYLOAD_BUF;
     fn chain_config_block_bytes(seq: u32, payload: &[u8]) -> ([u8; CFG_BUF], usize) {
         // Header-only block (no payload added) → a canonical HEADER_SIZE-byte
         // header laid out by `build_signed`'s named-offset code.
@@ -394,28 +433,34 @@ mod tests {
 
     #[test]
     fn chain_config_content_matches_equal_and_differing() {
-        let (equal, len) = chain_config_block_bytes(1, &[0xAB, 0xCD, 0xEF]);
-        let view = BlockView::from_bytes(&equal[..len])
+        let (payload, payload_len) = framed_config_payload(&OTHER_CONFIG_CONTENT);
+        let (block, len) = chain_config_block_bytes(1, &payload[..payload_len]);
+        let view = BlockView::from_bytes(&block[..len])
             .ok()
             .expect("valid raw block");
-        assert!(chain_config_content_matches(&view, &[0xAB, 0xCD, 0xEF]));
+        assert!(chain_config_content_matches(&view, &OTHER_CONFIG_CONTENT));
         // Differing content, shorter locked, longer locked all fail.
-        assert!(!chain_config_content_matches(&view, &[0xAB, 0xCD, 0x00]));
-        assert!(!chain_config_content_matches(&view, &[0xAB, 0xCD]));
+        assert!(!chain_config_content_matches(&view, &EMPTY_CONFIG_CONTENT));
         assert!(!chain_config_content_matches(
             &view,
-            &[0xAB, 0xCD, 0xEF, 0x11]
+            &OTHER_CONFIG_CONTENT[..4]
         ));
+        assert!(!chain_config_content_matches(&view, &[1, 0, 7, 1, 5, 0]));
     }
 
+    /// A payload that is not a framed envelope — here the empty payload of a
+    /// header-only block — carries no content region, so it matches nothing.
+    /// Before the Story 5.7 envelope this compared raw payload bytes and an
+    /// empty payload "matched" an empty locked configuration; content that is
+    /// not even framed can no longer be the locked content.
     #[test]
-    fn chain_config_content_matches_empty_payload() {
+    fn chain_config_unframed_payload_never_matches() {
         let (empty, len) = chain_config_block_bytes(1, &[]);
         let view = BlockView::from_bytes(&empty[..len])
             .ok()
             .expect("header-only block is valid");
-        assert!(chain_config_content_matches(&view, &[]));
-        assert!(!chain_config_content_matches(&view, &[0x01]));
+        assert!(!chain_config_content_matches(&view, &EMPTY_CONFIG_CONTENT));
+        assert!(!chain_config_content_matches(&view, &[]));
     }
 
     // --- AC4: accepted-new --------------------------------------------------
@@ -488,7 +533,7 @@ mod tests {
             &mut bc_slot,
             c,
             storage,
-            FixedChainConfig::new(),
+            chain_config_module(Some(&EMPTY_CONFIG_CONTENT)),
             5,
             node_zero,
             0,
@@ -579,10 +624,10 @@ mod tests {
 
     #[test]
     fn chain_config_matching_replay_proceeds() {
-        // Locked config == this block's payload → legitimate replay → stored.
-        let payload = [0xAB, 0xCD, 0xEF, 0x01];
-        let mut bc = locked_test_chain(&payload);
-        let (bytes, len) = chain_config_block_bytes(2, &payload);
+        // Locked content == this block's content → legitimate replay → stored.
+        let mut bc = locked_test_chain(&OTHER_CONFIG_CONTENT);
+        let (payload, payload_len) = framed_config_payload(&OTHER_CONFIG_CONTENT);
+        let (bytes, len) = chain_config_block_bytes(2, &payload[..payload_len]);
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
             .expect("valid raw block");
@@ -598,9 +643,10 @@ mod tests {
 
     #[test]
     fn chain_config_mismatch_is_discarded() {
-        let mut bc = locked_test_chain(&[0xAB, 0xCD, 0xEF, 0x01]);
-        // Different payload from the locked config → FR17 silent discard.
-        let (bytes, len) = chain_config_block_bytes(2, &[0x00, 0x11, 0x22, 0x33]);
+        let mut bc = locked_test_chain(&OTHER_CONFIG_CONTENT);
+        // Different content from the locked configuration → FR17 silent discard.
+        let (payload, payload_len) = framed_config_payload(&EMPTY_CONFIG_CONTENT);
+        let (bytes, len) = chain_config_block_bytes(2, &payload[..payload_len]);
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
             .expect("valid raw block");
@@ -616,12 +662,15 @@ mod tests {
         );
     }
 
+    /// The join path: a node that holds no configuration has no locked content
+    /// to compare against, so the FR17 gate stands down and the block proceeds
+    /// to Tier 1 and is stored — exactly as it did when the gate's lock flag was
+    /// hard-coded and the retained bytes were absent.
     #[test]
-    fn chain_config_no_locked_bytes_falls_through() {
-        // Durable-locked stub but no stored config bytes → FR17 gate is skipped;
-        // the block proceeds to Tier 1 and is stored (recognized schema).
-        let mut bc = new_test_chain();
-        let (bytes, len) = chain_config_block_bytes(2, &[0x00, 0x11]);
+    fn chain_config_gate_stands_down_without_configuration() {
+        let mut bc = unconfigured_test_chain();
+        let (payload, payload_len) = framed_config_payload(&OTHER_CONFIG_CONTENT);
+        let (bytes, len) = chain_config_block_bytes(2, &payload[..payload_len]);
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
             .expect("valid raw block");

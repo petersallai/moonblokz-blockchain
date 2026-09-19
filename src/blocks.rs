@@ -71,7 +71,7 @@ pub(crate) const NONE_REF: u32 = u32::MAX;
 /// stable, only arithmetic over one is not — and the bit capacity is `N * 8`.
 /// That is what lets the configuration crate's `UTXO_UNSPENT_BITS` be pinned to
 /// a width the build actually chose instead of to a second hand-written literal.
-const SPENT_BITS_BYTES: usize = 32;
+pub(crate) const SPENT_BITS_BYTES: usize = 32;
 
 /// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2
 /// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
