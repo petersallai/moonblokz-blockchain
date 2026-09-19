@@ -103,7 +103,12 @@ pub trait ChainConfigTrait {
     fn block_size_limit(&self) -> u16;
 
     /// Maximum UTXO outputs per block (ADR-016 / `MAX_BLOCK_UTXO_OUTPUT`).
-    fn max_utxo_outputs(&self) -> u8;
+    ///
+    /// `u16`, not `u8`: the ceiling is the build's spent-bit width, which is 256
+    /// bits by default, so a byte-wide value could neither reach the top of the
+    /// range nor be declared above it. The configuration module's registry
+    /// carries the parameter two bytes wide for the same reason.
+    fn max_utxo_outputs(&self) -> u16;
 
     /// Maximum aggregated signatures per approval-evidence block (ADR-015).
     fn max_aggregated_signatures(&self) -> u8;
@@ -177,7 +182,7 @@ impl ChainConfigTrait for FixedChainConfig {
         FIXED_BLOCK_SIZE_LIMIT
     }
 
-    fn max_utxo_outputs(&self) -> u8 {
+    fn max_utxo_outputs(&self) -> u16 {
         255
     }
 
