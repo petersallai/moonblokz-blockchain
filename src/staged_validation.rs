@@ -248,9 +248,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
             tier1_transaction_block(block, node_zero_public_key, crypto, is_genesis_block_zero)?;
         }
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
-        PAYLOAD_TYPE_CHAIN_CONFIG => {
-            tier1_chain_config_block(block, node_zero_public_key, crypto)?
-        }
+        PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
         PAYLOAD_TYPE_APPROVAL => {
             // Recognized schema. Approval-evidence payload Tier 1/3 checks are
             // owned by Epic 6 (FR12/FR27) — nothing to gate from block bytes
@@ -627,7 +625,9 @@ mod tests {
         b.set_chain_config_payload(&payload[..end])
             .ok()
             .expect("payload fits");
-        b.build_signed(signer).ok().expect("chain-config block builds")
+        b.build_signed(signer)
+            .ok()
+            .expect("chain-config block builds")
     }
 
     #[test]

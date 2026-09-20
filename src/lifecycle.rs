@@ -10,9 +10,11 @@
 //! Story 5.1 delivers the state machine, the init paths, and the
 //! collecting-state not-ready gating. The dominant-chain acquisition (5.2),
 //! processing-pass reconstruction (5.3), full-chain validation (5.4), atomic
-//! recovery (5.5), chain-config commitment (5.6), and restart-equivalence
-//! (5.7) drivers that *cause* the runtime transitions follow in later Epic-5
-//! stories. See architecture §4.2.
+//! recovery (5.5), chain-config commitment (5.9), and restart-equivalence
+//! (5.10) drivers that *cause* the runtime transitions follow in later Epic-5
+//! stories. (The commitment and restart story numbers shifted when the
+//! configuration stories 5.6–5.8 were inserted; 5.6 is `moonblokz-vm`.) See
+//! architecture §4.2.
 //!
 //! ## Not-ready gating contract (FR1)
 //!
