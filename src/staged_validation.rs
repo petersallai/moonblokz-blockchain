@@ -149,10 +149,14 @@ pub(crate) enum Tier1Failure {
     /// and no tentative configuration remains loaded (FR8). Produced in
     /// `Blockchain::tier1_admit` rather than the state-free `tier1_gate`: only
     /// the configuration module parses content (FR56), and reaching it needs
-    /// `&mut self`. Raised only for the block that would actually be loaded —
-    /// a config block arriving while a configuration is already held is retained
-    /// without a content evaluation (FR8's non-override rule), because there is
-    /// nothing to load it into.
+    /// `&mut self` for the load.
+    ///
+    /// Raised for **every** chain-config block, not only the one that loads. A
+    /// block arriving while a configuration is already held is not loaded — FR8
+    /// forbids overriding the tentative — but its content is still evaluated
+    /// through the module's pure acceptance pass, because FR8 says a bound
+    /// violation "shall not enter durable storage" without qualification, and
+    /// because storing it otherwise would make retention depend on arrival order.
     ChainConfigContentRejected,
     /// Story 5.1 single-genesis guard: a distinct `sequence == 0` block arrived
     /// while the active chain is already anchored (`active_chain_head_idx !=
