@@ -14,6 +14,7 @@ categories = ["embedded", "no-std"]
 # storage is an orthogonal *storage* backend (host/simulator/test), not a crypto
 # choice, so it stays enabled here directly.
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
+moonblokz-configuration = { path = "../moonblokz-configuration", default-features = false }
 moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["backend-memory"] }
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
 moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
@@ -37,18 +38,21 @@ moonblokz-vote = { path = "../moonblokz-vote", default-features = false, feature
 default = ["schnorr-crypto-bigint"]
 schnorr-crypto-bigint = [
     "moonblokz-vote/schnorr-crypto-bigint",
+    "moonblokz-configuration/schnorr-crypto-bigint",
     "moonblokz-chain-types/schnorr-crypto-bigint",
     "moonblokz-crypto/schnorr-crypto-bigint",
     "moonblokz-storage/schnorr-crypto-bigint",
 ]
 schnorr-malachite = [
     "moonblokz-vote/schnorr-malachite",
+    "moonblokz-configuration/schnorr-malachite",
     "moonblokz-chain-types/schnorr-malachite",
     "moonblokz-crypto/schnorr-malachite",
     "moonblokz-storage/schnorr-malachite",
 ]
 schnorr-num-bigint-dig = [
     "moonblokz-vote/schnorr-num-bigint-dig",
+    "moonblokz-configuration/schnorr-num-bigint-dig",
     "moonblokz-chain-types/schnorr-num-bigint-dig",
     "moonblokz-crypto/schnorr-num-bigint-dig",
     "moonblokz-storage/schnorr-num-bigint-dig",

@@ -160,8 +160,10 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         // `adjust_head_ref_count` saturates in release and an inflated-then-capped
         // count stops the FR19 eviction walk early, leaking blocks that were
         // exclusive to the evicted branch. Compile-time so that raise has to be a
-        // conscious decision, matching the `MAX_BLOCK_SIZE` assertions in
-        // `api.rs` / `chain_config.rs`. Inline `const` rather than a module-level
+        // conscious decision, matching the `MAX_BLOCK_SIZE` assertion in `api.rs`
+        // and its `limits_are_expressible` check on `BUILD_LIMITS` (Story 5.8
+        // deleted the third one with `chain_config.rs`). Inline `const` rather
+        // than a module-level
         // `const _`, because `MAX_BRANCH_COUNT` is a const-generic parameter.
         const { assert!(MAX_BRANCH_COUNT <= u8::MAX as usize) };
         // SAFETY: `slot.as_mut_ptr()` is derived from a live `&mut

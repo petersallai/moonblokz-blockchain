@@ -1,8 +1,9 @@
 //! Primary public API surface for `moonblokz-blockchain` (FR66). All
 //! blockchain-facing state is reachable only through types defined or
-//! re-exported here; internal modules stay crate-private. The temporary
-//! `chain_config` seam remains public only until the standalone
-//! `moonblokz-configuration` crate exists.
+//! re-exported here; internal modules stay crate-private. The
+//! chain-configuration seam is `moonblokz_configuration::ChainConfigTrait`:
+//! this crate is generic over it and never names a concrete implementation
+//! (FR56).
 //!
 //! Story 1.3 scope: trait seams (`CryptoTrait`/`StorageTrait`/
 //! `ChainConfigTrait`), construction-time init parameters
@@ -18,16 +19,18 @@
 //! therefore yield identical state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    Block, BlockBuilder, BlockHeader, BlockView, HEADER_SIZE, MAX_BLOCK_SIZE, NodeTransfer,
-    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE,
-    Registration, TransactionView,
+    Block, BlockBuilder, BlockHeader, BlockView, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
+    NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
+    REGISTRATION_SIZE, Registration, TransactionView,
 };
-use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait};
+use moonblokz_configuration::{BuildLimits, ChainConfigTrait, limits_are_expressible};
+use moonblokz_crypto::{
+    CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
+};
 use moonblokz_storage::StorageTrait;
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
-use crate::blocks::{BlockEntry, BlockTable, NONE_REF};
-use crate::chain_config::{ChainConfigError, ChainConfigTrait};
+use crate::blocks::{BlockEntry, BlockTable, NONE_REF, SPENT_BITS_BYTES};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
@@ -81,15 +84,28 @@ pub enum GenesisRejectReason {
     /// checks the in-memory chain state; detecting a non-empty *persisted*
     /// store on reboot is Story 5.6.
     StorageNotEmpty,
-    /// `initial_chain_config_bytes` would not fit in the Block #1
-    /// chain-config payload.
+    /// `initial_chain_config_bytes` plus its content-signature trailer would
+    /// not fit in the Block #1 chain-config payload.
     InitialChainConfigTooLarge,
-    /// The initial chain-config payload has already been retained and must
-    /// not be overwritten.
-    InitialChainConfigAlreadyStored,
+    /// The configuration module refused the genesis content (FR8 acceptance:
+    /// malformed framing, an unknown identifier, a width mismatch, a bytecode
+    /// value under a literal-only parameter, or a bound violation). The chain
+    /// is not bootstrapped; nothing is written.
+    InitialChainConfigRejected,
     /// Block #0 or Block #1 could not be persisted through the storage seam,
     /// so genesis must not report success.
     StorageSaveFailed,
+    /// The storage control plane is not initialized, so the FR54 durable
+    /// configuration could not be committed. Checked **before** any write,
+    /// because `save_block` does not need the control plane and
+    /// `set_chain_configuration` does: without the check the two genesis
+    /// blocks would persist and the configuration would not, leaving a chain
+    /// no retry can complete.
+    StorageNotInitialized,
+    /// A genesis block is larger than the block-size limit the genesis
+    /// configuration itself declares, so every peer would reject it at Tier 1
+    /// and the chain would be unusable from its first block.
+    GenesisBlockExceedsBlockSizeLimit,
 }
 
 /// The two genesis blocks produced by [`Blockchain::process_genesis`], created
@@ -371,8 +387,9 @@ pub enum TickOutcome {
 /// - `Storage: StorageTrait` — the module persists and reads state through
 ///   the trait; storage is a service it consumes (FR66 boundary).
 /// - `Config: ChainConfigTrait` — chain-configurable parameters arrive via
-///   the trait; the AR14 [`FixedChainConfig`](crate::FixedChainConfig) stub
-///   satisfies it in MVP.
+///   `moonblokz_configuration`'s trait, read through the `ActiveConfig` handle
+///   at the moment each value is needed (FR56); this crate never names a
+///   concrete implementation.
 ///
 /// Defaults (architecture §5): `MAX_NODES = 1000`,
 /// `SNAKE_CHAIN_LENGTH = 500`, `VERIFICATION_HORIZON = 20`,
@@ -544,9 +561,12 @@ pub struct Blockchain<
     //   (Story 4.1 fixes that field at a 32-byte constant — see
     //   `blocks::SPENT_BITS_BYTES` — because deriving an array length from a
     //   generic const parameter via division requires the unstable
-    //   `generic_const_exprs` feature). **Story 5.8** resolves it by making the
-    //   generic the byte width instead of the bit count, which needs no unstable
-    //   feature; Epic 7 then only gives `spent_bits` its semantics.
+    //   `generic_const_exprs` feature). Story 5.8 settled the ownership instead
+    //   of the sizing: the *chain's* value is a configuration parameter read
+    //   through the handle, and the *build's* capacity is stated once to the
+    //   configuration module in `BUILD_LIMITS` (`SPENT_BITS_BYTES * 8`), which
+    //   is where the two are now reconciled. Epic 7 gives `spent_bits` its
+    //   semantics.
 }
 
 impl<
@@ -572,6 +592,31 @@ impl<
         MAX_BLOCK_UTXO_OUTPUT,
     >
 {
+    /// This build's capacities, stated for the configuration module's §6
+    /// acceptance checks — the two bounds that crate cannot derive because the
+    /// capacities live here (specification §6, `BuildLimits`).
+    ///
+    /// Hand this to `ChainConfiguration::new` rather than restating the numbers
+    /// at the construction site: the module keeps no copy of them, so the two §6
+    /// checks read exactly what this constant says, and drift between the
+    /// blockchain's arrays and the module's bounds stays unrepresentable.
+    ///
+    /// - `utxo_unspent_bits` — `SPENT_BITS_BYTES * 8`, the per-block spent-bit
+    ///   width of `BlockEntry` (Story 4.1 fixes the field at 32 bytes).
+    /// - `snake_chain_length_max` — `SNAKE_CHAIN_LENGTH`. Before Story 5.11 the
+    ///   window length *is* the capacity; 5.11 changes the value passed here,
+    ///   not this seam.
+    pub const BUILD_LIMITS: BuildLimits = BuildLimits {
+        utxo_unspent_bits: (SPENT_BITS_BYTES * 8) as u16,
+        snake_chain_length_max: {
+            assert!(
+                SNAKE_CHAIN_LENGTH <= u16::MAX as u32,
+                "SNAKE_CHAIN_LENGTH must fit the configuration module's u16 capacity"
+            );
+            SNAKE_CHAIN_LENGTH as u16
+        },
+    };
+
     /// Constructs the node in place, inside caller-provided storage, and
     /// hands back a `&mut` to the initialized value. This is the type's
     /// **only** constructor.
@@ -644,10 +689,14 @@ impl<
         node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
         prng_seed: u64,
     ) -> &mut Self {
-        // Read the FR37 vote parameters from the config before it is moved into
-        // the slot (the config is still owned here; no field is read before write).
-        let vote_scale = chain_config.vote_scale();
-        let vote_interest = chain_config.vote_interest();
+        // The two §6 capacities this build states to the configuration module
+        // must leave a bound violation expressible in each parameter's declared
+        // width, or the module's acceptance check goes quiet (see
+        // [`Self::BUILD_LIMITS`]). Monomorphization-time, like
+        // `ChainHeadsTable::init`'s own const assert: invisible to `cargo check`
+        // while it passes.
+        const { assert!(limits_are_expressible(Self::BUILD_LIMITS)) };
+
         let p = slot.as_mut_ptr();
         // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it
         // is non-null, aligned, valid for writes of `Self` and not aliased.
@@ -667,11 +716,11 @@ impl<
             // SoA + vote registry init in place (never a MAX_NODES-scaled stack
             // temporary — Epic-4-retro §8 RAM watch-item).
             NodeInfoState::init(field_slot(&raw mut (*p).node_info));
-            VoteEngine::init(
-                field_slot(&raw mut (*p).vote_engine),
-                vote_scale,
-                vote_interest,
-            );
+            // Unparameterized: the FR37 values are chain configuration, which a
+            // node need not hold yet. `reset_vote_engine` supplies them the
+            // moment one is loaded; until then every vote effect refuses with
+            // `VoteEngineError::NotParameterized`.
+            VoteEngine::init(field_slot(&raw mut (*p).vote_engine));
             (&raw mut (*p).last_parent_request_emit_timestamp).write(0);
             (&raw mut (*p).active_chain_head_idx).write(NONE_REF);
             (&raw mut (*p)._snake_chain_tail_idx).write(0);
@@ -698,8 +747,6 @@ impl<
         node_zero_public_key: [u8; PUBLIC_KEY_SIZE],
         prng_seed: u64,
     ) -> Self {
-        let vote_scale = chain_config.vote_scale();
-        let vote_interest = chain_config.vote_interest();
         Self {
             crypto,
             storage,
@@ -711,7 +758,7 @@ impl<
             blocks: BlockTable::new(),
             chain_heads: ChainHeadsTable::new(),
             node_info: NodeInfoState::new(),
-            vote_engine: VoteEngine::new(vote_scale, vote_interest),
+            vote_engine: VoteEngine::new(),
             last_parent_request_emit_timestamp: 0,
             active_chain_head_idx: NONE_REF,
             _snake_chain_tail_idx: 0,
@@ -738,11 +785,25 @@ impl<
     ///
     /// Refusal (`Err(GenesisRejectReason::_)`, `self` left unchanged): the local
     /// node id is not `0`; the chain is not empty (`StorageNotEmpty` — already
-    /// bootstrapped); `initial_chain_config_bytes` does not fit or was already
-    /// retained; or a block cannot be persisted (`StorageSaveFailed`). All
-    /// non-persistence checks run before any storage write, and both blocks are
-    /// built before either is saved, so a refusal never leaves a half-written
-    /// chain from *this* call.
+    /// bootstrapped, which after FR54 means the configuration is durably
+    /// locked); the storage control plane is not initialized
+    /// (`StorageNotInitialized`); `initial_chain_config_bytes` plus its
+    /// signature trailer does not fit (`InitialChainConfigTooLarge`); the
+    /// configuration module refuses the content (`InitialChainConfigRejected`);
+    /// a genesis block exceeds the block-size limit that configuration declares
+    /// (`GenesisBlockExceedsBlockSizeLimit`); or a block cannot be persisted
+    /// (`StorageSaveFailed`).
+    ///
+    /// Every check but the last runs before any storage write, and both blocks
+    /// are built before either is saved, so those refusals leave nothing behind.
+    /// `StorageSaveFailed` is the exception and the honest limit of this method:
+    /// a backend that accepts one write and then fails leaves the earlier one
+    /// persisted, and the non-empty-chain guard above then refuses the retry.
+    /// The **systematic** version of that hazard — a backend whose control
+    /// plane was never initialized, where `save_block` succeeds and
+    /// `set_chain_configuration` cannot — is what the `StorageNotInitialized`
+    /// probe removes. A mid-sequence I/O failure is a genuinely partial write
+    /// and belongs to the Story 5.10 restart/repair path, not here.
     ///
     /// Unlike the other state-changing methods, genesis carries **no
     /// `NextCall`** (the return is a plain `Result<GenesisBlocks, _>`, not a
@@ -753,12 +814,15 @@ impl<
     /// with the caller's regular `on_tick` cadence. (No `now` parameter is needed
     /// for the same reason.)
     ///
-    /// **Walking-skeleton scope (Story 1.4).** Block layouts are
-    /// minimum-buildable per FR54; blocks are finalized through chain-types signed
-    /// builders. Full canonical validation (Stories 4.2 / 5.4 / 5.6), the
-    /// chain-config durable-lock semantics, block-tree insertion, and detecting a
-    /// non-empty *persisted* store on reboot land in later stories; the
-    /// `StorageNotEmpty` guard here inspects in-memory chain state only.
+    /// **Chain-config framing (FR54, Story 5.8).** `initial_chain_config_bytes`
+    /// is raw configuration *content*. This method frames Block #1's payload as
+    /// that content plus the node-#0 content signature it produces itself — at
+    /// genesis the local key *is* node #0's key — loads it into the
+    /// configuration module durably (acceptance first, so a refusal writes
+    /// nothing), and hands the block to the durable `set_chain_configuration`
+    /// seam. Detecting a non-empty *persisted* store on reboot is Story 5.10;
+    /// the `StorageNotEmpty` guard here inspects in-memory chain state and the
+    /// FR8 lock.
     pub fn process_genesis(
         &mut self,
         initial_total_network_currency: u64,
@@ -768,22 +832,53 @@ impl<
             return Err(GenesisRejectReason::LocalNodeIdNotZero);
         }
         // Genesis is only valid on a fresh chain. Re-running it would overwrite
-        // an existing Block #0 / retained chain-config.
-        if self.blocks.len() != 0 || self.chain_config.initial_chain_config_bytes().is_some() {
+        // an existing Block #0, and FR54's lock is set-once — the module itself
+        // would refuse the second load, so the guard reads the lock rather than
+        // a retention flag.
+        if self.blocks.len() != 0 || self.chain_config.is_durable_locked() {
             return Err(GenesisRejectReason::StorageNotEmpty);
         }
 
+        // The durable configuration commit below needs the storage control
+        // plane; `save_block` does not. Probing it here keeps the method's
+        // contract ("all non-persistence checks run before any storage write"):
+        // without the probe an uninitialized backend persists both blocks, then
+        // refuses the configuration, and every retry is turned away by the
+        // non-empty-chain guard above — a node that can never bootstrap.
+        if self.storage.load_control_data().is_err() {
+            return Err(GenesisRejectReason::StorageNotInitialized);
+        }
+
         let node_zero_public_key = *self.crypto.public_key().serialize();
+
+        // FR54 framing: Block #1's payload is the content region followed by the
+        // node-#0 content signature (the Story 5.7 envelope). Framed here rather
+        // than taken framed, because the signature is node #0's and this is the
+        // one place that key is the local one.
+        let content_len = initial_chain_config_bytes.len();
+        let Some(payload_len) = content_len
+            .checked_add(SIGNATURE_SIZE)
+            .filter(|len| *len <= MAX_PAYLOAD_SIZE)
+        else {
+            return Err(GenesisRejectReason::InitialChainConfigTooLarge);
+        };
+        let mut payload = [0u8; MAX_PAYLOAD_SIZE];
+        payload[..content_len].copy_from_slice(initial_chain_config_bytes);
+        payload[content_len..payload_len]
+            .copy_from_slice(self.crypto.sign(initial_chain_config_bytes).serialize());
+        let chain_config_payload = &payload[..payload_len];
+
+        // Tentative first: acceptance runs inside the load and before anything
+        // is retained, so a content refusal leaves the module exactly as it was
+        // and this call writes nothing. The **durable** lock is engaged only
+        // after the last storage write succeeds (below) — FR54's lock is
+        // set-once, and a module locked by a call that then failed on storage
+        // would refuse every retry, with `StorageNotEmpty`, for the life of the
+        // process. A tentative left behind by a failed genesis is harmless: the
+        // next attempt replaces it.
         self.chain_config
-            .store_initial_chain_config_bytes(initial_chain_config_bytes)
-            .map_err(|err| match err {
-                ChainConfigError::InitialChainConfigTooLarge => {
-                    GenesisRejectReason::InitialChainConfigTooLarge
-                }
-                ChainConfigError::InitialChainConfigAlreadyStored => {
-                    GenesisRejectReason::InitialChainConfigAlreadyStored
-                }
-            })?;
+            .load_tentative(chain_config_payload)
+            .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
 
         // Assemble signed Block #0: registration of node #0 + a self-transfer
         // of the initial total network currency.
@@ -854,18 +949,31 @@ impl<
             signature: [0u8; 64],
         };
         let mut cfg_builder = BlockBuilder::new().header(block_1_header);
-        // `initial_chain_config_bytes` already passed the capacity check in
-        // `store_initial_chain_config_bytes`, so the payload fits Block #1.
+        // The framed payload was bounded by `MAX_PAYLOAD_SIZE` above, so it fits
+        // Block #1.
         if cfg_builder
-            .set_chain_config_payload(initial_chain_config_bytes)
+            .set_chain_config_payload(chain_config_payload)
             .is_err()
         {
-            unreachable!("initial chain-config bytes were capacity-checked and fit the payload");
+            unreachable!("the framed chain-config payload was capacity-checked");
         }
         let block_1 = match cfg_builder.build_signed(&self.crypto) {
             Ok(b) => b,
             Err(_) => unreachable!("Block #1 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
         };
+
+        // Both blocks must fit the block-size limit **the genesis configuration
+        // itself declares**, which is a chain value now rather than the framing
+        // constant it was while the stub answered. The registry admits anything
+        // above `HEADER_SIZE`, so a founder can legally declare a limit smaller
+        // than the blocks this bootstrap produces — and then every peer refuses
+        // Block #1 at Tier 1 (`BlockTooLarge`) and the founder's own restart
+        // refuses it again at FR6. Checked before any write: a chain that cannot
+        // carry its own genesis must not be created.
+        let block_size_limit = self.block_size_limit() as usize;
+        if block_0.len() > block_size_limit || block_1.len() > block_size_limit {
+            return Err(GenesisRejectReason::GenesisBlockExceedsBlockSizeLimit);
+        }
 
         // Persist both blocks (only after both are built, so a build failure
         // never leaves a partially-persisted chain) AND mirror them into the
@@ -878,8 +986,7 @@ impl<
         // arrival timestamp of 0 — genesis heads sit on the active chain and are
         // never parent-recovery-scheduled, so the timestamp is unused. (Full
         // `Stored`→`Active` status promotion is Epic 6; the FR3 derived
-        // projections are Epic 7. Wiring Block #1 through the dedicated
-        // `set_chain_configuration` seam lands with the Story 5.6 boot flow.)
+        // projections are Epic 7.)
 
         // Block #0 — active-chain anchor (no parent).
         self.storage
@@ -899,6 +1006,22 @@ impl<
         self.storage
             .save_block(1, &block_1)
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+        // The durable chain-configuration seam (FR54): the blockchain owns the
+        // storage handle, so the durable commit is made here rather than by the
+        // configuration module (configuration specification §8.2).
+        self.storage
+            .set_chain_configuration(&block_1)
+            .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+        // Every durable write has succeeded: promote the tentative to FR54's
+        // set-once lock. `promote_durable` can only fail with `NotLoaded` or
+        // `DurableLocked`, and the load above plus the guard at the top of this
+        // method rule both out.
+        self.chain_config
+            .promote_durable()
+            .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
+        // The engine was constructed on the inert baseline while the module held
+        // no configuration (see `vote_parameters`); it now has FR37 values.
+        self.reset_vote_engine();
         let block_1_prev_hash = block_0.hash();
         let mut entry_1 = BlockEntry::new(block_1.hash(), 0, 1);
         entry_1.set_on_active_chain(true);
@@ -1119,7 +1242,7 @@ impl<
         hash: &[u8; 32],
         now: u64,
     ) -> Result<u32, AdmitError> {
-        let block_size_limit = self.chain_config.block_size_limit();
+        let block_size_limit = self.block_size_limit();
         tier1_gate(
             block,
             &self.node_zero_public_key,
@@ -1223,8 +1346,21 @@ impl<
         // currently the sole accept outcome; when Epic 6/8 add `AcceptedAndSend*`
         // accept variants they must be included in this gate (else a block admitted
         // under them would miss the transition).
+        //
+        // The configuration is part of the gate (Story 5.8): the FR3 derivation
+        // reads the FR37 vote parameters, so without a loaded configuration the
+        // pass would run on `vote_parameters`' inert baseline and produce a
+        // projection the node would then go `Ready` on. Specification §5.2: the
+        // block is simply not advanced past the last stage that needs no
+        // configuration-derived parameter — it stays admitted, the node stays
+        // `Collecting`, and the next admission after a configuration loads
+        // re-evaluates FR2 over the same tree. Gated here rather than inside
+        // `run_processing_pass`, because a refusal there is a `ProcessingError`
+        // and would trigger the FR5 recovery's block deletion — punishing a block
+        // for the node's own missing configuration.
         if outcome == ReceiveBlockOutcome::AcceptedSilently
             && self.lifecycle_phase == LifecyclePhase::Collecting
+            && self.chain_config.active_configuration().is_some()
         {
             // At most **two** full-chain passes per call. The second one runs
             // only after an `Invalid` recovery — see the `Err` arm — so the loop
@@ -1295,14 +1431,31 @@ impl<
         (outcome, self.next_parent_recovery_call())
     }
 
-    /// Re-initializes the vote registry to its empty seeded baseline in place
-    /// (FR3 "not resumable — clean working set on re-entry", AC5) through the
-    /// engine's own safe [`VoteEngine::reset`] — the same field writes as its
-    /// constructor, applied over the live value with no stack temporary.
+    /// Brings the vote registry into the state the current chain configuration
+    /// implies: empty, and parameterized when there is a configuration to
+    /// parameterize from.
+    ///
+    /// Emptying is the obligation every caller shares (FR3 "not resumable —
+    /// clean working set on re-entry", AC5, and the FR5 recovery's rollback);
+    /// supplying the FR37 values is what the genesis path additionally needs,
+    /// since the engine is constructed unparameterized. Both run in place, over
+    /// the live value, with no `MAX_NODES`-scaled stack temporary.
+    ///
+    /// Deliberately not named `init_*`: in this crate `init` means in-place
+    /// construction into uninitialized memory, exactly once, while this runs
+    /// repeatedly on a live engine.
     fn reset_vote_engine(&mut self) {
-        let vote_scale = self.chain_config.vote_scale();
-        let vote_interest = self.chain_config.vote_interest();
-        self.vote_engine.reset(vote_scale, vote_interest);
+        match self.chain_config.active_configuration() {
+            // FR37 parameters from the chain, and an empty working set.
+            Some(config) => self
+                .vote_engine
+                .reset(config.vote_scale(), config.vote_interest()),
+            // No configuration to parameterize with — but the working set must
+            // still be clean (FR3 / FR5), and the engine stays unparameterized,
+            // so a vote effect reached from here refuses rather than computing
+            // on a value nobody chose.
+            None => self.vote_engine.clear(),
+        }
     }
 
     /// FR5 atomic recovery from a failed full-chain pass (Story 5.5).
@@ -1770,7 +1923,7 @@ impl<
 
         // --- FR6 block-level invariants (AC2) ---------------------------------
         // (a) size ≤ durable-locked chain-config limit.
-        if view.len() > self.chain_config.block_size_limit() as usize {
+        if view.len() > self.block_size_limit() as usize {
             return Err(invalid(ValidationReason::BlockTooLarge));
         }
         // (b) previous_hash links to the immediately-preceding candidate block
@@ -2043,10 +2196,14 @@ impl<
             PAYLOAD_TYPE_CHAIN_CONFIG => {
                 // AC6: every chain-config block must carry config content
                 // byte-identical to the durable-locked configuration, when one is
-                // present. Establishing the lock from the candidate (no lock yet)
-                // and the FR7 content-signature are Story 5.6.
-                if let Some(locked) = self.chain_config.initial_chain_config_bytes()
-                    && view.payload() != locked
+                // present. The comparison is over the **content region**, not the
+                // whole payload: the payload also carries the node-#0 content
+                // signature, which the FR7 Tier-1 check owns (Story 5.9).
+                // Establishing the lock from the candidate (no lock yet) is
+                // Story 5.9 too. A payload whose envelope does not frame cannot
+                // carry the locked content, so it is a mismatch.
+                if let Some(locked) = self.chain_config.durable_content()
+                    && view.chain_config().map(|config| config.content()) != Some(locked)
                 {
                     return Err(invalid(ValidationReason::ChainConfigMismatch));
                 }
@@ -2269,10 +2426,9 @@ impl<
     /// remain (`NextCall::Idle` when none do). Story 8.4 extends this into the
     /// full multi-deadline scheduler.
     pub fn on_tick(&mut self, now: u64) -> CallResult<TickOutcome> {
-        let min_emit = self.chain_config.parent_recovery_min_emit_interval_ms();
-        let per_head_retry = self
-            .chain_config
-            .parent_recovery_per_head_retry_interval_ms();
+        let Some((min_emit, per_head_retry)) = self.parent_recovery_intervals() else {
+            return (TickOutcome::Idle, NextCall::Idle);
+        };
 
         let cooldown_cleared = self
             .last_parent_request_emit_timestamp
@@ -2343,12 +2499,11 @@ impl<
     /// (FR46 "deadline not scheduled when no Stored heads present"). An instant
     /// already in the past means "call back ASAP" (a request is due now).
     fn next_parent_recovery_call(&self) -> NextCall {
-        let per_head_retry = self
-            .chain_config
-            .parent_recovery_per_head_retry_interval_ms();
+        let Some((min_emit, per_head_retry)) = self.parent_recovery_intervals() else {
+            return NextCall::Idle;
+        };
         match self.chain_heads.earliest_recovery_deadline(per_head_retry) {
             Some(head_ready) => {
-                let min_emit = self.chain_config.parent_recovery_min_emit_interval_ms();
                 let cooldown_clear = self
                     .last_parent_request_emit_timestamp
                     .saturating_add(min_emit);
@@ -2462,33 +2617,174 @@ impl<
         self.blocks.len()
     }
 
-    /// FR8 durable-lock state of the chain-config (via the FR56 seam).
-    pub(crate) fn is_chain_config_durable_locked(&self) -> bool {
-        self.chain_config.is_durable_locked()
+    /// The durable-locked chain-config **content** — the FR17 comparand — or
+    /// `None` until the configuration is durably locked.
+    ///
+    /// One accessor, not two: the module returns `Some` here exactly when
+    /// `is_durable_locked()` is true, so reading both would be the same
+    /// predicate twice.
+    pub(crate) fn durable_chain_config_content(&self) -> Option<&[u8]> {
+        self.chain_config.durable_content()
     }
 
-    /// The durable-locked chain-config payload bytes, if any have been retained
-    /// (the FR17 content-mismatch comparand). `None` before genesis retention.
-    pub(crate) fn locked_chain_config_bytes(&self) -> Option<&[u8]> {
-        self.chain_config.initial_chain_config_bytes()
+    /// The block-size limit in force: the chain's value once a configuration is
+    /// loaded, and the framing bound `MAX_BLOCK_SIZE` until then.
+    ///
+    /// The fallback is not a policy choice standing in for a chain value — it is
+    /// the structural ceiling every node shares (a larger block cannot be framed
+    /// at all), so no two builds can diverge on it, which is what specification
+    /// §6 forbids of per-build fallbacks. It keeps intake alive in the window
+    /// before a node holds a configuration; without it a joining node could
+    /// admit no block, including the very chain-config block that would end the
+    /// window. (Ruled by the Project Lead, 2026-09-19.)
+    fn block_size_limit(&self) -> u16 {
+        self.chain_config
+            .active_configuration()
+            .map_or(MAX_BLOCK_SIZE as u16, |config| config.block_size_limit())
+    }
+
+    /// The FR19/FR46 parent-recovery intervals as `(min_emit, per_head_retry)`,
+    /// or `None` while no configuration is loaded.
+    ///
+    /// Unlike the block-size limit there is no structural value to fall back on:
+    /// a cadence is chain-governed through and through, so specification §5.2
+    /// applies unchanged — the step that needs the configuration does not run,
+    /// and the scheduler stays idle until one is loaded.
+    ///
+    /// **Do not "fix" this into a pre-configuration cadence.** The consequence
+    /// is understood and accepted (Project Lead, 2026-09-19): while unconfigured
+    /// both [`Self::on_tick`] and [`Self::receive_block`] answer
+    /// `NextCall::Idle`, so the bridge holds no deadline and recovery resumes
+    /// not on a timer but at the first admission after a configuration lands —
+    /// and a configuration must eventually arrive to move the node forward at
+    /// all, which is the same event that tips this. Inventing a cadence here
+    /// would be a per-build value standing in for a chain-governed one, which is
+    /// exactly what the configuration specification §6 forbids.
+    fn parent_recovery_intervals(&self) -> Option<(u64, u64)> {
+        self.chain_config.active_configuration().map(|config| {
+            (
+                config.parent_recovery_min_emit_interval_ms() as u64,
+                config.parent_recovery_per_head_retry_interval_ms() as u64,
+            )
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_config::{
-        ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
+    use moonblokz_chain_types::{
+        CONFIG_VALUE_COUNT_SIZE, ChainConfigPayloadBuilder, MAX_BLOCK_SIZE,
     };
-    use moonblokz_chain_types::MAX_BLOCK_SIZE;
+    use moonblokz_configuration::{ChainConfiguration, NoopConfigChangeSink, parameter};
     use moonblokz_crypto::{
         AggregatedSignature, Crypto, CryptoError, MultiSignature, PRIVATE_KEY_SIZE, PublicKey,
         Signature, SignatureTrait,
     };
-    use moonblokz_storage::backend_memory::MemoryBackend;
+    use moonblokz_storage::{
+        ControlPlaneData, INIT_PARAMS_SIZE, StorageError, backend_memory::MemoryBackend,
+    };
 
     fn any_nonzero(bytes: &[u8]) -> bool {
         bytes.iter().any(|value| *value != 0)
+    }
+
+    /// The configuration seam under test: the real module with the no-op change
+    /// sink. There is no stub any more — the tests exercise the same crate the
+    /// firmware does.
+    type TestConfig = ChainConfiguration<NoopConfigChangeSink>;
+
+    /// The empty override set as a **content region**
+    /// (`config_value_count = 0`): every parameter resolves to its code-baked
+    /// default, and those defaults are exactly the constants the retired
+    /// `FixedChainConfig` returned — which is why the suite's expected values
+    /// are unchanged.
+    const EMPTY_CONFIG_CONTENT: [u8; CONFIG_VALUE_COUNT_SIZE] = [0, 0];
+
+    /// A second content region, valid and **distinct in bytes** but resolving
+    /// identically: one literal entry declaring `vote_interest`'s own default.
+    /// Used where a test needs two different chain-config contents.
+    const OTHER_CONFIG_CONTENT: [u8; 5] = [1, 0, parameter::VOTE_INTEREST, 1, 5];
+
+    /// Storage whose control plane is fine and whose block writes are not.
+    ///
+    /// `MemoryBackend` cannot express this: a backend large enough to
+    /// initialize is large enough to hold blocks. The pair matters because
+    /// genesis has two distinct storage failure modes and they refuse at
+    /// different points — one before any write, one after the first.
+    struct BlockWriteFailsStorage;
+
+    impl StorageTrait for BlockWriteFailsStorage {
+        fn init(
+            &mut self,
+            _private_key: [u8; PRIVATE_KEY_SIZE],
+            _own_node_id: u32,
+            _init_params: [u8; INIT_PARAMS_SIZE],
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn save_block(&mut self, _storage_index: u32, _block: &Block) -> Result<(), StorageError> {
+            Err(StorageError::InvalidIndex)
+        }
+
+        fn read_block(&self, _storage_index: u32) -> Result<Block, StorageError> {
+            Err(StorageError::BlockAbsent)
+        }
+
+        fn capacity(&self) -> u32 {
+            0
+        }
+
+        fn set_chain_configuration(&mut self, _block: &Block) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn load_control_data(&mut self) -> Result<ControlPlaneData, StorageError> {
+            Ok(ControlPlaneData {
+                private_key: [1u8; PRIVATE_KEY_SIZE],
+                own_node_id: 0,
+                init_params: [0u8; INIT_PARAMS_SIZE],
+                chain_configuration: None,
+            })
+        }
+    }
+
+    /// A storage backend in the state a booted node's is: its control plane is
+    /// initialized, which the durable `set_chain_configuration` seam requires.
+    fn initialized_storage(
+        private_key: [u8; PRIVATE_KEY_SIZE],
+    ) -> MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }> {
+        let mut storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
+        storage
+            .init(private_key, 0, [0u8; INIT_PARAMS_SIZE])
+            .ok()
+            .expect("the test backend initializes");
+        storage
+    }
+
+    /// A configuration module holding no configuration — the state every node
+    /// starts in, and the one `process_genesis` requires (FR54's lock is
+    /// set-once).
+    /// `limits` is the receiving chain's own `BUILD_LIMITS`, never a default:
+    /// the module's §6 checks measure a declared value against exactly what it
+    /// was handed, so a fixture that lends one chain's capacities to another
+    /// would test the bound against a capacity that build does not have.
+    fn empty_chain_config(limits: BuildLimits) -> TestConfig {
+        ChainConfiguration::new(NoopConfigChangeSink, limits)
+    }
+
+    /// A configuration module already durably locked on the empty override set,
+    /// standing in for "genesis has run" wherever a test needs a configured node
+    /// without bootstrapping one.
+    fn locked_chain_config(crypto: &Crypto, limits: BuildLimits) -> TestConfig {
+        let mut config = empty_chain_config(limits);
+        let mut builder = ChainConfigPayloadBuilder::new();
+        config
+            .load_durable(builder.build_signed(crypto))
+            .ok()
+            .expect("the empty override set is accepted content");
+        config
     }
 
     /// The crypto seam for the construction tests — a stand-in that performs
@@ -2563,29 +2859,30 @@ mod tests {
     fn construction_backends() -> (
         NoCrypto,
         MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        FixedChainConfig,
+        TestConfig,
     ) {
         (
             NoCrypto,
             MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new(),
-            FixedChainConfig::new(),
+            empty_chain_config(TestChain::BUILD_LIMITS),
         )
     }
 
-    /// Helper: construct a (Crypto, MemoryBackend, FixedChainConfig) triple
-    /// for the walking-skeleton tests. Uses real backends so the trait-bound
-    /// seam is exercised end-to-end.
+    /// Helper: construct a (Crypto, MemoryBackend, TestConfig) triple for the
+    /// walking-skeleton tests. Uses real backends so the trait-bound seam is
+    /// exercised end-to-end; the configuration module is **empty**, which is
+    /// what the genesis path requires of a node about to bootstrap.
     fn test_backends() -> (
         Crypto,
         MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        FixedChainConfig,
+        TestConfig,
     ) {
         let private_key = [1u8; PRIVATE_KEY_SIZE];
         let crypto = Crypto::new(private_key)
             .ok()
             .expect("test private key should be accepted by the backend");
-        let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
-        let chain_config = FixedChainConfig::new();
+        let storage = initialized_storage(private_key);
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
         (crypto, storage, chain_config)
     }
 
@@ -2595,13 +2892,13 @@ mod tests {
     fn new_chain(
         crypto: Crypto,
         storage: MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        chain_config: FixedChainConfig,
+        chain_config: TestConfig,
         local_node_id: u32,
         prng_seed: u64,
     ) -> Blockchain<
         Crypto,
         MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        FixedChainConfig,
+        TestConfig,
         16,
         16,
         4,
@@ -2769,6 +3066,46 @@ mod tests {
         assert_eq!(_snake_chain_tail_idx, spec_snake_chain_tail_idx);
     }
 
+    /// AC2 — the neutrality proof: with an empty override set the configuration
+    /// module resolves every parameter the blockchain reads to the exact
+    /// constant the retired `FixedChainConfig` returned. This is what lets the
+    /// rest of the suite keep its expected values unchanged, and it replaces the
+    /// stub's own `fixed_returns_expected_constants`.
+    #[test]
+    fn code_baked_defaults_reproduce_the_retired_stub() {
+        let (crypto, _, _) = test_backends();
+        let chain_config = locked_chain_config(&crypto, TestChain::BUILD_LIMITS);
+        let config = chain_config
+            .active_configuration()
+            .expect("a locked module answers with a handle");
+
+        assert_eq!(config.inter_block_interval_ms(), 60_000);
+        assert_eq!(config.grace_period_window_ms(), 30_000);
+        assert_eq!(config.block_size_limit(), 2016);
+        assert_eq!(config.max_utxo_outputs(), 255);
+        assert_eq!(config.max_aggregated_signatures(), 50);
+        assert_eq!(config.vote_scale().get(), 1000);
+        assert_eq!(config.vote_interest(), 5);
+        assert_eq!(config.parent_recovery_per_head_retry_interval_ms(), 120_000);
+        assert_eq!(config.parent_recovery_min_emit_interval_ms(), 10_000);
+        assert!(chain_config.is_durable_locked());
+    }
+
+    /// AC3 — before any configuration is loaded the block-size limit falls back
+    /// to the framing bound, and the parent-recovery scheduler stands down.
+    /// (Project Lead ruling, 2026-09-19.)
+    #[test]
+    fn unconfigured_node_falls_back_to_the_framing_bound_and_idles() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+
+        assert_eq!(bc.block_size_limit(), MAX_BLOCK_SIZE as u16);
+        assert!(bc.parent_recovery_intervals().is_none());
+        let (outcome, next) = bc.on_tick(1_000_000);
+        assert!(matches!(outcome, TickOutcome::Idle));
+        assert!(matches!(next, NextCall::Idle));
+    }
+
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
     /// yields **both** Block #0 and Block #1 in a single `process_genesis`
     /// call (no `NextCall`), with no embassy deps anywhere in the harness.
@@ -2776,7 +3113,7 @@ mod tests {
     fn walking_skeleton_genesis_success() {
         let (crypto, storage, chain_config) = test_backends();
         let expected_node_zero_public_key = *crypto.public_key().serialize();
-        let initial_chain_config_bytes = [0xC0, 0xA5, 0xF6, 0x01];
+        let initial_chain_config_bytes = OTHER_CONFIG_CONTENT;
 
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0xDEAD_BEEF_CAFE_F00D);
         let GenesisBlocks {
@@ -2828,10 +3165,24 @@ mod tests {
             &block_zero.hash()[..],
             "Block #1 must chain to Block #0"
         );
+        let block_one_config = block_one
+            .view()
+            .chain_config()
+            .expect("Block #1 must frame a chain-config envelope");
         assert_eq!(
-            block_one.payload(),
+            block_one_config.content(),
             &initial_chain_config_bytes[..],
-            "Block #1 payload is the initial chain-config verbatim"
+            "Block #1 carries the initial chain-config content verbatim"
+        );
+        assert!(
+            bc.crypto.verify_signature(
+                &initial_chain_config_bytes[..],
+                &Signature::new(block_one_config.content_signature())
+                    .ok()
+                    .expect("the trailer is a well-formed signature"),
+                bc.crypto.public_key(),
+            ),
+            "FR54: node #0 signs Block #1's content region"
         );
         assert!(
             any_nonzero(block_one.signature()),
@@ -2839,8 +3190,9 @@ mod tests {
         );
 
         assert_eq!(
-            bc.chain_config.initial_chain_config_bytes(),
-            Some(&initial_chain_config_bytes[..])
+            bc.chain_config.durable_content(),
+            Some(&initial_chain_config_bytes[..]),
+            "FR54: genesis leaves the configuration durably locked on its content"
         );
         // Node #0 authored the whole chain — it is immediately Ready.
         assert!(bc.current_phase() == LifecyclePhase::Ready);
@@ -2867,7 +3219,7 @@ mod tests {
     fn genesis_head_is_connected_no_parent_recovery() {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
-        bc.process_genesis(1_000_000_000, &[0xAB])
+        bc.process_genesis(1_000_000_000, &EMPTY_CONFIG_CONTENT)
             .ok()
             .expect("genesis must succeed");
 
@@ -2898,16 +3250,16 @@ mod tests {
             Err(_) => panic!("expected LocalNodeIdNotZero refusal"),
             Ok(_) => panic!("FR54 precondition must refuse local_node_id != 0"),
         }
-        // Nothing was retained on the refusal path.
-        assert!(bc.chain_config.initial_chain_config_bytes().is_none());
+        // Nothing was loaded on the refusal path.
+        assert!(!bc.chain_config.is_durable_locked());
     }
 
-    /// Oversized genesis chain-config bytes are rejected; the bounded
-    /// retention lives in `chain_config.rs`.
+    /// Genesis content whose signature trailer would push the payload past
+    /// `MAX_PAYLOAD_SIZE` is refused before anything is written.
     #[test]
     fn walking_skeleton_rejects_oversized_initial_chain_config() {
         let (crypto, storage, chain_config) = test_backends();
-        let oversized = [0u8; INITIAL_CHAIN_CONFIG_BYTES_CAPACITY + 1];
+        let oversized = [0u8; MAX_PAYLOAD_SIZE - SIGNATURE_SIZE + 1];
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
         let outcome = bc.process_genesis(1_000_000_000, &oversized);
@@ -2919,27 +3271,26 @@ mod tests {
         }
     }
 
-    /// A chain that already retains initial chain-config bytes is not empty, so
-    /// genesis is refused before it can overwrite them (`StorageNotEmpty`).
+    /// A node whose configuration is already durably locked has been
+    /// bootstrapped, so genesis is refused before it can overwrite the lock
+    /// (`StorageNotEmpty`). FR54's lock is set-once.
     #[test]
-    fn walking_skeleton_refuses_genesis_when_chain_config_already_retained() {
-        let (crypto, storage, mut chain_config) = test_backends();
-        chain_config
-            .store_initial_chain_config_bytes(&[0x01, 0x02])
-            .unwrap();
+    fn walking_skeleton_refuses_genesis_when_chain_config_already_locked() {
+        let (crypto, storage, _) = test_backends();
+        let chain_config = locked_chain_config(&crypto, TestChain::BUILD_LIMITS);
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let outcome = bc.process_genesis(1_000_000_000, &[0x03, 0x04]);
+        let outcome = bc.process_genesis(1_000_000_000, &OTHER_CONFIG_CONTENT);
 
         match outcome {
             Err(GenesisRejectReason::StorageNotEmpty) => {}
             Err(_) => panic!("expected StorageNotEmpty refusal"),
-            Ok(_) => panic!("genesis must not overwrite retained chain-config bytes"),
+            Ok(_) => panic!("genesis must not overwrite a durably locked configuration"),
         }
-        // The pre-existing bytes are untouched.
+        // The locked content is untouched.
         assert_eq!(
-            bc.chain_config.initial_chain_config_bytes(),
-            Some(&[0x01, 0x02][..])
+            bc.chain_config.durable_content(),
+            Some(&EMPTY_CONFIG_CONTENT[..])
         );
     }
 
@@ -2950,10 +3301,10 @@ mod tests {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
 
-        let first = bc.process_genesis(1_000_000_000, &[0xAA]);
+        let first = bc.process_genesis(1_000_000_000, &EMPTY_CONFIG_CONTENT);
         assert!(first.is_ok(), "first genesis must succeed");
 
-        let second = bc.process_genesis(1_000_000_000, &[0xBB]);
+        let second = bc.process_genesis(1_000_000_000, &OTHER_CONFIG_CONTENT);
         match second {
             Err(GenesisRejectReason::StorageNotEmpty) => {}
             Err(_) => panic!("expected StorageNotEmpty on the second genesis"),
@@ -2969,8 +3320,7 @@ mod tests {
         let crypto = Crypto::new(private_key)
             .ok()
             .expect("test private key should be accepted by the backend");
-        let storage = MemoryBackend::<0>::new();
-        let chain_config = FixedChainConfig::new();
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
 
         let mut bc_slot =
@@ -2978,20 +3328,90 @@ mod tests {
         let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
             &mut bc_slot,
             crypto,
-            storage,
+            BlockWriteFailsStorage,
             chain_config,
             0,
             node_zero,
             0,
         );
 
-        let outcome = bc.process_genesis(1_000_000_000, &[]);
+        let outcome = bc.process_genesis(1_000_000_000, &EMPTY_CONFIG_CONTENT);
 
         match outcome {
             Err(GenesisRejectReason::StorageSaveFailed) => {}
             Err(_) => panic!("expected StorageSaveFailed refusal"),
             Ok(_) => panic!("genesis must not succeed when a genesis block cannot be persisted"),
         }
+        // FR54's lock is set-once, so a refusal that engaged it would refuse
+        // every retry for the life of the process. The content is held
+        // tentatively until the last durable write succeeds, so a storage
+        // failure leaves the node able to bootstrap again.
+        assert!(
+            !bc.chain_config.is_durable_locked(),
+            "a genesis that failed on storage must not leave the configuration locked"
+        );
+        assert!(
+            bc.chain_config.tentative_content().is_some(),
+            "the accepted content is held tentatively, ready to be replaced by a retry"
+        );
+    }
+
+    /// The durable configuration seam needs the storage control plane; block
+    /// writes do not. Without an up-front check an uninitialized backend would
+    /// persist both genesis blocks and then refuse the configuration, and the
+    /// non-empty-chain guard would turn away every retry for the life of the
+    /// process. The precondition is therefore checked with the other pre-write
+    /// guards, and nothing is written.
+    #[test]
+    fn walking_skeleton_refuses_uninitialized_storage() {
+        let private_key = [1u8; PRIVATE_KEY_SIZE];
+        let crypto = Crypto::new(private_key)
+            .ok()
+            .expect("test private key should be accepted by the backend");
+        // Never `init`ed: `save_block` would succeed, `set_chain_configuration`
+        // would not.
+        let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+        let bc = TestChain::init(&mut bc_slot, crypto, storage, chain_config, 0, node_zero, 0);
+
+        let outcome = bc.process_genesis(1_000_000_000, &EMPTY_CONFIG_CONTENT);
+
+        match outcome {
+            Err(GenesisRejectReason::StorageNotInitialized) => {}
+            Err(_) => panic!("expected StorageNotInitialized refusal"),
+            Ok(_) => panic!("genesis must not run without a usable control plane"),
+        }
+        assert_eq!(bc.blocks.len(), 0, "no block reached the in-memory tree");
+        assert!(
+            bc.storage.read_block(0).is_err(),
+            "no block reached storage either"
+        );
+        assert!(!bc.chain_config.is_durable_locked());
+    }
+
+    /// A configuration whose own `block_size_limit` is smaller than the genesis
+    /// blocks it frames would produce a chain no node can accept: every peer
+    /// refuses Block #1 at Tier 1, and the founder's own restart refuses it at
+    /// FR6. Genesis must not create it.
+    #[test]
+    fn walking_skeleton_refuses_genesis_blocks_above_the_declared_limit() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        // `block_size_limit` (id 3) declared as 300: legal for the registry
+        // (> HEADER_SIZE, <= MAX_BLOCK_SIZE), smaller than Block #0.
+        let content = [1u8, 0, parameter::BLOCK_SIZE_LIMIT, 2, 0x2C, 0x01];
+
+        let outcome = bc.process_genesis(1_000_000_000, &content);
+
+        match outcome {
+            Err(GenesisRejectReason::GenesisBlockExceedsBlockSizeLimit) => {}
+            Err(_) => panic!("expected GenesisBlockExceedsBlockSizeLimit refusal"),
+            Ok(_) => panic!("genesis must not create a chain that rejects its own blocks"),
+        }
+        assert_eq!(bc.blocks.len(), 0, "nothing was written");
+        assert!(!bc.chain_config.is_durable_locked());
     }
 
     /// AC3 — read-only queries are typed to **not** carry `NextCall`.
@@ -3002,7 +3422,7 @@ mod tests {
     fn walking_skeleton_query_carries_no_next_call() {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
-        bc.process_genesis(1_000_000_000, &[])
+        bc.process_genesis(1_000_000_000, &EMPTY_CONFIG_CONTENT)
             .ok()
             .expect("genesis must succeed for local_node_id == 0");
 
@@ -3021,7 +3441,7 @@ mod tests {
     type TestChain = Blockchain<
         Crypto,
         MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        FixedChainConfig,
+        TestConfig,
         16,
         16,
         4,
@@ -3031,7 +3451,11 @@ mod tests {
     >;
 
     fn new_test_chain() -> TestChain {
-        let (crypto, storage, chain_config) = test_backends();
+        let (crypto, storage, _) = test_backends();
+        // A node that already holds a chain configuration — the state every
+        // post-genesis test assumes, and what the retired stub gave them for
+        // free by answering every accessor unconditionally.
+        let chain_config = locked_chain_config(&crypto, TestChain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
         let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
         TestChain::init(&mut bc_slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -3310,7 +3734,7 @@ mod tests {
     fn genesis_node_is_ready() {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 1);
-        bc.process_genesis(1_000_000_000, &[0xAB])
+        bc.process_genesis(1_000_000_000, &EMPTY_CONFIG_CONTENT)
             .ok()
             .expect("genesis must succeed");
         assert!(bc.current_phase() == LifecyclePhase::Ready);
@@ -3539,21 +3963,73 @@ mod tests {
         );
     }
 
+    /// AC3 — a node holding no configuration does not enter Processing, even
+    /// when the FR2 stopping condition is met: the FR3 derivation reads the FR37
+    /// vote parameters, and running it on `vote_parameters`' inert baseline
+    /// would produce a projection the node then goes `Ready` on. The block is
+    /// admitted; only the stage that needs the configuration is withheld
+    /// (specification §5.2). Compare `fr2_genesis_anchored_triggers_processing`,
+    /// which is the same submission against a configured node.
+    #[test]
+    fn fr2_stays_collecting_without_configuration() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+        let genesis = node_transfer_block(0, 7, 0, 7);
+
+        let (outcome, _) = bc.receive_block(genesis.view(), 100);
+
+        assert_eq!(
+            outcome,
+            ReceiveBlockOutcome::AcceptedSilently,
+            "the block itself is still admitted"
+        );
+        assert!(
+            bc.current_phase() == LifecyclePhase::Collecting,
+            "no configuration → no FR3 derivation, so no Processing and no Ready"
+        );
+        assert!(!bc.is_ready());
+    }
+
+    /// Defence in depth behind the FR2 gate: if a caller ever reaches the FR3
+    /// derivation without a configuration, the vote engine refuses rather than
+    /// accumulating on parameters nobody chose. Epic 6's deep-zone
+    /// re-derivation and Story 5.10's restart are the callers this protects.
+    #[test]
+    fn processing_pass_refuses_without_configuration() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+        let genesis = node_transfer_block(0, 7, 0, 7);
+        let (outcome, _) = bc.receive_block(genesis.view(), 100);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+
+        // The same candidate a configured node validates all the way to Ready
+        // (see `fr2_genesis_anchored_triggers_processing`).
+        assert_eq!(
+            bc.run_processing_pass(0),
+            Err(ProcessingError::Vote(VoteEngineError::NotParameterized)),
+            "no FR37 parameters -> the derivation refuses, it does not guess"
+        );
+    }
+
     /// A test chain with a small active-chain window (`SNAKE_CHAIN_LENGTH = 4`) so
     /// an active-length segment fits the test harness's block storage. Same shape
     /// as `new_test_chain` otherwise (local_node_id 5, join/Collecting).
-    fn new_w4_chain() -> Blockchain<
+    type W4Chain = Blockchain<
         Crypto,
         MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        FixedChainConfig,
+        TestConfig,
         16,
         4,
         4,
         16,
         4,
         16,
-    > {
-        let (crypto, storage, chain_config) = test_backends();
+    >;
+
+    fn new_w4_chain() -> W4Chain {
+        let (crypto, storage, _) = test_backends();
+        // This harness's own capacities, not `TestChain`'s: its window is 4.
+        let chain_config = locked_chain_config(&crypto, W4Chain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
         Blockchain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -4969,11 +5445,9 @@ mod tests {
     /// gate and establishing the lock from the candidate are Story 5.6.)
     #[test]
     fn fr6_rejects_divergent_chain_config() {
+        // `new_test_chain` is durably locked on `EMPTY_CONFIG_CONTENT`; this
+        // block carries a different (but equally well-framed) content region.
         let mut bc = new_test_chain();
-        bc.chain_config
-            .store_initial_chain_config_bytes(&[0x01, 0x02, 0x03])
-            .expect("retain durable-locked config");
-        // A chain-config block whose payload diverges from the retained config.
         let header = BlockHeader {
             version: 1,
             sequence: 5,
@@ -4988,8 +5462,13 @@ mod tests {
         };
         let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
         let mut builder = BlockBuilder::new().header(header);
+        let mut config_payload = ChainConfigPayloadBuilder::new();
+        config_payload
+            .add_literal(parameter::VOTE_INTEREST, &[5])
+            .ok()
+            .expect("a one-entry override set frames");
         builder
-            .set_chain_config_payload(&[0x09, 0x09, 0x09])
+            .set_chain_config_payload(config_payload.build_signed(&signer))
             .ok()
             .expect("set chain-config payload");
         let block = builder.build_signed(&signer).ok().expect("build signed");

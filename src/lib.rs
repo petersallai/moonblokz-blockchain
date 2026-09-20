@@ -3,10 +3,10 @@
 //! # moonblokz-blockchain
 //!
 //! Authoritative MoonBlokz blockchain interpretation crate (`no_std`, no-alloc,
-//! embassy-free). The public surface is the [`api`] module plus the temporary
-//! [`chain_config`] seam/re-exports used until the standalone
-//! `moonblokz-configuration` crate exists. Every other internal module is
-//! crate-private (FR66, AC5).
+//! embassy-free). The public surface is the [`api`] module; every other
+//! internal module is crate-private (FR66, AC5). The chain-configuration seam
+//! is `moonblokz_configuration::ChainConfigTrait` — this crate is generic over
+//! it and never depends on a concrete configuration implementation (FR56).
 //!
 //! ## Replay determinism (FR62 / FR63 precondition)
 //!
@@ -20,7 +20,6 @@
 //! builds on.
 
 pub mod api;
-pub mod chain_config;
 
 // Internal modules — crate-private; never `pub mod` (FR66 boundary).
 pub(crate) mod approval;
@@ -46,9 +45,6 @@ pub use api::{
     InitOutcome, LifecyclePhase, LocalTransactionOutcome, NextCall, ParentRecoveryRequest,
     ReceiveBlockOutcome, ReceiveTransactionOutcome, RejectReason, TickOutcome, TransactionState,
     TxStateQueryError,
-};
-pub use chain_config::{
-    ChainConfigError, ChainConfigTrait, FixedChainConfig, INITIAL_CHAIN_CONFIG_BYTES_CAPACITY,
 };
 
 #[cfg(test)]
