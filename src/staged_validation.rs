@@ -134,12 +134,30 @@ pub(crate) enum Tier1Failure {
     /// `public_key ≠ node_zero_public_key`.
     NodeZeroBalanceKeyMismatch,
     /// FR69 (iii): a chain-config block's FR7 content-signature fails to
-    /// verify against `node_zero_public_key`. **Declared but not produced in
-    /// Epic 4** — see [`tier1_chain_config_block`]: chain-types has no
-    /// payload_type=3 view to extract the content/signature split, so the
-    /// mechanical verification is deferred. The variant exists so Story 4.3's
-    /// `RejectReason` mapping is complete.
+    /// verify against `node_zero_public_key`. Produced by
+    /// [`tier1_chain_config_block`] on **every** chain-config block at intake
+    /// (Story 5.9) — the check needs only the block bytes and the trust anchor,
+    /// so it is state-free and runs irrespective of connected ancestry, FR50
+    /// balance coverage, or the FR8 tentative-vs-durable state.
     ChainConfigContentSignatureInvalid,
+    /// FR8/FR16: a chain-config block's FR7 content-signature verified, but the
+    /// configuration module refused the **content** — malformed framing, an
+    /// identifier this firmware does not allocate, a value-width or value-form
+    /// error, or one of the three structural bound violations (Story 5.7, AC4).
+    ///
+    /// Exact evidence of invalidity, so the block does not enter durable storage
+    /// and no tentative configuration remains loaded (FR8). Produced in
+    /// `Blockchain::tier1_admit` rather than the state-free `tier1_gate`: only
+    /// the configuration module parses content (FR56), and reaching it needs
+    /// `&mut self` for the load.
+    ///
+    /// Raised for **every** chain-config block, not only the one that loads. A
+    /// block arriving while a configuration is already held is not loaded — FR8
+    /// forbids overriding the tentative — but its content is still evaluated
+    /// through the module's pure acceptance pass, because FR8 says a bound
+    /// violation "shall not enter durable storage" without qualification, and
+    /// because storing it otherwise would make retention depend on arrival order.
+    ChainConfigContentRejected,
     /// Story 5.1 single-genesis guard: a distinct `sequence == 0` block arrived
     /// while the active chain is already anchored (`active_chain_head_idx !=
     /// NONE_REF`). There is structurally exactly one genesis anchor, so a later
@@ -216,11 +234,17 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
 
     // FR54 exception (i)+(c): block #0 waives the no-self-vote and the
     // `sequence > anchor_sequence` rules (the genesis self-transfer legitimately
-    // has anchor_sequence == 0 and votes for node #0). The full FR54 bootstrap
-    // exception set (gated on the sequence-AND-content-match conjunction, incl.
-    // block #1 chain-config) is forward-tagged to the genesis path / Story 5.6;
-    // Story 4.2 implements only the two waivers needed so a legitimately-received
-    // genesis block is not falsely rejected here.
+    // has anchor_sequence == 0 and votes for node #0). Story 4.2 implements only
+    // the two waivers needed so a legitimately-received genesis block is not
+    // falsely rejected here.
+    //
+    // **Still deferred after Story 5.9:** the *full* FR54 bootstrap exception
+    // set is gated on a sequence-AND-content-match conjunction (block #1 must be
+    // the chain-config block whose content the chain committed to), and this gate
+    // is only sequence-gated. Story 5.9 deliberately does not close it: the
+    // conjunction's content half is a *candidate*-relative fact, while Tier 1 is
+    // state-free, so the check belongs where the candidate is known (FR6, the
+    // processing pass) rather than here. Recorded in `deferred-work.md`.
     let is_genesis_block_zero = block.sequence() == 0;
 
     match block.payload_type() {
@@ -228,7 +252,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
             tier1_transaction_block(block, node_zero_public_key, crypto, is_genesis_block_zero)?;
         }
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
-        PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key)?,
+        PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
         PAYLOAD_TYPE_APPROVAL => {
             // Recognized schema. Approval-evidence payload Tier 1/3 checks are
             // owned by Epic 6 (FR12/FR27) — nothing to gate from block bytes
@@ -393,25 +417,45 @@ fn tier1_balance_block(
 
 /// FR69 (iii) / FR7 chain-config content-signature verification — **DEFERRED**.
 ///
-/// `moonblokz-chain-types` exposes no `payload_type=3` (chain-config) payload
-/// view: the `(configuration content, node-#0 content-signature)` split that
-/// FR7 verifies has no defined wire layout to parse in this crate, and no
-/// chain-config block is even constructible yet (no builder). Inventing the
-/// layout here would risk diverging from the eventual real format, which
-/// belongs with the chain-types owner / the chain-config crate.
+/// FR7 / FR69 (iii) chain-config content-signature gate (Story 5.9).
 ///
-/// So Story 4.2 *recognizes* `payload_type=3` as a known schema (it is not
-/// rejected as [`Tier1Failure::UnknownPayloadType`]) but does not yet run the
-/// content-signature check. [`Tier1Failure::ChainConfigContentSignatureInvalid`]
-/// is declared for the day the check lands. The epics.md Story 5.6 note ("the
-/// mechanical signature check exists from Epic 4 Story 4.2") assumes a
-/// chain-config payload view that does not exist; tracked in
-/// `deferred-work.md`. `node_zero_public_key` is threaded in so the eventual
-/// implementation needs no signature change.
-fn tier1_chain_config_block(
-    _block: &BlockView,
-    _node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
+/// Verifies the envelope's content signature over the **content region** against
+/// `node_zero_public_key`, the FR69 trust anchor. Two properties make this the
+/// whole of FR7's "canonical bytes" requirement:
+///
+/// - The preimage is the envelope view's `content()` — the *unmodified
+///   wire bytes* of the region, never a re-serialization. So the bytes verified
+///   here are byte-for-byte the bytes node #0 signed, and FR7's replay
+///   byte-identity (FR49) holds trivially rather than by a canonicalization rule
+///   this crate would have to implement and keep in step.
+/// - The framing walk in `from_payload` already rejects trailing or missing
+///   bytes (`content_end + SIGNATURE_SIZE != payload.len()`), so the
+///   content/signature split is unambiguous: there is exactly one way to read
+///   this payload, hence exactly one preimage.
+///
+/// **Malformed before invalid.** A payload whose envelope does not frame carries
+/// no content region to verify, so it is [`Tier1Failure::MalformedPayload`] and
+/// is answered *before* the signature check — evidence about the block's shape
+/// is more specific than evidence about its authenticity, and a `None` view has
+/// no signature to test in the first place.
+///
+/// The FR6 block-creator signature requirement is independent of this check and
+/// unchanged: a chain-config block carries node #0's signature over the content
+/// *and* its creator's signature over the block.
+pub(crate) fn tier1_chain_config_block<C: CryptoTrait>(
+    block: &BlockView,
+    node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
+    crypto: &C,
 ) -> Result<(), Tier1Failure> {
+    let view = block.chain_config().ok_or(Tier1Failure::MalformedPayload)?;
+    if !verify_signature_bytes(
+        crypto,
+        view.content(),
+        view.content_signature(),
+        node_zero_public_key,
+    ) {
+        return Err(Tier1Failure::ChainConfigContentSignatureInvalid);
+    }
     Ok(())
 }
 
@@ -443,10 +487,10 @@ fn check_no_self_vote(
 mod tests {
     use super::*;
     use moonblokz_chain_types::{
-        Block, BlockBuilder, BlockHeader, ComplexTransaction, HEADER_SIZE, NodeInfo, NodeTransfer,
-        PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_TRANSACTION, Registration,
+        Block, BlockBuilder, BlockHeader, ComplexTransaction, HEADER_SIZE, MAX_PAYLOAD_SIZE,
+        NodeInfo, NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_TRANSACTION, Registration,
     };
-    use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE, SIGNATURE_SIZE};
 
     /// Block-size limit used by the "normal" Tier 1 tests (the chain-config
     /// stub's `block_size_limit()`).
@@ -567,17 +611,114 @@ mod tests {
         );
     }
 
+    // --- AC1 (FR7 / FR69 (iii)): chain-config content signature -------------
+
+    /// The empty override set as a **content region**: `config_value_count = 0`,
+    /// so every parameter resolves to its code-baked default.
+    const EMPTY_CONFIG_CONTENT: [u8; 2] = [0, 0];
+
+    /// Frames `content` as a chain-config block payload — the content region
+    /// followed by `signer`'s signature over exactly those bytes — and builds a
+    /// `payload_type=3` block around it.
+    fn chain_config_block(seq: u32, content: &[u8], signer: &Crypto) -> Block {
+        let mut payload = [0u8; MAX_PAYLOAD_SIZE];
+        let end = content.len() + SIGNATURE_SIZE;
+        payload[..content.len()].copy_from_slice(content);
+        payload[content.len()..end].copy_from_slice(signer.sign(content).serialize());
+        let mut b = BlockBuilder::new().header(header(seq, PAYLOAD_TYPE_CHAIN_CONFIG));
+        b.set_chain_config_payload(&payload[..end])
+            .ok()
+            .expect("payload fits");
+        b.build_signed(signer)
+            .ok()
+            .expect("chain-config block builds")
+    }
+
     #[test]
-    fn tier1_recognizes_chain_config_schema_without_content_check() {
-        // FR69 (iii) content-signature verification is deferred (no chain-types
-        // payload_type=3 view); the schema is still recognized (not rejected).
+    fn tier1_accepts_node_zero_signed_chain_config() {
+        let c = crypto(1);
+        let block = chain_config_block(5, &EMPTY_CONFIG_CONTENT, &c);
+        let view = BlockView::from_bytes(block.serialized_bytes())
+            .ok()
+            .expect("parses");
+        assert_eq!(
+            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn tier1_rejects_chain_config_signed_by_another_key() {
+        // FR7: the content signature must verify against the FR69 trust anchor,
+        // node #0's key — not merely against *some* key.
+        let node_zero = crypto(1);
+        let impostor = crypto(2);
+        let block = chain_config_block(5, &EMPTY_CONFIG_CONTENT, &impostor);
+        let view = BlockView::from_bytes(block.serialized_bytes())
+            .ok()
+            .expect("parses");
+        assert_eq!(
+            tier1_gate(&view, &pubkey_bytes(&node_zero), NORMAL_LIMIT, &node_zero),
+            Err(Tier1Failure::ChainConfigContentSignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn tier1_rejects_chain_config_with_tampered_content() {
+        // The signature is over the content region, so a single flipped content
+        // byte invalidates it — this is what makes FR7's "canonical bytes"
+        // requirement hold without a canonicalization rule: the verified preimage
+        // *is* the wire bytes.
+        let c = crypto(1);
+        let block = chain_config_block(5, &EMPTY_CONFIG_CONTENT, &c);
+        let mut bytes = [0u8; HEADER_SIZE + 2 + SIGNATURE_SIZE];
+        let original = block.serialized_bytes();
+        bytes[..original.len()].copy_from_slice(original);
+        // Declare one entry where the signed content declared none. The envelope
+        // then frames differently, so this lands as malformed rather than as a
+        // signature failure — both are exact evidence, and the shape evidence is
+        // the more specific of the two.
+        bytes[HEADER_SIZE] = 1;
+        let view = BlockView::from_bytes(&bytes).ok().expect("parses");
+        assert_eq!(
+            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            Err(Tier1Failure::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn tier1_rejects_chain_config_with_unframeable_payload() {
+        // A `payload_type=3` block with no envelope at all (header only): no
+        // content region exists to verify, so this is `MalformedPayload` — the
+        // check the story requires *before* the signature check.
         let bytes = raw_block(1, 5, PAYLOAD_TYPE_CHAIN_CONFIG);
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
             tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
-            Ok(())
+            Err(Tier1Failure::MalformedPayload)
         );
+    }
+
+    #[test]
+    fn tier1_chain_config_signature_is_checked_regardless_of_sequence() {
+        // FR7: the gate runs on **every** chain-config block, irrespective of
+        // ancestry, FR50 balance coverage, or the FR8 commitment state. Tier 1
+        // sees none of those, which is precisely why the check is unconditional —
+        // including on a block claiming `sequence == 1`, the genesis config slot.
+        let node_zero = crypto(1);
+        let impostor = crypto(2);
+        for seq in [1u32, 7, 4_000] {
+            let block = chain_config_block(seq, &EMPTY_CONFIG_CONTENT, &impostor);
+            let view = BlockView::from_bytes(block.serialized_bytes())
+                .ok()
+                .expect("parses");
+            assert_eq!(
+                tier1_gate(&view, &pubkey_bytes(&node_zero), NORMAL_LIMIT, &node_zero),
+                Err(Tier1Failure::ChainConfigContentSignatureInvalid),
+                "sequence {seq} must not exempt the FR7 gate"
+            );
+        }
     }
 
     // --- AC2/AC3: transaction-payload checks --------------------------------
