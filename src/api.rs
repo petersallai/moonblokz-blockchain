@@ -37,7 +37,9 @@ use crate::lifecycle::is_legal_transition;
 use crate::node_info::NodeInfoState;
 use crate::prng::Prng;
 use crate::spent_bits::resolve_utxo_bit;
-use crate::staged_validation::{BlockStatus, Tier1Failure, tier1_gate, verify_signature_bytes};
+use crate::staged_validation::{
+    BlockStatus, Tier1Failure, tier1_chain_config_block, tier1_gate, verify_signature_bytes,
+};
 use crate::uninit::field_slot;
 
 // `LifecyclePhase` is owned by `lifecycle.rs` (architecture §4.2) and
@@ -467,8 +469,20 @@ pub(crate) enum ValidationReason {
     /// A complex tx UTXO input references an output whose spent-bit is already 1.
     UtxoAlreadySpent,
     /// A `payload_type=3` block's config content is not byte-identical to the
-    /// durable-locked configuration.
+    /// configuration this node holds — the durable-locked one when the FR8 lock
+    /// is engaged, otherwise the tentatively-loaded one (Story 5.9).
     ChainConfigMismatch,
+    /// FR8/AC3: the candidate segment carries **no** chain-config block in scope.
+    /// Not evidence against any single block — a segment that names no
+    /// configuration cannot satisfy FR6 chain-config compliance at all — so the
+    /// FR5 deletion target is the candidate head, the same fallback the
+    /// no-`block_idx` variants take.
+    MissingChainConfigBlock,
+    /// FR8/AC6: the candidate's first in-scope chain-config block could not be
+    /// adopted as the new tentative configuration — its content signature failed
+    /// re-verification, or the configuration module refused its content. Exact
+    /// evidence against that block (FR16).
+    ChainConfigContentRejected,
     /// A balance block after the earliest carries a `max_node_id` that diverges
     /// from the forward-tracked watermark at its sequence (FR3/FR6).
     BalanceMaxNodeIdMismatch,
@@ -546,6 +560,25 @@ pub struct Blockchain<
     // active head yet). Genesis admission (Story 4.4 event (i)) sets it; the
     // full FR2/FR4 lifecycle drivers (Epic 5) refine it.
     active_chain_head_idx: u32,
+
+    // FR8 (Story 5.9): the block-table index of the chain-config block whose
+    // content supplied the currently **tentatively**-loaded configuration, or
+    // `NONE_REF` when none is held tentatively.
+    //
+    // Four bytes for one question the FR5 recovery cannot otherwise answer:
+    // *did the delete-set contain the block my tentative configuration came
+    // from?* (AC8). The configuration module holds the content, not its
+    // provenance — and it must not, since a block index is block-tree
+    // bookkeeping, not configuration. Re-deriving the provenance by scanning
+    // the tree for a config block whose content matches would be both O(tree)
+    // with a storage read per candidate and *wrong*: two blocks can legitimately
+    // carry identical content, and the answer must name the one that loaded.
+    //
+    // A freed slot is reused, so a stale index could later name an unrelated
+    // block. It cannot go stale: every path that drops the tentative clears this
+    // in the same step, and every path that deletes the block drops the
+    // tentative (AC8).
+    tentative_config_block_idx: u32,
 
     // Real snake-chain state is two block-table indices, not a W-sized
     // window. `SNAKE_CHAIN_LENGTH` remains an algorithmic bound for
@@ -723,6 +756,7 @@ impl<
             VoteEngine::init(field_slot(&raw mut (*p).vote_engine));
             (&raw mut (*p).last_parent_request_emit_timestamp).write(0);
             (&raw mut (*p).active_chain_head_idx).write(NONE_REF);
+            (&raw mut (*p).tentative_config_block_idx).write(NONE_REF);
             (&raw mut (*p)._snake_chain_tail_idx).write(0);
         }
         // SAFETY: every field of `Self` was written above.
@@ -761,6 +795,7 @@ impl<
             vote_engine: VoteEngine::new(),
             last_parent_request_emit_timestamp: 0,
             active_chain_head_idx: NONE_REF,
+            tentative_config_block_idx: NONE_REF,
             _snake_chain_tail_idx: 0,
         }
     }
@@ -1276,9 +1311,58 @@ impl<
         let idx = self.blocks.next_free_index().ok_or(AdmitError::TableFull)?;
         let owned = Block::from_bytes(block.serialized_bytes())
             .map_err(|_| AdmitError::Rejected(Tier1Failure::MalformedPayload))?;
-        self.storage
-            .save_block(idx, &owned)
-            .map_err(|_| AdmitError::StorageSaveFailed)?;
+
+        // FR8 tentative load (Story 5.9, AC2). The **first** chain-config block
+        // whose FR7 content-signature verified — `tier1_gate` above owns that,
+        // so passing it is a precondition here — and whose content the
+        // configuration module accepts is loaded tentatively, and is then
+        // retained like any other admitted block.
+        //
+        // **Only the first, and only when nothing is held.** `active_configuration()`
+        // answers `Some` for a tentative *and* for a durable configuration, which
+        // is exactly the guard FR8 asks for in both directions: a later config
+        // block arriving while Collecting "shall be stored in the block-tree
+        // subject to FR16 and shall not override the tentative configuration",
+        // and a config block arriving after the lock is either a faithful replay
+        // (admitted, nothing to load) or a mismatch the FR17 gate already
+        // discarded before this function ran.
+        //
+        // **Placement — after every other fallible pre-storage step, before the
+        // durable write.** FR8 requires that a refused content leaves the block
+        // out of durable storage *and* no configuration loaded. `load_tentative`
+        // gives the second half for free: the module runs its whole acceptance
+        // pass before it retains anything, so a refusal leaves its state exactly
+        // as it was (Story 5.7). The first half is this ordering — nothing is
+        // written yet, so the `?` below is a complete rollback. Sitting *after*
+        // the slot peek and the `Block` reconstruction means the only fallible
+        // step left is the durable write itself, which is the single place that
+        // has to undo the load.
+        //
+        // Ordering is load-then-check (FR56): only the configuration module
+        // parses content, so the three structural bounds cannot be evaluated
+        // before the load. This surfaces the module's refusal as exact evidence
+        // of invalidity (FR16) — never as a silent discard, which would make a
+        // node with a smaller build look like a node seeing a bad chain.
+        let loads_tentative = block.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG
+            && self.chain_config.active_configuration().is_none();
+        if loads_tentative {
+            self.chain_config
+                .load_tentative(block.payload())
+                .map_err(|_| AdmitError::Rejected(Tier1Failure::ChainConfigContentRejected))?;
+        }
+
+        if let Err(e) = self.storage.save_block(idx, &owned) {
+            let _ = e;
+            // The durable write is the one step after the load that can still
+            // fail. Undo the load rather than keep a configuration whose block
+            // was never persisted: on the next boot the block is not there, so a
+            // node that kept it would be deriving from a configuration it can no
+            // longer justify (and FR49 replay could not reproduce).
+            if loads_tentative {
+                self.chain_config.discard_tentative();
+            }
+            return Err(AdmitError::StorageSaveFailed);
+        }
 
         // FR19 parent resolution (Story 4.4). `previous_hash()` is a 32-byte
         // slice; convert to the array key. Genesis (`sequence == 0`) has no parent.
@@ -1302,6 +1386,12 @@ impl<
         self.blocks.insert_at(idx, entry);
         if is_genesis {
             self.active_chain_head_idx = idx;
+        }
+        // FR8 provenance (AC8): record which retained block supplied the
+        // tentative content, now that it has a slot. Written only on the path
+        // that actually loaded, so it always names a live block.
+        if loads_tentative {
+            self.tentative_config_block_idx = idx;
         }
 
         // FR19 chain_heads mutation events (i) + (ii).
@@ -1362,10 +1452,25 @@ impl<
             && self.lifecycle_phase == LifecyclePhase::Collecting
             && self.chain_config.active_configuration().is_some()
         {
-            // At most **two** full-chain passes per call. The second one runs
-            // only after an `Invalid` recovery — see the `Err` arm — so the loop
-            // cannot iterate further: `retries_left` is never replenished.
+            // At most **three** full-chain passes per call, from two
+            // independent single-use tokens, neither ever replenished inside the
+            // loop: `retries_left` covers the Story-5.5 `Invalid` recovery
+            // retry, and `adopt_retries_left` the Story-5.9 FR8 config-adopt
+            // retry (ratified 2026-07-30, raising Story 5.5's ceiling of two).
+            // `1 + 1 + 1 = 3` regardless of interleaving — `Invalid → adopt` and
+            // `adopt → Invalid` both terminate at three.
+            //
+            // The adopt retry additionally cannot recur *for the same candidate*
+            // by construction rather than by counter: the content it adopts **is**
+            // the candidate's own first in-scope config block, so on the retry
+            // that block matches. The one shape that could otherwise oscillate —
+            // a candidate carrying two config blocks with differing contents —
+            // is excluded by the same construction: after the adopt, the first
+            // block matches and the *other* one is the offender, so `block_idx`
+            // no longer equals the first config block and the adopt guard below
+            // does not fire. It takes the hard FR5 rollback instead.
             let mut retries_left = 1u8;
+            let mut adopt_retries_left = 1u8;
             while let Some(candidate_tip_idx) = self.evaluate_stopping_condition() {
                 self.set_lifecycle_phase(LifecyclePhase::Processing);
                 // Story 5.3 (FR3) + Story 5.4 (FR6/FR4): reconstruct AND validate the
@@ -1374,17 +1479,114 @@ impl<
                 // the Ready transition below overwrites; it does not pre-empt selection.
                 match self.run_processing_pass(candidate_tip_idx) {
                     Ok(()) => {
-                        // FR6 passed over the full candidate → FR4 Ready transition:
-                        // atomically promote every candidate block Stored→Active
-                        // (the Epic-4-deferred FR9 Tier-3 driver), establish the active
-                        // head, and move Processing→Ready. The FR40-series ready-only
-                        // surface becomes live (its query bodies remain Epic 7/10
+                        // FR8 durable set-once lock (Story 5.9, AC4). The pass has
+                        // just proved the AC3 final check — the candidate carries
+                        // at least one chain-config block and every one of them is
+                        // byte-identical to the tentative configuration — so this
+                        // is the instant FR8 names for the commitment.
+                        //
+                        // **Before `promote_candidate_active`, not after.** The
+                        // durable write can fail, and this is the last point at
+                        // which a failure costs nothing: nothing has been promoted,
+                        // so abandoning the transition needs no undo of a marking
+                        // the FR5 recovery explicitly cannot undo (see its step-4
+                        // note on recovering after a successful promotion). A
+                        // failure therefore leaves the node Collecting with its
+                        // blocks intact, to try again on the next admission —
+                        // Story 5.8's rule that a node's own local trouble must not
+                        // be charged to a valid block.
+                        if !self.chain_config.is_durable_locked() {
+                            let (first_config_idx, _) =
+                                self.scan_candidate_chain_config(candidate_tip_idx, NONE_REF);
+                            // AC3 guarantees this: the pass fails with
+                            // `MissingChainConfigBlock` when the candidate carries
+                            // none, so reaching `Ok(())` means one is there.
+                            debug_assert!(
+                                first_config_idx != NONE_REF,
+                                "AC3: a candidate that passed the pass carries a chain-config block"
+                            );
+                            if first_config_idx == NONE_REF
+                                || self.commit_durable_chain_config(first_config_idx).is_err()
+                            {
+                                self.set_lifecycle_phase(LifecyclePhase::Collecting);
+                                break;
+                            }
+                            // FR6 passed over the full candidate → FR4 Ready
+                            // transition: atomically promote every candidate block
+                            // Stored→Active (the Epic-4-deferred FR9 Tier-3
+                            // driver) and establish the active head.
+                            self.promote_candidate_active(candidate_tip_idx);
+                            // AC5: with the lock engaged and the active chain
+                            // marked, drop every chain-config block in the tree
+                            // that disagrees with what was just locked. Ordered
+                            // after the promotion so the marking the cleanup's
+                            // safety assertion reads is the final one.
+                            self.delete_mismatching_chain_config_blocks();
+                        } else {
+                            self.promote_candidate_active(candidate_tip_idx);
+                        }
+                        // Processing→Ready. The FR40-series ready-only surface
+                        // becomes live (its query bodies remain Epic 7/10
                         // `todo!()` — reachable, but this story wires no caller).
-                        self.promote_candidate_active(candidate_tip_idx);
                         self.set_lifecycle_phase(LifecyclePhase::Ready);
                         break;
                     }
                     Err(err) => {
+                        // FR8 mismatch path (Story 5.9, AC6) — evaluated **before**
+                        // the FR5 recovery, because it is not a recovery: the
+                        // candidate is not being condemned, the node's own
+                        // tentative configuration is. The guard is deliberately
+                        // narrow, and each clause carries weight:
+                        //
+                        // - a *durable* lock is irrevocable (FR8), so a mismatch
+                        //   against it is always the block's fault and never an
+                        //   invitation to adopt;
+                        // - the offender must be the candidate's **first** in-scope
+                        //   config block, which is exactly what makes the retry
+                        //   at-most-once by construction — adopting the first
+                        //   block's own content cannot leave it mismatching, and a
+                        //   later offender means the candidate carries two
+                        //   differing contents and can never satisfy AC3 under any
+                        //   adoption;
+                        // - and the single-use token bounds the pass count even if
+                        //   a future change breaks the reasoning above.
+                        if adopt_retries_left > 0
+                            && !self.chain_config.is_durable_locked()
+                            && let ProcessingError::Invalid {
+                                block_idx,
+                                reason: ValidationReason::ChainConfigMismatch,
+                            } = &err
+                        {
+                            let block_idx = *block_idx;
+                            let (first_config_idx, _) =
+                                self.scan_candidate_chain_config(candidate_tip_idx, NONE_REF);
+                            if block_idx == first_config_idx
+                                && self
+                                    .adopt_candidate_chain_config(candidate_tip_idx, first_config_idx)
+                                    .is_ok()
+                            {
+                                adopt_retries_left -= 1;
+                                // Re-run over the same candidate, in the same
+                                // call. Reverting to Collecting first is what
+                                // makes that safe rather than merely convenient:
+                                // the loop head re-enters Processing, and if the
+                                // re-evaluation were ever to yield no candidate,
+                                // the node is left in a phase it can act from
+                                // instead of stranded in Processing.
+                                //
+                                // The re-evaluation returns the same tip. The only
+                                // tree change an adopt makes is deleting an
+                                // off-candidate subtree, which can only remove a
+                                // *competitor* — the candidate's own dominance
+                                // cannot be reduced by it.
+                                self.set_lifecycle_phase(LifecyclePhase::Collecting);
+                                continue;
+                            }
+                            // Adoption impossible (unreadable block, signature
+                            // re-verification failed, or content refused): that is
+                            // exact evidence against the block, so fall through to
+                            // the FR5 recovery, which deletes it.
+                        }
                         // FR6 failed (or FR3 could not derive) → the FR5 atomic
                         // recovery (Story 5.5): discard the working set, delete the
                         // offending block (or the candidate head) with its
@@ -1418,7 +1620,20 @@ impl<
                         // sit at the tip, and a transient read may simply re-read
                         // clean), but the Project Lead ruled retry-on-`Invalid`-only:
                         // spend the second pass only where success is derivable.
-                        let retryable = matches!(err, ProcessingError::Invalid { .. });
+                        // `MissingChainConfigBlock` (AC3) is excluded: it is not
+                        // evidence against the deleted head, so the shortened
+                        // branch still carries no chain-config block and the retry
+                        // is structurally certain to fail — while eating a second
+                        // good block off the branch. The Story-5.5 argument for
+                        // retrying on `Invalid` ("the deletion removed the first
+                        // failing block, so the surviving prefix was already proved
+                        // valid") does not apply to a violation that no single
+                        // block commits.
+                        let retryable = matches!(
+                            &err,
+                            ProcessingError::Invalid { reason, .. }
+                                if !matches!(reason, ValidationReason::MissingChainConfigBlock)
+                        );
                         self.recover_from_failed_pass(err, candidate_tip_idx);
                         if !retryable || retries_left == 0 {
                             break;
@@ -1624,6 +1839,33 @@ impl<
             self.blocks.delete(*idx);
         }
 
+        // Step 3b — FR8 tentative unload (Story 5.9, AC8). A tentative
+        // configuration is justified by the block that carried it; if that block
+        // is gone, so is the justification, and keeping it would let the node go
+        // on deriving from a configuration it can no longer point at (and which
+        // FR49 replay could not reproduce).
+        //
+        // A **durable-locked** configuration is never unloaded — the FR8 lock is
+        // irrevocable for the lifetime of the chain — and the module enforces
+        // that itself: `discard_tentative` is a no-op unless the commitment is
+        // `Tentative`. So this needs no lock check of its own, and cannot become
+        // one by accident.
+        //
+        // The vote engine is re-reset **after** the unload, not instead of step
+        // 1's reset: step 1 ran while the configuration was still loaded, so it
+        // parameterized the engine from FR37 values that no longer have a source.
+        // Re-running it now leaves the engine unparameterized, so any later vote
+        // effect refuses rather than computing on a value nobody chose. Two
+        // clears on a rare path, in exchange for never deriving from a retracted
+        // configuration.
+        if self.tentative_config_block_idx != NONE_REF
+            && delete_set[..deleted_count].contains(&self.tentative_config_block_idx)
+        {
+            self.tentative_config_block_idx = NONE_REF;
+            self.chain_config.discard_tentative();
+            self.reset_vote_engine();
+        }
+
         // Step 4 — restore the pre-acquisition active-chain marking, so recovery
         // really returns the node to its baseline instead of only clearing the
         // anchor index (ratified 2026-07-30). Both halves of the marking are
@@ -1733,6 +1975,13 @@ impl<
         // node count instead of 0. The payload type is read from the cached flag
         // bits (`BlockEntry::payload_type`) — no storage read during the mark.
         let mut floor_balance_idx = NONE_REF;
+        // FR8 (Story 5.9, AC3): the **first** in-scope chain-config block — the
+        // lowest-sequence one, which is the last the backward walk assigns, the
+        // same idiom `floor_balance_idx` uses. It is both the AC3 existence
+        // witness and the content the AC4 lock and the AC6 adopt-retry take, and
+        // it is read from the cached `payload_type` flag bits, so establishing it
+        // costs no storage read.
+        let mut first_config_idx = NONE_REF;
         loop {
             if count >= MAX_BLOCKS {
                 return Err(ProcessingError::MarkOverflow);
@@ -1743,12 +1992,16 @@ impl<
             if entry.payload_type() == PAYLOAD_TYPE_BALANCE {
                 floor_balance_idx = cur;
             }
+            if entry.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG {
+                first_config_idx = cur;
+            }
             let parent = entry.parent_ref();
             if parent == NONE_REF {
                 break;
             }
             cur = parent;
         }
+
 
         // AC5 (spent-bit lifecycle): establish the clean all-zero baseline for the
         // marked segment's spent-bits at entry — matching the `node_info` /
@@ -1872,6 +2125,34 @@ impl<
             }
             prev_hash = Some(this_hash);
         }
+
+        // FR8 final check, existence half (Story 5.9, AC3). A candidate naming no
+        // configuration cannot satisfy FR6 chain-config compliance, so it is not
+        // a chain this node may go Ready on. The content half — every in-scope
+        // config block byte-identical to the held configuration — is enforced per
+        // block inside the walk above.
+        //
+        // **At pass end, after the forward walk, not before it.** The check is
+        // decidable from the cached flag bits alone, so running it early would be
+        // cheaper — but it would also pre-empt every per-block failure, and those
+        // are the more specific evidence. A candidate that both names no
+        // configuration *and* contains an invalid block should report the invalid
+        // block, whose deletion is exact evidence under FR16; the whole-candidate
+        // verdict is what remains when no single block is at fault. Checking last
+        // keeps the pass's "earliest offender wins" ordering intact.
+        //
+        // This is a **behavioural tightening** over Story 5.4: reaching Ready now
+        // requires the candidate to carry a chain-config block. The `Err` routes
+        // into the FR5 recovery like any other FR6 violation, with the candidate
+        // head as the deletion target — `MissingChainConfigBlock` names no
+        // offending block, because no single block is at fault.
+        if result.is_ok() && first_config_idx == NONE_REF {
+            result = Err(ProcessingError::Invalid {
+                block_idx: candidate_tip_idx,
+                reason: ValidationReason::MissingChainConfigBlock,
+            });
+        }
+
         if result.is_err() {
             for slot in marked.iter().take(count) {
                 self.blocks.clear_spent_bits(*slot);
@@ -2194,16 +2475,20 @@ impl<
                 // admitted block passed — not re-checked here.
             }
             PAYLOAD_TYPE_CHAIN_CONFIG => {
-                // AC6: every chain-config block must carry config content
-                // byte-identical to the durable-locked configuration, when one is
-                // present. The comparison is over the **content region**, not the
-                // whole payload: the payload also carries the node-#0 content
-                // signature, which the FR7 Tier-1 check owns (Story 5.9).
-                // Establishing the lock from the candidate (no lock yet) is
-                // Story 5.9 too. A payload whose envelope does not frame cannot
-                // carry the locked content, so it is a mismatch.
-                if let Some(locked) = self.chain_config.durable_content()
-                    && view.chain_config().map(|config| config.content()) != Some(locked)
+                // FR6 chain-config compliance + the FR8 final check, content half
+                // (Story 5.9, AC3): every chain-config block on the candidate must
+                // carry content byte-identical to the configuration this node
+                // holds — the durable-locked one once the FR8 lock is engaged, and
+                // the tentatively-loaded one while still Collecting. One
+                // comparison serves both: FR8's final check *is* FR6 compliance
+                // measured against the not-yet-committed content.
+                //
+                // The comparison is over the **content region**, not the whole
+                // payload: the payload also carries node #0's content signature,
+                // which the FR7 Tier-1 gate owns. A payload whose envelope does
+                // not frame carries no content region and so cannot match.
+                if let Some(held) = self.held_chain_config_content()
+                    && view.chain_config().map(|config| config.content()) != Some(held)
                 {
                     return Err(invalid(ValidationReason::ChainConfigMismatch));
                 }
@@ -2617,6 +2902,279 @@ impl<
         self.blocks.len()
     }
 
+    // -----------------------------------------------------------------------
+    // FR7/FR8 chain-config commitment lifecycle (Story 5.9)
+    // -----------------------------------------------------------------------
+
+    /// The configuration content this node currently holds: the durable-locked
+    /// one once the FR8 lock is engaged, otherwise the tentatively-loaded one,
+    /// and `None` while it holds none.
+    ///
+    /// The two are never both present — the module keeps one buffer and one
+    /// commitment flag (Story 5.7, NFR1) — so this is a selection, not a
+    /// precedence rule. Durable is read first anyway, so the expression states
+    /// the invariant it relies on rather than assuming it.
+    fn held_chain_config_content(&self) -> Option<&[u8]> {
+        match self.chain_config.durable_content() {
+            Some(durable) => Some(durable),
+            None => self.chain_config.tentative_content(),
+        }
+    }
+
+    /// Walks the candidate segment `tip → anchor` over `parent_ref`, answering
+    /// the two questions the FR8 lifecycle asks about it *without* a storage
+    /// read: which block is its **first** (lowest-sequence) in-scope chain-config
+    /// block (`NONE_REF` if it carries none), and whether `probe` lies on the
+    /// segment.
+    ///
+    /// This repeats the mark walk `run_processing_pass` performs, deliberately.
+    /// The pass's own `marked` buffer is a local of that function and its frame
+    /// is released before the Ready transition and the adopt-retry read the
+    /// answer; keeping the pass's signature free of an out-parameter — and the
+    /// `Blockchain` free of pass scratch state that a later caller could read
+    /// stale — is worth one re-walk over cached flag bits on paths that already
+    /// cost a full forward derivation.
+    ///
+    /// Pass `NONE_REF` for `probe` when only the config block is wanted;
+    /// `NONE_REF` is never a live index, so the flag is then always `false`.
+    fn scan_candidate_chain_config(&self, tip: u32, probe: u32) -> (u32, bool) {
+        let mut first_config_idx = NONE_REF;
+        let mut probe_on_segment = false;
+        let mut cur = tip;
+        for _ in 0..MAX_BLOCKS {
+            let Some(entry) = self.blocks.get(cur) else {
+                break;
+            };
+            if cur == probe {
+                probe_on_segment = true;
+            }
+            if entry.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG {
+                first_config_idx = cur;
+            }
+            let parent = entry.parent_ref();
+            if parent == NONE_REF {
+                break;
+            }
+            cur = parent;
+        }
+        (first_config_idx, probe_on_segment)
+    }
+
+    /// Reads the block at `idx` back from durable storage, trimmed to its exact
+    /// retained length, as the owned `Block` the storage seam takes.
+    ///
+    /// The trim is not cosmetic: durable backends store blocks in fixed-size
+    /// slots and read them back zero-padded, and every FR7/FR8 comparison here is
+    /// byte-exact over the signed bytes. This is the same trim the forward pass
+    /// applies, factored out because the commitment lifecycle needs it at three
+    /// separate seams.
+    fn read_retained_block(&self, idx: u32) -> Option<Block> {
+        let padded = self.storage.read_block(idx).ok()?;
+        let full = padded.serialized_bytes();
+        let n = match self.blocks.get(idx).map(|entry| entry.len() as usize) {
+            Some(len) if len > 0 && len <= full.len() => len,
+            _ => full.len(),
+        };
+        Block::from_bytes(&full[..n]).ok()
+    }
+
+    /// Deletes `target` and its whole descendant subtree, with the FR19
+    /// `chain_heads` follow-up — the **deletion half** of the FR5 policy, and
+    /// nothing else.
+    ///
+    /// Deliberately *not* [`Self::recover_from_failed_pass`]: the two FR8 callers
+    /// (the AC5 lock-time mismatch cleanup and the AC6 adopt-retry) are removing
+    /// blocks from a tree whose derived projection is **correct and wanted**. The
+    /// working-set rollback, the active-chain-marking reset and the
+    /// Processing→Collecting reversion that the recovery performs would all be
+    /// wrong here: the node is going Ready, not recovering. Keeping this as its
+    /// own small function rather than a flag on the recovery is the point — a
+    /// parameterized recovery would invite a future caller to take the rollback
+    /// where none is wanted.
+    ///
+    /// Transitive by necessity, not by choice: a block is chained to its parent
+    /// by `previous_hash`, so a descendant of a removed block can no longer be
+    /// verified against anything and is unusable regardless.
+    ///
+    /// Slot release **is** durable deletion (`StorageTrait` has no delete, and
+    /// deliberately so — `blocks[i] ⟷ storage_index = i` is 1:1, so freeing the
+    /// in-memory slot frees the durable one and the bytes are overwritten by the
+    /// next `save_block(i, …)`; ratified in Story 4.4).
+    ///
+    /// Returns the number of blocks deleted.
+    fn delete_subtree_with_followup(&mut self, target: u32) -> usize {
+        // Collect before deleting, so every ancestry walk runs against the
+        // pre-deletion tree. Stack: `[u32; MAX_BLOCKS]` is 2.4 KB at the default
+        // `MAX_BLOCKS = 600`, taken at the `receive_block` seam where
+        // `run_processing_pass`'s equally-sized `marked` buffer is already
+        // released — the same budget the FR5 recovery reasons about, and never
+        // live at the same time as it.
+        let mut delete_set = [NONE_REF; MAX_BLOCKS];
+        let deleted_count = self.blocks.mark_subtree(target, &mut delete_set);
+        if deleted_count == 0 {
+            return 0;
+        }
+        // The target's parent survives (the delete-set is closed under the child
+        // relation) and becomes a childless tip, which event (iv) re-tracks.
+        let parent_of_target = self
+            .blocks
+            .get(target)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
+        for idx in delete_set.iter().take(deleted_count) {
+            self.blocks.delete(*idx);
+        }
+        self.chain_heads
+            .on_blocks_deleted(&mut self.blocks, &delete_set[..deleted_count], parent_of_target);
+        deleted_count
+    }
+
+    /// FR8 durable set-once lock (AC4): commits the candidate's configuration to
+    /// the durable control plane and promotes the module's commitment, exactly
+    /// once for the lifetime of the chain.
+    ///
+    /// `first_config_idx` is the candidate's first in-scope chain-config block.
+    /// By the AC3 final check every in-scope config block carries identical
+    /// content, so *which* one is committed cannot matter; the first is chosen
+    /// because it is the one the chain named earliest and the one the AC6 adopt
+    /// path takes, so the two agree by construction.
+    ///
+    /// **Storage first, then promote** — the same order the FR54 genesis path
+    /// uses. The durable write is the step that can fail; doing it while the
+    /// module is still merely tentative means a failure leaves a node that can
+    /// try again, whereas promoting first would engage an *irrevocable* lock over
+    /// content the control plane does not hold.
+    ///
+    /// Returns `Err(())` if the durable write fails or the promotion is refused.
+    /// A refused promotion is not papered over: `promote_durable` refuses a
+    /// second promotion by design (Story 5.7), and swallowing that would turn the
+    /// set-once guarantee into a no-op.
+    fn commit_durable_chain_config(&mut self, first_config_idx: u32) -> Result<(), ()> {
+        let block = self.read_retained_block(first_config_idx).ok_or(())?;
+        self.storage
+            .set_chain_configuration(&block)
+            .map_err(|_| ())?;
+        self.chain_config.promote_durable().map_err(|_| ())
+    }
+
+    /// FR8 lock-time mismatch cleanup (AC5): deletes every chain-config block
+    /// anywhere in the block-tree whose content differs from the now-locked
+    /// configuration, each with its descendant subtree and the FR19
+    /// `chain_heads` follow-up.
+    ///
+    /// Scope is the **whole tree** — the candidate's own active chain, retained
+    /// side branches, and unconnected orphans alike — because FR8 words it that
+    /// way and because a retained block that can never again be admitted (FR17
+    /// silently discards it from now on) is pure occupancy in a bounded table.
+    ///
+    /// The active chain is never damaged, and that is a consequence rather than a
+    /// precaution: AC3 proved every in-scope config block byte-identical to what
+    /// was just locked, so no on-active-chain config block can mismatch, and the
+    /// delete-set is closed under the child relation, so nothing on the active
+    /// chain descends from a deleted block either. The debug assertion below
+    /// states that so a future change to AC3 fails loudly instead of quietly
+    /// deleting the chain the node just adopted.
+    ///
+    /// Deletion invalidates indices, so each subtree is discovered against the
+    /// tree as it stands at that moment rather than from one up-front list.
+    fn delete_mismatching_chain_config_blocks(&mut self) {
+        for idx in 0..MAX_BLOCKS {
+            let idx = idx as u32;
+            // Re-read per iteration: an earlier subtree deletion may have freed
+            // this slot, and a freed slot is not a block.
+            let is_config = self
+                .blocks
+                .get(idx)
+                .is_some_and(|entry| entry.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG);
+            if !is_config || self.chain_config_block_matches_lock(idx) {
+                continue;
+            }
+            debug_assert!(
+                !self
+                    .blocks
+                    .get(idx)
+                    .is_some_and(|entry| entry.is_on_active_chain()),
+                "AC5 cleanup must never delete an on-active-chain block: AC3 proved \
+                 every in-scope chain-config block matches the locked configuration"
+            );
+            self.delete_subtree_with_followup(idx);
+        }
+    }
+
+    /// `true` iff the block at `idx` carries chain-config content byte-identical
+    /// to the durable-locked configuration.
+    ///
+    /// A block that cannot be read back, or whose envelope does not frame, does
+    /// **not** match: it carries no content region to be identical to. Answering
+    /// `false` there is the safe direction — it deletes a block this node cannot
+    /// interpret, rather than retaining one it cannot check.
+    ///
+    /// Split out as a `&self` predicate so the comparison's borrow of
+    /// `chain_config` and `storage` ends before the caller mutates the block-tree.
+    fn chain_config_block_matches_lock(&self, idx: u32) -> bool {
+        let Some(locked) = self.chain_config.durable_content() else {
+            return false;
+        };
+        let Some(block) = self.read_retained_block(idx) else {
+            return false;
+        };
+        BlockView::from_bytes(block.serialized_bytes())
+            .ok()
+            .and_then(|view| view.chain_config().map(|config| config.content() == locked))
+            .unwrap_or(false)
+    }
+
+    /// FR8 mismatch path (AC6): adopts the candidate's first in-scope
+    /// chain-config content as the new tentative configuration, so the pass can
+    /// be re-run over the same candidate.
+    ///
+    /// **Replace, don't discard-then-load.** FR8 describes clearing the seam and
+    /// then adopting; `load_tentative` performs exactly that transition as one
+    /// step, and doing it as one step is strictly stronger than the two-step
+    /// reading: the module runs its whole acceptance pass before it retains
+    /// anything (Story 5.7), so a refusal leaves the previous tentative intact
+    /// and *no* intermediate state — no partially-committed configuration, and no
+    /// window in which the node holds nothing — is observable at any point. A
+    /// literal `discard_tentative()` first would create precisely that window,
+    /// and on a refusal would leave the node worse off than before it tried.
+    ///
+    /// The FR7 content signature is **re-verified** here rather than trusted from
+    /// the block's admission. It is the trust anchor for content this node is
+    /// about to derive its whole chain from, the block has since made a round trip
+    /// through durable storage, and this path is expected-rare.
+    ///
+    /// The previous tentative's block is removed per FR8 — but only when it is
+    /// **off-candidate**. A previous tentative that sits *on* the candidate (it
+    /// can: a higher-sequence config block that arrived first loads the tentative,
+    /// then a lower-sequence one arrives and becomes the candidate's first) is
+    /// left in place for the retry to condemn with exact evidence. Deleting it
+    /// here would take the candidate's own tip subtree with it and dissolve the
+    /// very candidate this retry exists to re-run.
+    ///
+    /// Returns `Err(())` when the block cannot be read, its signature does not
+    /// re-verify, or the module refuses its content — each exact evidence against
+    /// that block (FR16), which the caller routes into the FR5 recovery.
+    fn adopt_candidate_chain_config(&mut self, tip: u32, first_config_idx: u32) -> Result<(), ()> {
+        let block = self.read_retained_block(first_config_idx).ok_or(())?;
+        let view = BlockView::from_bytes(block.serialized_bytes()).map_err(|_| ())?;
+        // FR7 re-verification, over the same state-free gate the intake path uses,
+        // so the two can never drift apart.
+        tier1_chain_config_block(&view, &self.node_zero_public_key, &self.crypto)
+            .map_err(|_| ())?;
+        self.chain_config
+            .load_tentative(view.payload())
+            .map_err(|_| ())?;
+
+        let previous = self.tentative_config_block_idx;
+        self.tentative_config_block_idx = first_config_idx;
+        if previous != NONE_REF && previous != first_config_idx {
+            let (_, on_candidate) = self.scan_candidate_chain_config(tip, previous);
+            if !on_candidate {
+                self.delete_subtree_with_followup(previous);
+            }
+        }
+        Ok(())
+    }
+
     /// The durable-locked chain-config **content** — the FR17 comparand — or
     /// `None` until the configuration is durably locked.
     ///
@@ -2886,6 +3444,18 @@ mod tests {
         (crypto, storage, chain_config)
     }
 
+    /// A node that holds **no** configuration at all — the joining node's real
+    /// starting state, before any chain-config block has reached it.
+    ///
+    /// Needed by the admission tests: on a node that already holds a
+    /// configuration, an admitted block can complete an FR2 candidate and run the
+    /// whole Epic-5 lifecycle inside `receive_block`, which is exactly what an
+    /// admission test must not have happening underneath it.
+    fn new_unconfigured_test_chain() -> TestChain {
+        let (crypto, storage, chain_config) = test_backends();
+        new_chain(crypto, storage, chain_config, 5, 0)
+    }
+
     /// Helper: build an empty node via `init` ready for a
     /// `process_genesis` call. Genesis is node-zero-only, so node zero's own
     /// key (derived from `crypto`) is stored as the trust anchor.
@@ -2964,6 +3534,7 @@ mod tests {
             vote_engine,
             last_parent_request_emit_timestamp,
             active_chain_head_idx,
+            tentative_config_block_idx,
             _snake_chain_tail_idx,
         } = &*bc;
 
@@ -2981,6 +3552,7 @@ mod tests {
         assert_eq!(vote_engine.top_creator(), Some(0));
         assert_eq!(*last_parent_request_emit_timestamp, 0);
         assert_eq!(*active_chain_head_idx, NONE_REF);
+        assert_eq!(*tentative_config_block_idx, NONE_REF);
         assert_eq!(*_snake_chain_tail_idx, 0);
         assert_eq!(bc.local_node_id(), 7);
     }
@@ -3031,6 +3603,7 @@ mod tests {
             vote_engine,
             last_parent_request_emit_timestamp,
             active_chain_head_idx,
+            tentative_config_block_idx,
             _snake_chain_tail_idx,
         } = &*built;
         let Blockchain {
@@ -3047,6 +3620,7 @@ mod tests {
             vote_engine: spec_vote_engine,
             last_parent_request_emit_timestamp: spec_last_parent_request_emit_timestamp,
             active_chain_head_idx: spec_active_chain_head_idx,
+            tentative_config_block_idx: spec_tentative_config_block_idx,
             _snake_chain_tail_idx: spec_snake_chain_tail_idx,
         } = &spec;
 
@@ -3063,6 +3637,10 @@ mod tests {
             spec_last_parent_request_emit_timestamp
         );
         assert_eq!(active_chain_head_idx, spec_active_chain_head_idx);
+        assert_eq!(
+            tentative_config_block_idx,
+            spec_tentative_config_block_idx
+        );
         assert_eq!(_snake_chain_tail_idx, spec_snake_chain_tail_idx);
     }
 
@@ -3463,6 +4041,37 @@ mod tests {
         unsafe { bc_slot.assume_init() }
     }
 
+    /// As [`node_transfer_block`], but chained to `prev` so the block can sit
+    /// above another in a candidate segment.
+    fn chained_node_transfer_block(
+        seq: u32,
+        prev: [u8; 32],
+        vote: u32,
+        anchor: u32,
+        initializer: u32,
+    ) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(vote, anchor, initializer, 9, 100, 1, 0, &signer);
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        builder
+            .add_node_transfer(&nt)
+            .ok()
+            .expect("add node transfer");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
     fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer: u32) -> Block {
         // The block-creator signature is not a Tier 1 gate in Epic 4
         // (opportunistic / ready-state), so any signer works for these tests.
@@ -3554,19 +4163,39 @@ mod tests {
     /// head (hence no parent-recovery tick) is scheduled.
     #[test]
     fn receive_block_genesis_anchors_active_head() {
-        let mut bc = new_test_chain();
+        // A joining node, holding no configuration yet — the order in which a
+        // real node meets a chain, and the only order in which the genesis can be
+        // observed on its own: once a configuration is held, the genesis
+        // admission completes an FR2 candidate and the whole lifecycle runs
+        // inside this same call.
+        let mut bc = new_unconfigured_test_chain();
         // Block-zero waives the self-vote / anchor Tier 1 checks.
         let genesis = node_transfer_block(0, 7, 0, 7);
-        let (outcome, next) = bc.receive_block(genesis.view(), 100);
+        let (outcome, _) = bc.receive_block(genesis.view(), 100);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(
             bc.current_active_head(),
             Some(0),
             "genesis is the active head"
         );
+        // FR8 (Story 5.9): block #1 carries the chain-config, exactly as the FR54
+        // bootstrap emits it. It loads the tentative configuration (AC2) and
+        // completes a candidate that names one (AC3), so the node goes Ready —
+        // which is what makes the `NextCall::Idle` assertion below non-vacuous:
+        // the intervals it would need are now available, and there is genuinely
+        // no Stored head left to schedule.
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
+        let (outcome, next) = bc.receive_block(cfg.view(), 100);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert!(
+            bc.blocks
+                .get(0)
+                .is_some_and(|entry| entry.is_on_active_chain()),
+            "the genesis still anchors the active chain"
+        );
         assert!(
             matches!(next, NextCall::Idle),
-            "a Connected genesis head schedules no parent recovery"
+            "a fully-connected active chain schedules no parent recovery"
         );
     }
 
@@ -3836,7 +4465,12 @@ mod tests {
     /// reseats the active chain.
     #[test]
     fn single_genesis_guard_rejects_second_seq0() {
-        let mut bc = new_test_chain();
+        // Unconfigured: the guard is an admission property, decided from the
+        // block bytes and `active_chain_head_idx` alone. Holding a configuration
+        // would let the first genesis complete an FR2 candidate and run the
+        // Epic-5 lifecycle inside the same call, which would be testing the
+        // lifecycle rather than the guard.
+        let mut bc = new_unconfigured_test_chain();
 
         // First genesis (seq 0) anchors the active chain at slot 0.
         let g1 = node_transfer_block(0, 7, 0, 7);
@@ -3950,12 +4584,21 @@ mod tests {
     fn fr2_genesis_anchored_triggers_processing() {
         let mut bc = new_test_chain();
         let genesis = node_transfer_block(0, 7, 0, 7);
+        // FR8 (Story 5.9, AC3): the candidate must name a configuration, so
+        // block #1 carries the chain-config as the FR54 bootstrap emits it.
+        // Admitted first, while it is still an orphan (no FR2 trigger), so the
+        // genesis admission is what completes the genesis-anchored candidate —
+        // which is the transition this test is about.
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
+        let (cfg_outcome, _) = bc.receive_block(cfg.view(), 100);
+        assert_eq!(cfg_outcome, ReceiveBlockOutcome::AcceptedSilently);
         let (outcome, _) = bc.receive_block(genesis.view(), 100);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(
-            bc.current_active_head(),
-            Some(0),
-            "genesis is the active head after the FR4 promotion (AC9)"
+        assert!(
+            bc.blocks
+                .get(0)
+                .is_some_and(|entry| entry.is_on_active_chain()),
+            "the genesis is on the active chain after the FR4 promotion (AC9)"
         );
         assert!(
             bc.is_ready(),
@@ -4043,7 +4686,10 @@ mod tests {
     fn fr2_active_length_triggers_at_w() {
         let mut bc = new_w4_chain();
         // Tail orphan at seq 100 (unresolved parent), then children up to len 3.
-        let tail = node_transfer_block(100, 3, 99, 7);
+        // The tail is the chain-config block the FR8 final check requires in
+        // scope (Story 5.9, AC3); as the segment anchor it is inert with respect
+        // to the derivation — see `chain_config_anchor_block`.
+        let tail = chain_config_anchor_block(100, [0xAB; 32]);
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
         for seq in 101..=102 {
@@ -4276,6 +4922,61 @@ mod tests {
 
     /// A `payload_type=2` balance block with one `NodeInfo` entry per
     /// `(owner, balance, vote_count, pk_byte)` tuple, and the given `max_node_id`.
+    /// A validly-signed chain-config block carrying the **empty override set** —
+    /// the exact content `new_test_chain`'s configuration is locked on, so it
+    /// satisfies the FR6/FR8 content-identity check — chained to `prev`.
+    ///
+    /// Every fixture that drives a candidate to a successful pass needs one of
+    /// these, because the FR8 final check (Story 5.9, AC3) makes a candidate
+    /// segment without a chain-config block in scope invalid. Placed as the
+    /// segment's **anchor** (lowest sequence) so it is provably inert with
+    /// respect to everything the fixtures assert: the shared FR37/FR36 tail runs
+    /// against all-zero derived state at that point, so the anti-capture interest
+    /// is 0 (growth on 0 is 0), the creator-vote reset overwrites a 0 with a 0,
+    /// and `mined_amount = 0` credits nothing. A fixture's original purpose is
+    /// therefore preserved exactly, not approximately.
+    ///
+    /// `creator` is node 0, which the fixtures leave unseeded — so the
+    /// per-creator FR6 checks are skipped by the pre-seed-zone rule — and which
+    /// signs with the universal test key anyway, so the block is well-formed even
+    /// where a fixture *does* seed node 0.
+    fn chain_config_anchor_block(seq: u32, prev: [u8; 32]) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut payload_builder = ChainConfigPayloadBuilder::new();
+        let payload = payload_builder.build_signed(&signer);
+        let mut builder = BlockBuilder::new().header(header);
+        builder
+            .set_chain_config_payload(payload)
+            .ok()
+            .expect("empty override set fits the payload");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// Admits a [`chain_config_anchor_block`] at `seq` chained to `prev` and
+    /// returns its hash, for use as the next block's `previous_hash`. The block
+    /// is deliberately admitted through `tier1_admit`, so the FR7 content
+    /// signature is really verified on the way in.
+    fn admit_chain_config_anchor(bc: &mut TestChain, seq: u32, prev: [u8; 32]) -> [u8; 32] {
+        let cfg = chain_config_anchor_block(seq, prev);
+        let hash = cfg.view().hash();
+        bc.tier1_admit(&cfg.view(), &hash, 0)
+            .ok()
+            .expect("chain-config anchor admitted");
+        hash
+    }
+
     fn balance_block(
         seq: u32,
         prev: [u8; 32],
@@ -4360,9 +5061,13 @@ mod tests {
     #[test]
     fn fr3_derives_balance_block_seed_and_watermark() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         let anchor = balance_block(
             100,
-            [0xAB; 32],
+            cfg_hash,
             &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)],
             2,
         );
@@ -4398,7 +5103,11 @@ mod tests {
     #[test]
     fn fr3_derives_registration_and_watermark() {
         let mut bc = new_test_chain();
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 100, 0, 0xB1)], 1);
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0xB1)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // FR6 registration monotonicity: `new_node_id` must be the pre-block
@@ -4432,7 +5141,11 @@ mod tests {
     #[test]
     fn fr3_derives_node_transfer_between_seeded_nodes() {
         let mut bc = new_test_chain();
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // vote 0 — the permanent node-#0 vote-target exception (FR37/FR54), so the
@@ -4454,8 +5167,11 @@ mod tests {
     #[test]
     fn fr3_preseed_zone_auto_accepts() {
         let mut bc = new_test_chain();
-        // Orphan anchor: a transfer from node 7 to node 9, neither ever seeded.
-        let anchor = node_transfer_block(100, 3, 99, 7);
+        // FR8 (Story 5.9, AC3): the segment is anchored by a chain-config block,
+        // which is inert here — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        // A transfer from node 7 to node 9, neither ever seeded.
+        let anchor = chained_node_transfer_block(100, cfg_hash, 3, 99, 7);
         let ai = bc
             .tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
@@ -4476,11 +5192,18 @@ mod tests {
     fn fr3_genesis_anchored_watermark_zero() {
         let mut bc = new_test_chain();
         let g = node_transfer_block(0, 3, 0, 7);
-        let gi = bc
-            .tier1_admit(&g.view(), &g.view().hash(), 0)
+        bc.tier1_admit(&g.view(), &g.view().hash(), 0)
             .expect("genesis admitted");
+        // FR8 (Story 5.9, AC3): block #1 carries the chain-config. It contributes
+        // no balance block, so the watermark this test measures is untouched.
+        let ci = {
+            let cfg = chain_config_anchor_block(1, g.view().hash());
+            bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
+                .ok()
+                .expect("chain-config block admitted")
+        };
 
-        bc.run_processing_pass(gi).expect("pass succeeds");
+        bc.run_processing_pass(ci).expect("pass succeeds");
 
         assert_eq!(
             bc.node_info.max_known_node_id(),
@@ -4494,9 +5217,13 @@ mod tests {
     #[test]
     fn fr3_backward_mark_follows_selected_branch_only() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         let anchor = balance_block(
             100,
-            [0xAB; 32],
+            cfg_hash,
             &[(1, 1000, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
             3,
         );
@@ -4524,7 +5251,11 @@ mod tests {
     #[test]
     fn fr3_not_resumable_clean_reentry() {
         let mut bc = new_test_chain();
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 10, 0xB1)], 1);
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let tx = transfer_block(101, anchor.view().hash(), 1, 1, 0, 3, 0);
@@ -4556,7 +5287,11 @@ mod tests {
     fn fr3_projection_is_clock_independent_and_reproducible() {
         fn run(now_base: u64) -> (u64, u64, u32, u32) {
             let mut bc = new_test_chain();
-            let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
+            // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+            // block in scope, so the segment is anchored by one. Inert with
+            // respect to everything below — see `chain_config_anchor_block`.
+            let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+            let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
             let _ai = bc
                 .tier1_admit(&anchor.view(), &anchor.view().hash(), now_base)
                 .expect("anchor admitted");
@@ -4583,7 +5318,12 @@ mod tests {
     #[test]
     fn fr4_seam_reaches_ready_and_promotes_active() {
         let mut bc = new_test_chain();
-        let (outcome, _next) = bc.receive_block(node_transfer_block(0, 3, 0, 7).view(), 0);
+        let genesis = node_transfer_block(0, 3, 0, 7);
+        // FR8 (Story 5.9, AC3): block #1 carries the chain-config, admitted first
+        // as an orphan so the genesis admission completes the candidate.
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
+        bc.receive_block(cfg.view(), 0);
+        let (outcome, _next) = bc.receive_block(genesis.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert!(
             bc.is_ready(),
@@ -4609,32 +5349,40 @@ mod tests {
     /// failed pass had already proved every block below the offender, and
     /// `block_idx` names the earliest one.
     ///
-    /// The candidate `[#0 genesis, #1 registration]` is continuous
-    /// genesis-anchored (so FR2 qualifies on the genesis admission) but block
-    /// #1's `new_node_id = 5 ≠ watermark + 1 = 1` violates the FR6
-    /// registration-monotonicity rule.
+    /// The candidate `[#0 genesis, #1 chain-config, #2 registration]` is
+    /// continuous genesis-anchored (so FR2 qualifies on the genesis admission)
+    /// but block #2's `new_node_id = 5 ≠ watermark + 1 = 1` violates the FR6
+    /// registration-monotonicity rule. Block #1 is the chain-config the FR8
+    /// final check (Story 5.9, AC3) requires — and it has to be *below* the
+    /// offender, because the shortened branch the retry validates must still name
+    /// a configuration.
     #[test]
     fn fr5_seam_recovers_and_retries_invalid_candidate_in_one_call() {
         let mut bc = new_test_chain();
         let genesis = node_transfer_block(0, 0, 0, 0);
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
         // Out-of-sequence registration child (new_node_id 5, expected 1).
-        let child = registration_block(1, genesis.view().hash(), 1, 5, 0xC5);
-        // Admit the child first as an orphan (Stored, no FR2 — not yet anchored),
-        // then the genesis so the continuous genesis-anchored candidate qualifies.
+        let child = registration_block(2, cfg.view().hash(), 1, 5, 0xC5);
+        // Admit the upper blocks first, while they are still orphans (Stored, no
+        // FR2 — not yet anchored), then the genesis, so the continuous
+        // genesis-anchored candidate qualifies on that last admission.
         let (outcome, _) = bc.receive_block(child.view(), 0);
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::AcceptedSilently,
             "the orphan child is really admitted (the seam below is not vacuous)"
         );
+        let (cfg_outcome, _) = bc.receive_block(cfg.view(), 0);
+        assert_eq!(cfg_outcome, ReceiveBlockOutcome::AcceptedSilently);
         let child_idx = bc
             .blocks
-            .find(1, &child.view().hash())
+            .find(2, &child.view().hash())
             .expect("child in the tree");
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
         let (outcome, _) = bc.receive_block(genesis.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        // AC11(a): the offender and its descendants are gone, the genesis survives.
+        // AC11(a): the offender and its descendants are gone, the genesis and the
+        // chain-config block survive.
         assert!(
             bc.blocks.get(child_idx).is_none(),
             "the offending block is deleted from the tree (and its durable slot freed)"
@@ -4643,7 +5391,11 @@ mod tests {
             .blocks
             .find(0, &genesis.view().hash())
             .expect("genesis survives");
-        assert_eq!(bc.blocks.len(), 1);
+        let cfg_idx = bc
+            .blocks
+            .find(1, &cfg.view().hash())
+            .expect("chain-config block survives");
+        assert_eq!(bc.blocks.len(), 2);
         // AC11(f), amended: the shortened branch is re-evaluated in this very
         // call and validates, so the node is Ready on return — no second
         // admission, no tick, no wait for ambient traffic.
@@ -4652,8 +5404,8 @@ mod tests {
             "the retry validates the shortened genesis-anchored candidate in-call"
         );
         assert_eq!(
-            bc.active_chain_head_idx, genesis_idx,
-            "the retry's Ready transition establishes the surviving genesis as the active head"
+            bc.active_chain_head_idx, cfg_idx,
+            "the retry's Ready transition establishes the surviving tip as the active head"
         );
         assert_eq!(
             bc.blocks
@@ -4791,9 +5543,13 @@ mod tests {
     #[test]
     fn fr5_degenerate_target_still_rolls_back_and_reverts() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         let anchor = balance_block(
             100,
-            [0xAB; 32],
+            cfg_hash,
             &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)],
             5,
         );
@@ -4848,11 +5604,15 @@ mod tests {
     #[test]
     fn fr5_working_set_is_clean_after_recovery() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Window-anchored candidate: balance seed (watermark 5) → valid transfer
         // → out-of-sequence registration (id 3, expected 6).
         let anchor = balance_block(
             100,
-            [0xAB; 32],
+            cfg_hash,
             &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)],
             5,
         );
@@ -5054,8 +5814,13 @@ mod tests {
         fn run(now: u64) -> Snapshot {
             let mut bc = new_test_chain();
             let genesis = node_transfer_block(0, 0, 0, 0);
-            let child = registration_block(1, genesis.view().hash(), 1, 5, 0xC5);
+            // Block #1 is the chain-config the FR8 final check requires below the
+            // offender (Story 5.9, AC3) — see
+            // `fr5_seam_recovers_and_retries_invalid_candidate_in_one_call`.
+            let cfg = chain_config_anchor_block(1, genesis.view().hash());
+            let child = registration_block(2, cfg.view().hash(), 1, 5, 0xC5);
             let (first, _) = bc.receive_block(child.view(), now);
+            bc.receive_block(cfg.view(), now.saturating_add(1_000));
             let (second, _) = bc.receive_block(genesis.view(), now.saturating_add(9_000));
 
             let mut occupied = [false; 16];
@@ -5097,8 +5862,9 @@ mod tests {
         );
         assert_eq!(
             baseline.occupied.iter().filter(|slot| **slot).count(),
-            1,
-            "recovery deleted the offending subtree and left exactly the genesis"
+            2,
+            "recovery deleted the offending subtree and left exactly the genesis \
+             and the chain-config block"
         );
     }
 
@@ -5149,7 +5915,11 @@ mod tests {
     #[test]
     fn fr3_creator_credit_skipped_for_unseeded_creator() {
         let mut bc = new_test_chain();
-        let blk = credit_block(100, [0xAB; 32], 8, 500, 7, 9, 0);
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let blk = credit_block(100, cfg_hash, 8, 500, 7, 9, 0);
         let bi = bc
             .tier1_admit(&blk.view(), &blk.view().hash(), 0)
             .expect("block admitted");
@@ -5171,10 +5941,14 @@ mod tests {
     #[test]
     fn fr3_creator_credit_applied_to_seeded_creator() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // max_node_id 9 so the transfer's (unseeded, pre-window) initializer 7 and
         // receiver 9 are within the valid node-id range — only node 3 is
         // individually seeded (partial FR50 coverage).
-        let anchor = balance_block(100, [0xAB; 32], &[(3, 100, 0, 0xB3)], 9);
+        let anchor = balance_block(100, cfg_hash, &[(3, 100, 0, 0xB3)], 9);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let blk = credit_block(101, anchor.view().hash(), 3, 500, 7, 9, 0);
@@ -5199,9 +5973,13 @@ mod tests {
     #[test]
     fn fr6_rejects_out_of_sequence_registration() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Balance block declares max_node_id 5 → watermark 5; the next valid
         // registration id is 6. A registration for id 3 violates the stride-1 rule.
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 100, 0, 0xB1)], 5);
+        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0xB1)], 5);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let reg = registration_block(101, anchor.view().hash(), 1, 3, 0xC3);
@@ -5233,9 +6011,13 @@ mod tests {
     #[test]
     fn fr6_rejects_unknown_vote_target() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // max_node_id 8 so the transfer's initializer 1 and receiver 2 are in range;
         // the vote target 9 is beyond the watermark → cannot exist.
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 8);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 8);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // Vote target 9 is beyond max_known_node_id (8) → not a possible node.
@@ -5261,8 +6043,12 @@ mod tests {
     #[test]
     fn fr6_rejects_out_of_range_referenced_node() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Window-anchored, watermark 5 (only node 1 individually seeded).
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 5);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 5);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // Output side: receiver 99 is beyond the watermark.
@@ -5304,10 +6090,14 @@ mod tests {
     #[test]
     fn fr6_vote_target_in_range_but_not_individually_seeded_is_accepted() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Partial-coverage balance block: seeds only node 1, but declares
         // max_node_id = 10 (nodes 2..=10 exist pre-window / elsewhere in the window
         // but are not individually seeded by THIS block).
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 10);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 10);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // Node 1 (seeded) votes for node 5: 5 ∉ seeded-set but 5 ≤ watermark(10).
@@ -5347,10 +6137,14 @@ mod tests {
     #[test]
     fn fr6_window_anchored_registration_before_first_balance_is_trusted() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Orphan anchor (seq 100, window-anchored): a registration for node 7 —
         // stride-1 against a 0 watermark would demand id 1, so the OLD per-0 check
         // would reject it. It precedes the segment's only balance block (seq 101).
-        let reg = registration_block(100, [0xAB; 32], 1, 7, 0xC7);
+        let reg = registration_block(100, cfg_hash, 1, 7, 0xC7);
         bc.tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
         // Balance block at seq 101: declares the full count (max_node_id 10) — the
@@ -5420,8 +6214,12 @@ mod tests {
     #[test]
     fn fr6_rejects_later_balance_block_max_node_id_mismatch() {
         let mut bc = new_test_chain();
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Earliest balance block → watermark initialized to 1.
-        let b0 = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 1);
+        let b0 = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 1);
         bc.tier1_admit(&b0.view(), &b0.view().hash(), 0)
             .expect("earliest balance block admitted");
         // A later balance block claims max_node_id 5 ≠ the tracked watermark 1.
@@ -5491,7 +6289,11 @@ mod tests {
     #[test]
     fn fr6_rejects_duplicate_public_key() {
         let mut bc = new_test_chain();
-        let anchor = balance_block(100, [0xAB; 32], &[(1, 500, 0, 0xB1)], 1);
+        // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
+        // block in scope, so the segment is anchored by one. Inert with
+        // respect to everything below — see `chain_config_anchor_block`.
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // pk_byte == 1 ⇒ new_public_key == pubkey([1u8]) == node 1's seeded key.
