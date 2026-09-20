@@ -1431,10 +1431,19 @@ impl<
         (outcome, self.next_parent_recovery_call())
     }
 
-    /// Re-initializes the vote registry to its empty seeded baseline in place
-    /// (FR3 "not resumable — clean working set on re-entry", AC5) through the
-    /// engine's own safe [`VoteEngine::reset`] — the same field writes as its
-    /// constructor, applied over the live value with no stack temporary.
+    /// Brings the vote registry into the state the current chain configuration
+    /// implies: empty, and parameterized when there is a configuration to
+    /// parameterize from.
+    ///
+    /// Emptying is the obligation every caller shares (FR3 "not resumable —
+    /// clean working set on re-entry", AC5, and the FR5 recovery's rollback);
+    /// supplying the FR37 values is what the genesis path additionally needs,
+    /// since the engine is constructed unparameterized. Both run in place, over
+    /// the live value, with no `MAX_NODES`-scaled stack temporary.
+    ///
+    /// Deliberately not named `init_*`: in this crate `init` means in-place
+    /// construction into uninitialized memory, exactly once, while this runs
+    /// repeatedly on a live engine.
     fn reset_vote_engine(&mut self) {
         match self.chain_config.active_configuration() {
             // FR37 parameters from the chain, and an empty working set.
