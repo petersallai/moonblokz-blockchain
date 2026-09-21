@@ -27,7 +27,7 @@ use moonblokz_configuration::{BuildLimits, ChainConfigTrait, limits_are_expressi
 use moonblokz_crypto::{
     CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
 };
-use moonblokz_storage::StorageTrait;
+use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
 use crate::blocks::{BlockEntry, BlockTable, NONE_REF, SPENT_BITS_BYTES};
@@ -163,6 +163,14 @@ pub enum InitOutcome {
     Rejected(RestartRejectReason),
 }
 
+/// What an FR59 rebuild sweep found: how many blocks entered the tree, and how
+/// many slots held something that could not be turned into one. `unusable` is
+/// what separates a damaged store from an empty one.
+struct RebuildStats {
+    admitted: usize,
+    unusable: usize,
+}
+
 /// Why an FR59 restart refused the durable store (architecture §3.6: a failed
 /// precondition is a `Rejected` outcome, never a panic).
 #[cfg_attr(test, derive(Debug))]
@@ -172,9 +180,18 @@ pub enum RestartRejectReason {
     /// configuration those blocks were validated under cannot be established.
     ControlPlaneUnreadable,
     /// The control plane holds a chain-config block that cannot be used — its
-    /// envelope does not frame, or the configuration module refused its content.
-    /// Continuing would run the chain under a configuration nobody committed to.
+    /// envelope does not frame, its node-#0 content signature does not verify,
+    /// or the configuration module refused its content. Continuing would run the
+    /// chain under a configuration nobody committed to.
     ChainConfigUnusable,
+    /// Durable blocks are present but not one of them could be rebuilt — every
+    /// slot was unreadable or unmeasurable. Reported rather than silently
+    /// answering `StartedCollecting`, which would discard the whole chain and
+    /// present a damaged node as a fresh one.
+    NoUsableTree,
+    /// The node has already been initialized. `initialize_from_storage` is a
+    /// one-shot boot step; a second call would rebuild over live state.
+    AlreadyInitialized,
 }
 
 /// Not-ready result of the FR14/FR10 transaction-intake entry point
@@ -1266,8 +1283,28 @@ impl<
     ///
     /// The mempool is not durable (FR30) and is not reconstructed; it is empty.
     ///
+    /// **Two things do not survive, by construction.** A head's FR18
+    /// `arrival_timestamp` is not persisted, so every rebuilt head takes `now`;
+    /// and `last_request_timestamp` restarts at zero, which the FR19 scheduler
+    /// reads as "never requested". A restarted node's parent-recovery schedule
+    /// therefore **restarts rather than resumes** — callers relying on recovery
+    /// pacing across a reboot should expect one immediate round.
+    ///
     /// Carries a `NextCall` per AR4 (a state-changing init step).
     pub fn initialize_from_storage(&mut self, now: u64) -> CallResult<InitOutcome> {
+        // Step 0 — this is a one-shot boot step (AR6 / architecture §3.6). A
+        // second call would rebuild over live state: `insert_at` would overwrite
+        // occupied entries and `rebuild_from_blocks` would interleave duplicate
+        // head entries, both guarded only by `debug_assert!`s that compile out
+        // in exactly the release builds that run on the device. Refused at
+        // runtime instead.
+        if self.blocks.len() != 0 || !matches!(self.lifecycle_phase, LifecyclePhase::Collecting) {
+            return (
+                InitOutcome::Rejected(RestartRejectReason::AlreadyInitialized),
+                NextCall::Idle,
+            );
+        }
+
         // Step 1 — the durable footprint, read exactly once.
         //
         // A store whose control plane was never initialized is indistinguishable
@@ -1277,7 +1314,7 @@ impl<
         let control = match self.storage.load_control_data() {
             Ok(control) => control,
             Err(_) => {
-                return if self.durable_block_count() == 0 {
+                return if !self.durable_blocks_present() {
                     (InitOutcome::StartedCollecting, NextCall::Idle)
                 } else {
                     (
@@ -1296,18 +1333,34 @@ impl<
         // the returned `NextCall` would be `Idle`), `enforceable_block_size_limit`
         // answers the structural ceiling until a lock exists, and the FR2 gate
         // below refuses to run the derivation unconfigured.
+        let mut restored_durable_config = false;
         if let Some(config_block) = control.chain_configuration.as_ref() {
             let bytes = config_block.serialized_bytes();
             // The control plane stores the block zero-padded to the slot width
             // and records no length, exactly like a block slot, so the payload
             // has to come from the recovered exact length — never from
             // `serialized_bytes().len()`.
-            let Some(payload) = Self::exact_view(bytes).map(|view| view.payload()) else {
+            let Some(view) = Self::exact_view(bytes) else {
                 return (
                     InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
                     NextCall::Idle,
                 );
             };
+            // FR7 before an irrevocable commitment (review decision, 2026-09-21).
+            // `load_durable` runs the module's structural acceptance and no
+            // signature check, so without this the node would take a permanent
+            // FR8/FR54 lock on the control plane's word alone — while the
+            // *revocable* tentative path below verifies. The control plane's
+            // CRC32 is bit-rot detection, explicitly not tamper resistance, and
+            // `node_zero_public_key` is a construction parameter precisely so a
+            // corrupted store cannot supply its own trust anchor.
+            if tier1_chain_config_block(&view, &self.node_zero_public_key, &self.crypto).is_err() {
+                return (
+                    InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
+                    NextCall::Idle,
+                );
+            }
+            let payload = view.payload();
             if self.chain_config.load_durable(payload).is_err() {
                 return (
                     InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
@@ -1315,14 +1368,31 @@ impl<
                 );
             }
             self.reset_vote_engine();
+            restored_durable_config = true;
         }
 
         // Step 3 — rebuild the tree, its linkage and its heads.
-        let rebuilt = self.rebuild_block_tree_from_storage(now);
-        if rebuilt == 0 {
-            // Nothing to resume. This is the fresh-join shape even when the
-            // control plane is initialized.
-            return (InitOutcome::StartedCollecting, NextCall::Idle);
+        let RebuildStats { admitted, unusable } = self.rebuild_block_tree_from_storage(now);
+        if admitted == 0 {
+            let outcome = if unusable != 0 {
+                // Slots were present and not one of them could be rebuilt. This
+                // is a damaged store, not an empty one; answering
+                // `StartedCollecting` here would discard the node's whole chain
+                // and present it as fresh.
+                InitOutcome::Rejected(RestartRejectReason::NoUsableTree)
+            } else if restored_durable_config {
+                // No blocks, but a configuration *was* restored from the control
+                // plane: something was resumed, and the node is not the pure
+                // receiver `StartedCollecting` promises — it will refuse any
+                // chain-config that disagrees with the lock it now holds. Keyed
+                // on the restore actually having happened, not on
+                // `is_durable_locked()`, which is also true for a node
+                // constructed already-locked and never restarted.
+                InitOutcome::ResumedCollecting
+            } else {
+                InitOutcome::StartedCollecting
+            };
+            return (outcome, self.next_parent_recovery_call());
         }
 
         // Step 4 — FR8 tentative re-establishment.
@@ -1342,6 +1412,23 @@ impl<
         // Step 5 — the identical acquisition spine a fresh join runs.
         if self.chain_config.active_configuration().is_some() {
             self.drive_dominant_chain_acquisition();
+        }
+
+        // Step 6 — the FR8 lock-time cleanups, for a lock that was *restored*
+        // rather than newly taken (review decision, 2026-09-21).
+        //
+        // Both cleanups sit behind `if !is_durable_locked()` in the spine, so a
+        // restart that restored the lock in step 2 never reaches them — and the
+        // FR17 intake gate that would otherwise catch a post-lock mismatching
+        // config block is bypassed too, because the rebuild does not go through
+        // `tier1_admit`. Without this, AC9's convergence argument is only half
+        // true: a mismatching config block or an FR9-oversized block that is
+        // *off* the candidate chain is never re-condemned and occupies a slot in
+        // the bounded table forever. On the candidate chain the FR3/FR6 pass plus
+        // FR5 recovery already handle it.
+        if self.chain_config.is_durable_locked() {
+            self.delete_mismatching_chain_config_blocks();
+            self.reevaluate_retained_blocks_against_lock();
         }
 
         let outcome = if self.is_ready() {
@@ -1367,14 +1454,14 @@ impl<
         BlockView::from_bytes(bytes.get(..exact)?).ok()
     }
 
-    /// Number of durable slots that read back as blocks. Used only to tell a
+    /// Whether any durable slot reads back as a block. Used only to tell a
     /// never-initialized store apart from a populated one whose control plane is
-    /// unreadable.
-    fn durable_block_count(&self) -> usize {
+    /// unreadable, so presence is the whole question — it stops at the first hit
+    /// rather than counting, which matters because this runs precisely when the
+    /// device has already suffered a storage fault.
+    fn durable_blocks_present(&self) -> bool {
         let limit = self.durable_scan_limit();
-        (0..limit)
-            .filter(|idx| self.storage.read_block(*idx).is_ok())
-            .count()
+        (0..limit).any(|idx| self.storage.read_block(idx).is_ok())
     }
 
     /// Upper bound for a durable scan: the storage's slot capacity, never past
@@ -1413,12 +1500,15 @@ impl<
     /// tell a released slot from a live one, so the durable footprint is simply
     /// what is readable. This is safe because every deletion driver is
     /// deterministic and re-fires — the FR3/FR6 pass re-condemns an invalid
-    /// block, the FR8 lock re-runs its mismatch cleanup, and FR19 eviction
-    /// re-fires under capacity pressure — so the node still converges. What is
-    /// **not** claimed is that the rebuilt tree equals the pre-shutdown tree.
-    fn rebuild_block_tree_from_storage(&mut self, now: u64) -> usize {
+    /// block on the candidate chain, and [`Self::initialize_from_storage`]'s
+    /// step 6 re-runs the FR8 lock-time cleanups over everything off it — so the
+    /// node still converges. What is **not** claimed is that the rebuilt tree
+    /// equals the pre-shutdown tree.
+    fn rebuild_block_tree_from_storage(&mut self, now: u64) -> RebuildStats {
         let limit = self.durable_scan_limit();
         let mut admitted = 0usize;
+        let mut unusable = 0usize;
+        let mut genesis_admitted = false;
 
         // Pass 1 — materialize every readable slot at its own index. Parent
         // linkage is deliberately left unresolved: durable slot order is not
@@ -1434,14 +1524,35 @@ impl<
             // FR64 — the skipped-slot count is a structured-log event, not a
             // field: surfacing it would mean carrying a counter no caller reads
             // until Epic 11 builds the log sink. Emission point marked here.
-            let Ok(padded) = self.storage.read_block(idx) else {
-                continue;
+            let padded = match self.storage.read_block(idx) {
+                Ok(block) => block,
+                // An empty slot is not damage; anything else is.
+                Err(StorageError::BlockAbsent) => continue,
+                Err(_) => {
+                    unusable += 1;
+                    continue;
+                }
             };
             let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+                unusable += 1;
                 continue;
             };
             let hash = view.hash();
             let sequence = view.sequence();
+
+            // The single-genesis rule, which lives in `tier1_admit` and is
+            // therefore bypassed by this path. Pass 1 de-duplicates on
+            // `(sequence, hash)`, so two *distinct* sequence-0 blocks would both
+            // insert and pass 3 would anoint whichever sat at the lower slot —
+            // a state live intake can never produce. Reachable exactly through
+            // the AC9 resurrection of a condemned genesis whose slot was never
+            // reused. First by index wins, matching the live first-come rule.
+            if sequence == 0 {
+                if genesis_admitted {
+                    continue;
+                }
+                genesis_admitted = true;
+            }
             // FR11: the tree must never hold the same (sequence, hash) twice —
             // cheap insurance against a corrupt store, and what `insert_at`
             // debug-asserts.
@@ -1495,9 +1606,36 @@ impl<
         }
 
         // Pass 4 — heads and branch bookkeeping from the finished graph.
-        self.chain_heads.rebuild_from_blocks(&mut self.blocks, now);
+        self.chain_heads
+            .rebuild_from_blocks(&mut self.blocks, now, self.active_chain_head_idx);
 
-        admitted
+        // Pass 5 — seed each Stored head's missing-parent cache.
+        //
+        // This is the one `chain_heads` cache field a rebuild cannot derive from
+        // the tree: `BlockEntry` holds a block's own hash and its parent *index*,
+        // never its `previous_hash`. Left unseeded, every Stored head keeps the
+        // all-zero sentinel and `select_parent_recovery` emits FR19 requests for
+        // a hash that can never resolve — for the lifetime of the node. The
+        // crate warns about exactly that state twice already.
+        for slot in 0..MAX_BRANCH_COUNT {
+            let Some(tail_idx) = self.chain_heads.stored_head_tail(slot) else {
+                continue;
+            };
+            let Some(prev_hash) = self.previous_hash_of(tail_idx) else {
+                continue;
+            };
+            self.chain_heads.set_missing_parent_hash(slot, &prev_hash);
+        }
+
+        RebuildStats { admitted, unusable }
+    }
+
+    /// The `previous_hash` of the block in durable slot `idx`, trimmed to its
+    /// recovered exact length. `None` when the slot cannot be read or measured.
+    fn previous_hash_of(&self, idx: u32) -> Option<[u8; 32]> {
+        let padded = self.storage.read_block(idx).ok()?;
+        let view = Self::exact_view(padded.serialized_bytes())?;
+        <[u8; 32]>::try_from(view.previous_hash()).ok()
     }
 
     /// FR8 tentative re-establishment after a restart that found no durable
@@ -1800,9 +1938,10 @@ impl<
     ///
     /// Extracted from [`Self::receive_block`] so the FR59 restart
     /// ([`Self::initialize_from_storage`]) drives **the identical** loop rather
-    /// than a parallel copy of it. FR59 requires a restart to reuse "the
-    /// identical acquisition / reconstruction / validation code paths as a fresh
-    /// join (no separate restart-only logic)"; sharing the body is what makes
+    /// than a parallel copy of it. Story 5.10's acceptance criteria require a
+    /// restart to reuse "the identical acquisition / reconstruction / validation
+    /// code paths as a fresh join (no separate restart-only logic)" (the wording
+    /// is the epics', not FR59's); sharing the body is what makes
     /// that true by construction instead of by review discipline.
     ///
     /// The caller owns the entry gate — an admission outcome and the FR2
@@ -3934,6 +4073,54 @@ mod tests {
     /// initialize is large enough to hold blocks. The pair matters because
     /// genesis has two distinct storage failure modes and they refuse at
     /// different points — one before any write, one after the first.
+    /// Storage whose control plane is fine and every block slot is corrupt.
+    /// `MemoryBackend` cannot express this — it has no per-slot integrity check
+    /// and so can never return `IntegrityFailure`, which only the rp2040 backend
+    /// produces. Without a stub, the skip arm that matters on real hardware is
+    /// unexercised.
+    struct CorruptSlotsStorage;
+
+    impl StorageTrait for CorruptSlotsStorage {
+        fn init(
+            &mut self,
+            _private_key: [u8; PRIVATE_KEY_SIZE],
+            _own_node_id: u32,
+            _init_params: [u8; INIT_PARAMS_SIZE],
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn save_block(&mut self, _idx: u32, _block: &Block) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn read_block(&self, idx: u32) -> Result<Block, StorageError> {
+            // Two slots are occupied-but-corrupt; the rest are genuinely empty.
+            if idx < 2 {
+                Err(StorageError::IntegrityFailure)
+            } else {
+                Err(StorageError::BlockAbsent)
+            }
+        }
+
+        fn capacity(&self) -> u32 {
+            8
+        }
+
+        fn set_chain_configuration(&mut self, _block: &Block) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn load_control_data(&mut self) -> Result<ControlPlaneData, StorageError> {
+            Ok(ControlPlaneData {
+                private_key: [1u8; PRIVATE_KEY_SIZE],
+                own_node_id: 0,
+                init_params: [0u8; INIT_PARAMS_SIZE],
+                chain_configuration: None,
+            })
+        }
+    }
+
     struct BlockWriteFailsStorage;
 
     impl StorageTrait for BlockWriteFailsStorage {
@@ -8088,6 +8275,20 @@ mod tests {
         assert_eq!(restarted.is_ready(), fresh.is_ready());
         assert_eq!(restarted.current_active_head(), fresh.current_active_head());
         assert_eq!(restarted.blocks.len(), fresh.blocks.len());
+        // AC8 names the projection and the chain_heads set explicitly, and the
+        // review found that omitting them hid a real bug: every rebuilt Stored
+        // head had lost its missing-parent hash, which a chain_heads comparison
+        // would have caught immediately.
+        assert_eq!(
+            restarted.chain_heads.count(),
+            fresh.chain_heads.count(),
+            "AC8 - the same chain_heads set"
+        );
+        assert_eq!(
+            restarted.node_info.max_known_node_id(),
+            fresh.node_info.max_known_node_id(),
+            "AC8 - the same derived projection"
+        );
         assert_eq!(
             restarted.chain_config.durable_content(),
             fresh.chain_config.durable_content(),
@@ -8405,6 +8606,15 @@ mod tests {
         let (first_outcome, _) = first.initialize_from_storage(500);
         let first_len = first.blocks.len();
         let first_head = first.current_active_head();
+        let first_heads = first.chain_heads.count();
+        let first_phase = first.current_phase();
+        let mut first_tree = [None; 16];
+        for (idx, cell) in first_tree.iter_mut().enumerate() {
+            *cell = first
+                .blocks
+                .get(idx as u32)
+                .map(|entry| (entry.sequence(), *entry.hash(), entry.parent_ref()));
+        }
 
         // Restart the *same* durable store a second time, from scratch again.
         let mut second = restart(first);
@@ -8414,5 +8624,234 @@ mod tests {
         assert_eq!(first_outcome, second_outcome);
         assert_eq!(first_len, second.blocks.len());
         assert_eq!(first_head, second.current_active_head());
+        assert_eq!(
+            first_heads,
+            second.chain_heads.count(),
+            "same chain_heads set"
+        );
+        assert_eq!(first_phase, second.current_phase(), "same phase trace");
+        // AC10 asks for the same *tree*, not merely the same block count.
+        for idx in 0..16u32 {
+            assert_eq!(
+                first_tree[idx as usize],
+                second.blocks.get(idx).map(|entry| (
+                    entry.sequence(),
+                    *entry.hash(),
+                    entry.parent_ref()
+                )),
+                "slot {idx} must rebuild identically"
+            );
+        }
+    }
+
+    // ---- Review regressions (2026-09-21) --------------------------------
+
+    /// **Review finding, confirmed by execution.** Every rebuilt Stored head used
+    /// to come back with an all-zero `missing_parent_hash`, so FR19 emitted
+    /// parent-recovery requests for a hash that can never resolve — for the
+    /// lifetime of the node. Asserted through the observable outbound request
+    /// rather than the cache field, which is what a peer would actually receive.
+    #[test]
+    fn fr59_restart_preserves_the_missing_parent_hash_of_a_stored_head() {
+        let mut bc = new_unconfigured_test_chain();
+        let orphan = chain_config_anchor_block(100, [0xAB; 32]);
+        let (outcome, _) = bc.receive_block(orphan.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+
+        let mut restarted = restart(bc);
+        let (_, _) = restarted.initialize_from_storage(500);
+
+        let (tick, _) = restarted.on_tick(1_000_000);
+        match tick {
+            TickOutcome::SendParentRecoveryRequest(request) => {
+                assert_eq!(
+                    request.missing_parent_hash(),
+                    &[0xAB; 32],
+                    "the restarted node must request the parent the branch actually names"
+                );
+            }
+            _ => panic!("a Stored head should schedule FR19 parent recovery after a restart"),
+        }
+    }
+
+    /// **Review finding, confirmed by execution.** The single-genesis rule lives
+    /// in `tier1_admit`, which the rebuild bypasses, so two distinct sequence-0
+    /// blocks both entered the tree — a state live intake cannot produce.
+    #[test]
+    fn fr59_restart_admits_at_most_one_genesis() {
+        let (_, mut storage, _) = test_backends();
+        let genesis_a = node_transfer_block(0, 0, 0, 0);
+        let genesis_b = node_transfer_block(0, 7, 0, 7);
+        assert_ne!(
+            genesis_a.view().hash(),
+            genesis_b.view().hash(),
+            "precondition: two distinct sequence-0 blocks"
+        );
+        storage.save_block(0, &genesis_a).ok().expect("save");
+        storage.save_block(1, &genesis_b).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+        let (_, _) = bc.initialize_from_storage(500);
+
+        let genesis_count = (0..16u32)
+            .filter(|idx| {
+                bc.blocks
+                    .get(*idx)
+                    .is_some_and(|entry| entry.sequence() == 0)
+            })
+            .count();
+        assert_eq!(
+            genesis_count, 1,
+            "the rebuild must honour the single-genesis rule that tier1_admit enforces"
+        );
+        assert!(
+            bc.blocks.find(0, &genesis_a.view().hash()).is_some(),
+            "first by index wins, matching the live first-come rule"
+        );
+    }
+
+    /// `initialize_from_storage` is a one-shot boot step. A second call used to
+    /// be guarded only by `debug_assert!`s, which compile out in exactly the
+    /// release builds that run on the device.
+    #[test]
+    fn fr59_a_second_initialize_from_storage_is_refused() {
+        let (bc, _, _) = node_ready_from_the_mesh();
+        let mut restarted = restart(bc);
+        let (first, _) = restarted.initialize_from_storage(500);
+        assert_eq!(first, InitOutcome::ResumedReady);
+        let blocks_after_first = restarted.blocks.len();
+
+        let (second, _) = restarted.initialize_from_storage(600);
+
+        assert_eq!(
+            second,
+            InitOutcome::Rejected(RestartRejectReason::AlreadyInitialized)
+        );
+        assert_eq!(
+            restarted.blocks.len(),
+            blocks_after_first,
+            "the refused call must not have touched the tree"
+        );
+    }
+
+    /// AC11's second trigger: a store whose slots are all unreadable is damaged,
+    /// not empty, and must not be reported as a fresh join — that would discard
+    /// the node's whole chain silently.
+    #[test]
+    fn fr59_a_store_whose_every_slot_is_corrupt_is_refused() {
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            &mut slot,
+            crypto,
+            CorruptSlotsStorage,
+            chain_config,
+            5,
+            node_zero,
+            0,
+        );
+
+        let (outcome, _) = bc.initialize_from_storage(500);
+
+        assert_eq!(
+            outcome,
+            InitOutcome::Rejected(RestartRejectReason::NoUsableTree)
+        );
+        assert_eq!(bc.blocks.len(), 0);
+    }
+
+    /// The irrevocable FR8/FR54 lock must not be taken on the control plane's
+    /// word alone: the block it carries is verified through the same FR7 gate
+    /// the revocable tentative path uses (review decision, 2026-09-21).
+    #[test]
+    fn fr59_a_control_plane_config_failing_fr7_is_refused() {
+        let (_, mut storage, _) = test_backends();
+        // A chain-config block whose content signature is not node #0's.
+        let mut forged = chain_config_anchor_block(1, [0u8; 32]);
+        let tampered = {
+            let mut bytes = [0u8; MAX_BLOCK_SIZE];
+            let exact = forged.serialized_bytes();
+            bytes[..exact.len()].copy_from_slice(exact);
+            // Flip a byte inside the content region, invalidating the signature
+            // over it while leaving the envelope framing intact.
+            bytes[HEADER_SIZE + 2] ^= 0xFF;
+            Block::from_bytes(&bytes[..exact.len()])
+                .ok()
+                .expect("still structurally a block")
+        };
+        forged = tampered;
+        storage
+            .set_chain_configuration(&forged)
+            .ok()
+            .expect("control plane accepts it - storage does not verify signatures");
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        storage.save_block(0, &genesis).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+
+        let (outcome, _) = bc.initialize_from_storage(500);
+
+        assert_eq!(
+            outcome,
+            InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable)
+        );
+        assert!(
+            !bc.chain_config.is_durable_locked(),
+            "an unverifiable configuration must never become an irrevocable lock"
+        );
+    }
+
+    /// AC9's convergence argument named the FR8 lock-time cleanups, but they sit
+    /// behind `if !is_durable_locked()` in the spine and so never ran on a
+    /// restart. An off-chain mismatching chain-config block survived forever.
+    #[test]
+    fn fr59_restart_cleans_up_an_off_chain_mismatching_config_block() {
+        let (mut bc, _, _) = node_ready_from_the_mesh();
+        // Validly signed by node #0, but carrying different content from the
+        // configuration the chain locked. The live path refuses it outright.
+        let mismatching = chain_config_block_from(100, [0xAB; 32], &mut alt_config_builder());
+        let (live, _) = bc.receive_block(mismatching.view(), 0);
+        assert_ne!(
+            live,
+            ReceiveBlockOutcome::AcceptedSilently,
+            "precondition: the live path refuses a post-lock mismatching config"
+        );
+        // Plant it directly in a durable slot, as a pre-lock session would have.
+        bc.storage.save_block(6, &mismatching).ok().expect("save");
+
+        let mut restarted = restart(bc);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+
+        assert_eq!(outcome, InitOutcome::ResumedReady);
+        assert!(
+            restarted
+                .blocks
+                .find(100, &mismatching.view().hash())
+                .is_none(),
+            "the restored lock must re-run its mismatch cleanup over the rebuilt tree"
+        );
     }
 }
