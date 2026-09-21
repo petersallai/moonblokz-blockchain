@@ -578,14 +578,14 @@ pub struct Blockchain<
     // FR1–FR4 lifecycle state. Default `Collecting`; transitions to
     // `Processing` then `Ready` land in Story 5.1–5.4.
     lifecycle_phase: LifecyclePhase,
-    /// FR59 &#x2014; set when [`Self::initialize_from_storage`] refused a durable
+    /// FR59 — set when [`Self::initialize_from_storage`] refused a durable
     /// store it could not rebuild, and never cleared.
     ///
     /// A refused restart leaves the node looking exactly like a fresh one: empty
     /// tree, `Collecting`, no configuration. The durable store, meanwhile, still
     /// holds the chain. Admitting a block into that state would take
     /// `next_free_index() == 0` and `save_block(0, ..)` would overwrite a
-    /// durable block &#x2014; the node would silently begin destroying the chain
+    /// durable block — the node would silently begin destroying the chain
     /// it failed to load. The refusal only protects anything if the module stops
     /// accepting work, so it stops here rather than trusting every caller to act
     /// on the outcome.
@@ -8910,7 +8910,7 @@ mod tests {
     /// Before this guard, a caller that ignored `Rejected(_)` kept feeding the
     /// node, and because the rebuild left an empty tree over a populated store
     /// the first admission took slot 0 and `save_block` overwrote a durable
-    /// block &#x2014; the node silently destroying the chain it failed to load.
+    /// block — the node silently destroying the chain it failed to load.
     #[test]
     fn a_refused_restart_stops_accepting_blocks_instead_of_overwriting_the_chain() {
         let (_, mut storage, _) = test_backends();
