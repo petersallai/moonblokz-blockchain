@@ -1424,6 +1424,16 @@ impl<
         // linkage is deliberately left unresolved: durable slot order is not
         // topological, so a parent may live at a higher index than its child.
         for idx in 0..limit {
+            // A slot that cannot be read (`BlockAbsent` for an empty one;
+            // `IntegrityFailure`, which only the rp2040 backend can produce) or
+            // whose payload does not frame coherently enough to measure is
+            // skipped rather than fatal — one bad slot must not cost the node
+            // its chain. `InvalidIndex` cannot occur: the scan is already bounded
+            // by `capacity()`.
+            //
+            // FR64 — the skipped-slot count is a structured-log event, not a
+            // field: surfacing it would mean carrying a counter no caller reads
+            // until Epic 11 builds the log sink. Emission point marked here.
             let Ok(padded) = self.storage.read_block(idx) else {
                 continue;
             };
