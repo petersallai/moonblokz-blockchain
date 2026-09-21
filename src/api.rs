@@ -138,19 +138,43 @@ pub struct GenesisBlocks {
 /// raw-pointer construction isolated from the storage-reading business
 /// logic (architecture §3.6 "in-place constructor + role-specific follow-up").
 ///
-/// Story 5.1 realizes only the empty-storage (fresh-join) outcome
-/// `StartedCollecting`. The restart-from-durable-blocks path — read the retained
-/// blocks, rebuild the tree, evaluate FR2, run the FR3 pass — and its
-/// `ResumedProcessing` / `ResumedReady` / `Rejected(_)` outcomes land in
-/// **Story 5.7 (FR59)**, which fills the non-empty branch and adds those arms.
-/// (Minimal now, extended then: no dead arm ships early — the crate's
-/// declare-and-tag-forward discipline.)
+/// Story 5.1 realized the empty-storage (fresh-join) outcome; Story 5.10 (FR59)
+/// added the restart-from-durable-blocks arms below.
 #[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Eq)]
 pub enum InitOutcome {
     /// Storage held no blocks (fresh join): the node stays in `Collecting` as a
     /// pure receiver and acquires the chain from the mesh (FR1).
     StartedCollecting,
+    /// FR59 restart: the tree was rebuilt from durable blocks and the FR2/FR3/FR6
+    /// spine carried it to `Ready`.
+    ResumedReady,
+    /// FR59 restart: the tree was rebuilt, but no candidate segment satisfied the
+    /// FR2 stopping condition (or no configuration is held), so the node stays in
+    /// `Collecting` and continues ordinary intake until one does.
+    ///
+    /// Named for the phase the node is actually in. The epics text called this
+    /// `ResumedProcessing`, inherited from a superseded design in which the
+    /// lifecycle phase was persisted; FR59 persists no phase marker and enters
+    /// `Collecting` unconditionally, so that name would contradict the state it
+    /// reports (Story 5.10, ratified 2026-09-20).
+    ResumedCollecting,
+    /// FR59 restart: the durable footprint cannot be used to rebuild.
+    Rejected(RestartRejectReason),
+}
+
+/// Why an FR59 restart refused the durable store (architecture §3.6: a failed
+/// precondition is a `Rejected` outcome, never a panic).
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
+pub enum RestartRejectReason {
+    /// Durable blocks are present but the control plane could not be read, so the
+    /// configuration those blocks were validated under cannot be established.
+    ControlPlaneUnreadable,
+    /// The control plane holds a chain-config block that cannot be used — its
+    /// envelope does not frame, or the configuration module refused its content.
+    /// Continuing would run the chain under a configuration nobody committed to.
+    ChainConfigUnusable,
 }
 
 /// Not-ready result of the FR14/FR10 transaction-intake entry point
@@ -554,7 +578,7 @@ pub struct Blockchain<
     // FR37/FR38 accumulated-vote registry + creator-order projection, owned by
     // the Epic-3 `moonblokz-vote` crate. First driven by Story 5.3's FR3 pass
     // (`VoteEngine::apply_block` / `seed_from_balance_block`); reused by the
-    // FR23 chain-switch walk (Epic 6) and the FR59 restart (Story 5.7).
+    // FR23 chain-switch walk (Epic 6) and the FR59 restart (Story 5.10).
     vote_engine: VoteEngine<MAX_NODES>,
 
     // FR19/FR46 module-scope global emit cooldown: wall-clock time of the most
@@ -1210,27 +1234,306 @@ impl<
     /// "in-place constructor + role-specific follow-up"), so the raw-pointer
     /// memory init stays isolated from the storage-reading business logic.
     ///
-    /// **Story 5.1 scope:** the empty-storage (fresh-join) path — no durable
-    /// blocks → the node stays `Collecting` and returns `StartedCollecting`
-    /// (FR1). The **restart** path (durable blocks present → rebuild the
-    /// block-tree / `chain_heads`, evaluate FR2, run the FR3 pass, transition to
-    /// Ready-or-Collecting, returning `ResumedReady` / `ResumedProcessing`) is
-    /// **Story 5.7 (FR59)**; the non-empty branch is a `todo!()` forward-tag until
-    /// then (reachable only by a restart test — genesis uses
-    /// [`Self::process_genesis`], fresh join uses the empty path here).
+    /// **Empty storage** is the fresh-join path: the node stays `Collecting` and
+    /// returns `StartedCollecting` (FR1).
     ///
-    /// Carries a `NextCall` per AR4 (a state-changing init step). The emptiness
-    /// probe reads durable block index 0; Story 5.7 replaces it with the FR59
-    /// control-data-driven rebuild.
-    pub fn initialize_from_storage(&mut self, _now: u64) -> CallResult<InitOutcome> {
-        let has_durable_blocks = self.storage.read_block(0).is_ok();
-        if has_durable_blocks {
-            // FR59 restart rebuild — Story 5.7 reads the retained durable blocks,
-            // rebuilds the tree, and runs the FR2/FR3 spine. Not built here.
-            todo!("FR59 restart rebuild from durable storage — Story 5.7");
+    /// **Durable blocks present** is the FR59 restart. The minimal durable
+    /// footprint is the node id, the private key (held by the `Crypto` handle,
+    /// never by this module), the chain-config block, and the retained blocks —
+    /// no lifecycle marker, no derived projection, no `snake_chain` buffer. The
+    /// rebuild therefore:
+    ///
+    /// 1. reads the control plane **once** and re-establishes the FR8/FR54
+    ///    durable lock from it, *before* anything can consult a configuration;
+    /// 2. rebuilds the block-tree from the retained slots, then their parent
+    ///    linkage, then `chain_heads`;
+    /// 3. drives the **same** FR2/FR3/FR6 acquisition spine a fresh join drives
+    ///    ([`Self::drive_dominant_chain_acquisition`]), reaching `Ready` or
+    ///    staying `Collecting`.
+    ///
+    /// The phase is `Collecting` unconditionally on entry and is never restored
+    /// from storage — FR59 persists no lifecycle marker, and any in-flight
+    /// processing state from the previous session is discarded. The pass is
+    /// **not resumable**: nothing partial was ever written, so an interrupted
+    /// restart simply re-runs from the same footprint.
+    ///
+    /// **Intake is suspended for the whole rebuild flow** (FR59). The module's
+    /// synchronous single-threaded execution model enforces this structurally —
+    /// no call can interleave with this one — but it is stated here as a
+    /// contract so the radio and local-interface callers may rely on it
+    /// independently of any future scheduling reorganization. Ordinary intake
+    /// resumes when this method returns.
+    ///
+    /// The mempool is not durable (FR30) and is not reconstructed; it is empty.
+    ///
+    /// Carries a `NextCall` per AR4 (a state-changing init step).
+    pub fn initialize_from_storage(&mut self, now: u64) -> CallResult<InitOutcome> {
+        // Step 1 — the durable footprint, read exactly once.
+        //
+        // A store whose control plane was never initialized is indistinguishable
+        // from a fresh node, so it is only an error when blocks are actually
+        // present: then the node would be rebuilding a chain without knowing the
+        // configuration those blocks were accepted under.
+        let control = match self.storage.load_control_data() {
+            Ok(control) => control,
+            Err(_) => {
+                return if self.durable_block_count() == 0 {
+                    (InitOutcome::StartedCollecting, NextCall::Idle)
+                } else {
+                    (
+                        InitOutcome::Rejected(RestartRejectReason::ControlPlaneUnreadable),
+                        NextCall::Idle,
+                    )
+                };
+            }
+        };
+
+        // Step 2 — re-establish the FR8/FR54 durable lock before the scan.
+        //
+        // `chain_configuration.is_some()` is the **only** durable evidence of the
+        // lock: no boolean is persisted. Ordering matters three ways, all
+        // pointing here: the FR19/FR46 cadence is `None` while unconfigured (so
+        // the returned `NextCall` would be `Idle`), `enforceable_block_size_limit`
+        // answers the structural ceiling until a lock exists, and the FR2 gate
+        // below refuses to run the derivation unconfigured.
+        if let Some(config_block) = control.chain_configuration.as_ref() {
+            let bytes = config_block.serialized_bytes();
+            // The control plane stores the block zero-padded to the slot width
+            // and records no length, exactly like a block slot, so the payload
+            // has to come from the recovered exact length — never from
+            // `serialized_bytes().len()`.
+            let Some(payload) = Self::exact_view(bytes).map(|view| view.payload()) else {
+                return (
+                    InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
+                    NextCall::Idle,
+                );
+            };
+            if self.chain_config.load_durable(payload).is_err() {
+                return (
+                    InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
+                    NextCall::Idle,
+                );
+            }
+            self.reset_vote_engine();
         }
-        // Fresh join: empty durable storage → remain a pure receiver (FR1).
-        (InitOutcome::StartedCollecting, NextCall::Idle)
+
+        // Step 3 — rebuild the tree, its linkage and its heads.
+        let rebuilt = self.rebuild_block_tree_from_storage(now);
+        if rebuilt == 0 {
+            // Nothing to resume. This is the fresh-join shape even when the
+            // control plane is initialized.
+            return (InitOutcome::StartedCollecting, NextCall::Idle);
+        }
+
+        // Step 4 — FR8 tentative re-establishment.
+        //
+        // A node that shut down before the durable lock held its configuration
+        // only tentatively, and the tentative is not persisted. Nothing in the
+        // rebuild path re-loads it, because the rebuild deliberately does not go
+        // through `tier1_admit`. Without this the restarted node would hold no
+        // configuration at all, the FR2 gate would refuse, and it could not
+        // converge until some *new* chain-config block happened to arrive —
+        // while a fresh node fed the same blocks would adopt one immediately.
+        // That gap would break the FR59 equivalence the whole story is about.
+        if self.chain_config.active_configuration().is_none() {
+            self.reestablish_tentative_chain_config();
+        }
+
+        // Step 5 — the identical acquisition spine a fresh join runs.
+        if self.chain_config.active_configuration().is_some() {
+            self.drive_dominant_chain_acquisition();
+        }
+
+        let outcome = if self.is_ready() {
+            InitOutcome::ResumedReady
+        } else {
+            InitOutcome::ResumedCollecting
+        };
+        (outcome, self.next_parent_recovery_call())
+    }
+
+    /// Parses `bytes` and trims it to the block's own structurally recovered
+    /// length, so hashing and signature verification see the bytes that were
+    /// originally signed.
+    ///
+    /// Durable backends return blocks zero-padded to a fixed slot and record no
+    /// length, and `BlockView::len()` reports the slice it was handed — so a
+    /// view over the raw slot hashes the padding too. Every restart path goes
+    /// through here; `moonblokz_chain_types::BlockView::content_length` explains
+    /// why the recovery is a structural walk and not a trailing-zero scan.
+    fn exact_view(bytes: &[u8]) -> Option<BlockView<'_>> {
+        let probe = BlockView::from_bytes(bytes).ok()?;
+        let exact = probe.content_length()?;
+        BlockView::from_bytes(bytes.get(..exact)?).ok()
+    }
+
+    /// Number of durable slots that read back as blocks. Used only to tell a
+    /// never-initialized store apart from a populated one whose control plane is
+    /// unreadable.
+    fn durable_block_count(&self) -> usize {
+        let limit = self.durable_scan_limit();
+        (0..limit)
+            .filter(|idx| self.storage.read_block(*idx).is_ok())
+            .count()
+    }
+
+    /// Upper bound for a durable scan: the storage's slot capacity, never past
+    /// the in-memory table (`blocks[i] <-> storage_index = i` is 1:1, so a slot
+    /// the table cannot address could not have been written by this node).
+    fn durable_scan_limit(&self) -> u32 {
+        let capacity = self.storage.capacity();
+        let table = MAX_BLOCKS as u32;
+        if capacity < table { capacity } else { table }
+    }
+
+    /// FR59 step (1): rebuilds the block-tree, the `(sequence, hash)` duplicate
+    /// index, parent linkage and `chain_heads` from the retained durable blocks.
+    /// Returns how many blocks were admitted to the tree.
+    ///
+    /// **Blocks land at their own durable index.** `blocks[i]` and
+    /// `storage_index = i` are the same slot by construction, so the rebuild
+    /// uses `insert_at(i, ..)` rather than allocating a fresh index — and writes
+    /// nothing back to storage, because the bytes are already there.
+    ///
+    /// **No Tier-1 re-run.** Every byte in a slot got there through
+    /// `tier1_admit`, which persists only after the gate passes, so each block
+    /// was already verified under exactly those rules. Re-verifying N Schnorr
+    /// signatures at boot would buy nothing the FR6 pass does not redo for the
+    /// candidate it actually adopts.
+    ///
+    /// **A slot that cannot be understood is skipped, not fatal** — a single bad
+    /// slot must not cost the node its chain. That covers an unreadable slot
+    /// (`IntegrityFailure`, which the rp2040 backend can produce and the memory
+    /// backend cannot) and one whose payload does not frame coherently enough to
+    /// recover its exact length.
+    ///
+    /// **Blocks deleted before the restart come back** (ratified 2026-09-20).
+    /// `StorageTrait` has no delete: freeing a slot releases it, and the durable
+    /// bytes survive until the next `save_block` overwrites them. Storage cannot
+    /// tell a released slot from a live one, so the durable footprint is simply
+    /// what is readable. This is safe because every deletion driver is
+    /// deterministic and re-fires — the FR3/FR6 pass re-condemns an invalid
+    /// block, the FR8 lock re-runs its mismatch cleanup, and FR19 eviction
+    /// re-fires under capacity pressure — so the node still converges. What is
+    /// **not** claimed is that the rebuilt tree equals the pre-shutdown tree.
+    fn rebuild_block_tree_from_storage(&mut self, now: u64) -> usize {
+        let limit = self.durable_scan_limit();
+        let mut admitted = 0usize;
+
+        // Pass 1 — materialize every readable slot at its own index. Parent
+        // linkage is deliberately left unresolved: durable slot order is not
+        // topological, so a parent may live at a higher index than its child.
+        for idx in 0..limit {
+            let Ok(padded) = self.storage.read_block(idx) else {
+                continue;
+            };
+            let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+                continue;
+            };
+            let hash = view.hash();
+            let sequence = view.sequence();
+            // FR11: the tree must never hold the same (sequence, hash) twice —
+            // cheap insurance against a corrupt store, and what `insert_at`
+            // debug-asserts.
+            if sequence == NONE_REF || self.blocks.find(sequence, &hash).is_some() {
+                continue;
+            }
+
+            let mut entry = BlockEntry::new(hash, NONE_REF, sequence);
+            entry.set_status(BlockStatus::Stored);
+            entry.set_len(view.len() as u16);
+            entry.set_payload_type(view.payload_type());
+            self.blocks.insert_at(idx, entry);
+            admitted += 1;
+        }
+
+        // Pass 2 — resolve parent linkage now that every block is present.
+        for idx in 0..limit {
+            if self.blocks.get(idx).is_none() {
+                continue;
+            }
+            let Ok(padded) = self.storage.read_block(idx) else {
+                continue;
+            };
+            let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+                continue;
+            };
+            let Ok(prev_hash) = <[u8; 32]>::try_from(view.previous_hash()) else {
+                continue;
+            };
+            if let Some(parent) = self.blocks.find_parent(&prev_hash, view.sequence()) {
+                self.blocks.resolve_parent_ref(idx, parent);
+            }
+        }
+
+        // Pass 3 — re-establish the genesis anchor, the same way the FR5
+        // recovery re-establishes it after a deletion: the single surviving
+        // sequence-0 block is the active-chain root. `chain_heads` needs this
+        // before it classifies heads, because a head is Connected only if it
+        // walks to a block flagged on-active-chain.
+        self.active_chain_head_idx = NONE_REF;
+        for idx in 0..limit {
+            if self
+                .blocks
+                .get(idx)
+                .is_some_and(|entry| entry.sequence() == 0)
+            {
+                self.blocks.set_on_active_chain(idx, true);
+                self.active_chain_head_idx = idx;
+                break; // the single-genesis guard admits at most one block #0
+            }
+        }
+
+        // Pass 4 — heads and branch bookkeeping from the finished graph.
+        self.chain_heads.rebuild_from_blocks(&mut self.blocks, now);
+
+        admitted
+    }
+
+    /// FR8 tentative re-establishment after a restart that found no durable
+    /// configuration.
+    ///
+    /// The tentative phase is not persisted, so a node that shut down while
+    /// still collecting comes back holding nothing — yet its retained tree may
+    /// already carry the chain-config block it had adopted. Re-adopting keeps
+    /// the restart equivalent to a fresh node fed the same blocks, which is the
+    /// FR59 guarantee; without it the node could not run the FR3 derivation at
+    /// all until another config block happened to arrive.
+    ///
+    /// FR8 defines the tentative as "the first chain-config block whose
+    /// signature verifies and whose content is accepted", which is an
+    /// arrival-ordered fact — and arrival order is exactly what a restart has
+    /// lost. The lowest durable index is used instead: deterministic, and enough
+    /// for the property that is actually required, since Story 5.9 already
+    /// recorded that convergence on the same end state, not identity of the
+    /// intermediate tentative, is what FR8 can guarantee across orderings.
+    fn reestablish_tentative_chain_config(&mut self) {
+        let limit = self.durable_scan_limit();
+        for idx in 0..limit {
+            let is_config = self
+                .blocks
+                .get(idx)
+                .is_some_and(|entry| entry.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG);
+            if !is_config {
+                continue;
+            }
+            let Ok(padded) = self.storage.read_block(idx) else {
+                continue;
+            };
+            let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+                continue;
+            };
+            // The same state-free FR7 gate the intake path uses, so the two
+            // cannot drift.
+            if tier1_chain_config_block(&view, &self.node_zero_public_key, &self.crypto).is_err() {
+                continue;
+            }
+            if self.chain_config.load_tentative(view.payload()).is_ok() {
+                self.tentative_config_block_idx = idx;
+                self.reset_vote_engine();
+                return;
+            }
+        }
     }
 
     /// Read-only query — returns the local node id (FR67).
@@ -1476,251 +1779,274 @@ impl<
             && self.lifecycle_phase == LifecyclePhase::Collecting
             && self.chain_config.active_configuration().is_some()
         {
-            // At most **three** full-chain passes per call, from two
-            // independent single-use tokens, neither ever replenished inside the
-            // loop: `retries_left` covers the Story-5.5 `Invalid` recovery
-            // retry, and `adopt_retries_left` the Story-5.9 FR8 config-adopt
-            // retry (ratified 2026-07-30, raising Story 5.5's ceiling of two).
-            // `1 + 1 + 1 = 3` regardless of interleaving — `Invalid → adopt` and
-            // `adopt → Invalid` both terminate at three.
-            //
-            // The adopt retry additionally cannot recur *for the same candidate*
-            // by construction rather than by counter: the content it adopts **is**
-            // the candidate's own first in-scope config block, so on the retry
-            // that block matches. The one shape that could otherwise oscillate —
-            // a candidate carrying two config blocks with differing contents —
-            // is excluded by the same construction: after the adopt, the first
-            // block matches and the *other* one is the offender, so `block_idx`
-            // no longer equals the first config block and the adopt guard below
-            // does not fire. It takes the hard FR5 rollback instead.
-            let mut retries_left = 1u8;
-            let mut adopt_retries_left = 1u8;
-            while let Some(candidate_tip_idx) = self.evaluate_stopping_condition() {
-                self.set_lifecycle_phase(LifecyclePhase::Processing);
-                // Story 5.3 (FR3) + Story 5.4 (FR6/FR4): reconstruct AND validate the
-                // derived projection for the FR2 candidate in one forward pass. A
-                // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
-                // the Ready transition below overwrites; it does not pre-empt selection.
-                match self.run_processing_pass(candidate_tip_idx) {
-                    Ok(()) => {
-                        // FR8 durable set-once lock (Story 5.9, AC4). The pass has
-                        // just proved the AC3 final check — the candidate carries
-                        // at least one chain-config block and every one of them is
-                        // byte-identical to the tentative configuration — so this
-                        // is the instant FR8 names for the commitment.
-                        //
-                        // **Before `promote_candidate_active`, not after.** The
-                        // durable write can fail, and this is the last point at
-                        // which a failure costs nothing: nothing has been promoted,
-                        // so abandoning the transition needs no undo of a marking
-                        // the FR5 recovery explicitly cannot undo (see its step-4
-                        // note on recovering after a successful promotion). A
-                        // failure therefore leaves the node Collecting with its
-                        // blocks intact, to try again on the next admission —
-                        // Story 5.8's rule that a node's own local trouble must not
-                        // be charged to a valid block.
-                        if !self.chain_config.is_durable_locked() {
-                            let (first_config_idx, _) =
-                                self.scan_candidate_chain_config(candidate_tip_idx, NONE_REF);
-                            // AC3 guarantees this: the pass fails with
-                            // `MissingChainConfigBlock` when the candidate carries
-                            // none, so reaching `Ok(())` means one is there.
-                            debug_assert!(
-                                first_config_idx != NONE_REF,
-                                "AC3: a candidate that passed the pass carries a chain-config block"
-                            );
-                            // FR9 re-evaluation at the durable lock: the
-                            // block-size limit could not condemn a block while the
-                            // configuration was merely tentative, so it is applied
-                            // here, before anything irrevocable happens. A
-                            // violation is now exact evidence — the limit being
-                            // enforced is the one this very candidate declares —
-                            // and takes the ordinary FR5 rollback.
-                            if let Some(offender) =
-                                self.candidate_block_exceeding_size_limit(candidate_tip_idx)
-                            {
-                                self.recover_from_failed_pass(
-                                    ProcessingError::Invalid {
-                                        block_idx: offender,
-                                        reason: ValidationReason::BlockTooLarge,
-                                    },
-                                    candidate_tip_idx,
-                                );
-                                break;
-                            }
-                            if first_config_idx == NONE_REF
-                                || self.commit_durable_chain_config(first_config_idx).is_err()
-                            {
-                                // The pass returned `Ok`, so it left a complete
-                                // derived projection behind and never ran its
-                                // abort-path spent-bit rollback. Abandoning the
-                                // transition has to undo all of it, or the node
-                                // returns to Collecting holding the projection of
-                                // a chain it did not adopt. Nothing was promoted
-                                // (the commit is ordered before
-                                // `promote_candidate_active` precisely so this
-                                // path needs no un-promotion), so the FR5 step-1
-                                // rollback is the whole of the cleanup.
-                                self.node_info.reset();
-                                self.reset_vote_engine();
-                                for idx in 0..MAX_BLOCKS {
-                                    self.blocks.clear_spent_bits(idx as u32);
-                                }
-                                self.set_lifecycle_phase(LifecyclePhase::Collecting);
-                                break;
-                            }
-                            // FR6 passed over the full candidate → FR4 Ready
-                            // transition: atomically promote every candidate block
-                            // Stored→Active (the Epic-4-deferred FR9 Tier-3
-                            // driver) and establish the active head.
-                            self.promote_candidate_active(candidate_tip_idx);
-                            // AC5: with the lock engaged and the active chain
-                            // marked, drop every chain-config block in the tree
-                            // that disagrees with what was just locked. Ordered
-                            // after the promotion so the marking the cleanup's
-                            // safety assertion reads is the final one.
-                            self.delete_mismatching_chain_config_blocks();
-                            // FR9's other re-evaluation trigger, for the blocks
-                            // that are not on the chain just adopted.
-                            self.reevaluate_retained_blocks_against_lock();
-                        } else {
-                            self.promote_candidate_active(candidate_tip_idx);
-                        }
-                        // Processing→Ready. The FR40-series ready-only surface
-                        // becomes live (its query bodies remain Epic 7/10
-                        // `todo!()` — reachable, but this story wires no caller).
-                        self.set_lifecycle_phase(LifecyclePhase::Ready);
-                        break;
-                    }
-                    Err(err) => {
-                        // FR8 mismatch path (Story 5.9, AC6) — evaluated **before**
-                        // the FR5 recovery, because it is not a recovery: the
-                        // candidate is not being condemned, the node's own
-                        // tentative configuration is. The guard is deliberately
-                        // narrow, and each clause carries weight:
-                        //
-                        // - a *durable* lock is irrevocable (FR8), so a mismatch
-                        //   against it is always the block's fault and never an
-                        //   invitation to adopt;
-                        // - the offender must be the candidate's **first** in-scope
-                        //   config block, which is exactly what makes the retry
-                        //   at-most-once by construction — adopting the first
-                        //   block's own content cannot leave it mismatching, and a
-                        //   later offender means the candidate carries two
-                        //   differing contents and can never satisfy AC3 under any
-                        //   adoption;
-                        // - and the single-use token bounds the pass count even if
-                        //   a future change breaks the reasoning above.
-                        if adopt_retries_left > 0
-                            && !self.chain_config.is_durable_locked()
-                            && let ProcessingError::Invalid {
-                                block_idx,
-                                reason: ValidationReason::ChainConfigMismatch,
-                            } = &err
-                        {
-                            let block_idx = *block_idx;
-                            let (first_config_idx, _) =
-                                self.scan_candidate_chain_config(candidate_tip_idx, NONE_REF);
-                            if block_idx == first_config_idx
-                                && self
-                                    .adopt_candidate_chain_config(
-                                        candidate_tip_idx,
-                                        first_config_idx,
-                                    )
-                                    .is_ok()
-                            {
-                                adopt_retries_left -= 1;
-                                // Re-run over the same candidate, in the same
-                                // call. Reverting to Collecting first is what
-                                // makes that safe rather than merely convenient:
-                                // the loop head re-enters Processing, and if the
-                                // re-evaluation were ever to yield no candidate,
-                                // the node is left in a phase it can act from
-                                // instead of stranded in Processing.
-                                //
-                                // The re-evaluation returns the same tip. The only
-                                // tree change an adopt makes is deleting an
-                                // off-candidate subtree, which can only remove a
-                                // *competitor* — the candidate's own dominance
-                                // cannot be reduced by it.
-                                self.set_lifecycle_phase(LifecyclePhase::Collecting);
-                                continue;
-                            }
-                            // Adoption impossible (unreadable block, signature
-                            // re-verification failed, or content refused): that is
-                            // exact evidence against the block, so fall through to
-                            // the FR5 recovery, which deletes it.
-                        }
-                        // FR6 failed (or FR3 could not derive) → the FR5 atomic
-                        // recovery (Story 5.5): discard the working set, delete the
-                        // offending block (or the candidate head) with its
-                        // descendants, follow up on `chain_heads`, and revert
-                        // Processing→Collecting.
-                        //
-                        // **Re-evaluate immediately, but only after `Invalid`**
-                        // (ratified 2026-07-30, superseding the original
-                        // revert-only Decision #1). The shortened branch validates
-                        // **iff** the deletion removed the *first* failing block:
-                        // the anchor does not move and the forward derivation is
-                        // deterministic, so the retry recomputes exactly the prefix
-                        // of the run that just failed. `Invalid` carries that block
-                        // by construction — `block_idx` is the earliest offender, so
-                        // the surviving prefix was already proved valid by the very
-                        // pass that failed, and a retry over it succeeds. FR2 admits
-                        // it as a candidate: a genesis-anchored segment qualifies at
-                        // any length, and a window-anchored one that was well above
-                        // `SNAKE_CHAIN_LENGTH` (a large piece having just connected)
-                        // still clears the threshold after losing its tip.
-                        //
-                        // The other variants get **no** retry, because for them the
-                        // one-block head deletion is a guess, not evidence:
-                        // `MarkOverflow` means a `parent_ref` cycle (a legal ancestry
-                        // cannot exceed `MAX_BLOCKS`, the table's own capacity) and
-                        // `MissingBlock` a `parent_ref` into a freed slot — both
-                        // always *deeper* than the tip, so dropping the tip cannot
-                        // remove them and the retry is structurally certain to fail
-                        // while eating a second good block off the branch.
-                        // `StorageRead` and `Vote(_)` *could* succeed (the fault may
-                        // sit at the tip, and a transient read may simply re-read
-                        // clean), but the Project Lead ruled retry-on-`Invalid`-only:
-                        // spend the second pass only where success is derivable.
-                        // `MissingChainConfigBlock` (AC3) is excluded: it is not
-                        // evidence against the deleted head, so the shortened
-                        // branch still carries no chain-config block and the retry
-                        // is structurally certain to fail — while eating a second
-                        // good block off the branch. The Story-5.5 argument for
-                        // retrying on `Invalid` ("the deletion removed the first
-                        // failing block, so the surviving prefix was already proved
-                        // valid") does not apply to a violation that no single
-                        // block commits.
-                        let retryable = matches!(
-                            &err,
-                            ProcessingError::Invalid { reason, .. }
-                                if !matches!(reason, ValidationReason::MissingChainConfigBlock)
+            self.drive_dominant_chain_acquisition();
+        }
+        (outcome, self.next_parent_recovery_call())
+    }
+
+    /// The FR2→FR3→FR6→FR4 acquisition spine: while a candidate segment
+    /// qualifies, reconstruct and validate it, and either transition to `Ready`
+    /// or recover per FR5 and fall back to `Collecting`.
+    ///
+    /// Extracted from [`Self::receive_block`] so the FR59 restart
+    /// ([`Self::initialize_from_storage`]) drives **the identical** loop rather
+    /// than a parallel copy of it. FR59 requires a restart to reuse "the
+    /// identical acquisition / reconstruction / validation code paths as a fresh
+    /// join (no separate restart-only logic)"; sharing the body is what makes
+    /// that true by construction instead of by review discipline.
+    ///
+    /// The caller owns the entry gate — an admission outcome and the FR2
+    /// preconditions for `receive_block`, the completed rebuild for the restart
+    /// — because the two have different reasons to be here. Both must hold the
+    /// same two invariants on entry: the phase is `Collecting`, and a
+    /// configuration is loaded (Story 5.8 — an unconfigured pass would refuse at
+    /// the first FR37 vote effect and the FR5 fallback would then delete a valid
+    /// block for the node's own missing configuration).
+    pub(crate) fn drive_dominant_chain_acquisition(&mut self) {
+        debug_assert!(
+            matches!(self.lifecycle_phase, LifecyclePhase::Collecting),
+            "acquisition must be entered from Collecting"
+        );
+        // At most **three** full-chain passes per call, from two
+        // independent single-use tokens, neither ever replenished inside the
+        // loop: `retries_left` covers the Story-5.5 `Invalid` recovery
+        // retry, and `adopt_retries_left` the Story-5.9 FR8 config-adopt
+        // retry (ratified 2026-07-30, raising Story 5.5's ceiling of two).
+        // `1 + 1 + 1 = 3` regardless of interleaving — `Invalid → adopt` and
+        // `adopt → Invalid` both terminate at three.
+        //
+        // The adopt retry additionally cannot recur *for the same candidate*
+        // by construction rather than by counter: the content it adopts **is**
+        // the candidate's own first in-scope config block, so on the retry
+        // that block matches. The one shape that could otherwise oscillate —
+        // a candidate carrying two config blocks with differing contents —
+        // is excluded by the same construction: after the adopt, the first
+        // block matches and the *other* one is the offender, so `block_idx`
+        // no longer equals the first config block and the adopt guard below
+        // does not fire. It takes the hard FR5 rollback instead.
+        let mut retries_left = 1u8;
+        let mut adopt_retries_left = 1u8;
+        while let Some(candidate_tip_idx) = self.evaluate_stopping_condition() {
+            self.set_lifecycle_phase(LifecyclePhase::Processing);
+            // Story 5.3 (FR3) + Story 5.4 (FR6/FR4): reconstruct AND validate the
+            // derived projection for the FR2 candidate in one forward pass. A
+            // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
+            // the Ready transition below overwrites; it does not pre-empt selection.
+            match self.run_processing_pass(candidate_tip_idx) {
+                Ok(()) => {
+                    // FR8 durable set-once lock (Story 5.9, AC4). The pass has
+                    // just proved the AC3 final check — the candidate carries
+                    // at least one chain-config block and every one of them is
+                    // byte-identical to the tentative configuration — so this
+                    // is the instant FR8 names for the commitment.
+                    //
+                    // **Before `promote_candidate_active`, not after.** The
+                    // durable write can fail, and this is the last point at
+                    // which a failure costs nothing: nothing has been promoted,
+                    // so abandoning the transition needs no undo of a marking
+                    // the FR5 recovery explicitly cannot undo (see its step-4
+                    // note on recovering after a successful promotion). A
+                    // failure therefore leaves the node Collecting with its
+                    // blocks intact, to try again on the next admission —
+                    // Story 5.8's rule that a node's own local trouble must not
+                    // be charged to a valid block.
+                    if !self.chain_config.is_durable_locked() {
+                        let (first_config_idx, _) =
+                            self.scan_candidate_chain_config(candidate_tip_idx, NONE_REF);
+                        // AC3 guarantees this: the pass fails with
+                        // `MissingChainConfigBlock` when the candidate carries
+                        // none, so reaching `Ok(())` means one is there.
+                        debug_assert!(
+                            first_config_idx != NONE_REF,
+                            "AC3: a candidate that passed the pass carries a chain-config block"
                         );
-                        self.recover_from_failed_pass(err, candidate_tip_idx);
-                        // The FR2 gate above is evaluated once, on entry — but the
-                        // recovery can retract the configuration underneath it
-                        // (AC8 step 3b, when the delete-set contained the block
-                        // that supplied the tentative). Re-check before retrying:
-                        // an unconfigured pass refuses at the first FR37 vote
-                        // effect with `Vote(NotParameterized)`, which carries no
-                        // `block_idx`, so the FR5 fallback would delete the
-                        // candidate **head** — punishing a valid block for the
-                        // node's own missing configuration, which is precisely
-                        // what Story 5.8 put that gate there to prevent.
-                        if !retryable
-                            || retries_left == 0
-                            || self.chain_config.active_configuration().is_none()
+                        // FR9 re-evaluation at the durable lock: the
+                        // block-size limit could not condemn a block while the
+                        // configuration was merely tentative, so it is applied
+                        // here, before anything irrevocable happens. A
+                        // violation is now exact evidence — the limit being
+                        // enforced is the one this very candidate declares —
+                        // and takes the ordinary FR5 rollback.
+                        if let Some(offender) =
+                            self.candidate_block_exceeding_size_limit(candidate_tip_idx)
                         {
+                            self.recover_from_failed_pass(
+                                ProcessingError::Invalid {
+                                    block_idx: offender,
+                                    reason: ValidationReason::BlockTooLarge,
+                                },
+                                candidate_tip_idx,
+                            );
                             break;
                         }
-                        retries_left -= 1;
+                        if first_config_idx == NONE_REF
+                            || self.commit_durable_chain_config(first_config_idx).is_err()
+                        {
+                            // The pass returned `Ok`, so it left a complete
+                            // derived projection behind and never ran its
+                            // abort-path spent-bit rollback. Abandoning the
+                            // transition has to undo all of it, or the node
+                            // returns to Collecting holding the projection of
+                            // a chain it did not adopt. Nothing was promoted
+                            // (the commit is ordered before
+                            // `promote_candidate_active` precisely so this
+                            // path needs no un-promotion), so the FR5 step-1
+                            // rollback is the whole of the cleanup.
+                            self.node_info.reset();
+                            self.reset_vote_engine();
+                            for idx in 0..MAX_BLOCKS {
+                                self.blocks.clear_spent_bits(idx as u32);
+                            }
+                            self.set_lifecycle_phase(LifecyclePhase::Collecting);
+                            break;
+                        }
+                        // FR6 passed over the full candidate → FR4 Ready
+                        // transition: atomically promote every candidate block
+                        // Stored→Active (the Epic-4-deferred FR9 Tier-3
+                        // driver) and establish the active head.
+                        self.promote_candidate_active(candidate_tip_idx);
+                        // AC5: with the lock engaged and the active chain
+                        // marked, drop every chain-config block in the tree
+                        // that disagrees with what was just locked. Ordered
+                        // after the promotion so the marking the cleanup's
+                        // safety assertion reads is the final one.
+                        self.delete_mismatching_chain_config_blocks();
+                        // FR9's other re-evaluation trigger, for the blocks
+                        // that are not on the chain just adopted.
+                        self.reevaluate_retained_blocks_against_lock();
+                    } else {
+                        self.promote_candidate_active(candidate_tip_idx);
                     }
+                    // Processing→Ready. The FR40-series ready-only surface
+                    // becomes live (its query bodies remain Epic 7/10
+                    // `todo!()` — reachable, but this story wires no caller).
+                    self.set_lifecycle_phase(LifecyclePhase::Ready);
+                    break;
+                }
+                Err(err) => {
+                    // FR8 mismatch path (Story 5.9, AC6) — evaluated **before**
+                    // the FR5 recovery, because it is not a recovery: the
+                    // candidate is not being condemned, the node's own
+                    // tentative configuration is. The guard is deliberately
+                    // narrow, and each clause carries weight:
+                    //
+                    // - a *durable* lock is irrevocable (FR8), so a mismatch
+                    //   against it is always the block's fault and never an
+                    //   invitation to adopt;
+                    // - the offender must be the candidate's **first** in-scope
+                    //   config block, which is exactly what makes the retry
+                    //   at-most-once by construction — adopting the first
+                    //   block's own content cannot leave it mismatching, and a
+                    //   later offender means the candidate carries two
+                    //   differing contents and can never satisfy AC3 under any
+                    //   adoption;
+                    // - and the single-use token bounds the pass count even if
+                    //   a future change breaks the reasoning above.
+                    if adopt_retries_left > 0
+                        && !self.chain_config.is_durable_locked()
+                        && let ProcessingError::Invalid {
+                            block_idx,
+                            reason: ValidationReason::ChainConfigMismatch,
+                        } = &err
+                    {
+                        let block_idx = *block_idx;
+                        let (first_config_idx, _) =
+                            self.scan_candidate_chain_config(candidate_tip_idx, NONE_REF);
+                        if block_idx == first_config_idx
+                            && self
+                                .adopt_candidate_chain_config(candidate_tip_idx, first_config_idx)
+                                .is_ok()
+                        {
+                            adopt_retries_left -= 1;
+                            // Re-run over the same candidate, in the same
+                            // call. Reverting to Collecting first is what
+                            // makes that safe rather than merely convenient:
+                            // the loop head re-enters Processing, and if the
+                            // re-evaluation were ever to yield no candidate,
+                            // the node is left in a phase it can act from
+                            // instead of stranded in Processing.
+                            //
+                            // The re-evaluation returns the same tip. The only
+                            // tree change an adopt makes is deleting an
+                            // off-candidate subtree, which can only remove a
+                            // *competitor* — the candidate's own dominance
+                            // cannot be reduced by it.
+                            self.set_lifecycle_phase(LifecyclePhase::Collecting);
+                            continue;
+                        }
+                        // Adoption impossible (unreadable block, signature
+                        // re-verification failed, or content refused): that is
+                        // exact evidence against the block, so fall through to
+                        // the FR5 recovery, which deletes it.
+                    }
+                    // FR6 failed (or FR3 could not derive) → the FR5 atomic
+                    // recovery (Story 5.5): discard the working set, delete the
+                    // offending block (or the candidate head) with its
+                    // descendants, follow up on `chain_heads`, and revert
+                    // Processing→Collecting.
+                    //
+                    // **Re-evaluate immediately, but only after `Invalid`**
+                    // (ratified 2026-07-30, superseding the original
+                    // revert-only Decision #1). The shortened branch validates
+                    // **iff** the deletion removed the *first* failing block:
+                    // the anchor does not move and the forward derivation is
+                    // deterministic, so the retry recomputes exactly the prefix
+                    // of the run that just failed. `Invalid` carries that block
+                    // by construction — `block_idx` is the earliest offender, so
+                    // the surviving prefix was already proved valid by the very
+                    // pass that failed, and a retry over it succeeds. FR2 admits
+                    // it as a candidate: a genesis-anchored segment qualifies at
+                    // any length, and a window-anchored one that was well above
+                    // `SNAKE_CHAIN_LENGTH` (a large piece having just connected)
+                    // still clears the threshold after losing its tip.
+                    //
+                    // The other variants get **no** retry, because for them the
+                    // one-block head deletion is a guess, not evidence:
+                    // `MarkOverflow` means a `parent_ref` cycle (a legal ancestry
+                    // cannot exceed `MAX_BLOCKS`, the table's own capacity) and
+                    // `MissingBlock` a `parent_ref` into a freed slot — both
+                    // always *deeper* than the tip, so dropping the tip cannot
+                    // remove them and the retry is structurally certain to fail
+                    // while eating a second good block off the branch.
+                    // `StorageRead` and `Vote(_)` *could* succeed (the fault may
+                    // sit at the tip, and a transient read may simply re-read
+                    // clean), but the Project Lead ruled retry-on-`Invalid`-only:
+                    // spend the second pass only where success is derivable.
+                    // `MissingChainConfigBlock` (AC3) is excluded: it is not
+                    // evidence against the deleted head, so the shortened
+                    // branch still carries no chain-config block and the retry
+                    // is structurally certain to fail — while eating a second
+                    // good block off the branch. The Story-5.5 argument for
+                    // retrying on `Invalid` ("the deletion removed the first
+                    // failing block, so the surviving prefix was already proved
+                    // valid") does not apply to a violation that no single
+                    // block commits.
+                    let retryable = matches!(
+                        &err,
+                        ProcessingError::Invalid { reason, .. }
+                            if !matches!(reason, ValidationReason::MissingChainConfigBlock)
+                    );
+                    self.recover_from_failed_pass(err, candidate_tip_idx);
+                    // The FR2 gate above is evaluated once, on entry — but the
+                    // recovery can retract the configuration underneath it
+                    // (AC8 step 3b, when the delete-set contained the block
+                    // that supplied the tentative). Re-check before retrying:
+                    // an unconfigured pass refuses at the first FR37 vote
+                    // effect with `Vote(NotParameterized)`, which carries no
+                    // `block_idx`, so the FR5 fallback would delete the
+                    // candidate **head** — punishing a valid block for the
+                    // node's own missing configuration, which is precisely
+                    // what Story 5.8 put that gate there to prevent.
+                    if !retryable
+                        || retries_left == 0
+                        || self.chain_config.active_configuration().is_none()
+                    {
+                        break;
+                    }
+                    retries_left -= 1;
                 }
             }
         }
-        (outcome, self.next_parent_recovery_call())
     }
 
     /// Brings the vote registry into the state the current chain configuration
@@ -1756,7 +2082,7 @@ impl<
     /// [`Self::receive_block`]: no caller can observe the working set discarded
     /// but the blocks still present, or the blocks deleted but the phase not yet
     /// reverted. `pub(crate)` and self-contained (no `now`, no PRNG, no durable
-    /// I/O) so the FR59 restart (Story 5.7) and the FR23 deep-zone
+    /// I/O) so the FR59 restart (Story 5.10) and the FR23 deep-zone
     /// re-derivation (Epic 6) reuse it exactly as they reuse
     /// [`Self::run_processing_pass`].
     ///
@@ -1859,7 +2185,7 @@ impl<
     /// **Reuse constraint** (inherited from [`Self::run_processing_pass`]): this
     /// rollback is self-consistent only for a re-derivation over a candidate
     /// whose blocks are **not shared** with an already-active chain (fresh join,
-    /// the Story-5.7 restart, an Epic-6 deep zone of a *new* branch). A
+    /// the Story-5.10 restart, an Epic-6 deep zone of a *new* branch). A
     /// chain-switch that re-derives over shared blocks must work on a copy — a
     /// failed re-derivation there would zero a shared block's *committed*
     /// spent-bits instead of restoring them.
@@ -1869,7 +2195,7 @@ impl<
         candidate_tip_idx: u32,
     ) {
         // Entry contract: the only caller today is the `Processing` seam, and
-        // step 5's reversion target assumes it. A future reuse (Story 5.7, Epic
+        // step 5's reversion target assumes it. A future reuse (Story 5.10, Epic
         // 6) entering from another phase would be silently downgraded to
         // Collecting, so make that loud in debug and free in release.
         debug_assert!(
@@ -1967,7 +2293,7 @@ impl<
         // deleting block #0 deletes everything descending from it, and in
         // collecting state block #0 is the only block that is ever marked. The
         // demotion above is therefore unreachable in both directions. A caller
-        // that recovers after a *successful* promotion (the Story-5.7 restart,
+        // that recovers after a *successful* promotion (the Story-5.10 restart,
         // an Epic-6 chain switch) breaks that premise — `promote_candidate_active`
         // marks a whole chain — and must re-derive the survivors' caches itself.
         // The FR9 status is the other half of the same promotion and is reset
@@ -2018,7 +2344,7 @@ impl<
     /// it strictly forward from the anchor, deriving the complete active-chain
     /// projection into `node_info` (roster, public keys, balances, seed sources,
     /// `max_known_node_id`) and `vote_engine` (accumulated vote + creator order,
-    /// FR37/FR38). `pub(crate)` and self-contained so the FR59 restart (Story 5.7)
+    /// FR37/FR38). `pub(crate)` and self-contained so the FR59 restart (Story 5.10)
     /// and the FR23 deep-zone reconstruction (Epic 6) reuse the same primitive.
     ///
     /// **Derive-only** (Decision #2): it does not validate FR6 invariants, promote
@@ -2120,7 +2446,7 @@ impl<
         // the marked blocks are freshly-admitted `Stored` blocks (spent-bits already
         // 0); the reset makes the reusable primitive self-consistent for a
         // re-derivation over a candidate whose blocks are NOT shared with an
-        // already-active chain (fresh join, the Story-5.7 restart, and the Epic-6
+        // already-active chain (fresh join, the Story-5.10 restart, and the Epic-6
         // deep-zone reconstruction of a *new* branch). A chain-switch that
         // re-derives over blocks shared with the active chain must operate on a
         // working copy instead (owned by Epic 6): a failed re-derivation here would
@@ -6109,7 +6435,7 @@ mod tests {
     /// `is_on_active_chain` bit is cleared, and the FR19 genesis bootstrap is
     /// re-established on the surviving block #0. The pre-marked survivors here
     /// stand in for a `promote_candidate_active` that ran before this recovery
-    /// (the Story-5.7 / Epic-6 reuse) — without the clearing they would keep
+    /// (the Story-5.10 / Epic-6 reuse) — without the clearing they would keep
     /// claiming to be on an active chain that no longer has a head.
     #[test]
     fn fr5_restores_active_chain_marking_and_keeps_the_genesis_bootstrap() {
@@ -7595,5 +7921,488 @@ mod tests {
             Some(content_of(&first)),
             "the held configuration is untouched by the refusal"
         );
+    }
+
+    // ===================================================================
+    // FR59 — restart equivalence (Story 5.10)
+    //
+    // `MemoryBackend` lives in RAM, so a "power cycle" is modelled the only
+    // way it can be: the durable backend is carried into a freshly
+    // constructed node while every piece of derived state — tree, heads,
+    // projection, configuration — starts empty, exactly as it would after a
+    // reboot.
+    // ===================================================================
+
+    /// Carries `bc`'s durable storage into a brand-new node. The new node gets a
+    /// fresh, *unconfigured* configuration module and an empty tree: everything
+    /// it ends up holding, it recovered from the durable footprint.
+    fn restart(bc: TestChain) -> TestChain {
+        let storage = bc.storage;
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key should be accepted by the backend");
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        new_chain(crypto, storage, chain_config, 5, 0)
+    }
+
+    /// Drives an unconfigured node to `Ready` the way the network does: a
+    /// genesis plus chain-config blocks, admitted while orphaned so the genesis
+    /// connects them all at once. Reaching `Ready` runs the real FR8 durable
+    /// commit, which is what puts the configuration into the control plane —
+    /// the durable evidence the restart later reads back.
+    fn node_ready_from_the_mesh() -> (TestChain, Block, Block) {
+        let mut bc = new_unconfigured_test_chain();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
+        for block in [&cfg, &genesis] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert!(bc.is_ready(), "precondition: the node reached Ready");
+        assert!(
+            bc.chain_config.is_durable_locked(),
+            "precondition: reaching Ready performed the FR8 durable commit"
+        );
+        (bc, genesis, cfg)
+    }
+
+    /// AC1/AC3 precondition, proven end to end through the real storage seam:
+    /// a block shorter than a slot comes back padded, and only the structural
+    /// length recovery still finds the block inside it. Without this, every
+    /// hash the rebuild computes would be wrong.
+    #[test]
+    fn fr59_a_short_block_survives_the_storage_round_trip() {
+        let (_, mut storage, _) = test_backends();
+        let block = node_transfer_block(0, 7, 0, 7);
+        let exact = block.serialized_bytes();
+        assert!(
+            exact.len() < MAX_BLOCK_SIZE,
+            "precondition: shorter than a slot"
+        );
+        storage.save_block(0, &block).ok().expect("save");
+
+        let read_back = storage.read_block(0).ok().expect("read");
+        assert_eq!(
+            read_back.len(),
+            MAX_BLOCK_SIZE,
+            "the backend returns the whole padded slot - this is the problem FR59 faces"
+        );
+
+        let view = TestChain::exact_view(read_back.serialized_bytes())
+            .expect("the exact length is recoverable");
+        assert_eq!(
+            view.serialized_bytes(),
+            exact,
+            "byte-identical to what was saved"
+        );
+        assert_eq!(view.hash(), block.view().hash(), "and so is the hash");
+        assert_ne!(
+            read_back.view().hash(),
+            block.view().hash(),
+            "while the padded read-back hashes to something else entirely"
+        );
+    }
+
+    /// AC5/AC2 — the whole spine: rebuild from durable blocks, restore the FR8
+    /// lock from the control plane, re-run FR2/FR3/FR6 and land in `Ready`.
+    #[test]
+    fn fr59_restart_rebuilds_and_reaches_ready() {
+        let (bc, genesis, cfg) = node_ready_from_the_mesh();
+        let active_before = bc.current_active_head();
+
+        let mut restarted = restart(bc);
+        assert!(
+            restarted.chain_config.active_configuration().is_none(),
+            "precondition: the restarted node starts with nothing"
+        );
+
+        let (outcome, _) = restarted.initialize_from_storage(500);
+
+        assert_eq!(outcome, InitOutcome::ResumedReady);
+        assert!(
+            restarted.is_ready(),
+            "FR4 reached through the ordinary spine"
+        );
+        assert!(
+            restarted.chain_config.is_durable_locked(),
+            "AC2 - the FR8 lock is restored from the control plane"
+        );
+        assert_eq!(
+            restarted.current_active_head(),
+            active_before,
+            "the same active chain is re-derived"
+        );
+        assert!(
+            restarted.blocks.find(0, &genesis.view().hash()).is_some()
+                && restarted.blocks.find(1, &cfg.view().hash()).is_some(),
+            "both durable blocks are back in the tree, indexed by (sequence, hash)"
+        );
+    }
+
+    /// AC5 — no qualifying candidate means the node simply stays `Collecting`
+    /// and keeps its blocks, which FR59 step (4) states explicitly.
+    #[test]
+    fn fr59_restart_stays_collecting_without_a_qualifying_candidate() {
+        let mut bc = new_unconfigured_test_chain();
+        // A lone orphan far above the window: admitted, but neither
+        // genesis-anchored nor long enough to satisfy FR2.
+        let cfg = chain_config_anchor_block(100, [0xAB; 32]);
+        let (outcome, _) = bc.receive_block(cfg.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+
+        let mut restarted = restart(bc);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+
+        assert_eq!(outcome, InitOutcome::ResumedCollecting);
+        assert_eq!(restarted.current_phase(), LifecyclePhase::Collecting);
+        assert_eq!(restarted.blocks.len(), 1, "the retained block survived");
+    }
+
+    /// AC8 — the equivalence the story exists to deliver: a restarted node and a
+    /// fresh node fed the same blocks agree on the active chain, the phase, and
+    /// the locked configuration.
+    #[test]
+    fn fr59_restart_is_equivalent_to_a_fresh_node_fed_the_same_blocks() {
+        let (bc, genesis, cfg) = node_ready_from_the_mesh();
+        let mut restarted = restart(bc);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+        assert_eq!(outcome, InitOutcome::ResumedReady);
+
+        // The comparison node never restarts: it receives the same two blocks.
+        let mut fresh = new_unconfigured_test_chain();
+        for block in [&cfg, &genesis] {
+            let (outcome, _) = fresh.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+
+        assert_eq!(restarted.is_ready(), fresh.is_ready());
+        assert_eq!(restarted.current_active_head(), fresh.current_active_head());
+        assert_eq!(restarted.blocks.len(), fresh.blocks.len());
+        assert_eq!(
+            restarted.chain_config.durable_content(),
+            fresh.chain_config.durable_content(),
+            "both committed the same configuration"
+        );
+        for (sequence, hash) in [(0u32, genesis.view().hash()), (1u32, cfg.view().hash())] {
+            assert_eq!(
+                restarted.blocks.find(sequence, &hash).is_some(),
+                fresh.blocks.find(sequence, &hash).is_some(),
+                "the two trees hold the same blocks"
+            );
+        }
+    }
+
+    /// AC3 — durable slots are not necessarily contiguous, so the scan must run
+    /// the whole capacity rather than stopping at the first empty slot. A node
+    /// that stopped early would silently lose its chain.
+    #[test]
+    fn fr59_restart_scan_does_not_stop_at_the_first_empty_slot() {
+        let (_, mut storage, _) = test_backends();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
+        // Deliberately leaving slot 0 empty and scattering the blocks.
+        storage.save_block(1, &genesis).ok().expect("save");
+        storage.save_block(3, &cfg).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+        let (_, _) = bc.initialize_from_storage(500);
+
+        assert_eq!(bc.blocks.len(), 2, "both scattered blocks were found");
+        assert!(bc.blocks.get(1).is_some() && bc.blocks.get(3).is_some());
+        assert!(
+            bc.blocks.get(0).is_none() && bc.blocks.get(2).is_none(),
+            "blocks land at their own durable index, never compacted"
+        );
+    }
+
+    /// AC3 — durable order is not topological. A parent written to a *higher*
+    /// slot than its child must still be linked, which is why linkage is a
+    /// second pass over the completed table rather than done inline.
+    #[test]
+    fn fr59_restart_links_parents_stored_after_their_children() {
+        let (_, mut storage, _) = test_backends();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let child = chain_config_anchor_block(1, genesis.view().hash());
+        // Child first, parent second — the order a one-pass rebuild would break on.
+        storage.save_block(0, &child).ok().expect("save");
+        storage.save_block(1, &genesis).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+        let (_, _) = bc.initialize_from_storage(500);
+
+        let child_idx = bc
+            .blocks
+            .find(1, &child.view().hash())
+            .expect("the child is in the tree");
+        let parent_idx = bc
+            .blocks
+            .find(0, &genesis.view().hash())
+            .expect("the parent is in the tree");
+        assert_eq!(
+            bc.blocks.get(child_idx).map(|entry| entry.parent_ref()),
+            Some(parent_idx),
+            "the child resolved to its parent despite the inverted slot order"
+        );
+    }
+
+    /// AC7 — a retained side branch survives the restart with its fork point
+    /// intact; FR20 forbids silently collapsing it.
+    #[test]
+    fn fr59_restart_preserves_side_branches() {
+        let mut bc = new_unconfigured_test_chain();
+        // A fork that survives to be tested: the branch root is itself an orphan
+        // far above the window, so no FR2 candidate ever qualifies and neither
+        // the FR5 recovery nor the FR8 lock-time cleanup can prune a branch
+        // before the restart. The two tips differ in payload type, which is what
+        // makes them distinct blocks at the same sequence rather than duplicates.
+        let root = linked_transfer_block(100, [0xAB; 32]);
+        let tip_a = linked_transfer_block(101, root.view().hash());
+        let tip_b = chain_config_anchor_block(101, root.view().hash());
+        for block in [&root, &tip_a, &tip_b] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(
+            bc.chain_heads.count(),
+            2,
+            "precondition: the tree really forked, and both tips are tracked"
+        );
+        assert!(!bc.is_ready(), "precondition: no candidate qualified");
+
+        let mut restarted = restart(bc);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+
+        assert_eq!(outcome, InitOutcome::ResumedCollecting);
+        assert_eq!(restarted.blocks.len(), 3, "no branch was collapsed (FR20)");
+        assert_eq!(
+            restarted.chain_heads.count(),
+            2,
+            "AC7 - both branches are tracked again after the rebuild"
+        );
+
+        let root_idx = restarted
+            .blocks
+            .find(100, &root.view().hash())
+            .expect("the fork point is retained");
+        for tip in [&tip_a, &tip_b] {
+            let tip_idx = restarted
+                .blocks
+                .find(101, &tip.view().hash())
+                .expect("both tips are retained");
+            assert_eq!(
+                restarted
+                    .blocks
+                    .get(tip_idx)
+                    .map(|entry| entry.parent_ref()),
+                Some(root_idx),
+                "and both still hang off the same fork point"
+            );
+        }
+    }
+
+    /// AC9 (ratified 2026-09-20) — `StorageTrait` has no delete, so a block
+    /// removed before the shutdown is still readable afterwards and comes back.
+    /// The rebuilt tree is therefore **not** the pre-shutdown tree; what is
+    /// guaranteed is that the node still converges, because the deletion drivers
+    /// are deterministic and re-fire.
+    #[test]
+    fn fr59_restart_resurrects_a_deleted_block_and_still_converges() {
+        let (mut bc, genesis, _cfg) = node_ready_from_the_mesh();
+
+        // The post-deletion durable state, reproduced exactly: bytes present in
+        // a slot, no entry in the tree. That is all `BlockTable::delete` leaves
+        // behind, because `StorageTrait` has no delete and the slot is only
+        // reclaimed when a later `save_block` overwrites it.
+        let orphaned = linked_transfer_block(5, [0x77; 32]);
+        bc.storage.save_block(6, &orphaned).ok().expect("save");
+        assert!(
+            bc.blocks.find(5, &orphaned.view().hash()).is_none(),
+            "precondition: the block is durable but not in the pre-restart tree"
+        );
+        let head_before = bc.current_active_head();
+
+        let mut restarted = restart(bc);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+
+        assert!(
+            restarted.blocks.find(5, &orphaned.view().hash()).is_some(),
+            "AC9 - a slot that was never overwritten reads back and is admitted again"
+        );
+        assert_eq!(
+            outcome,
+            InitOutcome::ResumedReady,
+            "and the node still converges on its chain"
+        );
+        assert_eq!(
+            restarted.current_active_head(),
+            head_before,
+            "the resurrected block did not disturb the active chain"
+        );
+        assert!(
+            restarted.blocks.find(0, &genesis.view().hash()).is_some(),
+            "the genesis is still there"
+        );
+    }
+
+    /// AC3/AC11 — a slot whose payload does not frame coherently is skipped, not
+    /// fatal: one bad slot must not cost the node its chain. An approval block
+    /// with a populated payload is the reachable case today, because Epic 6 has
+    /// not defined that format and `content_length` refuses to guess at it.
+    #[test]
+    fn fr59_restart_skips_a_slot_whose_length_cannot_be_recovered() {
+        let (_, mut storage, _) = test_backends();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        storage.save_block(0, &genesis).ok().expect("save");
+
+        let mut raw = [0u8; HEADER_SIZE + 4];
+        raw[0] = 1; // version
+        raw[13] = moonblokz_chain_types::PAYLOAD_TYPE_APPROVAL;
+        raw[HEADER_SIZE] = 0xFF; // a payload with no defined framing
+        let undecodable = Block::from_bytes(&raw)
+            .ok()
+            .expect("structurally parseable, just not measurable");
+        storage.save_block(1, &undecodable).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+        let (_, _) = bc.initialize_from_storage(500);
+
+        assert_eq!(bc.blocks.len(), 1, "the unmeasurable slot is skipped");
+        assert!(
+            bc.blocks.find(0, &genesis.view().hash()).is_some(),
+            "and the good block is still recovered"
+        );
+    }
+
+    /// AC11 — a populated store whose control plane cannot be read is refused,
+    /// not panicked on and not silently rebuilt: the node would be reconstructing
+    /// a chain without knowing the configuration it was accepted under.
+    #[test]
+    fn fr59_restart_rejects_a_populated_store_with_an_unreadable_control_plane() {
+        // Never `init`ed, so `load_control_data` fails - but `save_block` still
+        // writes into the slot region, so blocks are readable.
+        let mut storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        storage.save_block(0, &genesis).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+
+        let (outcome, next) = bc.initialize_from_storage(500);
+
+        assert_eq!(
+            outcome,
+            InitOutcome::Rejected(RestartRejectReason::ControlPlaneUnreadable)
+        );
+        assert!(matches!(next, NextCall::Idle));
+        assert_eq!(bc.blocks.len(), 0, "nothing was rebuilt");
+    }
+
+    /// The same unreadable control plane with an *empty* store is not an error:
+    /// that is exactly what a fresh node looks like, and Story 5.1's join path
+    /// must keep working.
+    #[test]
+    fn fr59_an_empty_store_is_a_fresh_join_even_without_a_control_plane() {
+        let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+
+        let (outcome, next) = bc.initialize_from_storage(500);
+
+        assert_eq!(outcome, InitOutcome::StartedCollecting);
+        assert!(matches!(next, NextCall::Idle));
+        assert_eq!(bc.current_phase(), LifecyclePhase::Collecting);
+    }
+
+    /// FR8's tentative phase is not durable, so a node that shut down before the
+    /// lock comes back holding nothing — yet its retained tree still carries the
+    /// config block it had adopted. Re-adopting is what keeps the restart
+    /// equivalent to a fresh node fed the same blocks; without it the node holds
+    /// no configuration and cannot run the FR3 derivation at all.
+    #[test]
+    fn fr59_restart_reestablishes_a_tentative_when_nothing_was_locked() {
+        let mut bc = new_unconfigured_test_chain();
+        let cfg = chain_config_anchor_block(100, [0xAB; 32]);
+        let (outcome, _) = bc.receive_block(cfg.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert!(
+            !bc.chain_config.is_durable_locked(),
+            "precondition: the configuration is only tentative"
+        );
+        let mut restarted = restart(bc);
+        let (_, _) = restarted.initialize_from_storage(500);
+
+        assert!(
+            !restarted.chain_config.is_durable_locked(),
+            "a tentative is re-established as a tentative, never promoted by a restart"
+        );
+        assert_eq!(
+            restarted.chain_config.tentative_content(),
+            Some(content_of(&cfg)),
+            "the same configuration content is held again, from the retained block"
+        );
+    }
+
+    /// AC10 — the rebuild is a pure function of the durable footprint: the same
+    /// store restarted twice yields the same outcome and the same tree.
+    #[test]
+    fn fr59_restart_is_deterministic() {
+        let (bc, _, _) = node_ready_from_the_mesh();
+
+        let mut first = restart(bc);
+        let (first_outcome, _) = first.initialize_from_storage(500);
+        let first_len = first.blocks.len();
+        let first_head = first.current_active_head();
+
+        // Restart the *same* durable store a second time, from scratch again.
+        let mut second = restart(first);
+        // A different `now`: it must not influence the reconstruction.
+        let (second_outcome, _) = second.initialize_from_storage(9_999);
+
+        assert_eq!(first_outcome, second_outcome);
+        assert_eq!(first_len, second.blocks.len());
+        assert_eq!(first_head, second.current_active_head());
     }
 }

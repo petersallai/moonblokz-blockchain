@@ -371,6 +371,71 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// first if the table is at capacity (FR19 bounded eviction). Cache fields
     /// are computed from the tree: genesis/active-anchored heads come out
     /// Connected, missing-parent heads come out Stored.
+    /// FR59 — builds the whole table from an already-populated block-tree, as
+    /// the restart rebuild needs it.
+    ///
+    /// The incremental [`Self::on_block_admitted`] path cannot serve here: it
+    /// assumes live arrival (it restamps `arrival_timestamp`, and its
+    /// merge/fork accounting is written around one block appearing at a time),
+    /// so replaying it over durable slots would make the result depend on slot
+    /// order. This builds from the finished graph instead — every block that is
+    /// no retained block's parent is a tip (FR19's defining invariant) — and
+    /// then recomputes `head_ref_count` from the tree's edges, which is the same
+    /// full recompute the FR5 deletion follow-up already relies on.
+    ///
+    /// **Two quantities cannot be recovered and are not faked.**
+    /// `arrival_timestamp` is head-scoped (FR18) and deliberately not a
+    /// `BlockEntry` field, so nothing persists it: every rebuilt head takes
+    /// `arrival_now`. `last_request_timestamp` is `0`, which
+    /// [`Self::select_parent_recovery`] already reads as "never requested, so
+    /// immediately eligible". A restarted node's FR19 recovery schedule
+    /// therefore **restarts**; it does not resume.
+    pub(crate) fn rebuild_from_blocks<const MAX_BLOCKS: usize>(
+        &mut self,
+        blocks: &mut BlockTable<MAX_BLOCKS>,
+        arrival_now: u64,
+    ) {
+        debug_assert!(self.count() == 0, "rebuild expects an empty table");
+
+        for idx in 0..MAX_BLOCKS {
+            let idx = idx as u32;
+            if blocks.get(idx).is_none() {
+                continue;
+            }
+            // A tip is a block no retained block names as its parent.
+            let has_child = (0..MAX_BLOCKS).any(|child| {
+                blocks
+                    .get(child as u32)
+                    .is_some_and(|entry| entry.parent_ref() == idx)
+            });
+            if has_child {
+                continue;
+            }
+
+            let Some(slot) = self.first_empty() else {
+                // The tree holds more tips than the build allows branches. The
+                // surplus is simply untracked, exactly as `insert_head` leaves
+                // it when eviction cannot free a slot (bounded resources, FR20).
+                break;
+            };
+            self.heads[slot] = ChainHeadEntry {
+                head_idx: idx,
+                tail_or_connection_idx: idx,
+                missing_parent_hash: [0; 32],
+                last_request_timestamp: 0,
+                arrival_timestamp: arrival_now,
+                branch_value: 0,
+                flags: 0,
+            };
+            // No just-admitted block anchors this recompute, so the tail-point's
+            // `previous_hash` is resolved the same way the FR5 follow-up resolves
+            // it: from a sibling head's cache, else from the entry's own value.
+            self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
+        }
+
+        Self::recompute_head_ref_counts(blocks);
+    }
+
     fn insert_head<const MAX_BLOCKS: usize>(
         &mut self,
         blocks: &mut BlockTable<MAX_BLOCKS>,
