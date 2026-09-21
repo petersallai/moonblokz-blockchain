@@ -578,6 +578,22 @@ pub struct Blockchain<
     // FR1–FR4 lifecycle state. Default `Collecting`; transitions to
     // `Processing` then `Ready` land in Story 5.1–5.4.
     lifecycle_phase: LifecyclePhase,
+    /// FR59 &#x2014; set when [`Self::initialize_from_storage`] refused a durable
+    /// store it could not rebuild, and never cleared.
+    ///
+    /// A refused restart leaves the node looking exactly like a fresh one: empty
+    /// tree, `Collecting`, no configuration. The durable store, meanwhile, still
+    /// holds the chain. Admitting a block into that state would take
+    /// `next_free_index() == 0` and `save_block(0, ..)` would overwrite a
+    /// durable block &#x2014; the node would silently begin destroying the chain
+    /// it failed to load. The refusal only protects anything if the module stops
+    /// accepting work, so it stops here rather than trusting every caller to act
+    /// on the outcome.
+    ///
+    /// Checking durable occupancy per admission instead is not an option: FR5,
+    /// FR19 and FR8 deletion are all slot *release*, so a freed slot still reads
+    /// back as an occupied one and a legitimate admission would be refused.
+    restart_refused: bool,
 
     // FR18 bounded block-tree — data layer landed in Story 4.1.
     blocks: BlockTable<MAX_BLOCKS>,
@@ -792,6 +808,7 @@ impl<
             (&raw mut (*p).node_zero_public_key).write(node_zero_public_key);
             (&raw mut (*p).prng).write(Prng::new(prng_seed));
             (&raw mut (*p).lifecycle_phase).write(LifecyclePhase::Collecting);
+            (&raw mut (*p).restart_refused).write(false);
             BlockTable::init(field_slot(&raw mut (*p).blocks));
             ChainHeadsTable::init(field_slot(&raw mut (*p).chain_heads));
             // SoA + vote registry init in place (never a MAX_NODES-scaled stack
@@ -837,6 +854,7 @@ impl<
             node_zero_public_key,
             prng: Prng::new(prng_seed),
             lifecycle_phase: LifecyclePhase::Collecting,
+            restart_refused: false,
             blocks: BlockTable::new(),
             chain_heads: ChainHeadsTable::new(),
             node_info: NodeInfoState::new(),
@@ -1317,6 +1335,7 @@ impl<
                 return if !self.durable_blocks_present() {
                     (InitOutcome::StartedCollecting, NextCall::Idle)
                 } else {
+                    self.restart_refused = true;
                     (
                         InitOutcome::Rejected(RestartRejectReason::ControlPlaneUnreadable),
                         NextCall::Idle,
@@ -1341,6 +1360,7 @@ impl<
             // has to come from the recovered exact length — never from
             // `serialized_bytes().len()`.
             let Some(view) = Self::exact_view(bytes) else {
+                self.restart_refused = true;
                 return (
                     InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
                     NextCall::Idle,
@@ -1355,6 +1375,7 @@ impl<
             // `node_zero_public_key` is a construction parameter precisely so a
             // corrupted store cannot supply its own trust anchor.
             if tier1_chain_config_block(&view, &self.node_zero_public_key, &self.crypto).is_err() {
+                self.restart_refused = true;
                 return (
                     InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
                     NextCall::Idle,
@@ -1362,6 +1383,7 @@ impl<
             }
             let payload = view.payload();
             if self.chain_config.load_durable(payload).is_err() {
+                self.restart_refused = true;
                 return (
                     InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable),
                     NextCall::Idle,
@@ -1379,6 +1401,7 @@ impl<
                 // is a damaged store, not an empty one; answering
                 // `StartedCollecting` here would discard the node's whole chain
                 // and present it as fresh.
+                self.restart_refused = true;
                 InitOutcome::Rejected(RestartRejectReason::NoUsableTree)
             } else if restored_durable_config {
                 // No blocks, but a configuration *was* restored from the control
@@ -1901,6 +1924,24 @@ impl<
         now: u64,
     ) -> CallResult<ReceiveBlockOutcome> {
         // FR60 window if Ready+available (Epic 9); any `Err` → no window → FR60 skipped.
+        // A refused restart leaves an empty tree over a populated durable store,
+        // so `next_free_index()` would hand out slot 0 and `save_block` would
+        // overwrite a durable block: the node would silently start destroying
+        // the chain it failed to load. Refuse operationally. `Unstorable`
+        // already means "the block may be perfectly valid but could not be
+        // stored", which is exactly the situation.
+        //
+        // Deliberately **not** `NotReady`: that is the FR1 phase gate, which is
+        // transient and self-healing, while this is terminal and needs an
+        // operator. `ReceiveBlockOutcome` has no such arm in any case, because
+        // FR1 keeps block intake active while Collecting.
+        if self.restart_refused {
+            return (
+                ReceiveBlockOutcome::Rejected(RejectReason::Unstorable),
+                NextCall::Idle,
+            );
+        }
+
         let window = self.active_snake_chain_window().ok();
         let outcome = classify_block(self, &block, window, now);
         // FR2 dominant-chain acquisition (Story 5.2): a successful collecting-phase
@@ -4379,6 +4420,7 @@ mod tests {
             node_zero_public_key,
             prng: _, // seeded from `prng_seed`; its state is opaque by design
             lifecycle_phase,
+            restart_refused,
             blocks,
             chain_heads,
             node_info,
@@ -4391,6 +4433,10 @@ mod tests {
 
         assert_eq!(*local_node_id, 7);
         assert!(*lifecycle_phase == LifecyclePhase::Collecting);
+        assert!(
+            !*restart_refused,
+            "a freshly constructed node has refused nothing"
+        );
         assert_eq!(*node_zero_public_key, [3u8; PUBLIC_KEY_SIZE]);
         assert_eq!(blocks.len(), 0);
         // Story 4.4: the `chain_heads` table + scheduler state must init to
@@ -4448,6 +4494,7 @@ mod tests {
             node_zero_public_key,
             prng,
             lifecycle_phase,
+            restart_refused,
             blocks,
             chain_heads,
             node_info,
@@ -4465,6 +4512,7 @@ mod tests {
             node_zero_public_key: spec_node_zero_public_key,
             prng: spec_prng,
             lifecycle_phase: spec_lifecycle_phase,
+            restart_refused: spec_restart_refused,
             blocks: spec_blocks,
             chain_heads: spec_chain_heads,
             node_info: spec_node_info,
@@ -4479,6 +4527,7 @@ mod tests {
         assert_eq!(node_zero_public_key, spec_node_zero_public_key);
         assert!(prng == spec_prng);
         assert!(lifecycle_phase == spec_lifecycle_phase);
+        assert!(restart_refused == spec_restart_refused);
         assert!(blocks == spec_blocks);
         assert!(chain_heads == spec_chain_heads);
         assert!(node_info == spec_node_info);
@@ -8852,6 +8901,131 @@ mod tests {
                 .find(100, &mismatching.view().hash())
                 .is_none(),
             "the restored lock must re-run its mismatch cleanup over the rebuilt tree"
+        );
+    }
+
+    // ---- A refused restart must not be ignorable (2026-09-21) ------------
+
+    /// The refusal only protects the chain if the module stops accepting work.
+    /// Before this guard, a caller that ignored `Rejected(_)` kept feeding the
+    /// node, and because the rebuild left an empty tree over a populated store
+    /// the first admission took slot 0 and `save_block` overwrote a durable
+    /// block &#x2014; the node silently destroying the chain it failed to load.
+    #[test]
+    fn a_refused_restart_stops_accepting_blocks_instead_of_overwriting_the_chain() {
+        let (_, mut storage, _) = test_backends();
+        // A control-plane configuration whose content signature no longer
+        // verifies, so the restart refuses with `ChainConfigUnusable`.
+        let cfg = chain_config_anchor_block(1, [0u8; 32]);
+        let tampered = {
+            let mut bytes = [0u8; MAX_BLOCK_SIZE];
+            let exact = cfg.serialized_bytes();
+            bytes[..exact.len()].copy_from_slice(exact);
+            bytes[HEADER_SIZE + 2] ^= 0xFF;
+            Block::from_bytes(&bytes[..exact.len()])
+                .ok()
+                .expect("still structurally a block")
+        };
+        storage
+            .set_chain_configuration(&tampered)
+            .ok()
+            .expect("the control plane does not verify signatures");
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        let durable_hash = genesis.view().hash();
+        storage.save_block(0, &genesis).ok().expect("save");
+
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let mut bc = new_chain(
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            0,
+        );
+        let (outcome, _) = bc.initialize_from_storage(500);
+        assert_eq!(
+            outcome,
+            InitOutcome::Rejected(RestartRejectReason::ChainConfigUnusable)
+        );
+
+        // The caller ignores the refusal and keeps feeding the node.
+        let incoming = chain_config_anchor_block(100, [0xCD; 32]);
+        let (admitted, next) = bc.receive_block(incoming.view(), 600);
+
+        assert_eq!(
+            admitted,
+            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable),
+            "an operational refusal - the block may be valid, but this node cannot store anything"
+        );
+        assert!(matches!(next, NextCall::Idle));
+        assert_eq!(bc.blocks.len(), 0, "and nothing entered the tree");
+
+        let slot0 =
+            bc.storage.read_block(0).ok().and_then(|block| {
+                TestChain::exact_view(block.serialized_bytes()).map(|v| v.hash())
+            });
+        assert_eq!(
+            slot0,
+            Some(durable_hash),
+            "the durable block the restart could not load is still intact"
+        );
+    }
+
+    /// The same guard for the other refusal that leaves an unrebuilt store.
+    #[test]
+    fn a_no_usable_tree_refusal_also_stops_accepting_blocks() {
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key");
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            &mut slot,
+            crypto,
+            CorruptSlotsStorage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            5,
+            node_zero,
+            0,
+        );
+        let (outcome, _) = bc.initialize_from_storage(500);
+        assert_eq!(
+            outcome,
+            InitOutcome::Rejected(RestartRejectReason::NoUsableTree)
+        );
+
+        let incoming = node_transfer_block(0, 0, 0, 0);
+        let (admitted, _) = bc.receive_block(incoming.view(), 600);
+        assert_eq!(
+            admitted,
+            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable)
+        );
+    }
+
+    /// `AlreadyInitialized` must **not** poison the node: it means the node is
+    /// already up and running, and the caller simply asked twice.
+    #[test]
+    fn a_duplicate_initialize_call_does_not_stop_a_healthy_node() {
+        let (bc, _, _) = node_ready_from_the_mesh();
+        let mut restarted = restart(bc);
+        let (first, _) = restarted.initialize_from_storage(500);
+        assert_eq!(first, InitOutcome::ResumedReady);
+
+        let (second, _) = restarted.initialize_from_storage(600);
+        assert_eq!(
+            second,
+            InitOutcome::Rejected(RestartRejectReason::AlreadyInitialized)
+        );
+
+        let incoming = linked_transfer_block(7, [0x99; 32]);
+        let (admitted, _) = restarted.receive_block(incoming.view(), 700);
+        assert_ne!(
+            admitted,
+            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable),
+            "a healthy node must keep working after a spurious second init call"
         );
     }
 }
