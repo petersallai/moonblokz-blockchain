@@ -367,10 +367,106 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         self.resolve_pending_tails(blocks, new_idx, &prev_hash);
     }
 
-    /// Insert a brand-new head entry (fork / new-stored / bootstrap), evicting
-    /// first if the table is at capacity (FR19 bounded eviction). Cache fields
-    /// are computed from the tree: genesis/active-anchored heads come out
-    /// Connected, missing-parent heads come out Stored.
+    /// FR59 — builds the whole table from an already-populated block-tree, as
+    /// the restart rebuild needs it.
+    ///
+    /// The incremental [`Self::on_block_admitted`] path cannot serve here: it
+    /// assumes live arrival (it restamps `arrival_timestamp`, and its
+    /// merge/fork accounting is written around one block appearing at a time),
+    /// so replaying it over durable slots would make the result depend on slot
+    /// order. This builds from the finished graph instead — every block that is
+    /// no retained block's parent is a tip (FR19's defining invariant) — and
+    /// then recomputes `head_ref_count` from the tree's edges, which is the same
+    /// full recompute the FR5 deletion follow-up already relies on.
+    ///
+    /// **Two quantities cannot be recovered and are not faked.**
+    /// `arrival_timestamp` is head-scoped (FR18) and deliberately not a
+    /// `BlockEntry` field, so nothing persists it: every rebuilt head takes
+    /// `arrival_now`. `last_request_timestamp` is `0`, which
+    /// [`Self::select_parent_recovery`] already reads as "never requested, so
+    /// immediately eligible". A restarted node's FR19 recovery schedule
+    /// therefore **restarts**; it does not resume.
+    pub(crate) fn rebuild_from_blocks<const MAX_BLOCKS: usize>(
+        &mut self,
+        blocks: &mut BlockTable<MAX_BLOCKS>,
+        arrival_now: u64,
+        active_head_idx: u32,
+    ) {
+        debug_assert!(self.count() == 0, "rebuild expects an empty table");
+
+        for idx in 0..MAX_BLOCKS {
+            let idx = idx as u32;
+            if blocks.get(idx).is_none() {
+                continue;
+            }
+            // A tip is a block no retained block names as its parent.
+            let has_child = (0..MAX_BLOCKS).any(|child| {
+                blocks
+                    .get(child as u32)
+                    .is_some_and(|entry| entry.parent_ref() == idx)
+            });
+            if has_child {
+                continue;
+            }
+
+            if self.count() >= MAX_BRANCH_COUNT {
+                // More tips than the build allows branches. Evict by the same
+                // FR19 rule the incremental path uses (lowest head sequence,
+                // then lowest hash) rather than dropping whichever tips happen
+                // to sit at the highest slot indices — the retained set must be
+                // policy-selected, not index-biased.
+                self.evict_one(blocks, active_head_idx);
+            }
+            let Some(slot) = self.first_empty() else {
+                // Unreachable unless every entry is the active head and so
+                // cannot be evicted; the surplus tip is then simply untracked,
+                // exactly as `insert_head` leaves it (bounded resources, FR20).
+                break;
+            };
+            self.heads[slot] = ChainHeadEntry {
+                head_idx: idx,
+                tail_or_connection_idx: idx,
+                missing_parent_hash: [0; 32],
+                last_request_timestamp: 0,
+                arrival_timestamp: arrival_now,
+                branch_value: 0,
+                flags: 0,
+            };
+            // No just-admitted block anchors this recompute, so the tail-point's
+            // `previous_hash` is resolved the same way the FR5 follow-up resolves
+            // it: from a sibling head's cache, else from the entry's own value.
+            self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
+        }
+
+        Self::recompute_head_ref_counts(blocks);
+    }
+
+    /// FR59 — the tail point of the Stored head in `slot`, or `None` when that
+    /// slot is empty or its head is Connected.
+    ///
+    /// Exists because the missing-parent hash is the one cache field a rebuild
+    /// cannot derive from the block-tree: `BlockEntry` stores a block's own hash
+    /// and its parent *index*, never its `previous_hash`, so recovering it needs
+    /// a durable read — and durable storage is the `Blockchain`'s, not this
+    /// table's. The caller resolves it and hands it back through
+    /// [`Self::set_missing_parent_hash`].
+    pub(crate) fn stored_head_tail(&self, slot: usize) -> Option<u32> {
+        let head = self.heads.get(slot)?;
+        if head.is_empty() || head.is_connected() {
+            return None;
+        }
+        Some(head.tail_or_connection_idx)
+    }
+
+    /// FR59 — counterpart to [`Self::stored_head_tail`]; see its rationale.
+    pub(crate) fn set_missing_parent_hash(&mut self, slot: usize, hash: &[u8; 32]) {
+        if let Some(head) = self.heads.get_mut(slot)
+            && !head.is_empty()
+        {
+            head.missing_parent_hash = *hash;
+        }
+    }
+
     fn insert_head<const MAX_BLOCKS: usize>(
         &mut self,
         blocks: &mut BlockTable<MAX_BLOCKS>,
