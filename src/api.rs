@@ -1299,9 +1299,14 @@ impl<
             // A segment that names no configuration is not yet a candidate
             // (Story 5.13): the FR8 final check would refuse it, and the FR5
             // recovery would then delete its head — a valid block, since no
-            // single block is at fault. Waiting costs nothing; a later
-            // admission re-evaluates. Walked only for a segment that would
-            // otherwise win, over cached flag bits, with no storage read.
+            // single block is at fault. A later admission re-evaluates.
+            //
+            // Cost: the walk reads only the in-RAM block table (cached
+            // `payload_type` bits and `parent_ref`), never storage. It runs for
+            // every segment that passes the length test and beats the best
+            // config-bearing one so far — so while segments wait for their
+            // configuration, each of them is walked on every evaluation: at
+            // most `MAX_BRANCH_COUNT × MAX_BLOCKS` entry reads per admission.
             if better && self.scan_candidate_chain_config(head_idx, NONE_REF).0 != NONE_REF {
                 best = Some((head_idx, tip_seq, tip_hash));
             }
@@ -2239,7 +2244,11 @@ impl<
                     // it as a candidate: a genesis-anchored segment qualifies at
                     // any length, and a window-anchored one that was well above
                     // the configured `W` (a large piece having just connected)
-                    // still clears the threshold after losing its tip.
+                    // still clears the threshold after losing its tip — in both
+                    // cases only while the surviving prefix still carries a
+                    // chain-config block (Story 5.13). If the deletion took the
+                    // segment's only one, FR2 yields no candidate and the node
+                    // waits in Collecting rather than retrying.
                     //
                     // The other variants get **no** retry, because for them the
                     // one-block head deletion is a guess, not evidence:
@@ -2261,7 +2270,9 @@ impl<
                     // retrying on `Invalid` ("the deletion removed the first
                     // failing block, so the surviving prefix was already proved
                     // valid") does not apply to a violation that no single
-                    // block commits.
+                    // block commits. Since Story 5.13 FR2 never selects a
+                    // segment naming no configuration, so this exclusion is a
+                    // defensive guard, not a path the loop takes.
                     let retryable = matches!(
                         &err,
                         ProcessingError::Invalid { reason, .. }
@@ -2418,7 +2429,8 @@ impl<
     /// its Stored heads' FR19 parent-recovery requests. That mitigation is
     /// inverted. A genesis-anchored shortened branch is *Connected*, so it emits
     /// no requests at all — and it is exactly the branch that still qualifies,
-    /// because FR2 accepts a genesis-anchored segment at any length. The node
+    /// because FR2 accepts a genesis-anchored segment at any length (as long as
+    /// it carries its chain-config block, Story 5.13). The node
     /// would sit in Collecting holding a candidate whose validity the failed pass
     /// had *already computed* (`block_idx` is the earliest offender, so every
     /// block below it passed) and then discarded with the rollback.
@@ -2706,7 +2718,9 @@ impl<
         // legitimate block dies as `BlockTooLarge` under a limit its chain never
         // set, the failure is retryable, and the retry kills a second block
         // before the missing-config verdict is finally reached. Checking first
-        // bounds that to the single head deletion FR5 intends.
+        // bounds that to the single head deletion FR5 intends. Since Story 5.13
+        // FR2 does not select a candidate naming no configuration, so from the
+        // acquisition loop this check is a guard, not a path.
         //
         // Gated on a configuration actually being held. With none, there is
         // nothing for the candidate to disagree with and nothing to commit to;
@@ -3634,9 +3648,16 @@ impl<
     ///
     /// Pass `NONE_REF` for `probe` when only the config block is wanted;
     /// `NONE_REF` is never a live index, so the flag is then always `false`.
+    ///
+    /// A walk that does not end at the segment's anchor — a `parent_ref` into a
+    /// freed slot, or a cycle exhausting the `MAX_BLOCKS` bound — reports no
+    /// config block, matching the pass, which refuses that same ancestry with
+    /// `MissingBlock` / `MarkOverflow`. Otherwise FR2 would keep selecting a
+    /// segment whose every pass fails, and FR5 would take a head each time.
     fn scan_candidate_chain_config(&self, tip: u32, probe: u32) -> (u32, bool) {
         let mut first_config_idx = NONE_REF;
         let mut probe_on_segment = false;
+        let mut reached_anchor = false;
         let mut cur = tip;
         for _ in 0..MAX_BLOCKS {
             let Some(entry) = self.blocks.get(cur) else {
@@ -3650,9 +3671,13 @@ impl<
             }
             let parent = entry.parent_ref();
             if parent == NONE_REF {
+                reached_anchor = true;
                 break;
             }
             cur = parent;
+        }
+        if !reached_anchor {
+            first_config_idx = NONE_REF;
         }
         (first_config_idx, probe_on_segment)
     }
@@ -7730,8 +7755,14 @@ mod tests {
             bc.receive_block(blk.view(), 0);
         }
 
-        assert!(bc.evaluate_stopping_condition().is_none());
-        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        assert!(
+            bc.evaluate_stopping_condition().is_none(),
+            "length W, but the segment names no configuration"
+        );
+        assert!(
+            bc.current_phase() == LifecyclePhase::Collecting,
+            "no pass ran"
+        );
         assert_eq!(bc.block_tree_len(), 4, "nothing was deleted");
 
         // The segment's own configuration arriving above it makes it a
@@ -7739,6 +7770,16 @@ mod tests {
         let cfg = w4_config_anchor_block(104, b103.view().hash());
         bc.receive_block(cfg.view(), 0);
         assert!(bc.is_ready(), "the segment now names its configuration");
+        assert_eq!(
+            bc.block_tree_len(),
+            5,
+            "every block survived, the waiting included"
+        );
+        assert_eq!(
+            bc.current_active_head(),
+            Some(104),
+            "the active head is the config block that completed the segment"
+        );
     }
 
     /// AC4 + AC5 — the Ready transition commits the configuration durably exactly
