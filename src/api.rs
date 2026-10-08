@@ -257,8 +257,10 @@ pub(crate) enum SnakeChainWindowError {
     /// the FR60 check stays inactive and every admitted block is `Stored`.
     NotReady,
     /// `Ready`, but the `(S_tail, S_head)` derivation is Epic 9 (`snake_chain.rs`)
-    /// and not yet available, so FR60 stays inactive even in `Ready`. Epic 9
-    /// removes this arm when it supplies the real window (Ready branch → `Ok`).
+    /// and not yet available, so FR60 stays inactive even in `Ready`. Story 9.1
+    /// removes this arm when it supplies the real window (Ready branch → `Ok`),
+    /// deriving `S_tail` from the chain-configured `W`, never from the
+    /// `SNAKE_CHAIN_LENGTH_MAX` capacity.
     NotYetDerived,
 }
 
@@ -710,6 +712,12 @@ impl<
             assert!(
                 SNAKE_CHAIN_LENGTH_MAX <= u16::MAX as u32,
                 "SNAKE_CHAIN_LENGTH_MAX must fit the configuration module's u16 capacity"
+            );
+            // Every chain declares `W >= 1` (configuration §6 check 7), so a
+            // zero capacity would compile into a node that refuses every chain.
+            assert!(
+                SNAKE_CHAIN_LENGTH_MAX >= 1,
+                "SNAKE_CHAIN_LENGTH_MAX must hold a window of at least one block"
             );
             SNAKE_CHAIN_LENGTH_MAX as u16
         },
@@ -1221,8 +1229,8 @@ impl<
     /// The earliest block is the head's cached `tail_or_connection_idx` (the
     /// tail for a Stored head; the connection-point for a head Connected to the
     /// bootstrap-anchored genesis — which while collecting is the genesis,
-    /// `sequence 0`), so no ancestry re-walk is needed; continuity implies consecutive sequences, so segment
-    /// length is exact sequence arithmetic.
+    /// `sequence 0`), so no ancestry re-walk is needed; continuity implies
+    /// consecutive sequences, so segment length is exact sequence arithmetic.
     ///
     /// Selection: highest tip sequence; a same-sequence tie is broken by the
     /// **lowest tip block hash** (big-endian) — an in-memory total order (distinct
@@ -2172,8 +2180,12 @@ impl<
                             // the node is left in a phase it can act from
                             // instead of stranded in Processing.
                             //
-                            // The re-evaluation returns the same tip. The only
-                            // tree change an adopt makes is deleting an
+                            // The re-evaluation returns the same tip unless the
+                            // adopted content declares a larger `W` than the one
+                            // held before, in which case the segment may no
+                            // longer qualify and it yields no candidate (Story
+                            // 5.11) — the reverted phase covers that. Otherwise
+                            // the only tree change an adopt makes is deleting an
                             // off-candidate subtree, which can only remove a
                             // *competitor* — the candidate's own dominance
                             // cannot be reduced by it.
@@ -3537,9 +3549,10 @@ impl<
     /// not `Ready` (Collecting / Processing — no active chain) and
     /// `Err(NotYetDerived)` in `Ready` until Epic 9 (`snake_chain.rs`) supplies
     /// the real window from the `_snake_chain_tail_idx` / `active_chain_head_idx`
-    /// indices. Either `Err` leaves the FR60 window inactive, so every admitted
-    /// block stays `Stored` (FR9/AC6). The intake caller only needs "window or
-    /// not", so it maps this with `.ok()`.
+    /// indices, maintained over the chain-configured `W` (Story 9.1). Either
+    /// `Err` leaves the FR60 window inactive, so every admitted block stays
+    /// `Stored` (FR9/AC6). The intake caller only needs "window or not", so it
+    /// maps this with `.ok()`.
     fn active_snake_chain_window(&self) -> Result<(u32, u32), SnakeChainWindowError> {
         if !self.is_ready() {
             return Err(SnakeChainWindowError::NotReady);

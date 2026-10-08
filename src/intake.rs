@@ -42,9 +42,10 @@ pub(crate) enum WindowVerdict {
 }
 
 /// FR60 window classification. `w` is the chain-configured `snake_chain` window
-/// length `W` — never the build's capacity. `s_head + w` is widened to `u64` so a head sequence
-/// near the FR53 `u32::MAX` ceiling cannot wrap (FR53's `u32::MAX` refusal is
-/// Epic 8; this function must be correct without relying on it).
+/// length `W` — never the build's capacity. `s_head + w` is widened to `u64` so
+/// a head sequence near the FR53 `u32::MAX` ceiling cannot wrap (FR53's
+/// `u32::MAX` refusal is Epic 8; this function must be correct without relying
+/// on it).
 pub(crate) fn snake_chain_window_verdict(
     s_new: u32,
     s_tail: u32,
@@ -150,6 +151,10 @@ where
     //    it not, the check stands down as for `None` rather than measuring against
     //    the capacity. A zero-width window would misclassify the head itself as
     //    `TooFarAhead`; acceptance refuses `W = 0` (configuration §6 check 7).
+    debug_assert!(
+        window.is_none() || bc.active_chain_length().is_some(),
+        "a window exists only in Ready, and Ready holds a configuration"
+    );
     if let Some((s_tail, s_head)) = window
         && let Some(w) = bc.active_chain_length()
     {
@@ -233,7 +238,14 @@ mod tests {
     /// at `TestChain`'s capacity, every other parameter at its code-baked
     /// default. Leaving the window out would resolve it to the default 500,
     /// which this harness cannot hold, so acceptance would refuse it (FR8).
-    const BASE_CONFIG_CONTENT: [u8; 6] = [1, 0, parameter::ACTIVE_CHAIN_LENGTH, 2, W as u8, 0];
+    const BASE_CONFIG_CONTENT: [u8; 6] = [
+        1,
+        0,
+        parameter::ACTIVE_CHAIN_LENGTH,
+        2,
+        W.to_le_bytes()[0],
+        W.to_le_bytes()[1],
+    ];
 
     /// A second content region, equally valid and distinct in bytes: the base
     /// entry plus a literal declaring `vote_interest`'s own default value.
@@ -242,8 +254,8 @@ mod tests {
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
-        W as u8,
-        0,
+        W.to_le_bytes()[0],
+        W.to_le_bytes()[1],
         parameter::VOTE_INTEREST,
         1,
         5,
