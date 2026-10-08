@@ -719,6 +719,14 @@ impl<
                 SNAKE_CHAIN_LENGTH_MAX >= 1,
                 "SNAKE_CHAIN_LENGTH_MAX must hold a window of at least one block"
             );
+            // Acceptance admits any `W` up to this capacity, and FR2 needs a
+            // `W`-long segment in the block table to leave Collecting. A
+            // capacity above the table would accept chains this node can never
+            // acquire.
+            assert!(
+                SNAKE_CHAIN_LENGTH_MAX as usize <= MAX_BLOCKS,
+                "SNAKE_CHAIN_LENGTH_MAX must fit the block table (MAX_BLOCKS)"
+            );
             SNAKE_CHAIN_LENGTH_MAX as u16
         },
     };
