@@ -525,6 +525,11 @@ pub(crate) enum ValidationReason {
     /// configuration cannot satisfy FR6 chain-config compliance at all — so the
     /// FR5 deletion target is the candidate head, the same fallback the
     /// no-`block_idx` variants take.
+    ///
+    /// Unreachable from the acquisition loop since Story 5.13: FR2 no longer
+    /// selects a segment that names no configuration, so no valid head is
+    /// deleted for it. It remains the pass's own guard for callers that hand it
+    /// a tip directly.
     MissingChainConfigBlock,
     /// A balance block after the earliest carries a `max_node_id` that diverges
     /// from the forward-tracked watermark at its sequence (FR3/FR6).
@@ -1222,7 +1227,11 @@ impl<
     /// configuration; no `now`, no PRNG, no mutation — FR63/NFR5 determinism). A
     /// candidate is an occupied `chain_heads` tip whose continuous segment is
     /// either **genesis-anchored** (earliest block has `sequence == 0`, FR54) or
-    /// **active-length-satisfying** (segment length `≥ W`).
+    /// **active-length-satisfying** (segment length `≥ W`), and which carries at
+    /// least one chain-config block. The last condition is the FR8 final check's
+    /// precondition applied *before* the pass rather than as its failure: a
+    /// segment naming no configuration stays a non-candidate, with nothing
+    /// deleted, until a chain-config block on it arrives (Story 5.13).
     ///
     /// `W` is the window the held configuration — tentative or durable — declares,
     /// never the build's capacity `SNAKE_CHAIN_LENGTH_MAX`, which would make the
@@ -1254,7 +1263,7 @@ impl<
         // (head_idx, tip_sequence, tip_hash) of the best qualifying candidate.
         let mut best: Option<(u32, u32, [u8; 32])> = None;
         // The chain's window, once for the whole evaluation. With no
-        // configuration held only genesis-anchored segments qualify.
+        // configuration held the active-length condition is not evaluated.
         let window = self.active_chain_length();
         for (head_idx, earliest_idx) in self.chain_heads.occupied_heads() {
             let (Some(tip), Some(earliest)) =
@@ -1287,7 +1296,13 @@ impl<
                     tip_seq > best_seq || (tip_seq == best_seq && tip_hash < best_hash)
                 }
             };
-            if better {
+            // A segment that names no configuration is not yet a candidate
+            // (Story 5.13): the FR8 final check would refuse it, and the FR5
+            // recovery would then delete its head — a valid block, since no
+            // single block is at fault. Waiting costs nothing; a later
+            // admission re-evaluates. Walked only for a segment that would
+            // otherwise win, over cached flag bits, with no storage read.
+            if better && self.scan_candidate_chain_config(head_idx, NONE_REF).0 != NONE_REF {
                 best = Some((head_idx, tip_seq, tip_hash));
             }
         }
@@ -5604,12 +5619,14 @@ mod tests {
         );
     }
 
-    /// Story 5.11 — with no configuration held the chain's window is unknown, so
-    /// only a genesis-anchored segment is a candidate. A window-anchored segment
-    /// as long as the build's whole capacity is not: the capacity is not the
-    /// window.
+    /// Story 5.11 / 5.13 — with no configuration held the chain's window is
+    /// unknown, and no segment names a configuration, so nothing is a
+    /// candidate. A window-anchored segment as long as the build's whole capacity
+    /// is not: the capacity is not the window. Once block #1 brings the
+    /// configuration, the genesis-anchored segment carrying it qualifies — and
+    /// the window-anchored one still does not, because it names none.
     #[test]
-    fn fr2_without_a_configuration_only_genesis_anchored_qualifies() {
+    fn fr2_without_a_configuration_no_segment_qualifies() {
         let mut bc = new_unconfigured_w4_chain();
         let mut prev = [0xAB; 32];
         for seq in 100..=103 {
@@ -5625,13 +5642,23 @@ mod tests {
         );
 
         let genesis = node_transfer_block(0, 7, 0, 7);
-        let genesis_idx = bc
-            .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+        bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
             .expect("the genesis is admitted");
+        assert!(
+            bc.evaluate_stopping_condition().is_none(),
+            "a genesis alone names no configuration"
+        );
+
+        let cfg = w4_config_anchor_block(1, genesis.view().hash());
+        let cfg_idx = bc
+            .tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
+            .expect("block #1 is admitted");
+        assert_eq!(bc.active_chain_length(), Some(u32::from(W4)));
         assert_eq!(
             bc.evaluate_stopping_condition(),
-            Some(genesis_idx),
-            "a genesis-anchored segment qualifies at any length, configured or not"
+            Some(cfg_idx),
+            "the genesis-anchored segment carrying the configuration qualifies; \
+             the longer window-anchored one, naming none, does not"
         );
     }
 
@@ -5837,11 +5864,15 @@ mod tests {
         let g = node_transfer_block(0, 7, 0, 7);
         bc.tier1_admit(&g.view(), &g.view().hash(), 0)
             .expect("genesis admitted");
-        let gh = g.view().hash();
-        // Two distinct seq-1 children of genesis (a fork) → both genesis-anchored,
-        // both tip seq 1 → tie broken by lower tip hash.
-        let a = salted_linked_block(1, gh, 3);
-        let b = salted_linked_block(1, gh, 4);
+        // Block #1 names the configuration both branches inherit (Story 5.13).
+        let cfg = chain_config_anchor_block(1, g.view().hash());
+        bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
+            .expect("config admitted");
+        let gh = cfg.view().hash();
+        // Two distinct seq-2 children of block #1 (a fork) → both
+        // genesis-anchored, both tip seq 2 → tie broken by lower tip hash.
+        let a = salted_linked_block(2, gh, 3);
+        let b = salted_linked_block(2, gh, 4);
         let a_idx = bc
             .tier1_admit(&a.view(), &a.view().hash(), 0)
             .expect("A admitted");
@@ -5856,8 +5887,8 @@ mod tests {
             Some(lower),
             "same-sequence tie → lower tip hash wins"
         );
-        // Extend branch A to seq 2 → the higher sequence now outranks the tie.
-        let c = salted_linked_block(2, a_hash, 3);
+        // Extend branch A to seq 3 → the higher sequence now outranks the tie.
+        let c = salted_linked_block(3, a_hash, 3);
         let c_idx = bc
             .tier1_admit(&c.view(), &c.view().hash(), 0)
             .expect("C admitted");
@@ -5878,10 +5909,13 @@ mod tests {
             let g = node_transfer_block(0, 7, 0, 7);
             bc.tier1_admit(&g.view(), &g.view().hash(), now)
                 .expect("genesis");
-            let gh = g.view().hash();
+            let cfg = chain_config_anchor_block(1, g.view().hash());
+            bc.tier1_admit(&cfg.view(), &cfg.view().hash(), now)
+                .expect("config");
+            let gh = cfg.view().hash();
             let blocks = [
-                salted_linked_block(1, gh, order[0]),
-                salted_linked_block(1, gh, order[1]),
+                salted_linked_block(2, gh, order[0]),
+                salted_linked_block(2, gh, order[1]),
             ];
             for blk in &blocks {
                 bc.tier1_admit(&blk.view(), &blk.view().hash(), now)
@@ -5916,8 +5950,14 @@ mod tests {
             Some(0),
             "genesis is the placeholder anchor"
         );
-        // A separate non-genesis branch of length W = 4 (tail seq 100 → tip 103).
-        let tail = node_transfer_block(100, 3, 99, 7);
+        // Block #1 names the configuration, so the genesis branch is itself a
+        // qualifying candidate (Story 5.13) — the one that must not win.
+        let cfg = w4_config_anchor_block(1, g.view().hash());
+        bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
+            .expect("config admitted");
+        // A separate non-genesis branch of length W = 4 (tail seq 100 → tip 103),
+        // its tail naming the same configuration.
+        let tail = w4_config_anchor_block(100, [0xAB; 32]);
         bc.tier1_admit(&tail.view(), &tail.view().hash(), 0)
             .expect("tail admitted");
         let mut prev = tail.view().hash();
@@ -5946,8 +5986,9 @@ mod tests {
         let g = node_transfer_block(0, 7, 0, 7);
         bc.tier1_admit(&g.view(), &g.view().hash(), 0)
             .expect("genesis admitted");
-        // A child of genesis at seq 1 → a 2-block genesis-anchored segment (< W).
-        let c = linked_transfer_block(1, g.view().hash());
+        // Block #1, carrying the configuration (Story 5.13) → a 2-block
+        // genesis-anchored segment (< W).
+        let c = chain_config_anchor_block(1, g.view().hash());
         let c_idx = bc
             .tier1_admit(&c.view(), &c.view().hash(), 0)
             .expect("child admitted");
@@ -7671,17 +7712,14 @@ mod tests {
         );
     }
 
-    /// AC3 — and the refusal is **not** retried: the deletion of the candidate
-    /// head is not evidence against it, so the shortened branch still names no
-    /// configuration. Retrying would eat a second good block for a structurally
-    /// certain second failure.
+    /// Story 5.13 — a segment that names no configuration is not an FR2
+    /// candidate at all, so nothing is deleted for it. Before 5.13 it qualified,
+    /// failed the FR8 final check, and FR5 deleted its head — a valid block —
+    /// once per re-qualification.
     #[test]
-    fn fr8_missing_config_block_is_not_retried() {
-        // A window-anchored candidate of exactly W = 4 blocks, none of them a
-        // chain-config block. Window-anchored so every block is pre-seed-trusted
-        // and the *only* thing wrong with the candidate is that it names no
-        // configuration — which is what makes the deletion count below
-        // attributable to the retry rule and nothing else.
+    fn fr2_segment_naming_no_configuration_is_not_a_candidate() {
+        // A window-anchored segment of exactly W = 4 blocks, none of them a
+        // chain-config block, on a configured node.
         let mut bc = new_w4_chain();
         let tail = node_transfer_block(100, 3, 99, 7);
         bc.receive_block(tail.view(), 0);
@@ -7692,30 +7730,15 @@ mod tests {
             bc.receive_block(blk.view(), 0);
         }
 
-        assert!(
-            !bc.is_ready(),
-            "no configuration named → no Ready transition"
-        );
-        assert!(
-            bc.current_phase() == LifecyclePhase::Collecting,
-            "the FR5 recovery reverted the phase"
-        );
-        // Exactly one block deleted — the candidate head — and no retry that
-        // would have taken a second good block off the branch for a structurally
-        // certain second failure.
-        assert_eq!(
-            bc.block_tree_len(),
-            3,
-            "one deletion, not two: the refusal is not retryable"
-        );
-        assert!(
-            bc.blocks.find(100, &tail.view().hash()).is_some(),
-            "the deletion took the head, not the anchor"
-        );
-        assert!(
-            bc.blocks.find(103, &b103.view().hash()).is_none(),
-            "the candidate head is the block that went"
-        );
+        assert!(bc.evaluate_stopping_condition().is_none());
+        assert!(bc.current_phase() == LifecyclePhase::Collecting);
+        assert_eq!(bc.block_tree_len(), 4, "nothing was deleted");
+
+        // The segment's own configuration arriving above it makes it a
+        // candidate, which validates.
+        let cfg = w4_config_anchor_block(104, b103.view().hash());
+        bc.receive_block(cfg.view(), 0);
+        assert!(bc.is_ready(), "the segment now names its configuration");
     }
 
     /// AC4 + AC5 — the Ready transition commits the configuration durably exactly
