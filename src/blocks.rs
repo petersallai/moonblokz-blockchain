@@ -482,8 +482,8 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// distinct reasons, not one: (1) a **well-formed** parent chain cannot
     /// visit more than `MAX_BLOCKS` distinct entries, because the table
     /// structurally cannot hold more than that many at once — this holds
-    /// regardless of how `MAX_BLOCKS` relates to `SNAKE_CHAIN_LENGTH` (the
-    /// AC's "bounded by the snake_chain window" language), so this bound is
+    /// regardless of how `MAX_BLOCKS` relates to the active-chain window `W`
+    /// (the AC's "bounded by the snake_chain window" language), so this bound is
     /// never tighter than correctness requires. (2) a **malformed/cyclic**
     /// `parent_ref` chain (e.g. a self-loop or a small cycle) revisits the
     /// same few entries repeatedly; `MAX_BLOCKS` iterations is at least one
@@ -492,8 +492,8 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// already returned `true`/`false` by then rather than spinning forever
     /// — this is why the loop is safe against untrusted/malformed ancestry
     /// data, not merely "coincidentally" bounded. `blocks.rs` does not have
-    /// access to `SNAKE_CHAIN_LENGTH` — that const generic lives on
-    /// `Blockchain`, not `BlockTable` — so `MAX_BLOCKS` is used directly
+    /// access to `W` — it is chain configuration, read through the handle
+    /// `Blockchain` holds, not `BlockTable` — so `MAX_BLOCKS` is used directly
     /// rather than threading the tighter window bound through.
     pub(crate) fn walks_to_active_chain(&self, start_idx: u32) -> bool {
         let mut current = start_idx;

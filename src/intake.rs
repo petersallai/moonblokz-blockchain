@@ -41,10 +41,11 @@ pub(crate) enum WindowVerdict {
     BelowTail,
 }
 
-/// FR60 window classification. `w` is the configured `snake_chain` window size
-/// (`SNAKE_CHAIN_LENGTH`). `s_head + w` is widened to `u64` so a head sequence
-/// near the FR53 `u32::MAX` ceiling cannot wrap (FR53's `u32::MAX` refusal is
-/// Epic 8; this function must be correct without relying on it).
+/// FR60 window classification. `w` is the chain-configured `snake_chain` window
+/// length `W` — never the build's capacity. `s_head + w` is widened to `u64` so
+/// a head sequence near the FR53 `u32::MAX` ceiling cannot wrap (FR53's
+/// `u32::MAX` refusal is Epic 8; this function must be correct without relying
+/// on it).
 pub(crate) fn snake_chain_window_verdict(
     s_new: u32,
     s_tail: u32,
@@ -108,8 +109,7 @@ pub(crate) fn classify_block<
     S,
     Cfg,
     const MAX_NODES: usize,
-    const SNAKE_CHAIN_LENGTH: u32,
-    const VERIFICATION_HORIZON: usize,
+    const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const MAX_BLOCK_UTXO_OUTPUT: usize,
@@ -119,8 +119,7 @@ pub(crate) fn classify_block<
         S,
         Cfg,
         MAX_NODES,
-        SNAKE_CHAIN_LENGTH,
-        VERIFICATION_HORIZON,
+        SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         MAX_BLOCK_UTXO_OUTPUT,
@@ -134,17 +133,6 @@ where
     S: StorageTrait,
     Cfg: ChainConfigTrait,
 {
-    // FR60 window width: a zero-width window (`SNAKE_CHAIN_LENGTH == 0`) would
-    // set the upper bound to `s_head` and misclassify the head sequence itself
-    // as `TooFarAhead`. No real config uses 0 (architecture §5 default is 500),
-    // so reject it at compile time — evaluated once per monomorphization.
-    const {
-        assert!(
-            SNAKE_CHAIN_LENGTH >= 1,
-            "SNAKE_CHAIN_LENGTH (FR60 window width) must be >= 1"
-        )
-    };
-
     // 1. FR11 duplicate detection — authoritative, ahead of the window/config
     //    gates so an already-known block is `DuplicateKnown` even if the active
     //    window has since advanced past its sequence (nothing prunes the tree by
@@ -157,8 +145,20 @@ where
     // 2. FR60 out-of-snake-chain-window discard — ready state only. `None`
     //    (collecting) suppresses both the check and the `long-disconnect-detected`
     //    log (AC7).
-    if let Some((s_tail, s_head)) = window {
-        match snake_chain_window_verdict(block.sequence(), s_tail, s_head, SNAKE_CHAIN_LENGTH) {
+    //
+    //    The width is the chain-configured `W`, read now (FR56). A window exists
+    //    only in Ready, which implies a durable lock, so `W` is always there; were
+    //    it not, the check stands down as for `None` rather than measuring against
+    //    the capacity. A zero-width window would misclassify the head itself as
+    //    `TooFarAhead`; acceptance refuses `W = 0` (configuration §6 check 7).
+    debug_assert!(
+        window.is_none() || bc.active_chain_length().is_some(),
+        "a window exists only in Ready, and Ready holds a configuration"
+    );
+    if let Some((s_tail, s_head)) = window
+        && let Some(w) = bc.active_chain_length()
+    {
+        match snake_chain_window_verdict(block.sequence(), s_tail, s_head, w) {
             WindowVerdict::TooFarAhead => {
                 // FR64 (Epic 11 `LogSink`): emit `long-disconnect-detected`
                 // carrying S_new = block.sequence(), the incoming block hash,
@@ -213,8 +213,7 @@ mod tests {
     use super::*;
     use crate::api::NextCall;
     use moonblokz_chain_types::{
-        Block, BlockBuilder, BlockHeader, CONFIG_VALUE_COUNT_SIZE, MAX_BLOCK_SIZE, NodeTransfer,
-        PAYLOAD_TYPE_TRANSACTION,
+        Block, BlockBuilder, BlockHeader, MAX_BLOCK_SIZE, NodeTransfer, PAYLOAD_TYPE_TRANSACTION,
     };
     use moonblokz_configuration::{ChainConfiguration, NoopConfigChangeSink, parameter};
     use moonblokz_crypto::{
@@ -230,19 +229,37 @@ mod tests {
         TestConfig,
         16,
         16,
-        4,
         16,
         4,
         16,
     >;
 
-    /// The empty override set as a **content region** — every parameter
-    /// resolves to its code-baked default.
-    const EMPTY_CONFIG_CONTENT: [u8; CONFIG_VALUE_COUNT_SIZE] = [0, 0];
+    /// The base override set as a **content region**: the window `W` declared
+    /// at `TestChain`'s capacity, every other parameter at its code-baked
+    /// default. Leaving the window out would resolve it to the default 500,
+    /// which this harness cannot hold, so acceptance would refuse it (FR8).
+    const BASE_CONFIG_CONTENT: [u8; 6] = [
+        1,
+        0,
+        parameter::ACTIVE_CHAIN_LENGTH,
+        2,
+        W.to_le_bytes()[0],
+        W.to_le_bytes()[1],
+    ];
 
-    /// A second content region, equally valid and distinct in bytes: one
-    /// literal entry declaring `vote_interest`'s own default value.
-    const OTHER_CONFIG_CONTENT: [u8; 5] = [1, 0, parameter::VOTE_INTEREST, 1, 5];
+    /// A second content region, equally valid and distinct in bytes: the base
+    /// entry plus a literal declaring `vote_interest`'s own default value.
+    const OTHER_CONFIG_CONTENT: [u8; 9] = [
+        2,
+        0,
+        parameter::ACTIVE_CHAIN_LENGTH,
+        2,
+        W.to_le_bytes()[0],
+        W.to_le_bytes()[1],
+        parameter::VOTE_INTEREST,
+        1,
+        5,
+    ];
 
     /// Frames `content` as a chain-config payload: the content region followed
     /// by node #0's signature over it (the Story 5.7 envelope).
@@ -266,18 +283,18 @@ mod tests {
         }
         config
     }
-    // W = SNAKE_CHAIN_LENGTH = 16 for these tests.
+    // The configured window `W`, at `TestChain`'s full capacity of 16.
     const W: u32 = 16;
 
     fn crypto() -> Crypto {
         Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
     }
 
-    /// A configured node: the configuration is durably locked on the empty
+    /// A configured node: the configuration is durably locked on the base
     /// override set, which is the post-genesis state every classification test
     /// but the join-path one assumes.
     fn new_test_chain() -> TestChain {
-        chain_with_config(chain_config_module(Some(&EMPTY_CONFIG_CONTENT)))
+        chain_with_config(chain_config_module(Some(&BASE_CONFIG_CONTENT)))
     }
 
     /// A durably-locked chain whose configuration content is `content`.
@@ -440,12 +457,17 @@ mod tests {
             .expect("valid raw block");
         assert!(chain_config_content_matches(&view, &OTHER_CONFIG_CONTENT));
         // Differing content, shorter locked, longer locked all fail.
-        assert!(!chain_config_content_matches(&view, &EMPTY_CONFIG_CONTENT));
+        assert!(!chain_config_content_matches(&view, &BASE_CONFIG_CONTENT));
+        let longer = {
+            let mut bytes = [0u8; OTHER_CONFIG_CONTENT.len() + 1];
+            bytes[..OTHER_CONFIG_CONTENT.len()].copy_from_slice(&OTHER_CONFIG_CONTENT);
+            bytes
+        };
         assert!(!chain_config_content_matches(
             &view,
-            &OTHER_CONFIG_CONTENT[..4]
+            &OTHER_CONFIG_CONTENT[..OTHER_CONFIG_CONTENT.len() - 1]
         ));
-        assert!(!chain_config_content_matches(&view, &[1, 0, 7, 1, 5, 0]));
+        assert!(!chain_config_content_matches(&view, &longer));
     }
 
     /// A payload that is not a framed envelope — here the empty payload of a
@@ -459,7 +481,7 @@ mod tests {
         let view = BlockView::from_bytes(&empty[..len])
             .ok()
             .expect("header-only block is valid");
-        assert!(!chain_config_content_matches(&view, &EMPTY_CONFIG_CONTENT));
+        assert!(!chain_config_content_matches(&view, &BASE_CONFIG_CONTENT));
         assert!(!chain_config_content_matches(&view, &[]));
     }
 
@@ -528,12 +550,12 @@ mod tests {
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<0>::new();
         let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 4, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 4, 16, 4, 16>::init(
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
             &mut bc_slot,
             c,
             storage,
-            chain_config_module(Some(&EMPTY_CONFIG_CONTENT)),
+            chain_config_module(Some(&BASE_CONFIG_CONTENT)),
             5,
             node_zero,
             0,
@@ -582,6 +604,27 @@ mod tests {
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)
         );
         assert_eq!(bc.block_tree_len(), 0, "out-of-window block is not stored");
+    }
+
+    /// Story 5.11 — the FR60 width is the configured `W`, not the capacity: on
+    /// a build with capacity 16 locked on `W = 8`, `S_head + W = 13` is the first
+    /// out-of-window sequence.
+    #[test]
+    fn classify_window_width_is_the_configured_w() {
+        const W8_CONFIG_CONTENT: [u8; 6] = [1, 0, parameter::ACTIVE_CHAIN_LENGTH, 2, 8, 0];
+        let mut bc = locked_test_chain(&W8_CONFIG_CONTENT);
+
+        let last_in = node_transfer_block(12, 3, 4, 7);
+        let outcome = classify_block(&mut bc, &last_in.view(), Some((0, 5)), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+
+        let first_out = node_transfer_block(13, 3, 4, 7);
+        let outcome = classify_block(&mut bc, &first_out.view(), Some((0, 5)), 0);
+        assert_eq!(
+            outcome,
+            ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
+            "13 is inside the capacity of 16, but outside the configured window"
+        );
     }
 
     #[test]
@@ -645,7 +688,7 @@ mod tests {
     fn chain_config_mismatch_is_discarded() {
         let mut bc = locked_test_chain(&OTHER_CONFIG_CONTENT);
         // Different content from the locked configuration → FR17 silent discard.
-        let (payload, payload_len) = framed_config_payload(&EMPTY_CONFIG_CONTENT);
+        let (payload, payload_len) = framed_config_payload(&BASE_CONFIG_CONTENT);
         let (bytes, len) = chain_config_block_bytes(2, &payload[..payload_len]);
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
