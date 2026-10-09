@@ -23,7 +23,9 @@ use moonblokz_chain_types::{
     NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
     REGISTRATION_SIZE, Registration, TransactionView,
 };
-use moonblokz_configuration::{BuildLimits, ChainConfigTrait, limits_are_expressible};
+use moonblokz_configuration::{
+    BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
+};
 use moonblokz_crypto::{
     CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
 };
@@ -4152,13 +4154,54 @@ impl<
     /// all, which is the same event that tips this. Inventing a cadence here
     /// would be a per-build value standing in for a chain-governed one, which is
     /// exactly what the configuration specification §6 forbids.
+    ///
+    /// The scheduler runs outside any block application step, so its programs
+    /// read chain-info at the active head's post-state (Story 5.12).
     fn parent_recovery_intervals(&self) -> Option<(u64, u64)> {
         self.chain_config.active_configuration().map(|config| {
+            let config = config.with_chain_info(self.chain_info_at_head());
             (
                 config.parent_recovery_min_emit_interval_ms() as u64,
                 config.parent_recovery_per_head_retry_interval_ms() as u64,
             )
         })
+    }
+
+    /// The chain-info values at the active head, for a configuration consumer
+    /// that runs outside a block application step (specification §4.6).
+    ///
+    /// Served only in `Ready`. The head state is then a function of the last `W`
+    /// blocks alone (FR48-FR51), so every Ready node on the chain reads the same
+    /// value. While Collecting or Processing there is no active chain, and every
+    /// read declines.
+    ///
+    /// Until Story 7.2 maintains the projections on forward extension (FR35),
+    /// a Ready node's `node_info` is the state at its Ready transition. No
+    /// consensus-relevant consumer binds chain-info yet; Story 7.2 must keep the
+    /// watermark current before one does.
+    fn chain_info_at_head(&self) -> ChainInfoAtHead {
+        ChainInfoAtHead {
+            registered_node_count: self
+                .is_ready()
+                .then(|| u64::from(self.node_info.max_known_node_id()) + 1),
+        }
+    }
+}
+
+/// The blockchain's chain-info source: values read once, at bind time, from the
+/// FR34 projections. A thin read: no field, no cache, no maintenance of its own.
+#[derive(Clone, Copy)]
+struct ChainInfoAtHead {
+    /// Node ids are contiguous, so the count is the node-id watermark plus one.
+    registered_node_count: Option<u64>,
+}
+
+impl ChainInfoSource for ChainInfoAtHead {
+    fn read(&self, id: u8, _args: &[u64]) -> Option<u64> {
+        match id {
+            chain_info::REGISTERED_NODE_COUNT => self.registered_node_count,
+            _ => None,
+        }
     }
 }
 
@@ -4705,6 +4748,76 @@ mod tests {
         let (outcome, next) = bc.on_tick(1_000_000);
         assert!(matches!(outcome, TickOutcome::Idle));
         assert!(matches!(next, NextCall::Idle));
+    }
+
+    /// Story 5.12 — a parameter program reading the registered-node count:
+    /// `parent_recovery_min_emit_interval_ms = GETCHAININFO 1, 0; PUSH_U16 1000; MUL`.
+    fn node_count_cadence_builder() -> ChainConfigPayloadBuilder {
+        let mut builder = window_config_builder(TEST_W);
+        builder
+            .add_bytecode(
+                parameter::PARENT_RECOVERY_MIN_EMIT_INTERVAL_MS,
+                &[
+                    0x71,
+                    chain_info::REGISTERED_NODE_COUNT,
+                    0,
+                    0x11,
+                    0xE8,
+                    0x03,
+                    0x42,
+                    0x01,
+                ],
+            )
+            .ok()
+            .expect("the program frames");
+        builder
+    }
+
+    /// Story 5.12, AC4/AC5 — in Ready the scheduler's programs read the
+    /// registered-node count at the head: after genesis one node is registered.
+    #[test]
+    fn chain_info_reaches_the_scheduler_in_ready() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        let builder = node_count_cadence_builder();
+        bc.process_genesis(1_000_000_000, builder.content())
+            .ok()
+            .expect("genesis succeeds");
+        assert!(bc.is_ready());
+        assert_eq!(
+            bc.chain_info_at_head()
+                .read(chain_info::REGISTERED_NODE_COUNT, &[]),
+            Some(1)
+        );
+        assert_eq!(
+            bc.parent_recovery_intervals().map(|(min_emit, _)| min_emit),
+            Some(1_000),
+            "one registered node, one second"
+        );
+    }
+
+    /// Story 5.12, AC4 — while Collecting there is no active chain: the read is
+    /// declined and the program falls back to the code-baked default.
+    #[test]
+    fn chain_info_is_declined_while_collecting() {
+        let (crypto, storage, _) = test_backends();
+        let mut chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        chain_config
+            .load_durable(node_count_cadence_builder().build_signed(&crypto))
+            .ok()
+            .expect("the content is accepted");
+        let bc = new_chain(crypto, storage, chain_config, 5, 0);
+        assert!(!bc.is_ready());
+        assert_eq!(
+            bc.chain_info_at_head()
+                .read(chain_info::REGISTERED_NODE_COUNT, &[]),
+            None
+        );
+        assert_eq!(
+            bc.parent_recovery_intervals().map(|(min_emit, _)| min_emit),
+            Some(10_000),
+            "declined, so the code-baked default"
+        );
     }
 
     /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
