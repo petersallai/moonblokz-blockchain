@@ -10,12 +10,13 @@ categories = ["embedded", "no-std"]
 
 [dependencies]
 # The crypto backend is not pinned per-dependency; it is selected once by this
-# crate's `[features]` default and forwarded down (below). `backend-memory` on
-# storage is an orthogonal *storage* backend (host/simulator/test), not a crypto
-# choice, so it stays enabled here directly.
+# crate's `[features]` default and forwarded down (below). No *storage* backend
+# is chosen here: this crate only consumes `StorageTrait`, and the backend is the
+# final binary's choice (the node firmware's `backend-rp2040`, a host test's
+# `backend-memory`). Enabling one here would collide with the binary's.
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
 moonblokz-configuration = { path = "../moonblokz-configuration", default-features = false }
-moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["backend-memory"] }
+moonblokz-storage = { path = "../moonblokz-storage", default-features = false }
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
 moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
@@ -26,6 +27,8 @@ rand_xoshiro = { version = "0.7", default-features = false }
 # field by field. Never part of a production build.
 [dev-dependencies]
 moonblokz-vote = { path = "../moonblokz-vote", default-features = false, features = ["test-oracle"] }
+# The tests' storage is the in-memory backend.
+moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["backend-memory"] }
 
 [features]
 # The single Schnorr crypto backend for the whole stack is selected here at the
