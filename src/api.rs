@@ -4158,8 +4158,9 @@ impl<
     /// The scheduler runs outside any block application step, so its programs
     /// read chain-info at the active head's post-state (Story 5.12).
     fn parent_recovery_intervals(&self) -> Option<(u64, u64)> {
+        let chain_info = self.chain_info_at_head();
         self.chain_config.active_configuration().map(|config| {
-            let config = config.with_chain_info(self.chain_info_at_head());
+            let config = config.with_chain_info(&chain_info);
             (
                 config.parent_recovery_min_emit_interval_ms() as u64,
                 config.parent_recovery_per_head_retry_interval_ms() as u64,
@@ -4171,14 +4172,16 @@ impl<
     /// that runs outside a block application step (specification §4.6).
     ///
     /// Served only in `Ready`. The head state is then a function of the last `W`
-    /// blocks alone (FR48-FR51), so every Ready node on the chain reads the same
-    /// value. While Collecting or Processing there is no active chain, and every
-    /// read declines.
+    /// blocks alone (FR48-FR51), so every Ready node **at the same head** reads
+    /// the same value. While Collecting or Processing there is no active chain,
+    /// and every read declines.
     ///
-    /// Until Story 7.2 maintains the projections on forward extension (FR35),
-    /// a Ready node's `node_info` is the state at its Ready transition. No
-    /// consensus-relevant consumer binds chain-info yet; Story 7.2 must keep the
-    /// watermark current before one does.
+    /// **Until Story 7.2 maintains the projections on forward extension (FR35),
+    /// this is a per-node snapshot**: a Ready node's `node_info` is the state at
+    /// its Ready transition, and node #0, made Ready by genesis without a pass,
+    /// stays at the genesis count. Harmless for the one bound consumer, the
+    /// parent-recovery cadence, which is not consensus-relevant; Story 7.2 owns
+    /// keeping the watermark current before a consensus-relevant consumer binds.
     fn chain_info_at_head(&self) -> ChainInfoAtHead {
         ChainInfoAtHead {
             registered_node_count: self
@@ -4190,16 +4193,15 @@ impl<
 
 /// The blockchain's chain-info source: values read once, at bind time, from the
 /// FR34 projections. A thin read: no field, no cache, no maintenance of its own.
-#[derive(Clone, Copy)]
 struct ChainInfoAtHead {
     /// Node ids are contiguous, so the count is the node-id watermark plus one.
     registered_node_count: Option<u64>,
 }
 
 impl ChainInfoSource for ChainInfoAtHead {
-    fn read(&self, id: u8, _args: &[u64]) -> Option<u64> {
-        match id {
-            chain_info::REGISTERED_NODE_COUNT => self.registered_node_count,
+    fn read(&self, id: u8, args: &[u64]) -> Option<u64> {
+        match (id, args) {
+            (chain_info::REGISTERED_NODE_COUNT, []) => self.registered_node_count,
             _ => None,
         }
     }
@@ -4793,6 +4795,39 @@ mod tests {
             bc.parent_recovery_intervals().map(|(min_emit, _)| min_emit),
             Some(1_000),
             "one registered node, one second"
+        );
+    }
+
+    /// Story 5.12, AC5 — the value is the derived watermark plus one, not a
+    /// constant: a pass that registers node 2 on top of a balance block naming
+    /// nodes up to 1 leaves three registered nodes, served once Ready.
+    #[test]
+    fn chain_info_reads_the_derived_watermark() {
+        let mut bc = new_test_chain();
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0xB1)], 1);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        let reg = registration_block(101, anchor.view().hash(), 1, 2, 0xC5);
+        let ri = bc
+            .tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+        bc.run_processing_pass(ri).expect("pass succeeds");
+        assert_eq!(
+            bc.chain_info_at_head()
+                .read(chain_info::REGISTERED_NODE_COUNT, &[]),
+            None,
+            "not Ready yet"
+        );
+
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        bc.set_lifecycle_phase(LifecyclePhase::Ready);
+        let info = bc.chain_info_at_head();
+        assert_eq!(info.read(chain_info::REGISTERED_NODE_COUNT, &[]), Some(3));
+        assert_eq!(
+            info.read(chain_info::REGISTERED_NODE_COUNT, &[0]),
+            None,
+            "identifier 1 takes no arguments"
         );
     }
 
