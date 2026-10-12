@@ -123,6 +123,13 @@ impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
             .is_some_and(|slot| self.seed_source_idx[slot] != NONE_REF)
     }
 
+    /// Whether some node's FR50 seed source is the block at table slot
+    /// `block_idx` — the snake-chain tail-drop `SeedSource` test (Story 9.1).
+    /// O(`MAX_NODES`), bounded. `NONE_REF` (the unseeded sentinel) never matches.
+    pub(crate) fn is_seed_source(&self, block_idx: u32) -> bool {
+        block_idx != NONE_REF && self.seed_source_idx.contains(&block_idx)
+    }
+
     /// Credits `amount` to a node's balance (saturating — FR6 overflow
     /// validation is Story 5.4; the derivation must not panic).
     pub(crate) fn credit(&mut self, node_id: u32, amount: u64) {

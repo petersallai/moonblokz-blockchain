@@ -29,7 +29,10 @@
 //! UTXO spent-bits `0→1`, while the FR5 recovery (Story 5.5) and the FR23
 //! chain-switch (Epic 6) reverse the very same fields — so a one-way
 //! `promote`/`flip` API would be wrong; both directions reuse one setter.
-//! The block's `hash`/`sequence`/`parent_ref` stay immutable throughout.
+//! The block's `hash`/`sequence` stay immutable throughout; `parent_ref` is
+//! only ever resolved (`NONE_REF → idx`) or, since Story 9.1's snake-chain
+//! tail release, unlinked (`idx → NONE_REF`) — never re-pointed to another
+//! block (`set_parent_ref`).
 //! `BlockTable`'s first deletion path lands in Story 4.4 alongside
 //! `chain_heads.rs`'s eviction (FR19 chain_heads-eviction).
 //!
@@ -611,6 +614,27 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
                 "resolve_parent_ref: only an unresolved parent may be resolved, never re-pointed"
             );
             entry.parent_ref = parent_idx;
+        }
+    }
+
+    /// FR48 value setter — `parent_ref` on an **already-inserted** block. Returns
+    /// `false` for an empty/out-of-bounds slot.
+    ///
+    /// Exists for the snake-chain tail release (Story 9.1), the first deletion
+    /// that frees a block while its children survive: each surviving child is
+    /// unlinked `idx → NONE_REF` so no `parent_ref` names the freed slot, which
+    /// the next admission reuses. That is the reverse of
+    /// [`Self::resolve_parent_ref`]'s `NONE_REF → idx`, so this is a plain value
+    /// setter rather than a second one-way op. The link is never re-pointed to a
+    /// *different* block: unlinking makes the child a root; it does not change
+    /// which block it extends.
+    pub(crate) fn set_parent_ref(&mut self, idx: u32, parent_ref: u32) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.parent_ref = parent_ref;
+                true
+            }
+            _ => false,
         }
     }
 
