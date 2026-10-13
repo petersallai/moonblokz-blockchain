@@ -21,7 +21,7 @@ use moonblokz_chain_types::{
 };
 use moonblokz_storage::StorageTrait;
 
-use crate::blocks::BlockTable;
+use crate::blocks::{BlockTable, SPENT_BITS_BYTES};
 use crate::node_info::NodeInfoState;
 
 /// Below-tail retention `R`: how many released blocks stay in the block-tree
@@ -100,7 +100,11 @@ pub(crate) fn classify_tail_drop<
         .filter_map(|tx| tx.as_complex())
         .map(|cx| cx.outputs().filter(|o| o.as_utxo().is_some()).count())
         .sum();
-    if (0..utxo_outputs).any(|bit| blocks.spent_bit(tail_idx, bit) == Some(false)) {
+    // An output beyond the spent-bit capacity has no bit to say it is spent,
+    // and an unknowable state must not count as "no obligation".
+    if utxo_outputs > SPENT_BITS_BYTES * 8
+        || (0..utxo_outputs).any(|bit| blocks.spent_bit(tail_idx, bit) == Some(false))
+    {
         return Ok(TailObligation::Utxo);
     }
     Ok(TailObligation::None)

@@ -5,7 +5,8 @@
 //! - `public_keys: [[u8; PUBLIC_KEY_SIZE]; MAX_NODES]` — `node_id → public_key`
 //! - `balances: [u64; MAX_NODES]` — per-node money balance (FR36)
 //! - `seed_source_idx: [u32; MAX_NODES]` — FR50 per-node seed-source block-table
-//!   index (`NONE_REF` = node not yet seeded in the current pass)
+//!   index (`NONE_REF` = node not yet seeded in the current pass;
+//!   `SEED_SOURCE_RELEASED` = seeded, source block released off the tail)
 //! - `max_known_node_id: u32` — FR34 registration-sequence watermark
 //!
 //! **Scope split.** Story 5.3 (FR3) *introduces* this substrate to the extent
@@ -17,6 +18,14 @@
 //! `node_id` — it is deliberately *not* duplicated here.
 
 use crate::blocks::NONE_REF;
+
+/// `seed_source_idx` value of a node that **is** seeded but whose seed-source
+/// block has dropped off the snake-chain tail (Story 9.1). Distinct from
+/// `NONE_REF` (unseeded), so `is_seeded` / `key_is_registered` still count the
+/// node; never a table slot (`MAX_BLOCKS` is far below it), so it never
+/// matches a reused slot. Story 9.3 replaces the slot index with
+/// `seed_source_sequence`, retiring this sentinel.
+pub(crate) const SEED_SOURCE_RELEASED: u32 = NONE_REF - 1;
 use moonblokz_crypto::PUBLIC_KEY_SIZE;
 
 /// Per-node derived projection (SoA). See the module doc for the field roles
@@ -125,9 +134,22 @@ impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
 
     /// Whether some node's FR50 seed source is the block at table slot
     /// `block_idx` — the snake-chain tail-drop `SeedSource` test (Story 9.1).
-    /// O(`MAX_NODES`), bounded. `NONE_REF` (the unseeded sentinel) never matches.
+    /// O(`MAX_NODES`), bounded. Neither sentinel (`NONE_REF`,
+    /// [`SEED_SOURCE_RELEASED`]) ever matches.
     pub(crate) fn is_seed_source(&self, block_idx: u32) -> bool {
-        block_idx != NONE_REF && self.seed_source_idx.contains(&block_idx)
+        block_idx < SEED_SOURCE_RELEASED && self.seed_source_idx.contains(&block_idx)
+    }
+
+    /// The snake-chain tail release freed table slot `block_idx` (Story 9.1):
+    /// every node seeded from it keeps being seeded, but no longer names the
+    /// slot, which the next admission reuses — otherwise the unrelated block
+    /// landing there would classify as a seed source. O(`MAX_NODES`).
+    pub(crate) fn release_seed_source(&mut self, block_idx: u32) {
+        for seed in self.seed_source_idx.iter_mut() {
+            if *seed == block_idx {
+                *seed = SEED_SOURCE_RELEASED;
+            }
+        }
     }
 
     /// Credits `amount` to a node's balance (saturating — FR6 overflow

@@ -3438,10 +3438,27 @@ impl<
     /// only the AR16 log (Epic 11), so neither an obligation nor an unreadable
     /// block stops the release here.
     ///
+    /// That covers an *unreadable* block as well (Project Lead, 2026-10-13):
+    /// at adoption the obligation does not matter, so neither does whether it
+    /// could be read.
+    ///
     /// `W` is read now (FR56). A Ready node is durably locked, so it is always
     /// there; were it not, the window is the whole active chain and nothing is
     /// released — never the `SNAKE_CHAIN_LENGTH_MAX` capacity in its place
     /// (Story 5.11 Ratified Decision 2).
+    ///
+    /// Afterwards every `chain_heads` entry is recomputed against the new
+    /// marking (O-024 ruling): without it the adopted chain's own head stays
+    /// Stored and keeps requesting the anchor's parent, below `S_tail`.
+    ///
+    /// **Cost.** The tail is found by walking to the root and then releasing,
+    /// not by a `W − 1`-step walk, so the release is literally the steady-state
+    /// step. Each released block costs one storage read (transaction blocks
+    /// only), two O(`MAX_BLOCKS`) scans and up to `MAX_BRANCH_COUNT` anchor walks
+    /// of O(`MAX_BLOCKS`). The number released is the segment's excess over
+    /// `W` — 0 on a live join that stops at `W`, larger only on a restart that
+    /// re-admits released blocks (R3). Bounded, but O(excess × `MAX_BRANCH_COUNT`
+    /// × `MAX_BLOCKS`) in the worst case.
     fn establish_snake_chain_window(&mut self) {
         let mut root = self.active_chain_head_idx;
         for _ in 0..MAX_BLOCKS {
@@ -3476,6 +3493,7 @@ impl<
                 break;
             }
         }
+        self.chain_heads.recompute_all_caches(&self.blocks);
     }
 
     /// FR48 window-advance / tail-release step (AC5): moves the tail one block
@@ -3510,7 +3528,14 @@ impl<
         if released == self.active_chain_head_idx {
             return false;
         }
-        let Some(entry) = self.blocks.get(released) else {
+        // Runtime, not debug-only: Story 6.0 drives this, and releasing a block
+        // that is not the active chain's root would leave its parent with a
+        // stale `head_ref_count` and strand the chain below it.
+        let Some(entry) = self
+            .blocks
+            .get(released)
+            .filter(|entry| entry.is_on_active_chain() && entry.parent_ref() == NONE_REF)
+        else {
             return false;
         };
         let released_hash = *entry.hash();
@@ -3525,9 +3550,11 @@ impl<
         self.blocks.set_on_active_chain(released, false);
         self.blocks.delete(released);
         // Index hygiene: no module state may name the freed slot. The head is a
-        // descendant of the new tail (checked above), so only the tentative
-        // provenance is left to check. A Ready node is durably locked, so this
-        // never fires in practice — it costs one comparison.
+        // descendant of the new tail (checked above). Nodes seeded from the
+        // block stay seeded but stop naming the slot. The tentative provenance
+        // never fires in practice — a Ready node is durably locked — and costs
+        // one comparison.
+        self.node_info.release_seed_source(released);
         if self.tentative_config_block_idx == released {
             self.tentative_config_block_idx = NONE_REF;
             self.chain_config.discard_tentative();
@@ -3736,10 +3763,15 @@ impl<
         if !self.is_ready() {
             return Err(SnakeChainWindowError::NotReady);
         }
-        match (
+        let window = (
             self.blocks.get(self.snake_chain_tail_idx),
             self.blocks.get(self.active_chain_head_idx),
-        ) {
+        );
+        debug_assert!(
+            window.0.is_some() && window.1.is_some(),
+            "a Ready node holds its tail and head blocks"
+        );
+        match window {
             (Some(tail), Some(head)) => Ok((tail.sequence(), head.sequence())),
             _ => Err(SnakeChainWindowError::NotReady),
         }
@@ -8072,6 +8104,14 @@ mod tests {
             4,
             "every block survived the wait; only the window trim released one"
         );
+        assert!(
+            !bc.block_tree_contains(100, &tail.view().hash()),
+            "#100 is the one released"
+        );
+        for blk in [&b101, &b102, &b103, &cfg] {
+            let view = blk.view();
+            assert!(bc.block_tree_contains(view.sequence(), &view.hash()));
+        }
         assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
         assert_eq!(
             bc.current_active_head(),
@@ -9728,6 +9768,51 @@ mod tests {
         let (bc, _) = w4_ready_on_segment(103);
         assert_eq!(bc.active_snake_chain_window(), Ok((100, 103)));
         assert_eq!(bc.block_tree_len(), 4);
+        // O-024: the adopted chain's head is Connected, not a Stored head still
+        // asking for the anchor's parent below S_tail.
+        assert!(!bc.chain_heads.has_stored_head());
+    }
+
+    /// Review patch — a released seed source stops naming its slot: the node
+    /// stays seeded, and the unrelated block that reuses the slot does not
+    /// classify as a seed source.
+    #[test]
+    fn snake_released_seed_source_does_not_follow_the_slot() {
+        let (mut bc, h) = w4_ready_on_segment(103);
+        let slot_100 = slot_of(&bc, 100, &h[0]).expect("#100");
+        let key = *bc.crypto.public_key().serialize();
+        bc.node_info.seed_node(1, &key, 0, slot_100);
+        let b104 = w4_config_anchor_block(104, h[3]);
+        extend_active_head(&mut bc, &b104, 0);
+        assert!(bc.advance_snake_chain_tail());
+        assert!(bc.node_info.is_seeded(1), "the node stays seeded");
+        assert!(bc.node_info.key_is_registered(&key));
+        // The next admission reuses the freed slot.
+        let orphan = node_transfer_block(106, 3, 105, 7);
+        let (outcome, _) = bc.receive_block(orphan.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(slot_of(&bc, 106, &orphan.view().hash()), Some(slot_100));
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, &bc.storage, slot_100),
+            Ok(TailObligation::None),
+            "the reused slot is not anyone's seed source"
+        );
+    }
+
+    /// Review patch — the release step refuses a tail that is not the active
+    /// chain's root, at runtime.
+    #[test]
+    fn snake_advance_refuses_a_tail_that_is_not_the_root() {
+        let (mut bc, h) = w4_ready_on_segment(103);
+        let b104 = w4_config_anchor_block(104, h[3]);
+        extend_active_head(&mut bc, &b104, 0);
+        let slot_101 = slot_of(&bc, 101, &h[1]).expect("#101");
+        let real_tail = bc.snake_chain_tail_idx;
+        bc.snake_chain_tail_idx = slot_101; // has a parent: not the root
+        assert!(!bc.advance_snake_chain_tail());
+        assert_eq!(bc.block_tree_len(), 5, "nothing released");
+        bc.snake_chain_tail_idx = real_tail;
+        assert!(bc.advance_snake_chain_tail());
     }
 
     /// One drive step's record: the new `S_tail`, the released slot, and the
@@ -9866,7 +9951,7 @@ mod tests {
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
-            "below S_tail — including a block the window has just released"
+            "below S_tail — a block at the just-released sequence #100"
         );
         let (outcome, _) = bc.receive_block(node_transfer_block(108, 3, 107, 7).view(), 0);
         assert_eq!(
@@ -9907,11 +9992,15 @@ mod tests {
         assert!(!bc.is_ready());
         assert_eq!(bc.snake_chain_tail_idx, NONE_REF);
 
-        // Subtree deletion that takes the active head.
+        // Subtree deletion that takes the active head. Production reaches it
+        // only outside Ready (the FR8 adopt path runs in Processing), so the
+        // node is put there; the tail is the genesis window's.
         let mut bc = genesis_node_with_window(16);
         assert_ne!(bc.snake_chain_tail_idx, NONE_REF);
+        bc.lifecycle_phase = LifecyclePhase::Processing;
         let head = bc.active_chain_head_idx;
         bc.delete_subtree_with_followup(head);
+        assert!(!bc.is_ready());
         assert_eq!(bc.active_chain_head_idx, NONE_REF);
         assert_eq!(bc.snake_chain_tail_idx, NONE_REF);
     }

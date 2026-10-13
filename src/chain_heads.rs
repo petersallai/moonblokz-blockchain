@@ -766,6 +766,24 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     // released block loses its only active-chain ancestor. That transition is
     // [`Self::on_tail_released`]'s, not `recompute_caches`'.
 
+    /// Recomputes every entry's caches against the current active-chain
+    /// marking. Called once at Ready entry (Story 9.1, O-024 ruling): the
+    /// promotion flags the adopted chain without touching `chain_heads`, so the
+    /// candidate's own heads would otherwise stay Stored and keep requesting
+    /// the anchor's parent — a block below `S_tail` that FR60 refuses. A
+    /// Stored head keeps its missing-parent hash (the `Anchor::Tail` arm reads
+    /// its own cache). No storage reads, no `now`.
+    pub(crate) fn recompute_all_caches<const MAX_BLOCKS: usize>(
+        &mut self,
+        blocks: &BlockTable<MAX_BLOCKS>,
+    ) {
+        for slot in 0..MAX_BRANCH_COUNT {
+            if !self.heads[slot].is_empty() {
+                self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
+            }
+        }
+    }
+
     /// FR19 event (v) — the tip-table follow-up to a snake-chain tail release
     /// (FR48, Story 9.1).
     ///

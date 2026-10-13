@@ -631,6 +631,10 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     pub(crate) fn set_parent_ref(&mut self, idx: u32, parent_ref: u32) -> bool {
         match self.blocks.get_mut(idx as usize) {
             Some(entry) if !entry.is_empty_slot() => {
+                debug_assert!(
+                    parent_ref == NONE_REF || entry.parent_ref == NONE_REF,
+                    "set_parent_ref: a resolved parent is unlinked, never re-pointed"
+                );
                 entry.parent_ref = parent_ref;
                 true
             }
