@@ -118,6 +118,9 @@ pub(crate) enum Tier1Failure {
     /// `block.sequence ≤ anchor_sequence` for a node-transfer or a complex-tx
     /// balance input (FR9 Tier 1 intake monotonicity).
     AnchorSequenceNotBeforeBlock,
+    /// `block.sequence ≤ block_sequence` for a complex-tx UTXO input: the
+    /// referenced output's block is not a strict ancestor (ADR-016 causality).
+    UtxoInputNotBeforeBlock,
     /// FR6 no-self-vote: a transaction's `initializer` equals its `vote`
     /// (outside the permanent node-#0 and block-#0 exceptions).
     SelfVote,
@@ -350,7 +353,12 @@ fn tier1_complex_tx(
             }
             check_no_self_vote(bal.initializer(), vote, is_genesis_block_zero)?;
             declared_input_sum = declared_input_sum.saturating_add(bal.amount() as u128);
-        } else if input.as_utxo().is_some() {
+        } else if let Some(utxo) = input.as_utxo() {
+            // Causality is decidable from bytes, so Tier 1 owns it; the
+            // processing-pass resolver only guards it.
+            if block_sequence <= utxo.block_sequence() {
+                return Err(Tier1Failure::UtxoInputNotBeforeBlock);
+            }
             has_utxo_input = true;
         } else {
             return Err(Tier1Failure::MalformedPayload);
@@ -922,13 +930,31 @@ mod tests {
         // A UTXO input's amount is not in the input bytes → the sum rule is not
         // evaluable at Tier 1, so inputs<outputs is NOT exact evidence here.
         let block = complex_block(5, 3, &c, |cx| {
-            cx.add_utxo_input(&[7u8; 32], 0, &DUMMY_SIG).ok().unwrap();
+            cx.add_utxo_input(4, 0, &DUMMY_SIG).ok().unwrap();
             cx.add_balance_output(9, 50).ok().unwrap();
         });
         assert_eq!(
             tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
         );
+    }
+
+    #[test]
+    fn tier1_rejects_utxo_input_not_before_block() {
+        // ADR-016 causality: the referenced block must be a strict ancestor, so
+        // `block_sequence ≥ block.sequence` is exact evidence from bytes alone.
+        let c = crypto(1);
+        for referenced in [5, 6, u32::MAX] {
+            let block = complex_block(5, 3, &c, |cx| {
+                cx.add_utxo_input(referenced, 0, &DUMMY_SIG).ok().unwrap();
+                cx.add_balance_output(9, 50).ok().unwrap();
+            });
+            assert_eq!(
+                tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+                Err(Tier1Failure::UtxoInputNotBeforeBlock),
+                "block_sequence {referenced} at block 5"
+            );
+        }
     }
 
     #[test]

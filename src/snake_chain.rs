@@ -216,7 +216,7 @@ mod tests {
         let signer = signer();
         let mut cx = ComplexTransaction::new(3);
         for i in 0..inputs {
-            cx.add_utxo_input(&[i; 32], 0, &[0u8; 64])
+            cx.add_utxo_input(u32::from(i), 0, &[0u8; 64])
                 .ok()
                 .expect("add input");
         }
