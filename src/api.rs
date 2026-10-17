@@ -3507,22 +3507,25 @@ impl<
     /// [`crate::snake_chain::tail_drop_binding`] allows it.
     ///
     /// The release (Ratified Decision 2), in order:
-    /// 1. the dropped block's `is_on_active_chain` is cleared and its slot freed
+    /// 1. **FR58 stale side-branch reclamation** (pulled forward from Story 9.7,
+    ///    Project Lead 2026-10-17): every branch forked at the dropped block
+    ///    diverges below the new `S_tail`, so neither chain-switch zone can ever
+    ///    reach it. Each is deleted whole with
+    ///    [`Self::delete_subtree_with_followup`] — a child-closed delete-set, so
+    ///    the ordinary `chain_heads` event (iv) applies — while the dropped block
+    ///    is still in place, so no surviving walk ever meets the freed slot;
+    /// 2. the dropped block's `is_on_active_chain` is cleared and its slot freed
     ///    with the ordinary lazy [`BlockTable::delete`] — the durable bytes stay
     ///    until the slot is reused (Ratified Decision 3);
-    /// 2. the `chain_heads` follow-up runs while the surviving children still
-    ///    name the freed slot ([`ChainHeadsTable::on_tail_released`]): a branch
-    ///    forked at the dropped block becomes a Stored root whose missing parent
-    ///    is the dropped hash;
-    /// 3. **every** surviving child is unlinked (`parent_ref = NONE_REF`) — the
-    ///    new tail, which becomes the active chain's root, and each side root.
+    /// 3. its one remaining child, the new tail, is unlinked
+    ///    (`parent_ref = NONE_REF`) and becomes the active chain's root.
     ///
-    /// This is the first deletion whose delete-set is not closed under the child
-    /// relation, which is why it is its own step and not
-    /// [`Self::delete_subtree_with_followup`]. The children are found by an
-    /// O(`MAX_BLOCKS`) scan (the table has no child index), twice, so no buffer
-    /// is needed. With `R = 0` ([`crate::snake_chain::BELOW_TAIL_RETENTION`])
-    /// the block is freed at once.
+    /// No `chain_heads` pass is needed for the dropped block itself: it is not a
+    /// tip (the new tail is its child), every head above it anchors on the
+    /// active chain at or above the new tail, and nothing else passed through it.
+    /// The children are found by O(`MAX_BLOCKS`) scans (the table has no child
+    /// index). With `R = 0` ([`crate::snake_chain::BELOW_TAIL_RETENTION`]) the
+    /// block is freed at once.
     pub(crate) fn advance_snake_chain_tail(&mut self) -> bool {
         let released = self.snake_chain_tail_idx;
         if released == self.active_chain_head_idx {
@@ -3531,14 +3534,13 @@ impl<
         // Runtime, not debug-only: Story 6.0 drives this, and releasing a block
         // that is not the active chain's root would leave its parent with a
         // stale `head_ref_count` and strand the chain below it.
-        let Some(entry) = self
+        if !self
             .blocks
             .get(released)
-            .filter(|entry| entry.is_on_active_chain() && entry.parent_ref() == NONE_REF)
-        else {
+            .is_some_and(|entry| entry.is_on_active_chain() && entry.parent_ref() == NONE_REF)
+        {
             return false;
-        };
-        let released_hash = *entry.hash();
+        }
         let Some(new_tail) = (0..MAX_BLOCKS as u32).find(|&idx| {
             self.blocks
                 .get(idx)
@@ -3547,6 +3549,16 @@ impl<
             return false;
         };
 
+        for idx in 0..MAX_BLOCKS as u32 {
+            if idx != new_tail
+                && self
+                    .blocks
+                    .get(idx)
+                    .is_some_and(|child| child.parent_ref() == released)
+            {
+                self.delete_subtree_with_followup(idx);
+            }
+        }
         self.blocks.set_on_active_chain(released, false);
         self.blocks.delete(released);
         // Index hygiene: no module state may name the freed slot. The head is a
@@ -3559,17 +3571,7 @@ impl<
             self.tentative_config_block_idx = NONE_REF;
             self.chain_config.discard_tentative();
         }
-        self.chain_heads
-            .on_tail_released(&self.blocks, released, &released_hash);
-        for idx in 0..MAX_BLOCKS as u32 {
-            if self
-                .blocks
-                .get(idx)
-                .is_some_and(|child| child.parent_ref() == released)
-            {
-                self.blocks.set_parent_ref(idx, NONE_REF);
-            }
-        }
+        self.blocks.set_parent_ref(new_tail, NONE_REF);
         self.snake_chain_tail_idx = new_tail;
         // Story 6.1 adds the FR21 `branch_value` tail-eviction subtraction
         // (event (iii)) here, once per released block.
@@ -9833,34 +9835,52 @@ mod tests {
     }
 
     /// The AC10.4 drive: from the `W`-long window `100..=103`, two head
-    /// extensions with a side branch forked at #101 in between. Returns the
-    /// trace, the node, and the side block's hash.
-    fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [u8; 32]) {
+    /// extensions. In between, a two-block side branch forks at #101 and a
+    /// one-block side branch forks at #102. Returns the trace, the node, and
+    /// the hashes of the #101 fork's blocks and of the #102 fork.
+    fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [[u8; 32]; 3]) {
         let (mut bc, h) = w4_ready_on_segment(103);
         // Dropping #100 (chain-config) needs a chain-config extension (FR49).
         let b104 = w4_config_anchor_block(104, h[3]);
         let first = drive_step(&mut bc, &b104, now);
-        // A side branch forked at #101, still Connected through it.
+        // A two-block side branch forked at #101, Connected through it ...
         let side = salted_linked_block(102, h[1], 5);
-        let (outcome, _) = bc.receive_block(side.view(), now);
-        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert!(!bc.chain_heads.has_stored_head(), "the fork is Connected");
+        let side_child = salted_linked_block(103, side.view().hash(), 5);
+        // ... and one forked at #102, which the next advance keeps in range.
+        let keep = salted_linked_block(103, h[2], 6);
+        for blk in [&side, &side_child, &keep] {
+            let (outcome, _) = bc.receive_block(blk.view(), now);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert!(
+            !bc.chain_heads.has_stored_head(),
+            "both forks are Connected"
+        );
         let b105 = linked_transfer_block(105, b104.view().hash());
         let second = drive_step(&mut bc, &b105, now);
-        ([first, second], bc, side.view().hash())
+        (
+            [first, second],
+            bc,
+            [
+                side.view().hash(),
+                side_child.view().hash(),
+                keep.view().hash(),
+            ],
+        )
     }
 
     /// AC10.4 / AC5 / AC6 — the window advance one block at a time: tail
-    /// positions, released slots, `parent_ref` unlinks, and a side branch forked
-    /// at a dropped block demoting Connected → Stored with the dropped hash as
-    /// its missing parent.
+    /// positions, released slots, the new tail unlinked, and FR58 stale
+    /// reclamation (pulled forward, 2026-10-17): the whole branch forked at a
+    /// dropped block is deleted, a branch forked above the new tail is kept,
+    /// and nothing is left asking for a parent below `S_tail`.
     #[test]
     fn snake_drive_past_w() {
         let (h, slot_100, slot_101) = {
             let (bc, h) = w4_ready_on_segment(103);
             (h, slot_of(&bc, 100, &h[0]), slot_of(&bc, 101, &h[1]))
         };
-        let (trace, mut bc, side_hash) = drive_past_w(1_000);
+        let (trace, mut bc, [side, side_child, keep]) = drive_past_w(1_000);
 
         assert_eq!(
             trace[0],
@@ -9882,7 +9902,6 @@ mod tests {
         );
         assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
         assert!(slot_of(&bc, 100, &h[0]).is_none() && slot_of(&bc, 101, &h[1]).is_none());
-        assert_eq!(bc.block_tree_len(), 5, "#102..#105 and the side block");
 
         // The new tail is the active chain's root, unlinked from the freed slot.
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
@@ -9890,27 +9909,32 @@ mod tests {
         assert_eq!(tail.parent_ref(), NONE_REF);
         assert!(tail.is_on_active_chain());
 
-        // The side block is a root too, and a Stored head missing #101.
-        let side_idx = slot_of(&bc, 102, &side_hash).expect("side block retained");
-        let side = bc.blocks.get(side_idx).expect("side");
-        assert_eq!(side.parent_ref(), NONE_REF, "unlinked, not dangling");
-        assert!(!side.is_on_active_chain());
-        let stored: [Option<u32>; 4] = core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
-        assert_eq!(
-            stored.iter().filter(|t| t.is_some()).count(),
-            1,
-            "only the side root is Stored; the active root is not"
+        // FR58: the branch forked at #101 is gone, whole; the one at #102 stays.
+        assert!(slot_of(&bc, 102, &side).is_none(), "fork root deleted");
+        assert!(
+            slot_of(&bc, 103, &side_child).is_none(),
+            "and its descendant"
         );
-        assert!(stored.contains(&Some(side_idx)));
-        // Its recovery request is for the dropped #101.
+        let keep_idx = slot_of(&bc, 103, &keep).expect("in-range fork retained");
+        assert_eq!(
+            bc.blocks.get(keep_idx).map(|e| e.parent_ref()),
+            Some(bc.snake_chain_tail_idx),
+            "still attached to the new tail"
+        );
+        assert_eq!(bc.block_tree_len(), 5, "#102..#105 and the #102 fork");
+
+        // No head is left asking for a parent below S_tail.
+        assert!(!bc.chain_heads.has_stored_head());
+        assert_eq!(
+            bc.chain_heads.count(),
+            2,
+            "the active head and the #102 fork"
+        );
         let (outcome, _) = bc.on_tick(u64::MAX / 2);
-        match outcome {
-            TickOutcome::SendParentRecoveryRequest(request) => {
-                assert_eq!(request.missing_parent_hash(), &h[1]);
-                assert_eq!(request.claimed_parent_sequence(), 101);
-            }
-            _ => panic!("the demoted side head requests its parent"),
-        }
+        assert!(!matches!(
+            outcome,
+            TickOutcome::SendParentRecoveryRequest(_)
+        ));
     }
 
     /// AC10.8 — AR16 replay (FR63): the same event sequence twice gives

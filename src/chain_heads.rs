@@ -10,8 +10,9 @@
 //! parent-recovery scheduler (deterministic selection + tie-breaks), and the
 //! FR19 bounded eviction (the block-tree's first authorized deletion path).
 //! Event (iv) FR5 deletion is driven by [`ChainHeadsTable::on_blocks_deleted`]
-//! (Story 5.5, the FR5 atomic recovery); event (v) snake-chain tail release by
-//! [`ChainHeadsTable::on_tail_released`] (Story 9.1); event (iii) FR23 chain-switch remains
+//! (Story 5.5, the FR5 atomic recovery). Event (v), the snake-chain tail release
+//! (Story 9.1), deletes every branch forked at the dropped block through event
+//! (iv) and needs no pass of its own. Event (iii) FR23 chain-switch remains
 //! **specified** (documented below) but **driven** by Epic 6.
 //! `branch_value` (FR21) is present but unpopulated (Epic 6).
 //!
@@ -284,12 +285,11 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// (event (iv)), so the only transition it performs is Stored→Connected. The
     /// `Anchor::Tail` arm serves new Stored heads, extended Stored branches and
     /// deepened tail-points; it cannot re-derive a missing-parent hash for an
-    /// entry that *was* Connected. The one Connected→Stored demotion — a branch
-    /// forked at a released snake-chain tail block — therefore does not come
-    /// through here but through [`Self::on_tail_released`], which has the
-    /// released block's hash in hand. Read the `last_request_timestamp = 0`
-    /// below as the *promotion* rule (a connected branch has nothing left to
-    /// request).
+    /// entry that *was* Connected — and no path demotes one: the snake-chain
+    /// tail release, the one deletion that could strand a Connected branch,
+    /// deletes every branch forked at the dropped block instead (FR58, Story
+    /// 9.1). Read the `last_request_timestamp = 0` below as the *promotion*
+    /// rule (a connected branch has nothing left to request).
     fn recompute_caches<const MAX_BLOCKS: usize>(
         &mut self,
         slot: usize,
@@ -761,10 +761,11 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     //       stays on the active chain, so a switch alone demotes no head.
     //       Driver owned by Epic 6.
     //
-    // Connected→Stored demotion IS reachable since Story 9.1, through the
-    // snake-chain tail release (FR19 event (v)): a branch forked at the
-    // released block loses its only active-chain ancestor. That transition is
-    // [`Self::on_tail_released`]'s, not `recompute_caches`'.
+    // (v) snake-chain tail release (Story 9.1): every branch forked at the
+    //     dropped block is deleted as a child-closed subtree (event (iv)) before
+    //     the block is freed — FR58 stale reclamation, since its divergence point
+    //     is then below `S_tail`. No surviving head's walk passes through the
+    //     freed slot, so no head demotes and no pass of its own is needed.
 
     /// Recomputes every entry's caches against the current active-chain
     /// marking. Called once at Ready entry (Story 9.1, O-024 ruling): the
@@ -780,67 +781,6 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         for slot in 0..MAX_BRANCH_COUNT {
             if !self.heads[slot].is_empty() {
                 self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
-            }
-        }
-    }
-
-    /// FR19 event (v) — the tip-table follow-up to a snake-chain tail release
-    /// (FR48, Story 9.1).
-    ///
-    /// **Call contract:** the released block's `is_on_active_chain` bit is
-    /// cleared and its slot freed, but its surviving children are **not yet**
-    /// unlinked — their `parent_ref` still names `released_idx`. That is what
-    /// identifies the affected heads without a buffer or a storage read: a
-    /// head's ancestry walk now stops at the freed slot, and its tail-point is
-    /// then a block whose parent is `released_idx`. The caller unlinks the
-    /// children right after this returns.
-    ///
-    /// - A head whose walk passes through the released block — a side branch
-    ///   forked at it — demotes to Stored: its tail-point becomes the branch's
-    ///   surviving root and its missing parent is the released block, whose hash
-    ///   is in hand here (`released_hash`). FR19 recovery is scheduled at once
-    ///   (`last_request_timestamp = 0`), and `branch_value` is cleared (FR21:
-    ///   Connected/Active only). Recovering a block below the tail is FR60's to
-    ///   refuse, and reclaiming such a head is FR57 / Story 9.6 and Story 9.7.
-    /// - Every other head is recomputed as usual. A head reaching the active
-    ///   chain still does: the new tail is flagged and survives, so it is never
-    ///   given a missing parent and never requests the dropped block.
-    ///
-    /// `head_ref_count` needs no change: the released block is the active
-    /// chain's root (`parent_ref == NONE_REF`, the tail invariant), so no
-    /// surviving block loses a child edge. No `now`, no PRNG, no storage access
-    /// (FR63).
-    pub(crate) fn on_tail_released<const MAX_BLOCKS: usize>(
-        &mut self,
-        blocks: &BlockTable<MAX_BLOCKS>,
-        released_idx: u32,
-        released_hash: &[u8; 32],
-    ) {
-        for slot in 0..MAX_BRANCH_COUNT {
-            let head_idx = self.heads[slot].head_idx;
-            if self.heads[slot].is_empty() {
-                continue;
-            }
-            if head_idx == released_idx {
-                // The released block always has its active child, so it is not a
-                // tip; an entry naming it would name a freed slot. Drop it.
-                self.heads[slot] = ChainHeadEntry::new_empty();
-                continue;
-            }
-            match Self::locate_anchor(blocks, head_idx) {
-                Anchor::Tail(tail_idx)
-                    if blocks
-                        .get(tail_idx)
-                        .is_some_and(|entry| entry.parent_ref() == released_idx) =>
-                {
-                    let head = &mut self.heads[slot];
-                    head.flags &= !FLAG_CONNECTED;
-                    head.tail_or_connection_idx = tail_idx;
-                    head.missing_parent_hash = *released_hash;
-                    head.last_request_timestamp = 0;
-                    head.branch_value = 0;
-                }
-                _ => self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]),
             }
         }
     }
@@ -931,10 +871,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// survivor's ancestry can never contain a deleted block and no survivor's
     /// anchor can move. (FR23's chain switch cannot demote either: it walks back
     /// to a common ancestor that stays on the active chain, and
-    /// [`Self::locate_anchor`] stops at the **first** flagged block.) The one
-    /// deletion whose delete-set is *not* child-closed — the snake-chain tail
-    /// release — does demote, and has its own follow-up,
-    /// [`Self::on_tail_released`].
+    /// [`Self::locate_anchor`] stops at the **first** flagged block. The
+    /// snake-chain tail release cannot either: it first deletes, through this
+    /// function, every branch forked at the dropped block.)
     ///
     /// The `flags &= !FLAG_CONNECTED` in `recompute_caches`' `Anchor::Tail` arm
     /// is therefore an idempotent write on this path, not a demotion. That arm

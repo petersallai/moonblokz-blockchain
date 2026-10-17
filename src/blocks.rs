@@ -620,10 +620,10 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// FR48 value setter — `parent_ref` on an **already-inserted** block. Returns
     /// `false` for an empty/out-of-bounds slot.
     ///
-    /// Exists for the snake-chain tail release (Story 9.1), the first deletion
-    /// that frees a block while its children survive: each surviving child is
-    /// unlinked `idx → NONE_REF` so no `parent_ref` names the freed slot, which
-    /// the next admission reuses. That is the reverse of
+    /// Exists for the snake-chain tail release (Story 9.1), the one deletion
+    /// that frees a block while a child survives: the new tail is unlinked
+    /// `idx → NONE_REF` so no `parent_ref` names the freed slot, which the next
+    /// admission reuses. That is the reverse of
     /// [`Self::resolve_parent_ref`]'s `NONE_REF → idx`, so this is a plain value
     /// setter rather than a second one-way op. The link is never re-pointed to a
     /// *different* block: unlinking makes the child a root; it does not change
