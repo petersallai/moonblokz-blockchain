@@ -118,6 +118,9 @@ pub(crate) enum Tier1Failure {
     /// `block.sequence ≤ anchor_sequence` for a node-transfer or a complex-tx
     /// balance input (FR9 Tier 1 intake monotonicity).
     AnchorSequenceNotBeforeBlock,
+    /// A complex transaction's output amounts, or its declared balance-input
+    /// amounts, sum beyond `u64::MAX`.
+    AmountOverflow,
     /// `block.sequence ≤ block_sequence` for a complex-tx UTXO input: the
     /// referenced output's block is not a strict ancestor (ADR-016 causality).
     UtxoInputNotBeforeBlock,
@@ -383,6 +386,11 @@ fn tier1_complex_tx(
     }
     if output_seen != cx.output_count() as u32 {
         return Err(Tier1Failure::MalformedPayload);
+    }
+    // Both sums are decidable from the bytes, so their `u64` bound is Tier 1's
+    // (DEC-011); the FR6 pass relies on it.
+    if output_sum > u128::from(u64::MAX) || declared_input_sum > u128::from(u64::MAX) {
+        return Err(Tier1Failure::AmountOverflow);
     }
 
     // Zero-input complex tx (UTXO carry-forward, FR51) is exempt from the
@@ -937,6 +945,28 @@ mod tests {
             tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
             Ok(())
         );
+    }
+
+    #[test]
+    fn tier1_rejects_amount_overflow() {
+        let c = crypto(1);
+        let outputs = complex_block(5, 3, &c, |cx| {
+            cx.add_balance_output(9, u64::MAX).ok().unwrap();
+            cx.add_balance_output(9, 1).ok().unwrap();
+        });
+        let inputs = complex_block(5, 3, &c, |cx| {
+            cx.add_balance_input(4, 8, u64::MAX, 0, &DUMMY_SIG)
+                .ok()
+                .unwrap();
+            cx.add_balance_input(4, 8, 1, 0, &DUMMY_SIG).ok().unwrap();
+            cx.add_balance_output(9, 1).ok().unwrap();
+        });
+        for block in [outputs, inputs] {
+            assert_eq!(
+                tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+                Err(Tier1Failure::AmountOverflow)
+            );
+        }
     }
 
     #[test]

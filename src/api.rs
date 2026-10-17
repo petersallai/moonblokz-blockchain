@@ -482,7 +482,6 @@ pub(crate) enum ProcessingError {
 /// (Story 6.8). Only `Invalid` is evidence against the consuming block; the
 /// other two are local faults, which FR16 never charges against a block. The
 /// caller maps it into its own error type, adding the consuming block's index.
-#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum UtxoSpendError {
     /// The input names no spendable output (exact evidence).
     Invalid(ValidationReason),
@@ -562,7 +561,9 @@ pub(crate) enum ValidationReason {
     /// amounts plus the referenced UTXO amounts) summing to less than its
     /// outputs (money creation, FR6).
     InsufficientTransactionInputs,
-    /// A complex transaction's input or output sum overflows `u64`.
+    /// A complex transaction's input sum (balance inputs plus the referenced
+    /// UTXO amounts), or the block's fee total, overflows `u64`. The output sum
+    /// and the declared balance-input sum are bounded at Tier 1.
     ValueOverflow,
 }
 
@@ -2900,10 +2901,6 @@ impl<
     /// a genesis-anchored candidate. Returns the earliest offending block's
     /// `ProcessingError::Invalid { block_idx, reason }` on violation.
     ///
-    // The per-block context (indices and the two anchor-kind flags) is passed as flat parameters rather than bundled into a struct: they
-    // are all read-only scalars threaded straight through from `run_processing_pass`,
-    // and a wrapper would add indirection without clarifying the single call site.
-    #[allow(clippy::too_many_arguments)]
     fn validate_and_derive_block(
         &mut self,
         view: BlockView<'_>,
@@ -3128,6 +3125,9 @@ impl<
                         // (Story 6.8, D1), checked: an overflow is `Invalid`.
                         let mut in_sum: u64 = 0;
                         let mut out_sum: u64 = 0;
+                        // A trusted pre-window UTXO input has no known amount, so
+                        // the sum rule and the fee cannot be evaluated for its tx.
+                        let mut has_unknown_input = false;
                         for input in cx.inputs() {
                             if let Some(bi) = input.as_balance() {
                                 let binit = bi.initializer();
@@ -3163,18 +3163,21 @@ impl<
                                 // ancestry and spend. In the FR3 pass every ancestor
                                 // of a segment block is in the segment, so the bits
                                 // flipped here are exactly the ones the pass zeroes
-                                // at entry and rolls back on abort. The input's
-                                // signature is Story 7.1 (I-21).
+                                // at entry and rolls back on abort. A window-anchored
+                                // candidate trusts a reference below its anchor
+                                // (DEC-129). The input's signature is Story 7.1 (I-21).
                                 let parent = self
                                     .blocks
                                     .get(idx)
-                                    .map_or(NONE_REF, |entry| entry.parent_ref());
-                                let (_address, amount) = self
+                                    .ok_or(ProcessingError::MissingBlock)?
+                                    .parent_ref();
+                                let resolved = self
                                     .resolve_and_spend_utxo(
                                         parent,
                                         seq,
                                         ui.block_sequence(),
                                         ui.output_index(),
+                                        !genesis_anchored,
                                     )
                                     .map_err(|e| match e {
                                         UtxoSpendError::Invalid(reason) => invalid(reason),
@@ -3183,16 +3186,21 @@ impl<
                                             ProcessingError::MissingBlock
                                         }
                                     })?;
-                                in_sum = in_sum
-                                    .checked_add(amount)
-                                    .ok_or(invalid(ValidationReason::ValueOverflow))?;
+                                match resolved {
+                                    Some((_address, amount)) => {
+                                        in_sum = in_sum
+                                            .checked_add(amount)
+                                            .ok_or(invalid(ValidationReason::ValueOverflow))?;
+                                    }
+                                    None => has_unknown_input = true,
+                                }
                             }
                         }
                         for output in cx.outputs() {
+                            // Tier 1 bounds Σ outputs to `u64` (byte-decidable,
+                            // DEC-011), so the output sum cannot overflow here.
                             if let Some(uo) = output.as_utxo() {
-                                out_sum = out_sum
-                                    .checked_add(uo.amount())
-                                    .ok_or(invalid(ValidationReason::ValueOverflow))?;
+                                out_sum = out_sum.saturating_add(uo.amount());
                             } else if let Some(bo) = output.as_balance() {
                                 // FR6 node-existence bound: the balance-output
                                 // receiver (output side) must name an existing node,
@@ -3204,20 +3212,21 @@ impl<
                                 if self.node_info.is_seeded(bo.receiver()) {
                                     self.node_info.credit(bo.receiver(), bo.amount());
                                 }
-                                out_sum = out_sum
-                                    .checked_add(bo.amount())
-                                    .ok_or(invalid(ValidationReason::ValueOverflow))?;
+                                out_sum = out_sum.saturating_add(bo.amount());
                             }
                         }
                         // [D] FR6 total-inputs ≥ total-outputs for every complex
                         // tx with ≥1 input; a zero-input carry-forward is exempt
                         // (FR6) and pays no fee. The fee is the surplus over all
-                        // inputs and outputs, UTXO ones included.
-                        if cx.input_count() > 0 {
+                        // inputs and outputs, UTXO ones included. A tx with a
+                        // trusted pre-window input is trusted whole (FR3 AC4).
+                        if cx.input_count() > 0 && !has_unknown_input {
                             let fee = in_sum
                                 .checked_sub(out_sum)
                                 .ok_or(invalid(ValidationReason::InsufficientTransactionInputs))?;
-                            total_fees = total_fees.saturating_add(fee);
+                            total_fees = total_fees
+                                .checked_add(fee)
+                                .ok_or(invalid(ValidationReason::ValueOverflow))?;
                         }
                     } else {
                         return Err(invalid(ValidationReason::MalformedPayload));
@@ -3385,10 +3394,17 @@ impl<
     /// returns its `(address, amount)`:
     /// 1. causality: `block_sequence` must be below `consuming_seq` (Tier 1
     ///    owns this check; here it is a guard);
-    /// 2. a RAM-only walk up `parent_ref` to the ancestor at `block_sequence`.
-    ///    Reaching `NONE_REF` first (the FR3 anchor, or the released tail in
-    ///    Ready) is `UtxoUnresolvable`, as is any block on a side branch: only
-    ///    ancestors are visited (FR39);
+    /// 2. distance: `consuming_seq - block_sequence` must not exceed the
+    ///    window `W` (FR14 freshness: the output was at or above `S_tail` when
+    ///    the consuming block was made);
+    /// 3. a RAM-only walk up `parent_ref` to the ancestor at `block_sequence`.
+    ///    Only ancestors are visited, so a block on a side branch is never
+    ///    found (FR39). Reaching `NONE_REF` first means the output lies below
+    ///    the anchor: with `trust_below_anchor` (a window-anchored FR3
+    ///    candidate) that is trusted pre-window history and returns `Ok(None)`,
+    ///    with no bit to flip and no known amount (DEC-129); otherwise (a
+    ///    genesis-anchored candidate, or the released tail in Ready) it is
+    ///    `UtxoUnresolvable`;
     /// 3. the spent bit: out of bit capacity is `UtxoUnresolvable`, already
     ///    set is `UtxoAlreadySpent`;
     /// 4. exactly one storage read of the referenced block. A failed read is a
@@ -3401,9 +3417,18 @@ impl<
         consuming_seq: u32,
         block_sequence: u32,
         output_index: u8,
-    ) -> Result<([u8; 32], u64), UtxoSpendError> {
+        trust_below_anchor: bool,
+    ) -> Result<Option<([u8; 32], u64)>, UtxoSpendError> {
         let unresolvable = UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable);
         if block_sequence >= consuming_seq {
+            return Err(unresolvable);
+        }
+        // The held configuration's `W`. In the FR3 pass the preload has already
+        // made it the candidate's own, tentative or durable (DEC-129).
+        if self
+            .active_chain_length()
+            .is_some_and(|w| consuming_seq - block_sequence > w)
+        {
             return Err(unresolvable);
         }
         // Each parent is exactly one sequence lower (`blocks.rs` admission), so
@@ -3413,7 +3438,11 @@ impl<
         let mut found = None;
         for _ in 0..MAX_BLOCKS {
             if cur == NONE_REF {
-                return Err(unresolvable);
+                return if trust_below_anchor {
+                    Ok(None)
+                } else {
+                    Err(unresolvable)
+                };
             }
             let entry = self.blocks.get(cur).ok_or(UtxoSpendError::MissingBlock)?;
             if entry.sequence() == block_sequence {
@@ -3448,7 +3477,7 @@ impl<
         let output = utxo_output_at(&view, output_index).ok_or(unresolvable)?;
 
         self.blocks.set_spent_bit(ref_idx, bit, true);
-        Ok(output)
+        Ok(Some(output))
     }
 
     /// FR4 / FR9 Tier-3 Active-promotion driver (AC9): on a clean FR6 pass, walk
@@ -10419,11 +10448,30 @@ mod tests {
         (bc.run_processing_pass(si), si)
     }
 
-    /// AC8 (3) — a reference below the segment anchor (99) or to a block that
-    /// is no ancestor at all reaches `NONE_REF` first: `UtxoUnresolvable`.
+    /// AC8 (3) / DEC-129 — on a window-anchored candidate a reference below
+    /// the anchor (99) is trusted pre-window history when it is at most `W`
+    /// (16) blocks back: no bit, no known amount, so the tx pays no fee and
+    /// its sum rule is not evaluated.
     #[test]
-    fn utxo_reference_below_the_anchor_is_unresolvable() {
-        for referenced in [98, 50, 0] {
+    fn utxo_reference_below_a_window_anchor_is_trusted_within_w() {
+        let (mut bc, h100) = utxo_test_chain();
+        let mint = utxo_mint_block(h100);
+        admit(&mut bc, &mint);
+        let tx = utxo_tx(102, &[(98, 0), (86, 3)], None, &[Err((2, 70))]);
+        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+        let si = admit(&mut bc, &spend);
+
+        bc.run_processing_pass(si).expect("pass succeeds");
+
+        assert_eq!(bc.node_info.balance_of(2), 70, "the output is credited");
+        assert_eq!(bc.node_info.balance_of(3), 0, "no fee from an unknown sum");
+    }
+
+    /// AC8 (3) / DEC-129 — a reference more than `W` blocks back is
+    /// `UtxoUnresolvable`, below the anchor or not.
+    #[test]
+    fn utxo_reference_beyond_w_is_unresolvable() {
+        for referenced in [85, 50, 0] {
             let (verdict, si) = spend_verdict(&[(referenced, 0)]);
             assert_eq!(
                 verdict,
@@ -10434,6 +10482,55 @@ mod tests {
                 "block_sequence {referenced}"
             );
         }
+    }
+
+    /// DEC-129 boundary on a `W = 4` chain: exactly `W` back is trusted, one
+    /// more is not.
+    #[test]
+    fn utxo_distance_bound_is_exactly_w() {
+        fn verdict(referenced: u32) -> (Result<(), ProcessingError>, u32) {
+            let mut bc = new_w4_chain();
+            let cfg = w4_config_anchor_block(99, [0xAB; 32]);
+            bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
+                .expect("config admitted");
+            let seed = balance_block(100, cfg.view().hash(), &[(2, 0, 0, 0xB2)], 3);
+            bc.tier1_admit(&seed.view(), &seed.view().hash(), 0)
+                .expect("seed admitted");
+            let tx = utxo_tx(101, &[(referenced, 0)], None, &[Err((2, 5))]);
+            let spend = complex_tx_block(101, seed.view().hash(), 3, 0, &[&tx]);
+            let si = bc
+                .tier1_admit(&spend.view(), &spend.view().hash(), 0)
+                .expect("spend admitted");
+            (bc.run_processing_pass(si), si)
+        }
+        assert_eq!(verdict(97).0, Ok(()), "101 - 97 = W");
+        let (result, si) = verdict(96);
+        assert_eq!(
+            result,
+            Err(ProcessingError::Invalid {
+                block_idx: si,
+                reason: ValidationReason::UtxoUnresolvable,
+            }),
+            "101 - 96 > W"
+        );
+    }
+
+    /// AC3 — without trust (a genesis-anchored candidate, or Ready, where
+    /// `NONE_REF` is the released tail) a reference below the anchor is
+    /// `UtxoUnresolvable`, even within `W`.
+    #[test]
+    fn utxo_reference_below_the_anchor_is_unresolvable_without_trust() {
+        let (mut bc, h100) = utxo_test_chain();
+        let mint = utxo_mint_block(h100);
+        let mi = admit(&mut bc, &mint);
+        assert!(matches!(
+            bc.resolve_and_spend_utxo(mi, 102, 98, 0, false),
+            Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable))
+        ));
+        assert!(matches!(
+            bc.resolve_and_spend_utxo(mi, 102, 98, 0, true),
+            Ok(None)
+        ));
     }
 
     /// AC8 (5) — an `output_index` within bit capacity but past the
@@ -10567,14 +10664,68 @@ mod tests {
         assert_eq!(bc.node_info.balance_of(3), 0, "no fee anywhere");
     }
 
+    /// AC8 (2) — the same output named twice in one transaction, or by two
+    /// transactions of one block, is spent once: the second is
+    /// `UtxoAlreadySpent`.
+    #[test]
+    fn utxo_double_spend_within_one_block_is_already_spent() {
+        let same_tx = utxo_tx(102, &[(101, 0), (101, 0)], None, &[Err((2, 60))]);
+        let first = utxo_tx(102, &[(101, 0)], None, &[Err((2, 60))]);
+        let second = utxo_tx(102, &[(101, 0)], None, &[Err((2, 60))]);
+        for txs in [&[&same_tx][..], &[&first, &second][..]] {
+            let (mut bc, h100) = utxo_test_chain();
+            let mint = utxo_mint_block(h100);
+            admit(&mut bc, &mint);
+            let spend = complex_tx_block(102, mint.view().hash(), 3, 0, txs);
+            let si = admit(&mut bc, &spend);
+            assert_eq!(
+                bc.run_processing_pass(si),
+                Err(ProcessingError::Invalid {
+                    block_idx: si,
+                    reason: ValidationReason::UtxoAlreadySpent,
+                }),
+                "{} transaction(s)",
+                txs.len()
+            );
+        }
+    }
+
+    /// AC6 — the input sum (with UTXO amounts) and the block's fee total are
+    /// checked: an overflow is `ValueOverflow`, never a clamped credit.
+    #[test]
+    fn utxo_value_overflow_is_invalid() {
+        const HALF: u64 = 1 << 63;
+        let both = utxo_tx(102, &[(101, 0), (101, 1)], None, &[]);
+        let first = utxo_tx(102, &[(101, 0)], None, &[]);
+        let second = utxo_tx(102, &[(101, 1)], None, &[]);
+        for txs in [&[&both][..], &[&first, &second][..]] {
+            let (mut bc, h100) = utxo_test_chain();
+            // Two zero-input carry-forwards, each a UTXO output of 2^63.
+            let a = utxo_tx(101, &[], None, &[Ok(HALF)]);
+            let b = utxo_tx(101, &[], None, &[Ok(HALF)]);
+            let mint = complex_tx_block(101, h100, 3, 0, &[&a, &b]);
+            admit(&mut bc, &mint);
+            let spend = complex_tx_block(102, mint.view().hash(), 3, 0, txs);
+            let si = admit(&mut bc, &spend);
+            assert_eq!(
+                bc.run_processing_pass(si),
+                Err(ProcessingError::Invalid {
+                    block_idx: si,
+                    reason: ValidationReason::ValueOverflow,
+                }),
+                "{} transaction(s)",
+                txs.len()
+            );
+        }
+    }
+
     /// A storage backend whose reads of one slot start failing after a set
-    /// number of successful ones. The FR3 pass reads every segment block
-    /// once before the resolver re-reads the referenced one, so a budget of 1
-    /// fails exactly the resolver's read.
+    /// number of successful ones, counting every attempt on that slot.
     struct FailingReadStorage {
         inner: MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
         failing_slot: u32,
         reads_left: core::cell::Cell<u32>,
+        attempts: core::cell::Cell<u32>,
     }
 
     impl StorageTrait for FailingReadStorage {
@@ -10593,6 +10744,7 @@ mod tests {
 
         fn read_block(&self, idx: u32) -> Result<Block, StorageError> {
             if idx == self.failing_slot {
+                self.attempts.set(self.attempts.get() + 1);
                 let left = self.reads_left.get();
                 if left == 0 {
                     return Err(StorageError::BackendIo { code: 9 });
@@ -10619,10 +10771,10 @@ mod tests {
 
     /// AC8 (6) / AC3 step 5 — a failed read of the referenced block is a local
     /// fault: the pass reports `StorageRead`, never `Invalid`, so nothing is
-    /// charged against the spending block, nothing is deleted, and the spent
-    /// bits roll back.
+    /// charged against the spending block. (The FR5 driver's head fallback for
+    /// `StorageRead` is unchanged here; DEC-037 is Story 6.0.)
     #[test]
-    fn utxo_read_failure_is_a_local_error() {
+    fn utxo_read_failure_is_reported_as_storage_read() {
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
         let chain_config = locked_chain_config(&crypto, FailingReadChain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
@@ -10630,6 +10782,7 @@ mod tests {
             inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
             failing_slot: NONE_REF,
             reads_left: core::cell::Cell::new(0),
+            attempts: core::cell::Cell::new(0),
         };
         let mut slot = core::mem::MaybeUninit::<FailingReadChain>::uninit();
         FailingReadChain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -10663,8 +10816,11 @@ mod tests {
             bc.run_processing_pass(si),
             Err(ProcessingError::StorageRead)
         );
-        assert_eq!(bc.blocks.len(), stored, "nothing deleted");
-        assert!(bc.blocks.get(si).is_some() && bc.blocks.get(mi).is_some());
-        assert_eq!(bc.blocks.spent_bit(mi, 1), Some(false), "rolled back");
+        assert_eq!(
+            bc.storage.attempts.get(),
+            2,
+            "the segment walk read the block, then the resolver's read failed"
+        );
+        assert_eq!(bc.blocks.len(), stored, "the pass itself deletes nothing");
     }
 }
