@@ -94,10 +94,9 @@ pub(crate) fn chain_config_content_matches(block: &BlockView<'_>, locked_content
 ///
 /// `window` is `Some((S_tail, S_head))` in ready state and `None` in collecting
 /// state (the FR60 window check and its `long-disconnect-detected` log are
-/// suppressed when `None`). In Epic 4 the module is always collecting, so
-/// `receive_block` always passes `None`; the ready-state path is exercised by
-/// injecting a window here directly (see tests / the `active_snake_chain_window`
-/// seam).
+/// suppressed when `None`). `receive_block` supplies it from the live
+/// snake-chain window (Story 9.1); the dispatcher takes it as a parameter so it
+/// stays stateless, and the unit tests below pass a window directly.
 ///
 /// Check order — FR11 dedup → FR60 window → FR17 chain-config → Tier 1 — is
 /// load-bearing: FR11 is the authoritative duplicate index and must win over a
@@ -135,8 +134,9 @@ where
 {
     // 1. FR11 duplicate detection — authoritative, ahead of the window/config
     //    gates so an already-known block is `DuplicateKnown` even if the active
-    //    window has since advanced past its sequence (nothing prunes the tree by
-    //    window in Epic 4).
+    //    window has since advanced past its sequence (the tail release frees
+    //    only the dropped active block; a side root below `S_tail` stays
+    //    retained).
     let hash = block.hash();
     if bc.block_tree_contains(block.sequence(), &hash) {
         return ReceiveBlockOutcome::DuplicateKnown;
