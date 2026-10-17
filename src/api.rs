@@ -3399,6 +3399,13 @@ impl<
     /// placeholder) and the FR48 window over it. A pure `parent_ref` walk (no
     /// storage reads), bounded by `MAX_BLOCKS`.
     fn promote_candidate_active(&mut self, candidate_tip_idx: u32) {
+        // Only the candidate is the active chain. A Collecting genesis anchor
+        // that the candidate does not contain (FR2 adopted a window-anchored
+        // segment, or a restart re-flagged it) would otherwise keep its flag
+        // and leave its branch looking Connected for good (review r2).
+        for idx in 0..MAX_BLOCKS as u32 {
+            self.blocks.set_on_active_chain(idx, false);
+        }
         let mut cur = candidate_tip_idx;
         for _ in 0..MAX_BLOCKS {
             self.blocks.set_status(cur, BlockStatus::Active);
@@ -3449,17 +3456,21 @@ impl<
     ///
     /// Before the trim every `chain_heads` entry is recomputed against the new
     /// marking (O-024 ruling): without it the adopted chain's own head stays
-    /// Stored and keeps requesting the anchor's parent, below `S_tail` — and the
-    /// release step's stale-fragment reclamation would see it as a fragment.
+    /// Stored and keeps requesting the anchor's parent, below `S_tail`. Stored
+    /// fragments that can never connect are then reclaimed at once (DEC-126,
+    /// DEC-127), including a genesis island the adopted chain does not contain.
     ///
     /// **Cost.** The tail is found by walking to the root and then releasing,
     /// not by a `W − 1`-step walk, so the release is literally the steady-state
     /// step. Each released block costs one storage read (transaction blocks
-    /// only), two O(`MAX_BLOCKS`) scans and up to `MAX_BRANCH_COUNT` anchor walks
-    /// of O(`MAX_BLOCKS`). The number released is the segment's excess over
-    /// `W` — 0 on a live join that stops at `W`, larger only on a restart that
-    /// re-admits released blocks (R3). Bounded, but O(excess × `MAX_BRANCH_COUNT`
-    /// × `MAX_BLOCKS`) in the worst case.
+    /// only) plus the release step's own cost (see
+    /// [`Self::advance_snake_chain_tail`]): dominated by one
+    /// `delete_subtree_with_followup` per fork and per reclaimed fragment, each
+    /// O(`MAX_BLOCKS`²) through `mark_subtree`. The number released is the
+    /// segment's excess over `W` — 0 on a live join that stops at `W`, larger
+    /// only on a restart that re-admits released blocks (R3). Bounded, but
+    /// O(excess × `MAX_BRANCH_COUNT` × `MAX_BLOCKS`²) in the worst case; the
+    /// common case releases nothing and deletes nothing.
     fn establish_snake_chain_window(&mut self) {
         let mut root = self.active_chain_head_idx;
         for _ in 0..MAX_BLOCKS {
@@ -3469,11 +3480,15 @@ impl<
             }
         }
         self.snake_chain_tail_idx = root;
-        // Before any release: the promotion flagged the adopted chain without
-        // touching `chain_heads`, and the stale-fragment reclamation inside the
-        // release step must not mistake the adopted chain's own head for a
-        // Stored fragment.
+        // Before any reclamation or release: the promotion re-marked the active
+        // chain without touching `chain_heads`. Current caches keep the adopted
+        // chain's own head from looking like a Stored fragment, and make a
+        // stale genesis island (now unflagged) look like one — it is reclaimed
+        // here, at once, rather than at the first advance (DEC-127).
         self.chain_heads.recompute_all_caches(&self.blocks);
+        if let Some(root_seq) = self.blocks.get(root).map(|entry| entry.sequence()) {
+            self.reclaim_stale_fragments(root_seq);
+        }
 
         let Some(w) = self.active_chain_length() else {
             return;
@@ -3497,6 +3512,32 @@ impl<
             );
             if !self.advance_snake_chain_tail() {
                 break;
+            }
+        }
+    }
+
+    /// FR58 stale-fragment reclamation (DEC-126): deletes, whole, every Stored
+    /// fragment whose lowest block `t` has `t − 1 ≤ s_tail`. Its missing parent
+    /// is below the window (FR60 refuses it) or at `S_tail` without being the
+    /// tail block (which would already have linked it), so the fragment's
+    /// divergence is below `S_tail` and it can never connect.
+    ///
+    /// Runs at Ready entry and at the end of every tail advance. It reads only
+    /// Stored entries, and a Stored head's tail-point is never on the active
+    /// chain — its walk would have stopped there and made it Connected — as
+    /// long as the caches are current: Ready entry recomputes them first, and
+    /// every later mutation maintains them.
+    fn reclaim_stale_fragments(&mut self, s_tail: u32) {
+        for slot in 0..MAX_BRANCH_COUNT {
+            let Some(tail_point) = self.chain_heads.stored_head_tail(slot) else {
+                continue;
+            };
+            if self
+                .blocks
+                .get(tail_point)
+                .is_some_and(|entry| entry.sequence() <= s_tail.saturating_add(1))
+            {
+                self.delete_subtree_with_followup(tail_point);
             }
         }
     }
@@ -3535,9 +3576,13 @@ impl<
     /// No `chain_heads` pass is needed for the dropped block itself: it is not a
     /// tip (the new tail is its child), every head above it anchors on the
     /// active chain at or above the new tail, and nothing else passed through it.
-    /// The children are found by O(`MAX_BLOCKS`) scans (the table has no child
-    /// index). With `R = 0` ([`crate::snake_chain::BELOW_TAIL_RETENTION`]) the
-    /// block is freed at once.
+    /// **Cost.** Two O(`MAX_BLOCKS`) scans find the children (the table has no
+    /// child index) and one O(`MAX_BRANCH_COUNT`) pass finds the fragments. Each
+    /// deleted fork or fragment then costs one `delete_subtree_with_followup`:
+    /// O(`MAX_BLOCKS`²) worst case through `mark_subtree`, plus its 2.4 KB
+    /// delete-set buffer (one call at a time, never nested). A step with nothing
+    /// to reclaim stays O(`MAX_BLOCKS`). With `R = 0`
+    /// ([`crate::snake_chain::BELOW_TAIL_RETENTION`]) the block is freed at once.
     pub(crate) fn advance_snake_chain_tail(&mut self) -> bool {
         let released = self.snake_chain_tail_idx;
         if released == self.active_chain_head_idx {
@@ -3553,10 +3598,11 @@ impl<
         {
             return false;
         }
-        let Some(new_tail) = (0..MAX_BLOCKS as u32).find(|&idx| {
+        let Some((new_tail, s_tail)) = (0..MAX_BLOCKS as u32).find_map(|idx| {
             self.blocks
                 .get(idx)
-                .is_some_and(|child| child.parent_ref() == released && child.is_on_active_chain())
+                .filter(|child| child.parent_ref() == released && child.is_on_active_chain())
+                .map(|child| (idx, child.sequence()))
         }) else {
             return false;
         };
@@ -3585,27 +3631,7 @@ impl<
         }
         self.blocks.set_parent_ref(new_tail, NONE_REF);
         self.snake_chain_tail_idx = new_tail;
-
-        let s_tail = self
-            .blocks
-            .get(new_tail)
-            .map_or(0, |entry| entry.sequence());
-        for slot in 0..MAX_BRANCH_COUNT {
-            let Some(tail_point) = self.chain_heads.stored_head_tail(slot) else {
-                continue;
-            };
-            // A Stored head's tail-point is never on the active chain: its walk
-            // would have stopped there and made it Connected. The caches are
-            // current here — every path into Ready recomputes them before the
-            // first release, and every later mutation maintains them.
-            if self
-                .blocks
-                .get(tail_point)
-                .is_some_and(|entry| entry.sequence() <= s_tail.saturating_add(1))
-            {
-                self.delete_subtree_with_followup(tail_point);
-            }
-        }
+        self.reclaim_stale_fragments(s_tail);
         // Story 6.1 adds the FR21 `branch_value` tail-eviction subtraction
         // (event (iii)) here, once per released block.
         true
@@ -3940,10 +3966,12 @@ impl<
     fn delete_subtree_with_followup(&mut self, target: u32) -> usize {
         // Collect before deleting, so every ancestry walk runs against the
         // pre-deletion tree. Stack: `[u32; MAX_BLOCKS]` is 2.4 KB at the default
-        // `MAX_BLOCKS = 600`, taken at the `receive_block` seam where
-        // `run_processing_pass`'s equally-sized `marked` buffer is already
-        // released — the same budget the FR5 recovery reasons about, and never
-        // live at the same time as it.
+        // `MAX_BLOCKS = 600`. Every caller runs outside `run_processing_pass` —
+        // the `receive_block` seam, the post-promotion FR8 cleanups, and the
+        // snake-chain release step (reached from the promotion, from genesis and,
+        // from Story 6.0, from the head extension) — so its equally-sized
+        // `marked` buffer is already released, the same budget the FR5 recovery
+        // reasons about, and never live at the same time as it.
         let mut delete_set = [NONE_REF; MAX_BLOCKS];
         let deleted_count = self.blocks.mark_subtree(target, &mut delete_set);
         if deleted_count == 0 {
@@ -9868,35 +9896,39 @@ mod tests {
     }
 
     /// The AC10.4 drive: from the `W`-long window `100..=103`, two head
-    /// extensions. In between, a two-block side branch forks at #101 and a
-    /// one-block side branch forks at #102. Returns the trace, the node, and
-    /// the hashes of the #101 fork's blocks and of the #102 fork.
-    fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [[u8; 32]; 3]) {
+    /// extensions. Before the first, two forks hang off #100 (one of them two
+    /// blocks deep); before the second, one fork hangs off #101 and one off
+    /// #102. Returns the trace, the node, and the forks' hashes:
+    /// `[#100 fork, its child, second #100 fork, #101 fork, #102 fork]`.
+    fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [[u8; 32]; 5]) {
         let (mut bc, h) = w4_ready_on_segment(103);
-        // Dropping #100 (chain-config) needs a chain-config extension (FR49).
-        let b104 = w4_config_anchor_block(104, h[3]);
-        let first = drive_step(&mut bc, &b104, now);
-        // A two-block side branch forked at #101, Connected through it ...
-        let side = salted_linked_block(102, h[1], 5);
-        let side_child = salted_linked_block(103, side.view().hash(), 5);
-        // ... and one forked at #102, which the next advance keeps in range.
-        let keep = salted_linked_block(103, h[2], 6);
-        for blk in [&side, &side_child, &keep] {
+        let fork_a = salted_linked_block(101, h[0], 5);
+        let fork_a_child = salted_linked_block(102, fork_a.view().hash(), 5);
+        let fork_b = salted_linked_block(101, h[0], 6);
+        for blk in [&fork_a, &fork_a_child, &fork_b] {
             let (outcome, _) = bc.receive_block(blk.view(), now);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
-        assert!(
-            !bc.chain_heads.has_stored_head(),
-            "both forks are Connected"
-        );
+        // Dropping #100 (chain-config) needs a chain-config extension (FR49).
+        let b104 = w4_config_anchor_block(104, h[3]);
+        let first = drive_step(&mut bc, &b104, now);
+        let fork_c = salted_linked_block(102, h[1], 8);
+        let keep = salted_linked_block(103, h[2], 6);
+        for blk in [&fork_c, &keep] {
+            let (outcome, _) = bc.receive_block(blk.view(), now);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert!(!bc.chain_heads.has_stored_head(), "every fork is Connected");
         let b105 = linked_transfer_block(105, b104.view().hash());
         let second = drive_step(&mut bc, &b105, now);
         (
             [first, second],
             bc,
             [
-                side.view().hash(),
-                side_child.view().hash(),
+                fork_a.view().hash(),
+                fork_a_child.view().hash(),
+                fork_b.view().hash(),
+                fork_c.view().hash(),
                 keep.view().hash(),
             ],
         )
@@ -9904,16 +9936,16 @@ mod tests {
 
     /// AC10.4 / AC5 / AC6 — the window advance one block at a time: tail
     /// positions, released slots, the new tail unlinked, and FR58 stale
-    /// reclamation (pulled forward, 2026-10-17): the whole branch forked at a
-    /// dropped block is deleted, a branch forked above the new tail is kept,
-    /// and nothing is left asking for a parent below `S_tail`.
+    /// reclamation (DEC-125): every branch forked at a dropped block is deleted
+    /// whole (two in one scan at #100), a branch forked above the new tail is
+    /// kept, and nothing is left asking for a parent below `S_tail`.
     #[test]
     fn snake_drive_past_w() {
         let (h, slot_100, slot_101) = {
             let (bc, h) = w4_ready_on_segment(103);
             (h, slot_of(&bc, 100, &h[0]), slot_of(&bc, 101, &h[1]))
         };
-        let (trace, mut bc, [side, side_child, keep]) = drive_past_w(1_000);
+        let (trace, mut bc, [fork_a, fork_a_child, fork_b, fork_c, keep]) = drive_past_w(1_000);
 
         assert_eq!(
             trace[0],
@@ -9942,12 +9974,17 @@ mod tests {
         assert_eq!(tail.parent_ref(), NONE_REF);
         assert!(tail.is_on_active_chain());
 
-        // FR58: the branch forked at #101 is gone, whole; the one at #102 stays.
-        assert!(slot_of(&bc, 102, &side).is_none(), "fork root deleted");
+        // FR58: every branch forked at a dropped block is gone, whole.
+        assert!(slot_of(&bc, 101, &fork_a).is_none(), "#100 fork deleted");
         assert!(
-            slot_of(&bc, 103, &side_child).is_none(),
-            "and its descendant"
+            slot_of(&bc, 102, &fork_a_child).is_none(),
+            "with its descendant"
         );
+        assert!(
+            slot_of(&bc, 101, &fork_b).is_none(),
+            "second #100 fork, same scan"
+        );
+        assert!(slot_of(&bc, 102, &fork_c).is_none(), "#101 fork deleted");
         let keep_idx = slot_of(&bc, 103, &keep).expect("in-range fork retained");
         assert_eq!(
             bc.blocks.get(keep_idx).map(|e| e.parent_ref()),
@@ -9970,6 +10007,42 @@ mod tests {
         ));
     }
 
+    /// Review r2 (DEC-127) — a Collecting genesis anchor that the adopted chain
+    /// does not contain loses its flag at the promotion and is reclaimed at
+    /// Ready entry, so its branch neither looks Connected nor lingers. Live
+    /// path: only block #0 arrived, so the genesis branch names no
+    /// configuration and FR2 adopts a window-anchored segment instead. Also
+    /// pins that the head recompute runs before the Ready-entry reclamation.
+    #[test]
+    fn snake_ready_entry_reclaims_a_genesis_island() {
+        let mut bc = new_w4_chain();
+        let genesis = node_transfer_block(0, 3, 0, 7);
+        let (outcome, _) = bc.receive_block(genesis.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        let gi = slot_of(&bc, 0, &genesis.view().hash()).expect("genesis stored");
+        assert!(
+            bc.blocks.get(gi).is_some_and(|e| e.is_on_active_chain()),
+            "precondition: the Collecting bootstrap anchor"
+        );
+        let anchor = w4_config_anchor_block(100, [0xAB; 32]);
+        bc.receive_block(anchor.view(), 0);
+        let mut prev = anchor.view().hash();
+        for seq in 101..=103 {
+            let blk = linked_transfer_block(seq, prev);
+            prev = blk.view().hash();
+            bc.receive_block(blk.view(), 0);
+        }
+        assert!(bc.is_ready(), "the window-anchored segment won");
+        assert_eq!(bc.active_snake_chain_window(), Ok((100, 103)));
+        assert!(
+            slot_of(&bc, 0, &genesis.view().hash()).is_none(),
+            "island reclaimed"
+        );
+        assert_eq!(bc.block_tree_len(), 4);
+        assert_eq!(bc.chain_heads.count(), 1, "only the active head");
+        assert!(!bc.chain_heads.has_stored_head());
+    }
+
     /// FR58 stale-fragment reclamation (pulled forward 2026-10-17): at the tail
     /// advance, a Stored fragment whose lowest block `t` has `t - 1 <= S_tail`
     /// is deleted whole; one with `t - 1 > S_tail` may still connect and stays.
@@ -9977,17 +10050,17 @@ mod tests {
     #[test]
     fn snake_advance_reclaims_fragments_that_can_never_connect() {
         let (mut bc, h) = w4_ready_on_segment(103);
-        // Two orphans and a child of the first. After the advance S_tail = 101.
+        // Three orphans, two of them stale. After the advance S_tail = 101.
         let stale = node_transfer_block(102, 3, 101, 7); // t - 1 = 101 = S_tail
-        let stale_child = salted_linked_block(103, stale.view().hash(), 5);
+        let stale_two = node_transfer_block(101, 4, 100, 7); // t - 1 = 100 < S_tail
         let alive = node_transfer_block(103, 3, 102, 7); // t - 1 = 102 > S_tail
-        for blk in [&stale, &stale_child, &alive] {
+        for blk in [&stale, &stale_two, &alive] {
             let (outcome, _) = bc.receive_block(blk.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
         let stored_before: [Option<u32>; 4] =
             core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
-        assert_eq!(stored_before.iter().flatten().count(), 2, "precondition");
+        assert_eq!(stored_before.iter().flatten().count(), 3, "precondition");
 
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
@@ -9999,8 +10072,8 @@ mod tests {
             "stale fragment deleted"
         );
         assert!(
-            slot_of(&bc, 103, &stale_child.view().hash()).is_none(),
-            "whole"
+            slot_of(&bc, 101, &stale_two.view().hash()).is_none(),
+            "second fragment too"
         );
         let alive_idx = slot_of(&bc, 103, &alive.view().hash()).expect("may still connect");
         let stored_after: [Option<u32>; 4] =
