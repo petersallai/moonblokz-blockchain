@@ -3447,9 +3447,10 @@ impl<
     /// released — never the `SNAKE_CHAIN_LENGTH_MAX` capacity in its place
     /// (Story 5.11 Ratified Decision 2).
     ///
-    /// Afterwards every `chain_heads` entry is recomputed against the new
+    /// Before the trim every `chain_heads` entry is recomputed against the new
     /// marking (O-024 ruling): without it the adopted chain's own head stays
-    /// Stored and keeps requesting the anchor's parent, below `S_tail`.
+    /// Stored and keeps requesting the anchor's parent, below `S_tail` — and the
+    /// release step's stale-fragment reclamation would see it as a fragment.
     ///
     /// **Cost.** The tail is found by walking to the root and then releasing,
     /// not by a `W − 1`-step walk, so the release is literally the steady-state
@@ -3468,6 +3469,11 @@ impl<
             }
         }
         self.snake_chain_tail_idx = root;
+        // Before any release: the promotion flagged the adopted chain without
+        // touching `chain_heads`, and the stale-fragment reclamation inside the
+        // release step must not mistake the adopted chain's own head for a
+        // Stored fragment.
+        self.chain_heads.recompute_all_caches(&self.blocks);
 
         let Some(w) = self.active_chain_length() else {
             return;
@@ -3493,7 +3499,6 @@ impl<
                 break;
             }
         }
-        self.chain_heads.recompute_all_caches(&self.blocks);
     }
 
     /// FR48 window-advance / tail-release step (AC5): moves the tail one block
@@ -3518,7 +3523,14 @@ impl<
     ///    with the ordinary lazy [`BlockTable::delete`] — the durable bytes stay
     ///    until the slot is reused (Ratified Decision 3);
     /// 3. its one remaining child, the new tail, is unlinked
-    ///    (`parent_ref = NONE_REF`) and becomes the active chain's root.
+    ///    (`parent_ref = NONE_REF`) and becomes the active chain's root;
+    /// 4. **FR58 stale-fragment reclamation** (Project Lead 2026-10-17): every
+    ///    Stored fragment whose lowest block `t` has `t − 1 ≤ S_tail` (the new
+    ///    tail) is deleted whole. Its missing parent is either below the window
+    ///    (FR60 refuses it) or at `S_tail` — where it cannot be the tail block,
+    ///    which would already have linked it — so the fragment's divergence point
+    ///    is below `S_tail` and it can never connect. A fragment admitted after
+    ///    this step waits for the next advance.
     ///
     /// No `chain_heads` pass is needed for the dropped block itself: it is not a
     /// tip (the new tail is its child), every head above it anchors on the
@@ -3573,6 +3585,27 @@ impl<
         }
         self.blocks.set_parent_ref(new_tail, NONE_REF);
         self.snake_chain_tail_idx = new_tail;
+
+        let s_tail = self
+            .blocks
+            .get(new_tail)
+            .map_or(0, |entry| entry.sequence());
+        for slot in 0..MAX_BRANCH_COUNT {
+            let Some(tail_point) = self.chain_heads.stored_head_tail(slot) else {
+                continue;
+            };
+            // A Stored head's tail-point is never on the active chain: its walk
+            // would have stopped there and made it Connected. The caches are
+            // current here — every path into Ready recomputes them before the
+            // first release, and every later mutation maintains them.
+            if self
+                .blocks
+                .get(tail_point)
+                .is_some_and(|entry| entry.sequence() <= s_tail.saturating_add(1))
+            {
+                self.delete_subtree_with_followup(tail_point);
+            }
+        }
         // Story 6.1 adds the FR21 `branch_value` tail-eviction subtraction
         // (event (iii)) here, once per released block.
         true
@@ -9935,6 +9968,58 @@ mod tests {
             outcome,
             TickOutcome::SendParentRecoveryRequest(_)
         ));
+    }
+
+    /// FR58 stale-fragment reclamation (pulled forward 2026-10-17): at the tail
+    /// advance, a Stored fragment whose lowest block `t` has `t - 1 <= S_tail`
+    /// is deleted whole; one with `t - 1 > S_tail` may still connect and stays.
+    /// Both are admitted in Ready before the advance (FR60 accepts them).
+    #[test]
+    fn snake_advance_reclaims_fragments_that_can_never_connect() {
+        let (mut bc, h) = w4_ready_on_segment(103);
+        // Two orphans and a child of the first. After the advance S_tail = 101.
+        let stale = node_transfer_block(102, 3, 101, 7); // t - 1 = 101 = S_tail
+        let stale_child = salted_linked_block(103, stale.view().hash(), 5);
+        let alive = node_transfer_block(103, 3, 102, 7); // t - 1 = 102 > S_tail
+        for blk in [&stale, &stale_child, &alive] {
+            let (outcome, _) = bc.receive_block(blk.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let stored_before: [Option<u32>; 4] =
+            core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
+        assert_eq!(stored_before.iter().flatten().count(), 2, "precondition");
+
+        let b104 = w4_config_anchor_block(104, h[3]);
+        extend_active_head(&mut bc, &b104, 0);
+        assert!(bc.advance_snake_chain_tail());
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
+
+        assert!(
+            slot_of(&bc, 102, &stale.view().hash()).is_none(),
+            "stale fragment deleted"
+        );
+        assert!(
+            slot_of(&bc, 103, &stale_child.view().hash()).is_none(),
+            "whole"
+        );
+        let alive_idx = slot_of(&bc, 103, &alive.view().hash()).expect("may still connect");
+        let stored_after: [Option<u32>; 4] =
+            core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
+        assert_eq!(
+            stored_after.iter().flatten().count(),
+            1,
+            "only the live fragment is Stored"
+        );
+        assert!(stored_after.contains(&Some(alive_idx)));
+        // The active chain is untouched by the reclamation.
+        for (i, seq) in (101..=104).enumerate() {
+            let hash = if seq == 104 {
+                b104.view().hash()
+            } else {
+                h[i + 1]
+            };
+            assert!(slot_of(&bc, seq, &hash).is_some(), "active #{seq} kept");
+        }
     }
 
     /// AC10.8 — AR16 replay (FR63): the same event sequence twice gives

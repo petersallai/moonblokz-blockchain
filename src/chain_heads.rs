@@ -450,7 +450,8 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// and its parent *index*, never its `previous_hash`, so recovering it needs
     /// a durable read — and durable storage is the `Blockchain`'s, not this
     /// table's. The caller resolves it and hands it back through
-    /// [`Self::set_missing_parent_hash`].
+    /// [`Self::set_missing_parent_hash`]. The snake-chain tail release (Story
+    /// 9.1) reads it too, to find Stored fragments that can no longer connect.
     pub(crate) fn stored_head_tail(&self, slot: usize) -> Option<u32> {
         let head = self.heads.get(slot)?;
         if head.is_empty() || head.is_connected() {
