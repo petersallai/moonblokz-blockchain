@@ -1663,7 +1663,8 @@ impl<
     /// device has already suffered a storage fault.
     fn durable_blocks_present(&self) -> bool {
         let limit = self.durable_scan_limit();
-        (0..limit).any(|idx| self.storage.read_block(idx).is_ok())
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        (0..limit).any(|idx| self.storage.read_block_into(idx, &mut buf).is_ok())
     }
 
     /// Upper bound for a durable scan: the storage's slot capacity, never past
@@ -1726,16 +1727,17 @@ impl<
             // FR64 — the skipped-slot count is a structured-log event, not a
             // field: surfacing it would mean carrying a counter no caller reads
             // until Epic 11 builds the log sink. Emission point marked here.
-            let padded = match self.storage.read_block(idx) {
-                Ok(block) => block,
+            let mut buf = [0u8; MAX_BLOCK_SIZE];
+            match self.storage.read_block_into(idx, &mut buf) {
+                Ok(()) => {}
                 // An empty slot is not damage; anything else is.
                 Err(StorageError::BlockAbsent) => continue,
                 Err(_) => {
                     unusable += 1;
                     continue;
                 }
-            };
-            let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+            }
+            let Some(view) = Self::exact_view(&buf) else {
                 unusable += 1;
                 continue;
             };
@@ -1775,10 +1777,11 @@ impl<
             if self.blocks.get(idx).is_none() {
                 continue;
             }
-            let Ok(padded) = self.storage.read_block(idx) else {
+            let mut buf = [0u8; MAX_BLOCK_SIZE];
+            if self.storage.read_block_into(idx, &mut buf).is_err() {
                 continue;
-            };
-            let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+            }
+            let Some(view) = Self::exact_view(&buf) else {
                 continue;
             };
             let Ok(prev_hash) = <[u8; 32]>::try_from(view.previous_hash()) else {
@@ -1869,8 +1872,9 @@ impl<
     /// The `previous_hash` of the block in durable slot `idx`, trimmed to its
     /// recovered exact length. `None` when the slot cannot be read or measured.
     fn previous_hash_of(&self, idx: u32) -> Option<[u8; 32]> {
-        let padded = self.storage.read_block(idx).ok()?;
-        let view = Self::exact_view(padded.serialized_bytes())?;
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        self.storage.read_block_into(idx, &mut buf).ok()?;
+        let view = Self::exact_view(&buf)?;
         <[u8; 32]>::try_from(view.previous_hash()).ok()
     }
 
@@ -1901,10 +1905,11 @@ impl<
             if !is_config {
                 continue;
             }
-            let Ok(padded) = self.storage.read_block(idx) else {
+            let mut buf = [0u8; MAX_BLOCK_SIZE];
+            if self.storage.read_block_into(idx, &mut buf).is_err() {
                 continue;
-            };
-            let Some(view) = Self::exact_view(padded.serialized_bytes()) else {
+            }
+            let Some(view) = Self::exact_view(&buf) else {
                 continue;
             };
             // The same state-free FR7 gate the intake path uses, so the two
@@ -2000,13 +2005,9 @@ impl<
             return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
         }
 
-        // Storage-first: peek the slot, persist there, then write the entry at
-        // that same slot. Reconstruct an owned `Block` for the storage seam
-        // (`save_block` takes `&Block`); this copy happens only on the success
-        // path, after Tier 1 passed.
+        // Peek the slot; the entry and the durable write both land there
+        // (`persist` reconstructs the owned `Block` the storage seam takes).
         let idx = self.blocks.next_free_index().ok_or(AdmitError::TableFull)?;
-        let owned = Block::from_bytes(block.serialized_bytes())
-            .map_err(|_| AdmitError::Rejected(Tier1Failure::MalformedPayload))?;
 
         // FR8 tentative load (Story 5.9, AC2). The **first** chain-config block
         // whose FR7 content-signature verified — `tier1_gate` above owns that,
@@ -2111,7 +2112,7 @@ impl<
             }
         }
 
-        if self.storage.save_block(idx, &owned).is_err() {
+        if self.persist(idx, block).is_err() {
             // The durable write is the one step after the load that can still
             // fail. Undo the load rather than keep a configuration whose block
             // was never persisted: on the next boot the block is not there, so a
@@ -2168,6 +2169,16 @@ impl<
             }
         }
         Ok(idx)
+    }
+
+    /// Saves `block` at `idx` through the storage seam, which takes an owned
+    /// [`Block`]. The copy lives only in this frame, never alongside the
+    /// per-block step (stack budget, DEC-136). A view that does not convert
+    /// cannot occur — it parsed at intake — and is reported as a failed save.
+    #[inline(never)]
+    fn persist(&mut self, idx: u32, block: &BlockView) -> Result<(), ()> {
+        let owned = Block::from_bytes(block.serialized_bytes()).map_err(|_| ())?;
+        self.storage.save_block(idx, &owned).map_err(|_| ())
     }
 
     /// FR10 block-intake surface (Story 4.3). Classifies a submitted block into
@@ -2671,6 +2682,9 @@ impl<
     /// chain-switch that re-derives over shared blocks must work on a copy — a
     /// failed re-derivation there would zero a shared block's *committed*
     /// available-UTXO bits instead of restoring them.
+    // Its own frame: the 2.4 KB delete-set never merges with the pass's
+    // buffers into the acquisition loop's frame (stack budget, DEC-136).
+    #[inline(never)]
     pub(crate) fn recover_from_failed_pass(
         &mut self,
         err: ProcessingError,
@@ -2849,6 +2863,8 @@ impl<
     /// atomic recovery (Story 5.5). Reads no wall-clock (`now`-independent —
     /// FR63/NFR5); the only PRNG use is whatever `VoteEngine` performs internally
     /// (none for accumulation).
+    // Its own frame: see `recover_from_failed_pass` (DEC-136).
+    #[inline(never)]
     pub(crate) fn run_processing_pass(
         &mut self,
         candidate_tip_idx: u32,
@@ -3024,22 +3040,14 @@ impl<
         // candidates re-derive from block #0, so their watermark must build from 0
         // (the floor would wrongly pre-inflate it); skipped for them. One extra
         // storage read; the block is re-read (and re-validated) in the forward walk.
+        // One read buffer for the floor read and the whole forward walk.
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
         if !genesis_anchored
             && floor_balance_idx != NONE_REF
-            && let Ok(floor_block) = self.storage.read_block(floor_balance_idx)
+            && let Some(view) = self.view_retained(floor_balance_idx, &mut buf)
+            && let Some(payload) = view.balances()
         {
-            // Trim the zero-padded read-back to the exact stored length before
-            // parsing, exactly as the forward walk does.
-            let full = floor_block.serialized_bytes();
-            let n = match self.blocks.get(floor_balance_idx).map(|e| e.len() as usize) {
-                Some(len) if len > 0 && len <= full.len() => len,
-                _ => full.len(),
-            };
-            if let Ok(view) = BlockView::from_bytes(&full[..n])
-                && let Some(payload) = view.balances()
-            {
-                self.node_info.set_max_known_node_id(payload.max_node_id());
-            }
+            self.node_info.set_max_known_node_id(payload.max_node_id());
         }
 
         // `max_known_node_id` is an authoritative node-existence bound only once it
@@ -3068,29 +3076,12 @@ impl<
         let mut result = Ok(());
         for i in (0..count).rev() {
             let idx = marked[i];
-            let block = match self.storage.read_block(idx) {
-                Ok(b) => b,
-                Err(_) => {
-                    result = Err(ProcessingError::StorageRead);
-                    break;
-                }
-            };
-            // Trim the zero-padded read-back block to its exact stored length so
-            // the byte-exact FR6 checks (block-creator signature, chain-config
-            // content-identity, hash linkage) see the bytes originally signed —
-            // durable backends store blocks in fixed-size slots and read them
-            // back padded (Story 5.4).
-            let full = block.serialized_bytes();
-            let n = match self.blocks.get(idx).map(|e| e.len() as usize) {
-                Some(len) if len > 0 && len <= full.len() => len,
-                _ => full.len(),
-            };
-            let view = match BlockView::from_bytes(&full[..n]) {
-                Ok(v) => v,
-                Err(_) => {
-                    result = Err(ProcessingError::StorageRead);
-                    break;
-                }
+            // The exact stored length, so the byte-exact FR6 checks
+            // (block-creator signature, chain-config content-identity, hash
+            // linkage) see the bytes originally signed (Story 5.4).
+            let Some(view) = self.view_retained(idx, &mut buf) else {
+                result = Err(ProcessingError::StorageRead);
+                break;
             };
             let this_hash = view.hash();
             if let Err(e) = self.validate_and_derive_block(&view, idx, prev_hash, &mut projection) {
@@ -3755,6 +3746,9 @@ impl<
     /// `Some(valid)`, or `None` when the creator's public key is not yet derivable
     /// (pre-seed zone → the block is trusted, not re-proved). Node #0 resolves to
     /// the FR69 trust anchor (`node_zero_public_key`), available from construction.
+    // Its own frame (stack budget, DEC-136): the 2 KB preimage is live only
+    // here, never alongside the UTXO resolver's read buffer.
+    #[inline(never)]
     fn verify_block_creator_signature(&self, view: &BlockView) -> Option<bool> {
         let creator = view.creator();
         let key: [u8; PUBLIC_KEY_SIZE] = if creator == 0 {
@@ -3787,6 +3781,7 @@ impl<
     /// bad signature. Only node-transfer / registration transactions have this
     /// fixed trailing-64 layout; balance/UTXO input signatures (embedded, no
     /// `new_signed` convention) are a deferred seam.
+    #[inline(never)]
     fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
         let Some(key) = self.node_info.public_key_of(signer_node_id) else {
             return false;
@@ -3837,6 +3832,9 @@ impl<
     ///    (storage and RAM disagree); a `declared_amount` other than the
     ///    output's is `UtxoAmountMismatch`;
     /// 6. the bit is cleared.
+    // Its own frame (stack budget, DEC-136): the read buffer must not merge
+    // into the per-block step's frame with the signature preimage.
+    #[inline(never)]
     pub(crate) fn resolve_and_spend_utxo(
         &mut self,
         parent_idx: u32,
@@ -3863,27 +3861,15 @@ impl<
             None if trust_below_anchor => return Ok(None),
             None => return Err(unresolvable),
         };
-        let stored_len = self
-            .blocks
-            .get(ref_idx)
-            .map_or(0, |entry| entry.len() as usize);
-
         let bit = output_index as usize;
         if self.blocks.utxo_available(ref_idx, bit) != Some(true) {
             return Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable));
         }
 
-        let block = self
-            .storage
-            .read_block(ref_idx)
-            .map_err(|_| UtxoSpendError::StorageRead)?;
-        let full = block.serialized_bytes();
-        let n = if stored_len > 0 && stored_len <= full.len() {
-            stored_len
-        } else {
-            full.len()
-        };
-        let view = BlockView::from_bytes(&full[..n]).map_err(|_| UtxoSpendError::StorageRead)?;
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self
+            .view_retained(ref_idx, &mut buf)
+            .ok_or(UtxoSpendError::StorageRead)?;
         // The bit said the output exists; bytes that lack it are the node's own
         // fault, not evidence against the spending block.
         let (address, amount) =
@@ -3990,25 +3976,11 @@ impl<
             let Some((child, _)) = child else {
                 return;
             };
-            // The read copy (~2 KB) is dropped before any deletion or tail
-            // advance, whose delete-set buffer (2.4 KB) must not share the
-            // stack with it (D4).
-            let verdict = match self.read_retained_block(child) {
-                Some(block) => {
-                    let view = block.view();
-                    match self.judge_head_extension(&view, child) {
-                        Extension::Valid {
-                            advance,
-                            derivation,
-                        } => match self.commit_block(&view, child, derivation) {
-                            Ok(()) => Some(advance),
-                            Err(err) if is_evidence(&err) => None,
-                            Err(_) => return,
-                        },
-                        Extension::Invalid => None,
-                        Extension::Local => return,
-                    }
-                }
+            // The child's read copy lives in its own frame, gone before any
+            // deletion or tail advance, whose delete-set buffer (2.4 KB) must
+            // not share the stack with it (D4, DEC-136).
+            let verdict = match self.apply_stored_child(child) {
+                Some(verdict) => verdict,
                 None => return,
             };
             match verdict {
@@ -4022,6 +3994,27 @@ impl<
                     self.delete_subtree_with_followup(child);
                 }
             }
+        }
+    }
+
+    /// Reads a stored child of the head and runs the whole per-block step on
+    /// it: `Some(Some(advance))` when it applied (promote it), `Some(None)` on
+    /// evidence (delete it), `None` on a local failure (leave it Stored).
+    #[inline(never)]
+    fn apply_stored_child(&mut self, child: u32) -> Option<Option<bool>> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(child, &mut buf)?;
+        match self.judge_head_extension(&view, child) {
+            Extension::Valid {
+                advance,
+                derivation,
+            } => match self.commit_block(&view, child, derivation) {
+                Ok(()) => Some(Some(advance)),
+                Err(err) if is_evidence(&err) => Some(None),
+                Err(_) => None,
+            },
+            Extension::Invalid => Some(None),
+            Extension::Local => None,
         }
     }
 
@@ -4579,13 +4572,27 @@ impl<
     /// applies, factored out because the commitment lifecycle needs it at three
     /// separate seams.
     fn read_retained_block(&self, idx: u32) -> Option<Block> {
-        let padded = self.storage.read_block(idx).ok()?;
-        let full = padded.serialized_bytes();
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        Block::from_bytes(view.serialized_bytes()).ok()
+    }
+
+    /// Reads the retained block at `idx` into the caller's `buf` and views it
+    /// at the length cached at admission (`BlockEntry::len`): durable slots
+    /// read back padded, and the FR6 byte-exact checks need the bytes that
+    /// were signed. The caller's buffer is the only copy (stack budget,
+    /// DEC-136). `None` on a failed read or bytes that no longer parse.
+    fn view_retained<'b>(
+        &self,
+        idx: u32,
+        buf: &'b mut [u8; MAX_BLOCK_SIZE],
+    ) -> Option<BlockView<'b>> {
+        self.storage.read_block_into(idx, buf).ok()?;
         let n = match self.blocks.get(idx).map(|entry| entry.len() as usize) {
-            Some(len) if len > 0 && len <= full.len() => len,
-            _ => full.len(),
+            Some(len) if len > 0 && len <= MAX_BLOCK_SIZE => len,
+            _ => MAX_BLOCK_SIZE,
         };
-        Block::from_bytes(&full[..n]).ok()
+        BlockView::from_bytes(&buf[..n]).ok()
     }
 
     /// Deletes `target` and its whole descendant subtree, with the FR19
@@ -4743,6 +4750,9 @@ impl<
     /// A refused promotion is not papered over: `promote_durable` refuses a
     /// second promotion by design (Story 5.7), and swallowing that would turn the
     /// set-once guarantee into a no-op.
+    // Its own frame (stack budget, DEC-136): its block buffer stays out of
+    // the acquisition loop's frame.
+    #[inline(never)]
     fn commit_durable_chain_config(&mut self, first_config_idx: u32) -> Result<(), ()> {
         let block = self.read_retained_block(first_config_idx).ok_or(())?;
         // The pass compared content from one read of this slot; this is a second
@@ -4843,12 +4853,11 @@ impl<
         let Some(held) = self.held_chain_config_content() else {
             return ConfigPreload::Matches;
         };
-        let Some(block) = self.read_retained_block(idx) else {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let Some(view) = self.view_retained(idx, &mut buf) else {
             return ConfigPreload::Unreadable;
         };
-        match BlockView::from_bytes(block.serialized_bytes())
-            .ok()
-            .and_then(|view| view.chain_config().map(|config| config.content() == held))
+        match Some(view).and_then(|view| view.chain_config().map(|config| config.content() == held))
         {
             Some(true) => ConfigPreload::Matches,
             Some(false) => ConfigPreload::Differs,
@@ -4885,11 +4894,11 @@ impl<
         let Some(locked) = self.chain_config.durable_content() else {
             return ConfigPreload::Unreadable;
         };
-        let Some(block) = self.read_retained_block(idx) else {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let Some(view) = self.view_retained(idx, &mut buf) else {
             return ConfigPreload::Unreadable;
         };
-        match BlockView::from_bytes(block.serialized_bytes())
-            .ok()
+        match Some(view)
             .and_then(|view| view.chain_config().map(|config| config.content() == locked))
         {
             Some(true) => ConfigPreload::Matches,
@@ -4928,9 +4937,12 @@ impl<
     /// Returns `Err(())` when the block cannot be read, its signature does not
     /// re-verify, or the module refuses its content — each exact evidence against
     /// that block (FR16), which the caller routes into the FR5 recovery.
+    // Its own frame (stack budget, DEC-136): its block buffer stays out of
+    // the acquisition loop's frame.
+    #[inline(never)]
     fn adopt_candidate_chain_config(&mut self, tip: u32, first_config_idx: u32) -> Result<(), ()> {
-        let block = self.read_retained_block(first_config_idx).ok_or(())?;
-        let view = BlockView::from_bytes(block.serialized_bytes()).map_err(|_| ())?;
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(first_config_idx, &mut buf).ok_or(())?;
         // FR7 re-verification, over the same state-free gate the intake path uses,
         // so the two can never drift apart.
         tier1_chain_config_block(&view, &self.node_zero_public_key, &self.crypto)
@@ -5221,7 +5233,11 @@ mod tests {
             Ok(())
         }
 
-        fn read_block(&self, idx: u32) -> Result<Block, StorageError> {
+        fn read_block_into(
+            &self,
+            idx: u32,
+            _out: &mut [u8; MAX_BLOCK_SIZE],
+        ) -> Result<(), StorageError> {
             // Two slots are occupied-but-corrupt; the rest are genuinely empty.
             if idx < 2 {
                 Err(StorageError::IntegrityFailure)
@@ -5264,7 +5280,11 @@ mod tests {
             Err(StorageError::InvalidIndex)
         }
 
-        fn read_block(&self, _storage_index: u32) -> Result<Block, StorageError> {
+        fn read_block_into(
+            &self,
+            _storage_index: u32,
+            _out: &mut [u8; MAX_BLOCK_SIZE],
+        ) -> Result<(), StorageError> {
             Err(StorageError::BlockAbsent)
         }
 
@@ -11388,7 +11408,11 @@ mod tests {
             self.inner.save_block(idx, block)
         }
 
-        fn read_block(&self, idx: u32) -> Result<Block, StorageError> {
+        fn read_block_into(
+            &self,
+            idx: u32,
+            out: &mut [u8; MAX_BLOCK_SIZE],
+        ) -> Result<(), StorageError> {
             if idx == self.failing_slot {
                 self.attempts.set(self.attempts.get() + 1);
                 let left = self.reads_left.get();
@@ -11397,7 +11421,7 @@ mod tests {
                 }
                 self.reads_left.set(left - 1);
             }
-            self.inner.read_block(idx)
+            self.inner.read_block_into(idx, out)
         }
 
         fn capacity(&self) -> u32 {
@@ -12175,11 +12199,15 @@ mod tests {
             self.inner.save_block(idx, block)
         }
 
-        fn read_block(&self, idx: u32) -> Result<Block, StorageError> {
+        fn read_block_into(
+            &self,
+            idx: u32,
+            out: &mut [u8; MAX_BLOCK_SIZE],
+        ) -> Result<(), StorageError> {
             if idx == self.failing_read_slot {
                 return Err(StorageError::BackendIo { code: 9 });
             }
-            self.inner.read_block(idx)
+            self.inner.read_block_into(idx, out)
         }
 
         fn capacity(&self) -> u32 {
