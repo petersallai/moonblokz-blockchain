@@ -1820,6 +1820,16 @@ impl<
         // all-zero sentinel and `select_parent_recovery` emits FR19 requests for
         // a hash that can never resolve — for the lifetime of the node. The
         // crate warns about exactly that state twice already.
+        self.seed_missing_parent_hashes();
+
+        RebuildStats { admitted, unusable }
+    }
+
+    /// Seeds every Stored head's missing-parent cache from its tail-point's
+    /// durable `previous_hash` — the one `chain_heads` field the tree cannot
+    /// derive. One read per Stored head; an unreadable tail keeps its value.
+    /// Used by the FR59 rebuild and the index self-repair.
+    fn seed_missing_parent_hashes(&mut self) {
         for slot in 0..MAX_BRANCH_COUNT {
             let Some(tail_idx) = self.chain_heads.stored_head_tail(slot) else {
                 continue;
@@ -1829,8 +1839,31 @@ impl<
             };
             self.chain_heads.set_missing_parent_hash(slot, &prev_hash);
         }
+    }
 
-        RebuildStats { admitted, unusable }
+    /// Index self-repair after a `MissingBlock` failure (DEC-134): every block
+    /// whose `parent_ref` names a freed slot is unlinked, becoming the
+    /// tail-point of a Stored fragment that FR19 parent recovery asks for
+    /// again. The tree is then classified afresh and the new tail-points' missing
+    /// parents read from storage. Nothing is deleted; no deletion path leaves
+    /// such a reference (every deletion is child-closed and the tail release
+    /// unlinks the new tail), so this only guards against a defect.
+    /// O(`MAX_BLOCKS`), plus one read per Stored head when anything changed.
+    fn unlink_dangling_parents(&mut self) {
+        let mut unlinked = false;
+        for idx in 0..MAX_BLOCKS as u32 {
+            let Some(parent) = self.blocks.get(idx).map(|entry| entry.parent_ref()) else {
+                continue;
+            };
+            if parent != NONE_REF && self.blocks.get(parent).is_none() {
+                self.blocks.set_parent_ref(idx, NONE_REF);
+                unlinked = true;
+            }
+        }
+        if unlinked {
+            self.chain_heads.recompute_all_caches(&self.blocks);
+            self.seed_missing_parent_hashes();
+        }
     }
 
     /// The `previous_hash` of the block in durable slot `idx`, trimmed to its
@@ -2555,12 +2588,12 @@ impl<
     /// `ProcessingError::Invalid { block_idx, .. }` is the only variant that
     /// pins a block, and the forward walk guarantees `block_idx` is the
     /// **earliest** offender. A local failure (`StorageRead`,
-    /// `Vote(NotParameterized)`) is no evidence at all and deletes nothing
-    /// (amended FR5, DEC-037). The remaining variants (`MarkOverflow`,
-    /// `MissingBlock`, an arithmetic `Vote(_)`) pin no specific block, so the
-    /// target is the candidate head — FR5's explicit "delete exactly one block,
-    /// the candidate chain's head" fallback (O-021 asks whether the first two
-    /// should join the local failures). `ValidationReason` is
+    /// `Vote(NotParameterized)`, DEC-037; `MarkOverflow`, `MissingBlock`,
+    /// DEC-134) is no evidence at all and deletes nothing; after a
+    /// `MissingBlock` the index repairs itself (step 5b). An arithmetic
+    /// `Vote(_)` pins no specific block, so the target is the candidate head —
+    /// FR5's explicit "delete exactly one block, the candidate chain's head"
+    /// fallback. `ValidationReason` is
     /// diagnostic only (the FR64 log, Epic 11) and is never a selection input.
     ///
     /// **Step 3 — transitive deletion** (FR5): the target and every transitive
@@ -2658,18 +2691,20 @@ impl<
         self.reset_vote_engine();
 
         // Step 2 — exact offender, else the candidate-head fallback. A local
-        // failure — a read error or an absent vote parameter — is no evidence
-        // and deletes nothing (amended FR5, DEC-037); the node retries on a
-        // later admission. A mark overflow or a missing block keeps the head
-        // fallback (O-021 open).
+        // failure is no evidence and deletes nothing; the node retries on a
+        // later admission: a read error or an absent vote parameter (amended
+        // FR5, DEC-037), and an inconsistency of the node's own index — a mark
+        // overflow or a `parent_ref` into a freed slot (DEC-134). Both lie
+        // deeper than the tip, so deleting the head could never cure them.
         let target = match err {
             ProcessingError::Invalid { block_idx, .. } => block_idx,
             ProcessingError::StorageRead
-            | ProcessingError::Vote(VoteEngineError::NotParameterized) => NONE_REF,
-            ProcessingError::MarkOverflow
+            | ProcessingError::MarkOverflow
             | ProcessingError::MissingBlock
-            | ProcessingError::Vote(_) => candidate_tip_idx,
+            | ProcessingError::Vote(VoteEngineError::NotParameterized) => NONE_REF,
+            ProcessingError::Vote(_) => candidate_tip_idx,
         };
+        let repair_index = matches!(err, ProcessingError::MissingBlock);
 
         // Step 3 — collect the subtree first, then delete, so every ancestry
         // walk runs against the pre-deletion tree. A target naming an
@@ -2788,6 +2823,12 @@ impl<
             let deleted = &delete_set[..deleted_count];
             self.chain_heads
                 .on_blocks_deleted(&mut self.blocks, deleted, parent_of_target);
+        }
+
+        // Step 5b — index self-repair (DEC-134), against the final marking,
+        // so the next FR2 evaluation sees a tree it can walk.
+        if repair_index {
+            self.unlink_dangling_parents();
         }
 
         // Step 6 — revert. The caller re-evaluates FR2 (see step 6 in the doc).
@@ -7758,8 +7799,9 @@ mod tests {
         assert_eq!(bc.current_phase(), LifecyclePhase::Collecting);
     }
 
-    /// AC11(b) — a non-`Invalid` failure is not exact evidence against any
+    /// AC11(b) — an arithmetic vote failure is not exact evidence against any
     /// specific block, so exactly **one** block is deleted: the candidate head.
+    /// The local failures delete nothing.
     /// Its parent becomes the new tip and stays tracked, so the shortened branch
     /// remains an FR2 candidate.
     #[test]
@@ -7787,29 +7829,26 @@ mod tests {
             )
         }
         // A local failure is no evidence at all: nothing is deleted (amended
-        // FR5, DEC-037, Story 6.0 Task 10.1).
+        // FR5, DEC-037 and DEC-134).
         for err in [
             ProcessingError::StorageRead,
             ProcessingError::Vote(VoteEngineError::NotParameterized),
+            ProcessingError::MissingBlock,
+            ProcessingError::MarkOverflow,
         ] {
             assert_eq!(run(err).0, 3, "a local failure deletes nothing");
         }
-        for err in [
-            ProcessingError::MissingBlock,
-            ProcessingError::MarkOverflow,
-            // AC3 names four non-`Invalid` variants, and `Vote(_)` is the one
-            // the fallback exists for: the Story-5.4 review accepted that a vote
-            // failure carries no `block_idx`, and this arm is what makes that
-            // imprecision safe. Cover it explicitly, not by family resemblance.
-            ProcessingError::Vote(VoteEngineError::AccumulatedVoteOverflow),
-        ] {
-            assert_eq!(
-                run(err),
-                (2, true, true),
-                "the head fallback deletes exactly the candidate head and keeps \
-                 the shortened branch tracked"
-            );
-        }
+        // `Vote(_)` is the one the head fallback exists for: the Story-5.4
+        // review accepted that a vote failure carries no `block_idx`, and this
+        // arm is what makes that imprecision safe.
+        assert_eq!(
+            run(ProcessingError::Vote(
+                VoteEngineError::AccumulatedVoteOverflow
+            )),
+            (2, true, true),
+            "the head fallback deletes exactly the candidate head and keeps \
+             the shortened branch tracked"
+        );
     }
 
     /// Task 2 / AC3 degenerate target: an `Invalid` whose `block_idx` names an
@@ -12727,5 +12766,59 @@ mod tests {
         receive(&mut bc, &a);
         assert_eq!(head_of(&bc), (2, a.view().hash()));
         assert!(bc.blocks.find(3, &child.view().hash()).is_none());
+    }
+
+    /// DEC-134 — a `parent_ref` into a freed slot is the node's own index
+    /// defect: the pass reports `MissingBlock`, the recovery deletes nothing,
+    /// unlinks the dangling reference, and the block becomes a Stored
+    /// tail-point that FR19 asks its real parent for.
+    #[test]
+    fn missing_block_repairs_the_index_and_deletes_nothing() {
+        let mut bc = new_test_chain();
+        let genesis = node_transfer_block(0, 0, 0, 0);
+        bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+            .expect("genesis admitted");
+        let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+        bc.tier1_admit(&b1.view(), &b1.view().hash(), 0)
+            .expect("b1 admitted");
+        let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+        let bi2 = bc
+            .tier1_admit(&b2.view(), &b2.view().hash(), 0)
+            .expect("b2 admitted");
+        // The defect: b2 names a slot that holds no block.
+        let freed = bc.blocks.next_free_index().expect("free");
+        bc.blocks.set_parent_ref(bi2, NONE_REF);
+        bc.blocks.set_parent_ref(bi2, freed);
+
+        bc.set_lifecycle_phase(LifecyclePhase::Processing);
+        let err = bc
+            .run_processing_pass(bi2)
+            .expect_err("the walk meets the freed slot");
+        assert_eq!(err, ProcessingError::MissingBlock);
+        bc.recover_from_failed_pass(err, bi2);
+
+        assert_eq!(bc.blocks.len(), 3, "nothing deleted");
+        assert_eq!(bc.current_phase(), LifecyclePhase::Collecting);
+        assert_eq!(
+            bc.blocks.get(bi2).map(|e| e.parent_ref()),
+            Some(NONE_REF),
+            "unlinked"
+        );
+        assert!(
+            (0..4).any(|slot| bc.chain_heads.stored_head_tail(slot) == Some(bi2)),
+            "b2 is a Stored tail-point"
+        );
+        let (outcome, _) = bc.on_tick(u64::MAX / 2);
+        match outcome {
+            TickOutcome::SendParentRecoveryRequest(req) => {
+                assert_eq!(
+                    req.missing_parent_hash(),
+                    &b1.view().hash(),
+                    "asks for its parent"
+                );
+                assert_eq!(req.claimed_parent_sequence(), 1);
+            }
+            _ => panic!("a parent-recovery request is due"),
+        }
     }
 }
