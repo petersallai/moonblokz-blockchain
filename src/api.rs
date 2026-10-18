@@ -452,6 +452,7 @@ const _: () = assert!(MAX_BLOCK_SIZE <= u16::MAX as usize);
 /// block's UTXO outputs, stated to the configuration module in `BUILD_LIMITS`
 /// and enforced at Tier 1 before the durable lock (DEC-132).
 const UTXO_BITFIELD_WIDTH: u16 = (AVAILABLE_UTXO_BYTES * 8) as u16;
+const _: () = assert!(AVAILABLE_UTXO_BYTES * 8 <= u16::MAX as usize);
 
 /// Failure modes of the FR3 processing pass (Story 5.3).
 ///
@@ -2145,6 +2146,14 @@ impl<
                         if let Some(offender) =
                             self.candidate_block_exceeding_size_limit(candidate_tip_idx)
                         {
+                            // The pass returned `Ok`, so its abort-path clear never
+                            // ran and the derived available-UTXO bits are still set;
+                            // the recovery does not sweep them, and a surviving
+                            // block must not advertise outputs of a chain the node
+                            // did not adopt (DEC-132).
+                            for idx in 0..MAX_BLOCKS {
+                                self.blocks.clear_available_utxo(idx as u32);
+                            }
                             self.recover_from_failed_pass(
                                 ProcessingError::Invalid {
                                     block_idx: offender,
@@ -10631,7 +10640,11 @@ mod tests {
                 reason: ValidationReason::UtxoUnavailable,
             })
         );
-        assert_eq!(bc.blocks.utxo_available(side_idx, 0), Some(false));
+        assert_eq!(
+            bc.blocks.has_available_utxo(side_idx),
+            Some(false),
+            "a side branch is never derived: its whole bitfield stays 0"
+        );
     }
 
     /// AC8 (7) / AC5 — Tier 1 rejects a UTXO input whose `block_sequence` is
@@ -11007,6 +11020,13 @@ mod tests {
         bc.tier1_admit(&stray.view(), &stray.view().hash(), 0)
             .expect("the stray is admitted");
         assert!(bc.chain_config.tentative_content().is_some());
+        assert_eq!(
+            bc.chain_config
+                .active_configuration()
+                .map(|config| config.max_utxo_outputs()),
+            Some(1),
+            "the tentative configuration really declares the cap of 1"
+        );
         assert!(
             bc.tier1_admit(&two_outputs.view(), &two_outputs.view().hash(), 0)
                 .is_ok(),
@@ -11040,6 +11060,36 @@ mod tests {
     /// Tier 1 admitted under the bitfield-width bound cannot be adopted past it.
     #[test]
     fn fr3_pass_enforces_the_candidates_declared_utxo_output_cap() {
+        let (mut bc, h100) = tentative_one_utxo_output_chain();
+        let mint = utxo_mint_block(h100);
+        let mi = admit(&mut bc, &mint);
+
+        assert_eq!(
+            bc.run_processing_pass(mi),
+            Err(ProcessingError::Invalid {
+                block_idx: mi,
+                reason: ValidationReason::TooManyUtxoOutputs,
+            })
+        );
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "rolled back");
+    }
+
+    /// Story 6.11 D3 boundary — exactly the declared cap passes the FR6 step.
+    #[test]
+    fn fr3_pass_admits_exactly_the_declared_utxo_output_cap() {
+        let (mut bc, h100) = tentative_one_utxo_output_chain();
+        let tx = utxo_tx(101, &[], Some((1, 100)), &[Ok(100)]);
+        let block = complex_tx_block(101, h100, 3, 0, &[&tx]);
+        let bi = admit(&mut bc, &block);
+
+        bc.run_processing_pass(bi).expect("one output, cap one");
+        assert_eq!(bc.blocks.utxo_available(bi, 0), Some(true));
+    }
+
+    /// An unconfigured node holding, tentatively, a chain-config anchor at 99
+    /// that declares `max_block_utxo_output = 1`, and the [`utxo_test_chain`]
+    /// balance block at 100 above it. Returns the node and block 100's hash.
+    fn tentative_one_utxo_output_chain() -> (TestChain, [u8; 32]) {
         let mut bc = new_unconfigured_test_chain();
         let cfg = chain_config_block_from(99, [0xAB; 32], &mut one_utxo_output_config_builder());
         admit(&mut bc, &cfg);
@@ -11054,16 +11104,79 @@ mod tests {
             3,
         );
         admit(&mut bc, &seed);
-        let mint = utxo_mint_block(seed.view().hash());
-        let mi = admit(&mut bc, &mint);
+        (bc, seed.view().hash())
+    }
 
+    /// Story 6.11 AC2 / AC4 end to end — deriving a block sets exactly one bit
+    /// per UTXO output, which gives it the FR51 tail obligation; spending every
+    /// output clears it.
+    #[test]
+    fn utxo_derivation_drives_the_tail_obligation() {
+        let (mut bc, h100) = utxo_test_chain();
+        let mint = utxo_mint_block(h100);
+        let mi = admit(&mut bc, &mint);
+        bc.run_processing_pass(mi).expect("the mint derives");
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true));
+        assert_eq!(bc.blocks.utxo_available(mi, 1), Some(true));
         assert_eq!(
-            bc.run_processing_pass(mi),
-            Err(ProcessingError::Invalid {
-                block_idx: mi,
-                reason: ValidationReason::TooManyUtxoOutputs,
-            })
+            bc.blocks.utxo_available(mi, 2),
+            Some(false),
+            "two outputs only"
         );
-        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "rolled back");
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, mi),
+            Ok(TailObligation::Utxo)
+        );
+
+        let tx = utxo_tx(102, &[(101, 0, 60), (101, 1, 40)], None, &[Err((2, 100))]);
+        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+        let si = admit(&mut bc, &spend);
+        bc.run_processing_pass(si).expect("both outputs spent");
+        assert_eq!(bc.blocks.has_available_utxo(mi), Some(false));
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, mi),
+            Ok(TailObligation::None)
+        );
+    }
+
+    /// Review patch — the lock-time `BlockTooLarge` rollback follows a pass that
+    /// returned `Ok`, so it must clear the derived bits itself: a surviving
+    /// ancestor of the offender may not keep advertising its outputs.
+    #[test]
+    fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
+        let mut bc = new_unconfigured_w4_chain();
+        let base = balance_block(100, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let one = utxo_tx(101, &[], None, &[Ok(5)]);
+        let b101 = complex_tx_block(101, base.view().hash(), 3, 0, &[&one]);
+        let three = utxo_tx(102, &[], None, &[Ok(5), Ok(6), Ok(7)]);
+        let b102 = complex_tx_block(102, b101.view().hash(), 3, 0, &[&three]);
+        let cfg =
+            chain_config_block_from(103, b102.view().hash(), &mut small_limit_config_builder(W4));
+        for small in [&base, &b101, &cfg] {
+            assert!(small.len() <= SMALL_BLOCK_SIZE_LIMIT as usize);
+        }
+        assert!(b102.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
+        for block in [&base, &b101, &b102, &cfg] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+
+        assert!(
+            !bc.is_ready(),
+            "the re-evaluation at the lock refuses the candidate"
+        );
+        assert!(
+            bc.blocks.find(102, &b102.view().hash()).is_none(),
+            "offender deleted"
+        );
+        let survivor = bc
+            .blocks
+            .find(101, &b101.view().hash())
+            .expect("the offender's ancestor survives");
+        assert_eq!(
+            bc.blocks.has_available_utxo(survivor),
+            Some(false),
+            "no bit of the refused candidate survives"
+        );
     }
 }

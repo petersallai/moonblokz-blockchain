@@ -110,10 +110,6 @@ const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
 /// field access rather than an accessor surface, keeping the embedded API
 /// surface small — the same discipline `moonblokz-mempool`'s `IndexEntry`
 /// follows.
-// No caller reads `head_ref_count`/`available_utxo` yet (Story 4.2/4.4/Epic 7
-// consume them); silencing dead_code keeps the struct clean until those
-// callers land, matching Story 1.2's scaffold convention.
-#[allow(dead_code)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct BlockEntry {
     hash: [u8; 32],
