@@ -196,7 +196,7 @@ where
     //    head arrival timestamp / bootstrap scheduling).
     match bc.tier1_admit(block, &hash, now) {
         Ok(_) => ReceiveBlockOutcome::AcceptedSilently,
-        Err(AdmitError::Rejected(_)) => {
+        Err(AdmitError::Rejected(_)) | Err(AdmitError::InvalidExtension) => {
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
         }
         // Operational (capacity/persistence) refusal — NOT an FR10 validity

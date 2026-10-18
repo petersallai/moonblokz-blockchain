@@ -19,9 +19,10 @@
 //! therefore yield identical state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    Block, BlockBuilder, BlockHeader, BlockView, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
-    NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
-    REGISTRATION_SIZE, Registration, TransactionView,
+    Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HEADER_SIZE,
+    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NodeTransfer, PAYLOAD_TYPE_BALANCE,
+    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE, Registration,
+    TransactionView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
@@ -39,7 +40,7 @@ use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
 use crate::node_info::NodeInfoState;
 use crate::prng::Prng;
-use crate::snake_chain::classify_tail_drop;
+use crate::snake_chain::{TailBinding, classify_tail_drop, tail_drop_binding};
 use crate::staged_validation::{
     BlockStatus, Tier1Failure, tier1_chain_config_block, tier1_gate, verify_signature_bytes,
 };
@@ -302,6 +303,10 @@ pub(crate) enum AdmitError {
     /// The bounded block-tree is at capacity (`MAX_BLOCKS`); no eviction path
     /// exists until Story 4.4 (FR19 chain_heads-eviction).
     TableFull,
+    /// A Ready-state direct extension of the active head failed its Tier 2 /
+    /// Tier 3 checks or the FR48 binding (Story 6.0 D2) — exact evidence; the
+    /// block is not stored.
+    InvalidExtension,
     /// The block passed Tier 1 but could not be persisted through the storage
     /// seam — it is not inserted into the tree (storage-first admission).
     StorageSaveFailed,
@@ -575,6 +580,71 @@ pub(crate) enum ValidationReason {
     /// The block's fee total overflows `u64`. Every transaction's own sums are
     /// bounded at Tier 1.
     ValueOverflow,
+    /// A credit (receiver, balance output, creator) would overflow the
+    /// receiving node's `u64` balance (Story 6.0 D1: credits are checked).
+    BalanceOverflow,
+    /// A balance-block entry for a seeded node disagrees with the derived
+    /// pre-state `(balance, vote_count, public_key)` (FR50, Story 6.0 D9).
+    BalanceSnapshotMismatch,
+}
+
+/// The projection context of the per-block step (Story 6.0 D3). The FR3 pass
+/// passes its pass-local flags; the Ready forward extension and the genesis
+/// node pass [`Projection::COMPLETE`]. Nothing of it is persisted.
+pub(crate) struct Projection {
+    /// Every registered node is seeded: an unseeded actor is invalid, with no
+    /// pre-seed trust zone (genesis-anchored FR3 pass, Ready, genesis).
+    complete: bool,
+    /// The watermark is an authoritative node-existence bound for the range
+    /// checks.
+    roster_bounded: bool,
+    /// A non-complete FR3 pass has met its first balance block, which
+    /// initialized the watermark.
+    saw_balance_block: bool,
+}
+
+impl Projection {
+    /// A Ready projection is always complete (D3, FR50 coverage).
+    const COMPLETE: Self = Self {
+        complete: true,
+        roster_bounded: true,
+        saw_balance_block: true,
+    };
+}
+
+/// The verdict on a prospective extension of the active head (Story 6.0 D2).
+enum Extension {
+    /// The window gate and the fallible half of the step passed; `advance`
+    /// says whether promoting it moves the tail.
+    Valid {
+        advance: bool,
+        derivation: BlockDerivation,
+    },
+    /// Exact evidence of invalidity (Tier 2 / Tier 3, or the FR48 binding).
+    Invalid,
+    /// A local failure — no evidence against the block (FR16, AC6).
+    Local,
+}
+
+/// Whether a per-block step error is evidence against the block (Story 6.0
+/// AC3/AC6, DEC-037). A failed read, an inconsistent in-memory ancestry and
+/// an unparameterized vote engine are the node's own faults.
+fn is_evidence(err: &ProcessingError) -> bool {
+    match err {
+        ProcessingError::Invalid { .. } => true,
+        ProcessingError::Vote(e) => *e != VoteEngineError::NotParameterized,
+        ProcessingError::StorageRead
+        | ProcessingError::MissingBlock
+        | ProcessingError::MarkOverflow => false,
+    }
+}
+
+/// What [`Blockchain::derive_block`] hands the commit tail.
+pub(crate) struct BlockDerivation {
+    /// FR36(b) transaction-fee total.
+    total_fees: u64,
+    /// The block's UTXO-output count: its available-UTXO bits to set.
+    utxo_outputs: usize,
 }
 
 /// The FR3 candidate chain-config preload verdict — see
@@ -1127,6 +1197,33 @@ impl<
             return Err(GenesisRejectReason::GenesisBlockExceedsBlockSizeLimit);
         }
 
+        // D6 (Story 6.0): node #0 runs the ordinary per-block step over its own
+        // blocks, in the complete context (D3) — one code path, no node-#0
+        // trust zone; the FR54 exemptions are the step's own genesis branches.
+        // It runs before any write, against the tentative configuration (the
+        // vote parameters and the content block #1 must match), so a refusal
+        // leaves nothing behind. The blocks are built here from the local key
+        // and the caller's content, so the configuration is the only input the
+        // derivation can refuse.
+        self.node_info.reset();
+        self.reset_vote_engine();
+        let mut projection = Projection::COMPLETE;
+        let derived = self
+            .validate_and_derive_block(&block_0.view(), 0, None, &mut projection)
+            .and_then(|()| {
+                self.validate_and_derive_block(
+                    &block_1.view(),
+                    1,
+                    Some(block_0.hash()),
+                    &mut projection,
+                )
+            });
+        if derived.is_err() {
+            self.node_info.reset();
+            self.reset_vote_engine();
+            return Err(GenesisRejectReason::InitialChainConfigRejected);
+        }
+
         // Persist both blocks (only after both are built, so a build failure
         // never leaves a partially-persisted chain) AND mirror them into the
         // in-memory block-tree as node #0's active chain, so storage and the tree
@@ -1136,15 +1233,15 @@ impl<
         // they are placed exactly as that path establishes the genesis anchor
         // (`on_active_chain` + active head + `chain_heads`), with a sentinel
         // arrival timestamp of 0 — genesis heads sit on the active chain and are
-        // never parent-recovery-scheduled, so the timestamp is unused. (Full
-        // `Stored`→`Active` status promotion is Epic 6; the FR3 derived
-        // projections are Epic 7.)
+        // never parent-recovery-scheduled, so the timestamp is unused. Both are
+        // Active: the step above validated them (D7).
 
         // Block #0 — active-chain anchor (no parent).
         self.storage
             .save_block(0, &block_0)
             .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
         let mut entry_0 = BlockEntry::new(block_0.hash(), NONE_REF, 0);
+        entry_0.set_status(BlockStatus::Active);
         entry_0.set_on_active_chain(true);
         entry_0.set_len(block_0.len() as u16);
         entry_0.set_payload_type(block_0.payload_type());
@@ -1171,11 +1268,11 @@ impl<
         self.chain_config
             .promote_durable()
             .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
-        // The engine was constructed on the inert baseline while the module held
-        // no configuration (see `vote_parameters`); it now has FR37 values.
-        self.reset_vote_engine();
+        // The vote engine was parameterized from this same content, tentative,
+        // before the derivation above; the lock changes nothing it reads.
         let block_1_prev_hash = block_0.hash();
         let mut entry_1 = BlockEntry::new(block_1.hash(), 0, 1);
+        entry_1.set_status(BlockStatus::Active);
         entry_1.set_on_active_chain(true);
         entry_1.set_len(block_1.len() as u16);
         entry_1.set_payload_type(block_1.payload_type());
@@ -1933,19 +2030,6 @@ impl<
                 .map_err(|_| AdmitError::Rejected(Tier1Failure::ChainConfigContentRejected))?;
         }
 
-        if let Err(e) = self.storage.save_block(idx, &owned) {
-            let _ = e;
-            // The durable write is the one step after the load that can still
-            // fail. Undo the load rather than keep a configuration whose block
-            // was never persisted: on the next boot the block is not there, so a
-            // node that kept it would be deriving from a configuration it can no
-            // longer justify (and FR49 replay could not reproduce).
-            if loads_tentative {
-                self.chain_config.discard_tentative();
-            }
-            return Err(AdmitError::StorageSaveFailed);
-        }
-
         // FR19 parent resolution (Story 4.4). `previous_hash()` is a 32-byte
         // slice; convert to the array key. Genesis (`sequence == 0`) has no parent.
         let prev_hash: [u8; 32] = block.previous_hash().try_into().unwrap_or([0; 32]);
@@ -1965,7 +2049,52 @@ impl<
         if is_genesis {
             entry.set_on_active_chain(true);
         }
+        // The entry takes its slot before the durable write and leaves it again
+        // on any refusal below, so a refused block leaves the tree as it was.
+        // The per-block step needs it there: the UTXO resolver walks from it
+        // and the commit tail sets its bits.
         self.blocks.insert_at(idx, entry);
+
+        // Story 6.0 AC3 (D2): in Ready, a direct extension of the active head
+        // is judged now, against the head's derived state — its verdict is
+        // final, so a failing one is never stored.
+        let mut extension = None;
+        if self.lifecycle_phase == LifecyclePhase::Ready
+            && self.active_chain_head_idx != NONE_REF
+            && parent == Some(self.active_chain_head_idx)
+        {
+            match self.judge_head_extension(block, idx) {
+                Extension::Valid {
+                    advance,
+                    derivation,
+                } => extension = Some((advance, derivation)),
+                Extension::Invalid => {
+                    self.blocks.delete(idx);
+                    return Err(AdmitError::InvalidExtension);
+                }
+                // No evidence (FR16): the block is admitted as Stored and the
+                // continuation retries it at a later admission.
+                Extension::Local => {}
+            }
+        }
+
+        if self.storage.save_block(idx, &owned).is_err() {
+            // The durable write is the one step after the load that can still
+            // fail. Undo the load rather than keep a configuration whose block
+            // was never persisted: on the next boot the block is not there, so a
+            // node that kept it would be deriving from a configuration it can no
+            // longer justify (and FR49 replay could not reproduce).
+            if loads_tentative {
+                self.chain_config.discard_tentative();
+            }
+            // A judged extension is not blamed: its effects are inverted (D1).
+            if extension.is_some() {
+                self.invert_transactions(block, idx, usize::MAX);
+            }
+            self.blocks.delete(idx);
+            return Err(AdmitError::StorageSaveFailed);
+        }
+
         if is_genesis {
             self.active_chain_head_idx = idx;
             // A Collecting anchor, not a Ready head: no window yet (FR48).
@@ -1988,6 +2117,23 @@ impl<
             now,
             active_head,
         );
+
+        if let Some((advance, derivation)) = extension {
+            match self.commit_block(block, idx, derivation) {
+                Ok(()) => self.promote_head_extension(idx, advance),
+                // The vote apply refused and inverted the step. Without
+                // parameters that is the node's own fault and the block stays
+                // Stored; an arithmetic refusal is evidence. The block is
+                // already persisted, so it leaves through the ordinary deletion
+                // (its bytes stay in the freed slot until reuse).
+                Err(err) => {
+                    if is_evidence(&err) {
+                        self.delete_subtree_with_followup(idx);
+                        return Err(AdmitError::InvalidExtension);
+                    }
+                }
+            }
+        }
         Ok(idx)
     }
 
@@ -2029,6 +2175,9 @@ impl<
         }
 
         let window = self.active_snake_chain_window().ok();
+        // Read before the Collecting branch below, which can reach Ready
+        // inside this same call (AC4).
+        let was_ready = self.lifecycle_phase == LifecyclePhase::Ready;
         let outcome = classify_block(self, &block, window, now);
         // FR2 dominant-chain acquisition (Story 5.2): a successful collecting-phase
         // admission may complete a candidate segment. Evaluate the stopping
@@ -2055,6 +2204,9 @@ impl<
             && self.chain_config.active_configuration().is_some()
         {
             self.drive_dominant_chain_acquisition();
+        }
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && was_ready {
+            self.drive_forward_extension();
         }
         (outcome, self.next_parent_recovery_call())
     }
@@ -2402,11 +2554,13 @@ impl<
     /// **Step 2 — deletion target** (FR5 exact evidence):
     /// `ProcessingError::Invalid { block_idx, .. }` is the only variant that
     /// pins a block, and the forward walk guarantees `block_idx` is the
-    /// **earliest** offender. Every other variant (`MarkOverflow`,
-    /// `MissingBlock`, `StorageRead`, `Vote(_)`) is not evidence against a
-    /// specific block, so the target is the candidate head — FR5's explicit
-    /// "delete exactly one block, the candidate chain's head" fallback, which is
-    /// what makes `Vote(_)` carrying no `block_idx` safe. `ValidationReason` is
+    /// **earliest** offender. A local failure (`StorageRead`,
+    /// `Vote(NotParameterized)`) is no evidence at all and deletes nothing
+    /// (amended FR5, DEC-037). The remaining variants (`MarkOverflow`,
+    /// `MissingBlock`, an arithmetic `Vote(_)`) pin no specific block, so the
+    /// target is the candidate head — FR5's explicit "delete exactly one block,
+    /// the candidate chain's head" fallback (O-021 asks whether the first two
+    /// should join the local failures). `ValidationReason` is
     /// diagnostic only (the FR64 log, Epic 11) and is never a selection input.
     ///
     /// **Step 3 — transitive deletion** (FR5): the target and every transitive
@@ -2503,12 +2657,17 @@ impl<
         self.node_info.reset();
         self.reset_vote_engine();
 
-        // Step 2 — exact offender, else the candidate-head fallback.
+        // Step 2 — exact offender, else the candidate-head fallback. A local
+        // failure — a read error or an absent vote parameter — is no evidence
+        // and deletes nothing (amended FR5, DEC-037); the node retries on a
+        // later admission. A mark overflow or a missing block keeps the head
+        // fallback (O-021 open).
         let target = match err {
             ProcessingError::Invalid { block_idx, .. } => block_idx,
+            ProcessingError::StorageRead
+            | ProcessingError::Vote(VoteEngineError::NotParameterized) => NONE_REF,
             ProcessingError::MarkOverflow
             | ProcessingError::MissingBlock
-            | ProcessingError::StorageRead
             | ProcessingError::Vote(_) => candidate_tip_idx,
         };
 
@@ -2859,7 +3018,11 @@ impl<
         // Available-UTXO bits set or cleared mid-pass are rolled back below on any
         // abort (the FR5 working-set rollback's UTXO half); on success they persist
         // as the active chain's unspent-output state.
-        let mut saw_balance_block = false;
+        let mut projection = Projection {
+            complete: genesis_anchored,
+            roster_bounded,
+            saw_balance_block: false,
+        };
         let mut prev_hash: Option<[u8; 32]> = None;
         let mut result = Ok(());
         for i in (0..count).rev() {
@@ -2889,14 +3052,7 @@ impl<
                 }
             };
             let this_hash = view.hash();
-            if let Err(e) = self.validate_and_derive_block(
-                view,
-                idx,
-                prev_hash,
-                &mut saw_balance_block,
-                genesis_anchored,
-                roster_bounded,
-            ) {
+            if let Err(e) = self.validate_and_derive_block(&view, idx, prev_hash, &mut projection) {
                 result = Err(e);
                 break;
             }
@@ -2911,28 +3067,47 @@ impl<
         result
     }
 
-    /// Validates one candidate block against the FR6 invariant set **and**
-    /// applies its effects to the derived projection (Story 5.4, interleaved with
-    /// the Story-5.3 FR3 derivation). Every check reads the state derived from the
-    /// preceding candidate blocks; per-node state-dependent checks (balance,
-    /// signature, vote-target) are **gated on the initializer being seeded** —
-    /// the FR3 pre-seed-zone trust rule (AC4): a window-anchored candidate trusts
-    /// history it cannot yet re-derive, so full FR6 re-proof is complete only for
-    /// a genesis-anchored candidate. Returns the earliest offending block's
-    /// `ProcessingError::Invalid { block_idx, reason }` on violation.
+    /// The FR6 per-block step (Story 6.0 AC1): validates one block against the
+    /// FR6 invariant set **and** applies its effects to the derived projection.
+    /// Shared by the FR3 forward walk, the Ready forward extension and the
+    /// genesis node (D6), so there is one implementation of both.
     ///
+    /// Two halves, so the direct head extension can persist the block between
+    /// them (AC3): [`Self::derive_block`] runs every check and every invertible
+    /// effect, and [`Self::commit_block`] the vote apply and the commit tail.
+    /// Either half leaves `node_info`, the vote engine, every available-UTXO
+    /// bit and the watermark exactly as it found them when it returns `Err`
+    /// (D1); the one exception is the floor seeding of a non-complete FR3
+    /// pass, whose failure resets the whole pass.
     fn validate_and_derive_block(
         &mut self,
-        view: BlockView<'_>,
+        view: &BlockView<'_>,
         idx: u32,
         prev_hash: Option<[u8; 32]>,
-        saw_balance_block: &mut bool,
-        genesis_anchored: bool,
-        roster_bounded: bool,
+        projection: &mut Projection,
     ) -> Result<(), ProcessingError> {
-        // `view` is the block trimmed to its exact stored length. `bytes` re-views
-        // it for the by-value `VoteEngine` calls (`BlockView` is not `Copy`).
-        let bytes = view.serialized_bytes();
+        let derivation = self.derive_block(view, idx, prev_hash, projection)?;
+        self.commit_block(view, idx, derivation)
+    }
+
+    /// The fallible half of the per-block step, in the D1 order: block-level
+    /// checks; per transaction, its checks and then its invertible effects;
+    /// the balance-block checks (D9); the creator-credit overflow check. On
+    /// `Err` the effects already applied are inverted, newest first.
+    ///
+    /// Every check reads the state derived from the preceding blocks and from
+    /// the earlier transactions of this block, so a balance spent by tx 1
+    /// limits tx 2, and a key registered by tx 1 is a duplicate in tx 2. In a
+    /// non-complete FR3 projection (D3) the per-node state-dependent checks
+    /// are gated on the actor being seeded: a window-anchored candidate trusts
+    /// history it cannot re-derive.
+    fn derive_block(
+        &mut self,
+        view: &BlockView<'_>,
+        idx: u32,
+        prev_hash: Option<[u8; 32]>,
+        projection: &mut Projection,
+    ) -> Result<BlockDerivation, ProcessingError> {
         let seq = view.sequence();
         // FR54 genesis exceptions: block #0 waives no-self-vote / anchor /
         // watermark-`+1` and mints currency (FR54(d)); blocks #0/#1 are
@@ -2953,60 +3128,88 @@ impl<
         if view.len() > self.enforceable_block_size_limit() as usize {
             return Err(invalid(ValidationReason::BlockTooLarge));
         }
-        // (b) previous_hash links to the immediately-preceding candidate block
-        //     (the anchor has no in-segment predecessor → `prev_hash == None`).
+        // (b) previous_hash links to the immediately-preceding block (the FR3
+        //     anchor has no in-segment predecessor → `prev_hash == None`).
         if let Some(ph) = prev_hash
             && view.previous_hash() != &ph[..]
         {
             return Err(invalid(ValidationReason::PreviousHashMismatch));
         }
-        // (c) block-creator signature (first signature check anywhere in the
-        //     crate). Skipped when the creator's key is not yet derivable
-        //     (pre-seed zone → trusted); node #0 always resolves to the FR69
-        //     trust anchor, so a genesis-anchored candidate's block #0 is checked.
-        match self.verify_block_creator_signature(&view) {
+        // (c) block-creator signature. Skipped when the creator's key is not
+        //     yet derivable (pre-seed zone → trusted); node #0 always resolves
+        //     to the FR69 trust anchor. In a complete projection a non-derivable
+        //     creator past block #0 is exact evidence of invalidity (D3).
+        match self.verify_block_creator_signature(view) {
             Some(false) => return Err(invalid(ValidationReason::CreatorSignatureInvalid)),
-            // On a genesis-anchored candidate the creator's key must be derivable
-            // (it registered earlier in the same fully-re-derived chain); a
-            // non-derivable creator past block #0 is exact evidence of invalidity,
-            // not a trusted pre-seed block (AC2/AC4 genesis-anchored). Uses
-            // `!is_genesis_zero` — the same "only block #0 is bootstrap-exempt"
-            // predicate as the tx-level actor checks below (block #1's config
-            // creator is node #0, which resolves to the trust anchor, never `None`).
-            None if genesis_anchored && !is_genesis_zero => {
+            None if projection.complete && !is_genesis_zero => {
                 return Err(invalid(ValidationReason::UnseededActor));
             }
             _ => {}
         }
 
-        // FR36 (b) transaction-fee total; consumed by the shared creator tail.
-        let mut total_fees: u64 = 0;
+        let mut derivation = BlockDerivation {
+            total_fees: 0,
+            utxo_outputs: 0,
+        };
+        // How many transactions have applied their effects, for the prefix
+        // inversion on a later failure.
+        let mut applied = 0usize;
 
         match view.payload_type() {
             PAYLOAD_TYPE_BALANCE => {
                 let payload = view
                     .balances()
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
-                if !*saw_balance_block {
-                    // Earliest balance block: initialize the watermark from its
-                    // `max_node_id` (FR3/FR54(h)).
+                if projection.complete || projection.saw_balance_block {
+                    // Every balance block carries `max_node_id` == the
+                    // forward-tracked watermark at its sequence (FR50).
+                    if payload.max_node_id() != self.node_info.max_known_node_id() {
+                        return Err(invalid(ValidationReason::BalanceMaxNodeIdMismatch));
+                    }
+                } else {
+                    // The earliest balance block of a non-complete FR3 pass
+                    // initializes the watermark (FR3/FR54(h)).
                     let advanced = self
                         .node_info
                         .max_known_node_id()
                         .max(payload.max_node_id());
                     self.node_info.set_max_known_node_id(advanced);
-                    *saw_balance_block = true;
-                } else if payload.max_node_id() != self.node_info.max_known_node_id() {
-                    // AC7 (deferred from 5.3): every balance block after the
-                    // earliest must carry `max_node_id` == the forward-tracked
-                    // watermark at its sequence.
-                    return Err(invalid(ValidationReason::BalanceMaxNodeIdMismatch));
+                    projection.saw_balance_block = true;
                 }
+                // D9: the payload repeats the pre-state; it seeds only what a
+                // non-complete projection does not know yet.
+                let mut floor_seeded = false;
                 for info in payload.iter() {
-                    self.node_info
-                        .seed_node(info.owner(), info.public_key(), info.balance(), idx);
+                    let owner = info.owner();
+                    // Node ids are contiguous: an entry beyond the watermark
+                    // names no node (and would occupy a slot a later
+                    // registration needs empty, D1 precondition 2).
+                    if owner > payload.max_node_id() {
+                        return Err(invalid(ValidationReason::NodeIdOutOfRange));
+                    }
+                    if self.node_info.is_seeded(owner) {
+                        let matches = self.node_info.balance_of(owner) == info.balance()
+                            && self.vote_engine.accumulated_vote_of(owner) == info.vote_count()
+                            && self
+                                .node_info
+                                .public_key_of(owner)
+                                .is_some_and(|key| key[..] == *info.public_key());
+                        if !matches {
+                            return Err(invalid(ValidationReason::BalanceSnapshotMismatch));
+                        }
+                    } else if projection.complete {
+                        // FR50 coverage: every registered node is seeded in a
+                        // complete projection (D3).
+                        return Err(invalid(ValidationReason::UnseededActor));
+                    } else {
+                        self.node_info
+                            .seed_node(owner, info.public_key(), info.balance(), idx);
+                        floor_seeded = true;
+                    }
                 }
-                if let Ok(v) = BlockView::from_bytes(bytes) {
+                // The vote half of the floor seeding. A seeded entry's
+                // `vote_count` was just shown equal, so re-seeding it is a no-op.
+                if floor_seeded && let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
                     self.vote_engine.seed_from_balance_block(v);
                 }
             }
@@ -3014,245 +3217,14 @@ impl<
                 let txs = view
                     .transactions()
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
-                // The block's UTXO-output stream position (ADR-016): one counter
-                // over the whole block, never reset per transaction. It is also
-                // the output's available-UTXO bit and is held within the
-                // configuration's cap (I-07, DEC-133).
-                let max_utxo_outputs = self.held_max_utxo_outputs() as usize;
-                let mut utxo_position = 0usize;
-
                 for tx in txs.iter() {
-                    let vote = tx.vote();
-                    if let Some(nt) = tx.as_node_transfer() {
-                        let init = nt.initializer();
-                        // [A] Genesis-anchored: an unseeded initializer means the
-                        // node transacts before it exists — invalid (no pre-seed
-                        // trust zone). Window-anchored: trusted pre-window history.
-                        if genesis_anchored && !is_genesis_zero && !self.node_info.is_seeded(init) {
-                            return Err(invalid(ValidationReason::UnseededActor));
-                        }
-                        // FR6 node-existence bound: the initializer (input) and the
-                        // receiver (output) must name nodes that can exist
-                        // (`id <= max_known_node_id`) — checkable even when unseeded
-                        // (a pre-window node's *existence* is still range-bounded).
-                        if roster_bounded && !is_genesis_zero {
-                            self.check_node_id_in_range(init).map_err(&invalid)?;
-                            self.check_node_id_in_range(nt.receiver())
-                                .map_err(&invalid)?;
-                        }
-                        // State-dependent FR6 checks apply once the initializer is
-                        // derivable (past its pre-seed zone). The intrinsic
-                        // invariants (no-self-vote, anchor-before-block) are decided
-                        // from the block bytes alone and are owned by the Tier-1
-                        // intake gate (`staged_validation`), which every admitted
-                        // block passed before it could reach this pass — so they are
-                        // not re-checked here.
-                        if !is_genesis_zero && self.node_info.is_seeded(init) {
-                            self.check_vote_target(vote).map_err(&invalid)?;
-                            if !self.verify_tx_signature(tx.as_bytes(), init) {
-                                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
-                            }
-                        }
-                        let fee = nt.fee() as u64;
-                        let debit = nt.amount().saturating_add(fee);
-                        if is_genesis_zero {
-                            // FR54(d): the genesis self-transfer *creates* currency
-                            // — credit the receiver, no debit (bypass the balance
-                            // check), so node #0's balance becomes the initial
-                            // total network currency explicitly.
-                            if self.node_info.is_seeded(nt.receiver()) {
-                                self.node_info.credit(nt.receiver(), nt.amount());
-                            }
-                        } else if self.node_info.is_seeded(init) {
-                            if self.node_info.balance_of(init) < debit {
-                                return Err(invalid(ValidationReason::InsufficientBalance));
-                            }
-                            self.node_info.debit(init, debit);
-                            if self.node_info.is_seeded(nt.receiver()) {
-                                self.node_info.credit(nt.receiver(), nt.amount());
-                            }
-                        } else if self.node_info.is_seeded(nt.receiver()) {
-                            // Pre-seed initializer: still credit a seeded receiver
-                            // (its own state is derivable) — trust the debit side.
-                            self.node_info.credit(nt.receiver(), nt.amount());
-                        }
-                        total_fees = total_fees.saturating_add(fee);
-                    } else if let Some(reg) = tx.as_registration() {
-                        let node_id = reg.new_node_id();
-                        let init = reg.initializer();
-                        // [A] Genesis-anchored: the registering initializer must be
-                        // an existing (seeded) node; unseeded ⇒ invalid (block #0's
-                        // node-#0 self-registration is the FR54 bootstrap exception).
-                        if genesis_anchored && !is_genesis_zero && !self.node_info.is_seeded(init) {
-                            return Err(invalid(ValidationReason::UnseededActor));
-                        }
-                        // FR6 node-existence bound: the registering initializer must
-                        // name an existing node (`id <= max_known_node_id`), checkable
-                        // even when unseeded. (`new_node_id` is the id being *created*
-                        // — bounded by the monotonicity check, not this range check.)
-                        if roster_bounded && !is_genesis_zero {
-                            self.check_node_id_in_range(init).map_err(&invalid)?;
-                        }
-                        // FR6 registration monotonicity: `new_node_id ==
-                        // pre-block-position watermark + 1`, checked against the
-                        // running watermark so within-block registrations form a
-                        // stride-1 sequence. Waived for genesis block #0
-                        // (`new_node_id == 0`, FR54(h)). Reads the incremental
-                        // watermark, which is authoritative only once established —
-                        // from block #0 on a genesis-anchored candidate, or from the
-                        // first balance block on a window-anchored one; before that
-                        // (window-anchored pre-first-balance region) it is trusted
-                        // (AC4), matching the vote-target existence floor.
-                        if !is_genesis_zero {
-                            if genesis_anchored || *saw_balance_block {
-                                let expected = self.node_info.max_known_node_id().wrapping_add(1);
-                                if node_id != expected {
-                                    return Err(invalid(ValidationReason::RegistrationWatermark));
-                                }
-                            }
-                            // No-self-vote is intrinsic and owned by the Tier-1 gate
-                            // (checked at admission); not re-checked here.
-                            if self.node_info.is_seeded(init) {
-                                self.check_vote_target(vote).map_err(&invalid)?;
-                                if !self.verify_tx_signature(tx.as_bytes(), init) {
-                                    return Err(invalid(
-                                        ValidationReason::TransactionSignatureInvalid,
-                                    ));
-                                }
-                                let debit = reg.registration_price().saturating_add(reg.fee());
-                                if self.node_info.balance_of(init) < debit {
-                                    return Err(invalid(ValidationReason::InsufficientBalance));
-                                }
-                                // `registration_price` is absorbed (debited, credited
-                                // to no node); the fee goes to the creator (FR36).
-                                self.node_info.debit(init, debit);
-                                total_fees = total_fees.saturating_add(reg.fee());
-                            }
-                        }
-                        // [E] FR6 registration uniqueness: `new_public_key` must not
-                        // already be held by a seeded/registered node on the
-                        // candidate (within-block earlier registrations are seeded
-                        // in tx order, so a same-block collision is caught too).
-                        // Checked before any state mutation below, so a rejection
-                        // leaves no dirty watermark/roster.
-                        if self.node_info.key_is_registered(reg.new_public_key()) {
-                            return Err(invalid(ValidationReason::DuplicatePublicKey));
-                        }
-                        // Advance the watermark for an in-range id (genesis #0 does
-                        // not advance it — FR54(h)); then register the roster entry.
-                        if !is_genesis_zero && (node_id as usize) < MAX_NODES {
-                            let advanced = self.node_info.max_known_node_id().max(node_id);
-                            self.node_info.set_max_known_node_id(advanced);
-                        }
-                        self.node_info
-                            .register_node(node_id, reg.new_public_key(), idx);
-                    } else if let Some(cx) = tx.as_complex() {
-                        // FR6 value accounting over every input and output
-                        // (Story 6.8, D1). Every input declares its amount
-                        // (DEC-131) and Tier 1 has checked both sums against `u64`
-                        // and `Σ inputs ≥ Σ outputs` from the bytes (DEC-011), so
-                        // neither sum can overflow and the fee cannot go negative.
-                        let mut in_sum: u64 = 0;
-                        let mut out_sum: u64 = 0;
-                        for input in cx.inputs() {
-                            if let Some(bi) = input.as_balance() {
-                                let binit = bi.initializer();
-                                // [A] Genesis-anchored: a balance-input initializer
-                                // must be seeded (it spends a derived balance).
-                                if genesis_anchored
-                                    && !is_genesis_zero
-                                    && !self.node_info.is_seeded(binit)
-                                {
-                                    return Err(invalid(ValidationReason::UnseededActor));
-                                }
-                                // FR6 node-existence bound: the balance-input
-                                // initializer (input side) must name an existing node,
-                                // checkable even when unseeded.
-                                if roster_bounded && !is_genesis_zero {
-                                    self.check_node_id_in_range(binit).map_err(&invalid)?;
-                                }
-                                // No-self-vote and anchor-before-block are intrinsic,
-                                // owned by the Tier-1 gate (checked at admission);
-                                // only the state-dependent checks run here.
-                                if !is_genesis_zero && self.node_info.is_seeded(binit) {
-                                    self.check_vote_target(vote).map_err(&invalid)?;
-                                    if self.node_info.balance_of(binit) < bi.amount() {
-                                        return Err(invalid(ValidationReason::InsufficientBalance));
-                                    }
-                                    self.node_info.debit(binit, bi.amount());
-                                }
-                                in_sum = in_sum.saturating_add(bi.amount());
-                            } else if let Some(ui) = input.as_utxo() {
-                                // [H] ADR-016: resolve along this block's own
-                                // ancestry and spend. In the FR3 pass every ancestor
-                                // of a segment block is in the segment, so every bit
-                                // cleared here was set by this pass when it derived
-                                // that ancestor, and the abort resets it. A window-anchored
-                                // candidate trusts a reference below its anchor
-                                // (DEC-129), declared amount included. The input's
-                                // signature, against the returned address, is Story
-                                // 7.1 (I-21).
-                                let parent = self
-                                    .blocks
-                                    .get(idx)
-                                    .ok_or(ProcessingError::MissingBlock)?
-                                    .parent_ref();
-                                let _address = self
-                                    .resolve_and_spend_utxo(
-                                        parent,
-                                        seq,
-                                        ui.block_sequence(),
-                                        ui.output_index(),
-                                        ui.amount(),
-                                        !genesis_anchored,
-                                    )
-                                    .map_err(|e| match e {
-                                        UtxoSpendError::Invalid(reason) => invalid(reason),
-                                        UtxoSpendError::StorageRead => ProcessingError::StorageRead,
-                                        UtxoSpendError::MissingBlock => {
-                                            ProcessingError::MissingBlock
-                                        }
-                                    })?;
-                                in_sum = in_sum.saturating_add(ui.amount());
-                            }
-                        }
-                        // Outputs after the inputs: a block never spends its own
-                        // outputs (Tier-1 causality), and the bits it sets here
-                        // become spendable only by descendants.
-                        for output in cx.outputs() {
-                            if let Some(uo) = output.as_utxo() {
-                                if utxo_position >= max_utxo_outputs {
-                                    return Err(invalid(ValidationReason::TooManyUtxoOutputs));
-                                }
-                                self.blocks.set_utxo_available(idx, utxo_position, true);
-                                utxo_position += 1;
-                                out_sum = out_sum.saturating_add(uo.amount());
-                            } else if let Some(bo) = output.as_balance() {
-                                // FR6 node-existence bound: the balance-output
-                                // receiver (output side) must name an existing node,
-                                // checkable even when unseeded.
-                                if roster_bounded && !is_genesis_zero {
-                                    self.check_node_id_in_range(bo.receiver())
-                                        .map_err(&invalid)?;
-                                }
-                                if self.node_info.is_seeded(bo.receiver()) {
-                                    self.node_info.credit(bo.receiver(), bo.amount());
-                                }
-                                out_sum = out_sum.saturating_add(bo.amount());
-                            }
-                        }
-                        // [D] The fee is the surplus over all inputs and outputs,
-                        // UTXO ones included; a zero-input carry-forward pays none
-                        // (FR6). Only the block's fee total can overflow.
-                        if cx.input_count() > 0 {
-                            let fee = in_sum.saturating_sub(out_sum);
-                            total_fees = total_fees
-                                .checked_add(fee)
-                                .ok_or(invalid(ValidationReason::ValueOverflow))?;
-                        }
-                    } else {
-                        return Err(invalid(ValidationReason::MalformedPayload));
+                    if let Err(e) =
+                        self.apply_transaction(&tx, idx, seq, projection, &mut derivation)
+                    {
+                        self.invert_transactions(view, idx, applied);
+                        return Err(e);
                     }
+                    applied += 1;
                 }
                 // FR6 registration/complex mutual-exclusivity is intrinsic (decided
                 // from block bytes) and owned by the Tier-1 intake gate, which every
@@ -3285,23 +3257,410 @@ impl<
             }
         }
 
-        // Shared FR37 + FR36 tail (every payload type): apply this block's vote
-        // effects once (anti-capture interest + creator reset), then credit the
-        // creator with (a) mined_amount + (b) transaction fees. Gated on
-        // `is_seeded` so a pre-seed-zone creator is auto-accepted; genesis blocks
-        // #0/#1 are FR36-exempt. FR36(c) replay-block reward is deferred (Epic 9).
-        if let Ok(v) = BlockView::from_bytes(bytes) {
-            self.vote_engine
-                .apply_block(v)
-                .map_err(ProcessingError::Vote)?;
-        }
+        // FR36 creator credit, checked here so the commit tail cannot fail.
         if !is_genesis && self.node_info.is_seeded(view.creator()) {
+            let fits = (view.mined_amount() as u64)
+                .checked_add(derivation.total_fees)
+                .and_then(|credit| {
+                    self.node_info
+                        .balance_of(view.creator())
+                        .checked_add(credit)
+                });
+            if fits.is_none() {
+                self.invert_transactions(view, idx, applied);
+                return Err(invalid(ValidationReason::BalanceOverflow));
+            }
+        }
+        Ok(derivation)
+    }
+
+    /// The second half of the per-block step: the FR37 vote apply — the last
+    /// fallible operation, and atomic — then the commit tail (D1 precondition
+    /// 5), the effects no later check of the block reads: the FR36 creator
+    /// credit (`mined_amount` + fees; FR36(c) is Epic 9), the D9 seed-source
+    /// moves and the block's own available-UTXO bits. On a vote failure the
+    /// effects of [`Self::derive_block`] are inverted.
+    fn commit_block(
+        &mut self,
+        view: &BlockView<'_>,
+        idx: u32,
+        derivation: BlockDerivation,
+    ) -> Result<(), ProcessingError> {
+        if let Ok(v) = BlockView::from_bytes(view.serialized_bytes())
+            && let Err(e) = self.vote_engine.apply_block(v)
+        {
+            self.invert_transactions(view, idx, usize::MAX);
+            return Err(ProcessingError::Vote(e));
+        }
+        let seq = view.sequence();
+        if seq > 1 && self.node_info.is_seeded(view.creator()) {
             self.node_info.credit(
                 view.creator(),
-                (view.mined_amount() as u64).saturating_add(total_fees),
+                view.mined_amount() as u64 + derivation.total_fees,
             );
         }
+        if let Some(payload) = view.balances() {
+            for info in payload.iter() {
+                self.node_info.move_seed_source(info.owner(), idx);
+            }
+        }
+        // A block never spends its own outputs (Tier-1 causality), so its
+        // bits become spendable only by descendants.
+        for bit in 0..derivation.utxo_outputs {
+            self.blocks.set_utxo_available(idx, bit, true);
+        }
         Ok(())
+    }
+
+    /// Checks one transaction and applies its effects, atomically: on `Err`
+    /// nothing of this transaction remains applied.
+    fn apply_transaction(
+        &mut self,
+        tx: &TransactionView<'_>,
+        idx: u32,
+        seq: u32,
+        projection: &Projection,
+        derivation: &mut BlockDerivation,
+    ) -> Result<(), ProcessingError> {
+        let is_genesis_zero = seq == 0;
+        let complete = projection.complete;
+        let invalid = |reason| ProcessingError::Invalid {
+            block_idx: idx,
+            reason,
+        };
+        let vote = tx.vote();
+        if let Some(nt) = tx.as_node_transfer() {
+            let init = nt.initializer();
+            let receiver = nt.receiver();
+            // [A] Complete projection: an unseeded initializer transacts
+            // before it exists (D3). Non-complete: trusted pre-window history.
+            if complete && !is_genesis_zero && !self.node_info.is_seeded(init) {
+                return Err(invalid(ValidationReason::UnseededActor));
+            }
+            // FR6 node-existence bound: the initializer (input) and the
+            // receiver (output) must name nodes that can exist
+            // (`id <= max_known_node_id`) — checkable even when unseeded.
+            if projection.roster_bounded && !is_genesis_zero {
+                self.check_node_id_in_range(init).map_err(&invalid)?;
+                self.check_node_id_in_range(receiver).map_err(&invalid)?;
+            }
+            // State-dependent FR6 checks apply once the initializer is
+            // derivable. The intrinsic invariants (no-self-vote,
+            // anchor-before-block) are owned by the Tier-1 gate.
+            if !is_genesis_zero && self.node_info.is_seeded(init) {
+                self.check_vote_target(vote).map_err(&invalid)?;
+                if !self.verify_tx_signature(tx.as_bytes(), init) {
+                    return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+                }
+            }
+            let fee = nt.fee() as u64;
+            let debit = nt.amount().saturating_add(fee);
+            // FR54(d): the genesis self-transfer *creates* currency — no debit.
+            let debits = !is_genesis_zero && self.node_info.is_seeded(init);
+            let credits = self.node_info.is_seeded(receiver);
+            if debits && self.node_info.balance_of(init) < debit {
+                return Err(invalid(ValidationReason::InsufficientBalance));
+            }
+            // A self-transfer credits back less than it debited.
+            if credits
+                && !(debits && receiver == init)
+                && self
+                    .node_info
+                    .balance_of(receiver)
+                    .checked_add(nt.amount())
+                    .is_none()
+            {
+                return Err(invalid(ValidationReason::BalanceOverflow));
+            }
+            let total_fees = derivation
+                .total_fees
+                .checked_add(fee)
+                .ok_or(invalid(ValidationReason::ValueOverflow))?;
+            if debits {
+                self.node_info.debit(init, debit);
+            }
+            if credits {
+                self.node_info.credit(receiver, nt.amount());
+            }
+            derivation.total_fees = total_fees;
+        } else if let Some(reg) = tx.as_registration() {
+            let node_id = reg.new_node_id();
+            let init = reg.initializer();
+            // [A] Complete projection: the registering initializer must be an
+            // existing (seeded) node (block #0's node-#0 self-registration is
+            // the FR54 bootstrap exception).
+            if complete && !is_genesis_zero && !self.node_info.is_seeded(init) {
+                return Err(invalid(ValidationReason::UnseededActor));
+            }
+            // FR6 node-existence bound on the initializer. (`new_node_id` is
+            // bounded by the monotonicity check, not this range check.)
+            if projection.roster_bounded && !is_genesis_zero {
+                self.check_node_id_in_range(init).map_err(&invalid)?;
+            }
+            let debits = !is_genesis_zero && self.node_info.is_seeded(init);
+            let debit = reg.registration_price().saturating_add(reg.fee());
+            if !is_genesis_zero {
+                // FR6 registration monotonicity: `new_node_id == running
+                // watermark + 1`, authoritative once the watermark is
+                // established (a complete projection, or after the first
+                // balance block of a window-anchored one).
+                if complete || projection.saw_balance_block {
+                    let expected = self.node_info.max_known_node_id().wrapping_add(1);
+                    if node_id != expected {
+                        return Err(invalid(ValidationReason::RegistrationWatermark));
+                    }
+                }
+                if debits {
+                    self.check_vote_target(vote).map_err(&invalid)?;
+                    if !self.verify_tx_signature(tx.as_bytes(), init) {
+                        return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+                    }
+                    if self.node_info.balance_of(init) < debit {
+                        return Err(invalid(ValidationReason::InsufficientBalance));
+                    }
+                }
+            }
+            // [E] FR6 registration uniqueness, against the seeded roster —
+            // earlier registrations of this block included.
+            if self.node_info.key_is_registered(reg.new_public_key()) {
+                return Err(invalid(ValidationReason::DuplicatePublicKey));
+            }
+            let total_fees = if debits {
+                derivation
+                    .total_fees
+                    .checked_add(reg.fee())
+                    .ok_or(invalid(ValidationReason::ValueOverflow))?
+            } else {
+                derivation.total_fees
+            };
+            // Effects, after every check. `registration_price` is absorbed
+            // (debited, credited to no node); the fee goes to the creator.
+            if debits {
+                self.node_info.debit(init, debit);
+            }
+            // Genesis #0 does not advance the watermark (FR54(h)).
+            if !is_genesis_zero && (node_id as usize) < MAX_NODES {
+                let advanced = self.node_info.max_known_node_id().max(node_id);
+                self.node_info.set_max_known_node_id(advanced);
+            }
+            self.node_info
+                .register_node(node_id, reg.new_public_key(), idx);
+            derivation.total_fees = total_fees;
+        } else if let Some(cx) = tx.as_complex() {
+            let mut inputs = 0usize;
+            let mut outputs = 0usize;
+            let result = self.apply_complex(
+                &cx,
+                vote,
+                idx,
+                seq,
+                projection,
+                derivation,
+                &mut inputs,
+                &mut outputs,
+            );
+            if result.is_err() {
+                self.invert_complex(&cx, idx, inputs, outputs, is_genesis_zero);
+            }
+            result?;
+        } else {
+            return Err(invalid(ValidationReason::MalformedPayload));
+        }
+        Ok(())
+    }
+
+    /// The complex-transaction arm of [`Self::apply_transaction`]: FR6 value
+    /// accounting over every input and output (Story 6.8). Effects apply in
+    /// order — a later input of the same initializer sees the earlier debit —
+    /// and `inputs` / `outputs` count how many applied, for the caller's
+    /// partial inversion.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_complex(
+        &mut self,
+        cx: &ComplexTransactionView<'_>,
+        vote: u32,
+        idx: u32,
+        seq: u32,
+        projection: &Projection,
+        derivation: &mut BlockDerivation,
+        inputs: &mut usize,
+        outputs: &mut usize,
+    ) -> Result<(), ProcessingError> {
+        let is_genesis_zero = seq == 0;
+        let invalid = |reason| ProcessingError::Invalid {
+            block_idx: idx,
+            reason,
+        };
+        // Every input declares its amount (DEC-131) and Tier 1 has checked
+        // both sums against `u64` and `Σ inputs ≥ Σ outputs` (DEC-011).
+        let mut in_sum: u64 = 0;
+        let mut out_sum: u64 = 0;
+        for input in cx.inputs() {
+            if let Some(bi) = input.as_balance() {
+                let binit = bi.initializer();
+                if projection.complete && !is_genesis_zero && !self.node_info.is_seeded(binit) {
+                    return Err(invalid(ValidationReason::UnseededActor));
+                }
+                if projection.roster_bounded && !is_genesis_zero {
+                    self.check_node_id_in_range(binit).map_err(&invalid)?;
+                }
+                if !is_genesis_zero && self.node_info.is_seeded(binit) {
+                    self.check_vote_target(vote).map_err(&invalid)?;
+                    if self.node_info.balance_of(binit) < bi.amount() {
+                        return Err(invalid(ValidationReason::InsufficientBalance));
+                    }
+                    self.node_info.debit(binit, bi.amount());
+                }
+                in_sum = in_sum.saturating_add(bi.amount());
+            } else if let Some(ui) = input.as_utxo() {
+                // [H] ADR-016: resolve along this block's own ancestry and
+                // spend. A non-complete candidate trusts a reference below its
+                // anchor (DEC-129), declared amount included. The input's
+                // signature is Story 7.1 (I-21).
+                let parent = self
+                    .blocks
+                    .get(idx)
+                    .ok_or(ProcessingError::MissingBlock)?
+                    .parent_ref();
+                self.resolve_and_spend_utxo(
+                    parent,
+                    seq,
+                    ui.block_sequence(),
+                    ui.output_index(),
+                    ui.amount(),
+                    !projection.complete,
+                )
+                .map_err(|e| match e {
+                    UtxoSpendError::Invalid(reason) => invalid(reason),
+                    UtxoSpendError::StorageRead => ProcessingError::StorageRead,
+                    UtxoSpendError::MissingBlock => ProcessingError::MissingBlock,
+                })?;
+                in_sum = in_sum.saturating_add(ui.amount());
+            }
+            *inputs += 1;
+        }
+        // Outputs after the inputs. A UTXO output's bit is set in the commit
+        // tail; here it only takes its stream position, held within the
+        // configuration's cap (I-07, DEC-133).
+        let max_utxo_outputs = self.held_max_utxo_outputs() as usize;
+        for output in cx.outputs() {
+            if let Some(uo) = output.as_utxo() {
+                if derivation.utxo_outputs >= max_utxo_outputs {
+                    return Err(invalid(ValidationReason::TooManyUtxoOutputs));
+                }
+                derivation.utxo_outputs += 1;
+                out_sum = out_sum.saturating_add(uo.amount());
+            } else if let Some(bo) = output.as_balance() {
+                if projection.roster_bounded && !is_genesis_zero {
+                    self.check_node_id_in_range(bo.receiver())
+                        .map_err(&invalid)?;
+                }
+                if self.node_info.is_seeded(bo.receiver()) {
+                    if self
+                        .node_info
+                        .balance_of(bo.receiver())
+                        .checked_add(bo.amount())
+                        .is_none()
+                    {
+                        return Err(invalid(ValidationReason::BalanceOverflow));
+                    }
+                    self.node_info.credit(bo.receiver(), bo.amount());
+                }
+                out_sum = out_sum.saturating_add(bo.amount());
+            }
+            *outputs += 1;
+        }
+        // [D] The fee is the surplus over all inputs and outputs; a zero-input
+        // carry-forward pays none (FR6).
+        if cx.input_count() > 0 {
+            let fee = in_sum.saturating_sub(out_sum);
+            derivation.total_fees = derivation
+                .total_fees
+                .checked_add(fee)
+                .ok_or(invalid(ValidationReason::ValueOverflow))?;
+        }
+        Ok(())
+    }
+
+    /// Inverts the effects of the first `count` transactions of `view` (all of
+    /// them for `usize::MAX`), newest first — the D1 prefix inversion, which
+    /// Story 6.3 reuses to undo a committed block. Each inverse is computed
+    /// from the transaction bytes plus the current state, which, in reverse
+    /// order, is the state right after that transaction applied. O(`count`²)
+    /// transaction parses, on failure paths only.
+    fn invert_transactions(&mut self, view: &BlockView<'_>, idx: u32, count: usize) {
+        let Some(txs) = view.transactions() else {
+            return;
+        };
+        let is_genesis_zero = view.sequence() == 0;
+        let count = count.min(txs.iter().count());
+        for k in (0..count).rev() {
+            let Some(tx) = txs.iter().nth(k) else {
+                continue;
+            };
+            if let Some(nt) = tx.as_node_transfer() {
+                if self.node_info.is_seeded(nt.receiver()) {
+                    self.node_info.debit(nt.receiver(), nt.amount());
+                }
+                if !is_genesis_zero && self.node_info.is_seeded(nt.initializer()) {
+                    let debit = nt.amount().saturating_add(nt.fee() as u64);
+                    self.node_info.credit(nt.initializer(), debit);
+                }
+            } else if let Some(reg) = tx.as_registration() {
+                // Stride-1 on a bounded roster: the slot was empty and the
+                // watermark one below the new id (D1 precondition 2).
+                let node_id = reg.new_node_id();
+                self.node_info.clear_node(node_id);
+                if !is_genesis_zero && (node_id as usize) < MAX_NODES {
+                    self.node_info
+                        .set_max_known_node_id(node_id.saturating_sub(1));
+                }
+                if !is_genesis_zero && self.node_info.is_seeded(reg.initializer()) {
+                    let debit = reg.registration_price().saturating_add(reg.fee());
+                    self.node_info.credit(reg.initializer(), debit);
+                }
+            } else if let Some(cx) = tx.as_complex() {
+                self.invert_complex(&cx, idx, usize::MAX, usize::MAX, is_genesis_zero);
+            }
+        }
+    }
+
+    /// Inverts the first `inputs` inputs and `outputs` outputs of a complex
+    /// transaction. The balance inverses wrap, so they are exact in any order,
+    /// and every spent UTXO bit is a distinct bit; a spend is re-resolved by
+    /// the same ancestor walk, and a trusted below-anchor input (nothing was
+    /// spent) re-resolves to nothing.
+    fn invert_complex(
+        &mut self,
+        cx: &ComplexTransactionView<'_>,
+        idx: u32,
+        inputs: usize,
+        outputs: usize,
+        is_genesis_zero: bool,
+    ) {
+        for output in cx.outputs().take(outputs) {
+            if let Some(bo) = output.as_balance()
+                && self.node_info.is_seeded(bo.receiver())
+            {
+                self.node_info.debit(bo.receiver(), bo.amount());
+            }
+        }
+        let parent = self
+            .blocks
+            .get(idx)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
+        for input in cx.inputs().take(inputs) {
+            if let Some(bi) = input.as_balance() {
+                if !is_genesis_zero && self.node_info.is_seeded(bi.initializer()) {
+                    self.node_info.credit(bi.initializer(), bi.amount());
+                }
+            } else if let Some(ui) = input.as_utxo()
+                && let Ok(Some(slot)) = self.ancestor_at(parent, ui.block_sequence())
+            {
+                self.blocks
+                    .set_utxo_available(slot, ui.output_index() as usize, true);
+            }
+        }
     }
 
     /// FR6 vote-target existence (AC5): the `vote` node id must name a node that
@@ -3458,27 +3817,15 @@ impl<
         {
             return Err(unresolvable);
         }
-        // Each parent is exactly one sequence lower (`blocks.rs` admission), so
-        // the walk ends within `consuming_seq - block_sequence` steps; the
-        // `MAX_BLOCKS` bound only guards against a corrupt `parent_ref` cycle.
-        let mut cur = parent_idx;
-        let mut found = None;
-        for _ in 0..MAX_BLOCKS {
-            if cur == NONE_REF {
-                return if trust_below_anchor {
-                    Ok(None)
-                } else {
-                    Err(unresolvable)
-                };
-            }
-            let entry = self.blocks.get(cur).ok_or(UtxoSpendError::MissingBlock)?;
-            if entry.sequence() == block_sequence {
-                found = Some((cur, entry.len() as usize));
-                break;
-            }
-            cur = entry.parent_ref();
-        }
-        let (ref_idx, stored_len) = found.ok_or(UtxoSpendError::MissingBlock)?;
+        let ref_idx = match self.ancestor_at(parent_idx, block_sequence)? {
+            Some(ref_idx) => ref_idx,
+            None if trust_below_anchor => return Ok(None),
+            None => return Err(unresolvable),
+        };
+        let stored_len = self
+            .blocks
+            .get(ref_idx)
+            .map_or(0, |entry| entry.len() as usize);
 
         let bit = output_index as usize;
         if self.blocks.utxo_available(ref_idx, bit) != Some(true) {
@@ -3508,6 +3855,154 @@ impl<
 
         self.blocks.set_utxo_available(ref_idx, bit, false);
         Ok(Some(address))
+    }
+
+    /// Judges a prospective extension of the active head — a direct one at
+    /// intake (AC3, before it is stored) or a stored child (AC4) — in the
+    /// complete context (D3): first the FR48 window gate, then the fallible
+    /// half of the per-block step. On `Valid` its invertible effects are
+    /// applied; otherwise the derived state is as it was (D1). `idx` is the
+    /// block's slot, already holding its entry.
+    fn judge_head_extension(&mut self, view: &BlockView<'_>, idx: u32) -> Extension {
+        let head = self.active_chain_head_idx;
+        let Some(head_hash) = self.blocks.get(head).map(|entry| *entry.hash()) else {
+            return Extension::Local;
+        };
+        // FR48 window gate (9.1): an extension that would make the active
+        // chain longer than `W` drops the tail block, which its binding must
+        // allow. `W` is read now (FR56), never the capacity.
+        let mut advance = false;
+        if let Some(w) = self.active_chain_length() {
+            let (Some(tail), Some(head)) = (
+                self.blocks.get(self.snake_chain_tail_idx),
+                self.blocks.get(head),
+            ) else {
+                return Extension::Local;
+            };
+            // New length `S_head + 1 − S_tail + 1` exceeds `W`.
+            if head.sequence() + 1 - tail.sequence() >= w {
+                let Ok(obligation) =
+                    classify_tail_drop(&self.blocks, &self.node_info, self.snake_chain_tail_idx)
+                else {
+                    return Extension::Local;
+                };
+                if tail_drop_binding(obligation, view) == TailBinding::Invalid {
+                    return Extension::Invalid;
+                }
+                advance = true;
+            }
+        }
+        let mut projection = Projection::COMPLETE;
+        match self.derive_block(view, idx, Some(head_hash), &mut projection) {
+            Ok(derivation) => Extension::Valid {
+                advance,
+                derivation,
+            },
+            Err(err) if is_evidence(&err) => Extension::Invalid,
+            Err(_) => Extension::Local,
+        }
+    }
+
+    /// Promotes a block that passed the whole per-block step to the active
+    /// head (AC3/AC4, D7: Stored → Active directly), refreshes its
+    /// `chain_heads` entry (AC7) and, when the window gate said so, advances
+    /// the tail (9.1).
+    fn promote_head_extension(&mut self, idx: u32, advance: bool) {
+        self.blocks.set_status(idx, BlockStatus::Active);
+        self.blocks.set_on_active_chain(idx, true);
+        self.active_chain_head_idx = idx;
+        self.chain_heads.refresh_head(&self.blocks, idx);
+        // Story 6.1 (FR19 event (i)): the head's `branch_value` increment
+        // goes here, once per promoted block.
+        //
+        // FR64 (Epic 11 `LogSink`): emit the head-extension event carrying the
+        // promoted block's hash and sequence. Deferred — see deferred-work.md.
+        if advance {
+            self.advance_snake_chain_tail();
+        }
+    }
+
+    /// Story 6.0 AC4 — continues the active head over children that are
+    /// already stored: orphans that became children of the head when their
+    /// parent arrived and was promoted, and an earlier local-failure retry.
+    /// Runs after every Ready admission and after every direct extension.
+    ///
+    /// Each pass picks one Stored child of the head (D5, interim: the lowest
+    /// block hash; Story 6.1 replaces it with the FR22 tie-break), judges it,
+    /// and either promotes it, deletes it with its descendants (its verdict is
+    /// final, D2), or stops on a local failure, leaving it Stored. At most
+    /// `MAX_BLOCKS` passes; each costs an O(`MAX_BLOCKS`) child scan (there is
+    /// no child index) and one storage read.
+    fn drive_forward_extension(&mut self) {
+        for _ in 0..MAX_BLOCKS {
+            let head = self.active_chain_head_idx;
+            let mut child: Option<(u32, [u8; 32])> = None;
+            for idx in 0..MAX_BLOCKS as u32 {
+                if let Some(entry) = self.blocks.get(idx)
+                    && entry.parent_ref() == head
+                    && entry.status() == BlockStatus::Stored
+                    && child.is_none_or(|(_, hash)| *entry.hash() < hash)
+                {
+                    child = Some((idx, *entry.hash()));
+                }
+            }
+            let Some((child, _)) = child else {
+                return;
+            };
+            // The read copy (~2 KB) is dropped before any deletion or tail
+            // advance, whose delete-set buffer (2.4 KB) must not share the
+            // stack with it (D4).
+            let verdict = match self.read_retained_block(child) {
+                Some(block) => {
+                    let view = block.view();
+                    match self.judge_head_extension(&view, child) {
+                        Extension::Valid {
+                            advance,
+                            derivation,
+                        } => match self.commit_block(&view, child, derivation) {
+                            Ok(()) => Some(advance),
+                            Err(err) if is_evidence(&err) => None,
+                            Err(_) => return,
+                        },
+                        Extension::Invalid => None,
+                        Extension::Local => return,
+                    }
+                }
+                None => return,
+            };
+            match verdict {
+                Some(advance) => self.promote_head_extension(child, advance),
+                // AC5: no derived state was touched (D1), the head stays, and
+                // the node stays Ready — never the FR5 recovery.
+                //
+                // FR64 (Epic 11 `LogSink`): emit the deletion event carrying
+                // the child's hash. Deferred — see deferred-work.md.
+                None => {
+                    self.delete_subtree_with_followup(child);
+                }
+            }
+        }
+    }
+
+    /// The ancestor of `from` (inclusive) at `sequence`, by a RAM-only walk up
+    /// `parent_ref` (ADR-016 resolution; the UTXO inverse re-resolves by it).
+    /// `Ok(None)` when the walk reaches the anchor first. Each parent is
+    /// exactly one sequence lower (`blocks.rs` admission), so the walk ends
+    /// within the sequence distance; the `MAX_BLOCKS` bound only guards
+    /// against a corrupt `parent_ref` cycle.
+    fn ancestor_at(&self, from: u32, sequence: u32) -> Result<Option<u32>, UtxoSpendError> {
+        let mut cur = from;
+        for _ in 0..MAX_BLOCKS {
+            if cur == NONE_REF {
+                return Ok(None);
+            }
+            let entry = self.blocks.get(cur).ok_or(UtxoSpendError::MissingBlock)?;
+            if entry.sequence() == sequence {
+                return Ok(Some(cur));
+            }
+            cur = entry.parent_ref();
+        }
+        Err(UtxoSpendError::MissingBlock)
     }
 
     /// FR4 / FR9 Tier-3 Active-promotion driver (AC9): on a clean FR6 pass, walk
@@ -7291,8 +7786,15 @@ mod tests {
                 bc.chain_heads.occupied_heads().any(|(h, _)| h == bi1),
             )
         }
+        // A local failure is no evidence at all: nothing is deleted (amended
+        // FR5, DEC-037, Story 6.0 Task 10.1).
         for err in [
             ProcessingError::StorageRead,
+            ProcessingError::Vote(VoteEngineError::NotParameterized),
+        ] {
+            assert_eq!(run(err).0, 3, "a local failure deletes nothing");
+        }
+        for err in [
             ProcessingError::MissingBlock,
             ProcessingError::MarkOverflow,
             // AC3 names four non-`Invalid` variants, and `Vote(_)` is the one
@@ -9884,16 +10386,18 @@ mod tests {
         bc.blocks.find(seq, hash)
     }
 
-    /// Story 6.0's job, done by hand: receive `block` as a child of the active
-    /// head and make it the new head.
+    /// Receives `block` as a child of the active head; the Story 6.0 forward
+    /// extension makes it the new head and, past `W`, advances the tail.
     fn extend_active_head(bc: &mut W4Chain, block: &Block, now: u64) -> u32 {
         let (outcome, _) = bc.receive_block(block.view(), now);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         let view = block.view();
         let idx = slot_of(bc, view.sequence(), &view.hash()).expect("stored");
-        bc.blocks.set_on_active_chain(idx, true);
-        bc.blocks.set_status(idx, BlockStatus::Active);
-        bc.active_chain_head_idx = idx;
+        assert_eq!(bc.active_chain_head_idx, idx, "the extension is the head");
+        assert_eq!(
+            bc.blocks.get(idx).map(|e| e.status()),
+            Some(BlockStatus::Active)
+        );
         idx
     }
 
@@ -9986,7 +10490,11 @@ mod tests {
         bc.node_info.seed_node(1, &key, 0, slot_100);
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
-        assert!(bc.advance_snake_chain_tail());
+        assert_eq!(
+            bc.active_snake_chain_window(),
+            Ok((101, 104)),
+            "#100 released"
+        );
         assert!(bc.node_info.is_seeded(1), "the node stays seeded");
         assert!(bc.node_info.key_is_registered(&key));
         // The next admission reuses the freed slot.
@@ -10008,11 +10516,11 @@ mod tests {
         let (mut bc, h) = w4_ready_on_segment(103);
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
-        let slot_101 = slot_of(&bc, 101, &h[1]).expect("#101");
+        let slot_102 = slot_of(&bc, 102, &h[2]).expect("#102");
         let real_tail = bc.snake_chain_tail_idx;
-        bc.snake_chain_tail_idx = slot_101; // has a parent: not the root
+        bc.snake_chain_tail_idx = slot_102; // has a parent: not the root
         assert!(!bc.advance_snake_chain_tail());
-        assert_eq!(bc.block_tree_len(), 5, "nothing released");
+        assert_eq!(bc.block_tree_len(), 4, "nothing released");
         bc.snake_chain_tail_idx = real_tail;
         assert!(bc.advance_snake_chain_tail());
     }
@@ -10022,14 +10530,15 @@ mod tests {
     type DriveRecord = (u32, u32, TailObligation, TailBinding);
 
     /// One step of the drive in [`drive_past_w`]: classify the tail, decide
-    /// the binding for `extension`, extend, advance. Returns the trace record.
+    /// the binding for `extension`, then extend — the forward extension
+    /// advances the window. Returns the trace record.
     fn drive_step(bc: &mut W4Chain, extension: &Block, now: u64) -> DriveRecord {
         let released = bc.snake_chain_tail_idx;
         let obligation =
             classify_tail_drop(&bc.blocks, &bc.node_info, released).expect("the tail is readable");
         let binding = tail_drop_binding(obligation, &extension.view());
         extend_active_head(bc, extension, now);
-        assert!(bc.advance_snake_chain_tail(), "the window advances");
+        assert_ne!(bc.snake_chain_tail_idx, released, "the window advances");
         let (s_tail, _) = bc.active_snake_chain_window().expect("Ready");
         (s_tail, released, obligation, binding)
     }
@@ -10058,7 +10567,9 @@ mod tests {
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
         assert!(!bc.chain_heads.has_stored_head(), "every fork is Connected");
-        let b105 = linked_transfer_block(105, b104.view().hash());
+        // A Ready projection is complete (Story 6.0 D3): this segment seeds no
+        // node but #0, so the extension must not name another actor.
+        let b105 = w4_config_anchor_block(105, b104.view().hash());
         let second = drive_step(&mut bc, &b105, now);
         (
             [first, second],
@@ -10203,7 +10714,6 @@ mod tests {
 
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
-        assert!(bc.advance_snake_chain_tail());
         assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
 
         assert!(
@@ -11178,5 +11688,1044 @@ mod tests {
             Some(false),
             "no bit of the refused candidate survives"
         );
+    }
+
+    // ===================================================================
+    // Story 6.0 — Ready-state active-head forward extension
+    // ===================================================================
+
+    /// Every chain of this section shares `TestChain`'s capacities; only the
+    /// storage differs (the fault-injecting one of AC6).
+    type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, 16, 4, 16>;
+
+    /// The FR54 currency of every genesis node in this section.
+    const CURRENCY: u64 = 1_000_000_000;
+
+    /// A node-#0 genesis node on `W = w`: Ready, with the complete projection
+    /// the per-block step derived over #0 / #1 (D6). Returns it with the two
+    /// genesis blocks.
+    fn ready_genesis(w: u16) -> (TestChain, Block, Block) {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        let genesis = bc
+            .process_genesis(CURRENCY, window_config_builder(w).content())
+            .ok()
+            .expect("genesis succeeds");
+        (bc, genesis.block_zero, genesis.block_one)
+    }
+
+    fn head_of<S: StorageTrait>(bc: &Chain16<S>) -> (u32, [u8; 32]) {
+        let entry = bc.blocks.get(bc.active_chain_head_idx).expect("a head");
+        (entry.sequence(), *entry.hash())
+    }
+
+    fn receive<S: StorageTrait>(bc: &mut Chain16<S>, block: &Block) -> ReceiveBlockOutcome {
+        bc.receive_block(block.view(), 0).0
+    }
+
+    /// A registration of `new_node_id` by `initializer`, its key from
+    /// `pk_byte` (the cross-key construction of [`registration_block`]).
+    fn registration_tx(initializer: u32, new_node_id: u32, pk_byte: u8) -> Registration {
+        let init_signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("init key");
+        let new_signer = Crypto::new([pk_byte; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("new key");
+        let new_pk = *new_signer.public_key().serialize();
+        let mut new_key_sig = [0u8; 64];
+        new_key_sig.copy_from_slice(&new_signer.sign(&new_pk).serialize()[..64]);
+        let zero = [0u8; 64];
+        let unsigned = Registration::new(
+            0,
+            initializer,
+            new_node_id,
+            50,
+            1,
+            &new_pk,
+            &new_key_sig,
+            &zero,
+        );
+        let mut tx_sig = [0u8; 64];
+        tx_sig.copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..64]);
+        Registration::new(
+            0,
+            initializer,
+            new_node_id,
+            50,
+            1,
+            &new_pk,
+            &new_key_sig,
+            &tx_sig,
+        )
+    }
+
+    /// A transaction block by node #0 with `mined_amount`, its payload added
+    /// by `add`.
+    fn tx_block(
+        seq: u32,
+        prev: [u8; 32],
+        mined: u32,
+        add: impl FnOnce(&mut BlockBuilder),
+    ) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: mined,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        add(&mut builder);
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// A node #0 → `receiver` transfer of `amount` (fee 1, vote 0).
+    fn transfer_tx(seq: u32, receiver: u32, amount: u64) -> NodeTransfer {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        NodeTransfer::new_signed(0, seq - 1, 0, receiver, amount, 1, 0, &signer)
+    }
+
+    fn transfer(seq: u32, prev: [u8; 32], receiver: u32, amount: u64) -> Block {
+        let nt = transfer_tx(seq, receiver, amount);
+        tx_block(seq, prev, 0, |b| {
+            b.add_node_transfer(&nt).ok().expect("add transfer");
+        })
+    }
+
+    fn register(seq: u32, prev: [u8; 32], new_node_id: u32, pk_byte: u8) -> Block {
+        let reg = registration_tx(0, new_node_id, pk_byte);
+        tx_block(seq, prev, 0, |b| {
+            b.add_registration(&reg).ok().expect("add registration");
+        })
+    }
+
+    /// Node #0's current `(balance, vote_count)` — a matching D9 snapshot.
+    fn node_zero_snapshot<S: StorageTrait>(bc: &Chain16<S>) -> (u32, u64, u32, u8) {
+        (
+            0,
+            bc.node_info.balance_of(0),
+            bc.vote_engine.accumulated_vote_of(0),
+            0,
+        )
+    }
+
+    /// AC2 / AC10.4: the derived state of two nodes is identical — `node_info`,
+    /// the vote engine, the whole block table (statuses, chain flags,
+    /// available-UTXO bits), `chain_heads`, the head and the tail.
+    fn assert_same_state<S: StorageTrait, T: StorageTrait>(
+        a: &Chain16<S>,
+        b: &Chain16<T>,
+        what: &str,
+    ) {
+        assert!(a.node_info == b.node_info, "{what}: node_info");
+        assert!(a.vote_engine == b.vote_engine, "{what}: votes");
+        assert!(a.blocks == b.blocks, "{what}: block table");
+        assert!(a.chain_heads == b.chain_heads, "{what}: chain_heads");
+        assert_eq!(
+            a.active_chain_head_idx, b.active_chain_head_idx,
+            "{what}: head"
+        );
+        assert_eq!(
+            a.snake_chain_tail_idx, b.snake_chain_tail_idx,
+            "{what}: tail"
+        );
+        assert_eq!(a.lifecycle_phase, b.lifecycle_phase, "{what}: phase");
+    }
+
+    /// The durable slot `idx` holds the same bytes on both nodes.
+    fn same_slot<S: StorageTrait, T: StorageTrait>(
+        a: &Chain16<S>,
+        b: &Chain16<T>,
+        idx: u32,
+    ) -> bool {
+        match (a.storage.read_block(idx), b.storage.read_block(idx)) {
+            (Ok(x), Ok(y)) => x.serialized_bytes() == y.serialized_bytes(),
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The reason the fallible half of the step gives for `block` as an
+    /// extension of the head, run on a scratch entry that is removed again.
+    /// `None` on success, whose effects are then inverted, so either way the
+    /// node is left as it was.
+    fn step_reason<S: StorageTrait>(
+        bc: &mut Chain16<S>,
+        block: &Block,
+    ) -> Option<ValidationReason> {
+        let view = block.view();
+        let idx = bc.blocks.next_free_index().expect("a free slot");
+        let head = bc.active_chain_head_idx;
+        let head_hash = *bc.blocks.get(head).expect("head").hash();
+        bc.blocks
+            .insert_at(idx, BlockEntry::new(view.hash(), head, view.sequence()));
+        let mut projection = Projection::COMPLETE;
+        let reason = match bc.derive_block(&view, idx, Some(head_hash), &mut projection) {
+            Ok(_) => {
+                bc.invert_transactions(&view, idx, usize::MAX);
+                None
+            }
+            Err(ProcessingError::Invalid { reason, .. }) => Some(reason),
+            Err(other) => panic!("not a validation failure: {other:?}"),
+        };
+        bc.blocks.delete(idx);
+        reason
+    }
+
+    /// The UTXO fixture on a genesis node: #2 registers node 1, #3 mints two
+    /// UTXO outputs (60, 40) from node #0's balance. Returns the node and #3.
+    fn utxo_genesis() -> (TestChain, Block) {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        assert_eq!(
+            receive(&mut bc, &reg),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let mint_tx = utxo_tx(3, &[], Some((0, 100)), &[Ok(60), Ok(40)]);
+        let mint = complex_tx_block(3, reg.view().hash(), 0, 0, &[&mint_tx]);
+        assert_eq!(
+            receive(&mut bc, &mint),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc).1, mint.view().hash());
+        (bc, mint)
+    }
+
+    // --- Task 2.2: every inverse is exact (apply ∘ invert = identity) -------
+
+    #[test]
+    fn step_inverses_restore_the_derived_state_exactly() {
+        // Node transfer, registration, and a complex transaction with a UTXO
+        // spend, a balance input and a balance output — each applied by the
+        // step and inverted, on a node that has a twin.
+        let (mut bc, mint) = utxo_genesis();
+        let (twin, _) = utxo_genesis();
+        let (seq, prev) = (4, mint.view().hash());
+        let nt = transfer_tx(seq, 1, 500);
+        let reg = registration_tx(0, 2, 0xB2);
+        let cx = utxo_tx(seq, &[(3, 1, 40)], Some((0, 10)), &[Err((1, 45))]);
+        let blocks = [
+            tx_block(seq, prev, 0, |b| {
+                b.add_node_transfer(&nt).ok().expect("transfer");
+            }),
+            tx_block(seq, prev, 0, |b| {
+                b.add_registration(&reg).ok().expect("registration");
+            }),
+            complex_tx_block(seq, prev, 0, 0, &[&cx]),
+        ];
+        for block in &blocks {
+            assert_eq!(step_reason(&mut bc, block), None, "the block is valid");
+            assert_same_state(&bc, &twin, "after apply and invert");
+        }
+    }
+
+    // --- AC10.1: direct extension -------------------------------------------
+
+    #[test]
+    fn forward_extension_promotes_each_direct_extension() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        let t3 = transfer(3, reg.view().hash(), 1, 100);
+        let t4 = transfer(4, t3.view().hash(), 1, 50);
+        for block in [&reg, &t3, &t4] {
+            assert_eq!(
+                receive(&mut bc, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            let idx = bc
+                .blocks
+                .find(block.view().sequence(), &block.view().hash())
+                .expect("stored");
+            assert_eq!(
+                bc.current_active_head(),
+                Some(idx),
+                "D19: the head advances"
+            );
+            let entry = bc.blocks.get(idx).expect("entry");
+            assert_eq!(entry.status(), BlockStatus::Active);
+            assert!(entry.is_on_active_chain());
+        }
+        assert_eq!(bc.node_info.max_known_node_id(), 1);
+        assert_eq!(bc.node_info.balance_of(1), 150);
+        // Registration 50 + 1, transfers 101 + 51; every fee back to the
+        // creator, node #0.
+        assert_eq!(bc.node_info.balance_of(0), CURRENCY - 51 - 101 - 51 + 3);
+        assert!(bc.is_ready());
+    }
+
+    // --- AC10.2: orphan continuation ----------------------------------------
+
+    #[test]
+    fn forward_extension_continues_over_a_stored_orphan() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let a = transfer(2, b1.view().hash(), 0, 7);
+        let b = transfer(3, a.view().hash(), 0, 8);
+        assert_eq!(receive(&mut bc, &b), ReceiveBlockOutcome::AcceptedSilently);
+        let bi = bc.blocks.find(3, &b.view().hash()).expect("orphan stored");
+        assert_eq!(
+            bc.blocks.get(bi).map(|e| e.status()),
+            Some(BlockStatus::Stored)
+        );
+        assert_eq!(head_of(&bc).0, 1, "the orphan does not move the head");
+
+        assert_eq!(receive(&mut bc, &a), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            head_of(&bc),
+            (3, b.view().hash()),
+            "A at intake, B by continuation"
+        );
+        assert_eq!(
+            bc.blocks.get(bi).map(|e| e.status()),
+            Some(BlockStatus::Active)
+        );
+        assert!(!bc.chain_heads.has_stored_head());
+    }
+
+    // --- AC10.3: sibling choice (D5) ----------------------------------------
+
+    #[test]
+    fn forward_extension_takes_the_lowest_hash_sibling() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let a = transfer(2, b1.view().hash(), 0, 7);
+        let c1 = transfer(3, a.view().hash(), 0, 8);
+        let c2 = transfer(3, a.view().hash(), 0, 9);
+        for c in [&c1, &c2] {
+            assert_eq!(receive(&mut bc, c), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(receive(&mut bc, &a), ReceiveBlockOutcome::AcceptedSilently);
+        let (low, high) = if c1.view().hash() < c2.view().hash() {
+            (&c1, &c2)
+        } else {
+            (&c2, &c1)
+        };
+        assert_eq!(head_of(&bc), (3, low.view().hash()), "the lower hash wins");
+        let hi = bc.blocks.find(3, &high.view().hash()).expect("loser kept");
+        assert_eq!(
+            bc.blocks.get(hi).map(|e| e.status()),
+            Some(BlockStatus::Stored)
+        );
+        assert!(
+            bc.chain_heads.occupied_heads().any(|(h, _)| h == hi),
+            "the loser is a tracked side head"
+        );
+        assert!(!bc.chain_heads.has_stored_head(), "and a Connected one");
+    }
+
+    // --- AC10.4: invalid direct extension (AC3, AC2) ------------------------
+
+    /// Feeds `bad` to a node and asserts the AC3 refusal: `InvalidEvidence`,
+    /// nothing stored, and every piece of derived state identical to a twin
+    /// that never saw it (AC2). `reason` pins why, against a third twin.
+    fn assert_refused_at_intake(
+        build: impl Fn() -> TestChain,
+        bad: &Block,
+        reason: ValidationReason,
+    ) {
+        let mut bc = build();
+        let twin = build();
+        let mut probe = build();
+        assert_eq!(step_reason(&mut probe, bad), Some(reason));
+        assert_same_state(&probe, &twin, "the probe left nothing behind");
+        let free = bc.blocks.next_free_index().expect("a free slot");
+        assert_eq!(
+            receive(&mut bc, bad),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_same_state(&bc, &twin, "refused extension");
+        assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
+        assert!(same_slot(&bc, &twin, free), "storage unchanged");
+    }
+
+    #[test]
+    fn invalid_direct_extension_is_not_stored_and_leaves_no_trace() {
+        let genesis = || ready_genesis(16).0;
+        let (_, _, b1) = ready_genesis(16);
+        let prev = b1.view().hash();
+        // Insufficient balance after an earlier, valid transfer in the block.
+        let ok = transfer_tx(2, 0, 10);
+        let broke = transfer_tx(2, 0, CURRENCY);
+        let overspend = tx_block(2, prev, 0, |b| {
+            b.add_node_transfer(&ok).ok().expect("first");
+            b.add_node_transfer(&broke).ok().expect("second");
+        });
+        assert_refused_at_intake(genesis, &overspend, ValidationReason::InsufficientBalance);
+
+        // A duplicate key after an earlier registration's debit and seeding.
+        let first = registration_tx(0, 1, 0xB1);
+        let dup = registration_tx(0, 2, 0xB1);
+        let duplicate = tx_block(2, prev, 0, |b| {
+            b.add_registration(&first).ok().expect("first");
+            b.add_registration(&dup).ok().expect("second");
+        });
+        assert_refused_at_intake(genesis, &duplicate, ValidationReason::DuplicatePublicKey);
+
+        // A UTXO spend after an earlier input spent the same output.
+        let utxo = || utxo_genesis().0;
+        let (_, mint) = utxo_genesis();
+        let spend = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+        let again = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+        let double = complex_tx_block(4, mint.view().hash(), 0, 0, &[&spend, &again]);
+        assert_refused_at_intake(utxo, &double, ValidationReason::UtxoUnavailable);
+    }
+
+    // --- AC10.5: invalid stored child (AC4, AC5) ----------------------------
+
+    #[test]
+    fn invalid_stored_child_is_deleted_with_its_descendants() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let (mut twin, _, _) = ready_genesis(16);
+        let a = transfer(2, b1.view().hash(), 0, 7);
+        let bad = transfer(3, a.view().hash(), 0, CURRENCY);
+        let below = transfer(4, bad.view().hash(), 0, 8);
+        for block in [&below, &bad] {
+            assert_eq!(
+                receive(&mut bc, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(bc.blocks.len(), 4, "both orphans stored");
+
+        assert_eq!(receive(&mut bc, &a), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            receive(&mut twin, &a),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc), (2, a.view().hash()), "A stays the head");
+        assert!(
+            bc.blocks.find(3, &bad.view().hash()).is_none(),
+            "child deleted"
+        );
+        assert!(
+            bc.blocks.find(4, &below.view().hash()).is_none(),
+            "with its descendant"
+        );
+        assert!(bc.is_ready(), "no FR5 recovery in Ready");
+        // Nothing of the failed child reached the derived state.
+        assert!(bc.node_info == twin.node_info);
+        assert!(bc.vote_engine == twin.vote_engine);
+    }
+
+    // --- AC10.6: local failures (AC6) ---------------------------------------
+
+    /// A backend that can fail reads of one slot and every block write.
+    struct FaultyStorage {
+        inner: MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
+        failing_read_slot: u32,
+        fail_saves: bool,
+    }
+
+    impl StorageTrait for FaultyStorage {
+        fn init(
+            &mut self,
+            private_key: [u8; PRIVATE_KEY_SIZE],
+            own_node_id: u32,
+            init_params: [u8; INIT_PARAMS_SIZE],
+        ) -> Result<(), StorageError> {
+            self.inner.init(private_key, own_node_id, init_params)
+        }
+
+        fn save_block(&mut self, idx: u32, block: &Block) -> Result<(), StorageError> {
+            if self.fail_saves {
+                return Err(StorageError::BackendIo { code: 7 });
+            }
+            self.inner.save_block(idx, block)
+        }
+
+        fn read_block(&self, idx: u32) -> Result<Block, StorageError> {
+            if idx == self.failing_read_slot {
+                return Err(StorageError::BackendIo { code: 9 });
+            }
+            self.inner.read_block(idx)
+        }
+
+        fn capacity(&self) -> u32 {
+            self.inner.capacity()
+        }
+
+        fn set_chain_configuration(&mut self, block: &Block) -> Result<(), StorageError> {
+            self.inner.set_chain_configuration(block)
+        }
+
+        fn load_control_data(&mut self) -> Result<ControlPlaneData, StorageError> {
+            self.inner.load_control_data()
+        }
+    }
+
+    /// [`utxo_genesis`] on a [`FaultyStorage`] whose faults are disarmed.
+    fn faulty_utxo_genesis() -> (Chain16<FaultyStorage>, Block) {
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let storage = FaultyStorage {
+            inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
+            failing_read_slot: NONE_REF,
+            fail_saves: false,
+        };
+        let mut slot = core::mem::MaybeUninit::<Chain16<FaultyStorage>>::uninit();
+        Chain16::<FaultyStorage>::init(&mut slot, crypto, storage, chain_config, 0, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut bc = unsafe { slot.assume_init() };
+        let genesis = bc
+            .process_genesis(CURRENCY, window_config_builder(16).content())
+            .ok()
+            .expect("genesis");
+        let reg = register(2, genesis.block_one.view().hash(), 1, 0xB1);
+        assert_eq!(
+            receive(&mut bc, &reg),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let mint_tx = utxo_tx(3, &[], Some((0, 100)), &[Ok(60), Ok(40)]);
+        let mint = complex_tx_block(3, reg.view().hash(), 0, 0, &[&mint_tx]);
+        assert_eq!(
+            receive(&mut bc, &mint),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        (bc, mint)
+    }
+
+    #[test]
+    fn read_failure_at_intake_stores_the_extension_and_retries_it() {
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let (twin, _) = faulty_utxo_genesis();
+        let mint_idx = bc.active_chain_head_idx;
+        let tx = utxo_tx(4, &[(3, 1, 40)], None, &[Err((1, 40))]);
+        let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
+
+        bc.storage.failing_read_slot = mint_idx;
+        assert_eq!(
+            receive(&mut bc, &spend),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let si = bc
+            .blocks
+            .find(4, &spend.view().hash())
+            .expect("stored, not blamed");
+        assert_eq!(
+            bc.blocks.get(si).map(|e| e.status()),
+            Some(BlockStatus::Stored)
+        );
+        assert_eq!(bc.active_chain_head_idx, mint_idx, "head unchanged");
+        assert!(bc.node_info == twin.node_info, "derived state unchanged");
+        assert!(bc.vote_engine == twin.vote_engine);
+        assert_eq!(
+            bc.blocks.utxo_available(mint_idx, 1),
+            Some(true),
+            "bit restored"
+        );
+
+        // The fault clears; the next admission — any block — extends it.
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = node_transfer_block(9, 3, 8, 7);
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(bc.active_chain_head_idx, si, "the retry extended the head");
+        assert_eq!(bc.blocks.utxo_available(mint_idx, 1), Some(false));
+        assert_eq!(bc.node_info.balance_of(1), 40);
+    }
+
+    #[test]
+    fn save_failure_inverts_the_extension_and_is_unstorable() {
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let (twin, _) = faulty_utxo_genesis();
+        let tx = utxo_tx(4, &[(3, 1, 40)], Some((0, 5)), &[Err((1, 44))]);
+        let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
+        bc.storage.fail_saves = true;
+        assert_eq!(
+            receive(&mut bc, &spend),
+            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable)
+        );
+        assert_same_state(&bc, &twin, "save failure");
+    }
+
+    // --- AC10.7: the window path --------------------------------------------
+
+    /// A genesis node on `W = 4` with #2 and #3 added: the window is full
+    /// (`0..=3`), and its tail #0 is node #0's seed source (its registration).
+    fn full_w4_genesis() -> (TestChain, Block) {
+        let (mut bc, _, b1) = ready_genesis(4);
+        let b2 = transfer(2, b1.view().hash(), 0, 7);
+        let b3 = transfer(3, b2.view().hash(), 0, 8);
+        for block in [&b2, &b3] {
+            assert_eq!(
+                receive(&mut bc, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
+        (bc, b3)
+    }
+
+    fn snapshot_block<S: StorageTrait>(bc: &Chain16<S>, seq: u32, prev: [u8; 32]) -> Block {
+        balance_block(
+            seq,
+            prev,
+            &[node_zero_snapshot(bc)],
+            bc.node_info.max_known_node_id(),
+        )
+    }
+
+    #[test]
+    fn window_extension_past_w_advances_and_binds() {
+        // Binding `Invalid` at intake: dropping #0 needs a balance block (FR50).
+        let (mut bc, b3) = full_w4_genesis();
+        let (twin, _) = full_w4_genesis();
+        let plain = transfer(4, b3.view().hash(), 0, 9);
+        assert_eq!(
+            receive(&mut bc, &plain),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_same_state(&bc, &twin, "binding refusal stores nothing");
+
+        // A stored child failing its binding is deleted. The snapshot at #4
+        // advances the tail to #1 (chain-config), so a transfer at #5 cannot
+        // drop it (FR49) — admitted first as an orphan, judged by continuation.
+        let replay = snapshot_block(&bc, 4, b3.view().hash());
+        let child = transfer(5, replay.view().hash(), 0, 9);
+        assert_eq!(
+            receive(&mut bc, &child),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            receive(&mut bc, &replay),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc), (4, replay.view().hash()));
+        assert_eq!(
+            bc.active_snake_chain_window(),
+            Ok((1, 4)),
+            "the extension past W advanced the tail in the same step"
+        );
+        assert!(
+            bc.blocks.find(0, &bc_genesis_hash()).is_none(),
+            "#0 released"
+        );
+        assert!(
+            bc.blocks.find(5, &child.view().hash()).is_none(),
+            "child deleted"
+        );
+        let replay_idx = bc.active_chain_head_idx;
+        assert!(
+            bc.node_info.is_seed_source(replay_idx),
+            "D9: the seed source moved"
+        );
+    }
+
+    /// Block #0 of every genesis node in this section (it is deterministic).
+    fn bc_genesis_hash() -> [u8; 32] {
+        ready_genesis(16).1.view().hash()
+    }
+
+    /// AC10.7 — a classification failure is a local one: no mutation, no
+    /// verdict. Since Story 6.11 the classification reads no storage, so its
+    /// only failure is a tail naming an empty slot; that is reached here by
+    /// corrupting the index and judging directly, since `receive_block`'s FR60
+    /// window asserts the same invariant in debug builds.
+    #[test]
+    fn window_classification_failure_changes_nothing() {
+        let (mut bc, b3) = full_w4_genesis();
+        let (twin, _) = full_w4_genesis();
+        let real_tail = bc.snake_chain_tail_idx;
+        let replay = snapshot_block(&bc, 4, b3.view().hash());
+        let view = replay.view();
+        let idx = bc.blocks.next_free_index().expect("free");
+        let head = bc.active_chain_head_idx;
+        bc.blocks
+            .insert_at(idx, BlockEntry::new(view.hash(), head, view.sequence()));
+        bc.snake_chain_tail_idx = idx + 1; // an empty slot
+        assert!(matches!(
+            bc.judge_head_extension(&view, idx),
+            Extension::Local
+        ));
+        bc.snake_chain_tail_idx = real_tail;
+        bc.blocks.delete(idx);
+        assert_same_state(&bc, &twin, "classification failure");
+
+        // With the tail readable again, the same block extends the head.
+        assert_eq!(
+            receive(&mut bc, &replay),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc), (4, replay.view().hash()));
+    }
+
+    // --- AC10.8: genesis-node equivalence (AC8) -----------------------------
+
+    #[test]
+    fn genesis_node_and_mesh_node_derive_the_same_state() {
+        let (mut g, b0, b1) = ready_genesis(16);
+        assert_eq!(
+            g.blocks.get(0).map(|e| e.status()),
+            Some(BlockStatus::Active)
+        );
+        assert_eq!(
+            g.blocks.get(1).map(|e| e.status()),
+            Some(BlockStatus::Active)
+        );
+        let mut m = new_unconfigured_test_chain();
+        for block in [&b0, &b1] {
+            assert_eq!(
+                receive(&mut m, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(m.is_ready(), "the mesh node joined through FR3");
+        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        let t3 = transfer(3, reg.view().hash(), 1, 100);
+        for block in [&reg, &t3] {
+            assert_eq!(
+                receive(&mut g, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(
+                receive(&mut m, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(g.node_info == m.node_info, "node_info");
+        assert!(g.vote_engine == m.vote_engine, "votes");
+        for idx in 0..4 {
+            let (a, b) = (g.blocks.get(idx).expect("g"), m.blocks.get(idx).expect("m"));
+            assert_eq!(a.hash(), b.hash());
+            assert_eq!(a.status(), b.status());
+            assert_eq!(a.is_on_active_chain(), b.is_on_active_chain());
+        }
+        assert_eq!(head_of(&g), head_of(&m));
+    }
+
+    // --- AC10.9: FR3 / restart / double-run equivalence (AC9) ---------------
+
+    /// The AC9 sequence on a genesis node: a registration, a transfer, a mined
+    /// UTXO mint, a spend, and a matching balance block. Returns the node and
+    /// the blocks in chain order, #0 first.
+    fn extended_genesis() -> (TestChain, [Block; 7]) {
+        let (mut bc, b0, b1) = ready_genesis(16);
+        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        receive(&mut bc, &reg);
+        let t3 = transfer(3, reg.view().hash(), 1, 100);
+        receive(&mut bc, &t3);
+        let mint_tx = utxo_tx(4, &[], Some((0, 100)), &[Ok(60), Ok(40)]);
+        let mint = complex_tx_block(4, t3.view().hash(), 0, 25, &[&mint_tx]);
+        receive(&mut bc, &mint);
+        let spend_tx = utxo_tx(5, &[(4, 0, 60)], None, &[Err((1, 59))]);
+        let spend = complex_tx_block(5, mint.view().hash(), 0, 0, &[&spend_tx]);
+        receive(&mut bc, &spend);
+        let snap = snapshot_block(&bc, 6, spend.view().hash());
+        receive(&mut bc, &snap);
+        assert_eq!(
+            head_of(&bc),
+            (6, snap.view().hash()),
+            "every block extended"
+        );
+        (bc, [b0, b1, reg, t3, mint, spend, snap])
+    }
+
+    #[test]
+    fn forward_extension_matches_fr3_restart_and_replay() {
+        let (a, blocks) = extended_genesis();
+        assert_eq!(a.blocks.utxo_available(4, 0), Some(false), "spent");
+        assert_eq!(a.blocks.utxo_available(4, 1), Some(true), "unspent");
+
+        // (1) A fresh node receiving the same blocks while Collecting reaches
+        // Ready through FR3 over all of them: orphans first, genesis last.
+        let mut b = new_unconfigured_test_chain();
+        for block in blocks.iter().rev() {
+            assert_eq!(
+                receive(&mut b, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(b.is_ready());
+        assert_eq!(head_of(&b), head_of(&a));
+        assert_eq!(
+            b.node_info.max_known_node_id(),
+            a.node_info.max_known_node_id()
+        );
+        for node in 0..16 {
+            assert_eq!(b.node_info.balance_of(node), a.node_info.balance_of(node));
+            assert_eq!(
+                b.node_info.public_key_of(node),
+                a.node_info.public_key_of(node)
+            );
+            assert_eq!(
+                b.vote_engine.accumulated_vote_of(node),
+                a.vote_engine.accumulated_vote_of(node)
+            );
+        }
+        for block in &blocks {
+            let view = block.view();
+            let ai = a.blocks.find(view.sequence(), &view.hash()).expect("a");
+            let bi = b.blocks.find(view.sequence(), &view.hash()).expect("b");
+            let (ea, eb) = (a.blocks.get(ai).expect("a"), b.blocks.get(bi).expect("b"));
+            assert_eq!(ea.status(), eb.status(), "#{}", view.sequence());
+            assert_eq!(ea.is_on_active_chain(), eb.is_on_active_chain());
+            for bit in 0..16 {
+                assert_eq!(ea.utxo_available(bit), eb.utxo_available(bit));
+            }
+            assert_eq!(
+                a.node_info.is_seed_source(ai),
+                b.node_info.is_seed_source(bi),
+                "seed source #{}",
+                view.sequence()
+            );
+        }
+
+        // (2) Restart of A rebuilds the same state from its own slots.
+        let (a, _) = extended_genesis();
+        let (reference, _) = extended_genesis();
+        let mut restarted = restart(a);
+        let _ = restarted.initialize_from_storage(0);
+        assert!(restarted.is_ready());
+        assert!(
+            restarted.node_info == reference.node_info,
+            "restart node_info"
+        );
+        assert!(
+            restarted.vote_engine == reference.vote_engine,
+            "restart votes"
+        );
+        assert_eq!(head_of(&restarted), head_of(&reference));
+        for idx in 0..7 {
+            let (x, y) = (
+                restarted.blocks.get(idx).expect("restarted"),
+                reference.blocks.get(idx).expect("reference"),
+            );
+            assert_eq!(x.status(), y.status());
+            assert_eq!(x.is_on_active_chain(), y.is_on_active_chain());
+            for bit in 0..16 {
+                assert_eq!(x.utxo_available(bit), y.utxo_available(bit));
+            }
+        }
+
+        // (3) The same admission sequence twice gives the same state.
+        let (twice, _) = extended_genesis();
+        assert_same_state(&twice, &reference, "double run");
+    }
+
+    // --- AC10.10: chain_heads cache and eviction protection (AC7) -----------
+
+    #[test]
+    fn promoted_head_has_current_caches() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let a = transfer(2, b1.view().hash(), 0, 7);
+        receive(&mut bc, &a);
+        let head = bc.active_chain_head_idx;
+        assert!(
+            bc.chain_heads
+                .occupied_heads()
+                .any(|(h, anchor)| h == head && anchor == head),
+            "the head's entry anchors on the head itself, not the old head"
+        );
+    }
+
+    // --- AC10.11: balance block (D9) ----------------------------------------
+
+    /// A balance block by node #0 with `mined_amount`.
+    fn mined_balance_block(
+        seq: u32,
+        prev: [u8; 32],
+        entries: &[(u32, u64, u32, u8)],
+        max_node_id: u32,
+        mined: u32,
+    ) -> Block {
+        use moonblokz_chain_types::NodeInfo;
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let real_key = *signer.public_key().serialize();
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: mined,
+            payload_type: PAYLOAD_TYPE_BALANCE,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        for &(owner, balance, vote_count, _) in entries {
+            let ni = NodeInfo::new(owner, balance, vote_count, &real_key);
+            builder.add_node_info(&ni).ok().expect("add node info");
+        }
+        builder
+            .set_max_node_id(max_node_id)
+            .ok()
+            .expect("max node id");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    #[test]
+    fn balance_block_repeats_the_pre_state_in_ready() {
+        // Two nodes: #0 (the creator) and #1, registered at #2. A transfer at
+        // #3 gives #1 a vote so the snapshot has a non-trivial vote count.
+        let build = || {
+            let (mut bc, _, b1) = ready_genesis(16);
+            let reg = register(2, b1.view().hash(), 1, 0xB1);
+            receive(&mut bc, &reg);
+            let nt = NodeTransfer::new_signed(
+                1,
+                2,
+                0,
+                1,
+                10,
+                1,
+                0,
+                &Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key"),
+            );
+            let t3 = tx_block(3, reg.view().hash(), 0, |b| {
+                b.add_node_transfer(&nt).ok().expect("transfer");
+            });
+            receive(&mut bc, &t3);
+            (bc, t3)
+        };
+        let (mut bc, t3) = build();
+        let prev = t3.view().hash();
+        let (owner, balance, votes, _) = node_zero_snapshot(&bc);
+        assert!(bc.vote_engine.accumulated_vote_of(1) > 0, "precondition");
+
+        // Each mismatching field of a seeded entry is Invalid (FR50).
+        for entry in [
+            (owner, balance - 1, votes, 0),
+            (owner, balance, votes + 1, 0),
+            // Node #1's key is `pubkey(0xB1)`; the builder writes node #0's.
+            (
+                1,
+                bc.node_info.balance_of(1),
+                bc.vote_engine.accumulated_vote_of(1),
+                0,
+            ),
+        ] {
+            let bad = mined_balance_block(4, prev, &[entry], 1, 3);
+            assert_eq!(
+                step_reason(&mut bc, &bad),
+                Some(ValidationReason::BalanceSnapshotMismatch)
+            );
+        }
+        // An entry for a node that does not exist is Invalid in Ready.
+        let ghost = mined_balance_block(4, prev, &[(2, 0, 0, 0)], 1, 3);
+        assert_eq!(
+            step_reason(&mut bc, &ghost),
+            Some(ValidationReason::NodeIdOutOfRange)
+        );
+
+        // A mismatch as a stored child is deleted, derived state untouched.
+        let (mut twin, _) = build();
+        let mut bad_child_chain = build().0;
+        let filler = transfer(4, prev, 0, 7);
+        let bad = mined_balance_block(5, filler.view().hash(), &[(owner, 0, votes, 0)], 1, 3);
+        receive(&mut bad_child_chain, &bad);
+        receive(&mut bad_child_chain, &filler);
+        receive(&mut twin, &filler);
+        assert!(
+            bad_child_chain.blocks.find(5, &bad.view().hash()).is_none(),
+            "deleted"
+        );
+        assert!(bad_child_chain.node_info == twin.node_info);
+        assert!(bad_child_chain.vote_engine == twin.vote_engine);
+
+        // The matching snapshot is accepted: the entries leave balances and
+        // votes as they were; only the block-level effects apply.
+        let good = mined_balance_block(4, prev, &[(owner, balance, votes, 0)], 1, 3);
+        let vote_one = bc.vote_engine.accumulated_vote_of(1);
+        assert_eq!(
+            receive(&mut bc, &good),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc), (4, good.view().hash()));
+        assert_eq!(
+            bc.node_info.balance_of(0),
+            balance + 3,
+            "the creator credit"
+        );
+        assert_eq!(
+            bc.vote_engine.accumulated_vote_of(0),
+            0,
+            "the creator reset"
+        );
+        assert!(
+            bc.vote_engine.accumulated_vote_of(1) >= vote_one,
+            "only interest applies to the listed-or-not others"
+        );
+        let gi = bc.active_chain_head_idx;
+        assert!(
+            bc.node_info.is_seed_source(gi),
+            "node #0's seed source moved"
+        );
+    }
+
+    #[test]
+    fn balance_block_snapshot_is_checked_in_fr3() {
+        // A genesis-anchored FR3 pass over a balance block whose snapshot
+        // disagrees deletes it (FR5); the matching one is adopted.
+        let (g, b0, b1) = ready_genesis(16);
+        let (owner, balance, votes, _) = node_zero_snapshot(&g);
+        for (entry_balance, adopted) in [(balance + 1, false), (balance, true)] {
+            let snap = balance_block(2, b1.view().hash(), &[(owner, entry_balance, votes, 0)], 0);
+            let mut m = new_unconfigured_test_chain();
+            for block in [&snap, &b1, &b0] {
+                receive(&mut m, block);
+            }
+            assert!(m.is_ready());
+            assert_eq!(m.blocks.find(2, &snap.view().hash()).is_some(), adopted);
+            assert_eq!(head_of(&m).0, if adopted { 2 } else { 1 });
+        }
+        // A window-anchored pass seeds an unseeded entry (floor seeding).
+        let (mut bc, _) = utxo_test_chain();
+        let tip = (0..16u32)
+            .find(|&i| bc.blocks.get(i).is_some_and(|e| e.sequence() == 100))
+            .expect("#100");
+        assert_eq!(bc.run_processing_pass(tip), Ok(()));
+        assert!(bc.node_info.is_seeded(1));
+        assert_eq!(bc.node_info.balance_of(1), 100);
+    }
+
+    // --- AC10.12: complete context in Ready (D3) ----------------------------
+
+    #[test]
+    fn ready_has_no_trust_zone() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let prev = b1.view().hash();
+        // An unseeded creator.
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+        let header = BlockHeader {
+            version: 1,
+            sequence: 2,
+            creator: 5,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let nt = transfer_tx(2, 0, 1);
+        let mut builder = BlockBuilder::new().header(header);
+        builder.add_node_transfer(&nt).ok().expect("transfer");
+        let by_stranger = builder.build_signed(&signer).ok().expect("build");
+        assert_eq!(
+            step_reason(&mut bc, &by_stranger),
+            Some(ValidationReason::UnseededActor)
+        );
+        // An initializer that is not seeded (here: does not exist).
+        let foreign = transfer_block(2, prev, 7, 0, 1, 1, 0);
+        assert_eq!(
+            step_reason(&mut bc, &foreign),
+            Some(ValidationReason::UnseededActor)
+        );
+        // As a stored child, it is deleted.
+        let a = transfer(2, prev, 0, 7);
+        let child = transfer_block(3, a.view().hash(), 7, 0, 1, 1, 0);
+        receive(&mut bc, &child);
+        receive(&mut bc, &a);
+        assert_eq!(head_of(&bc), (2, a.view().hash()));
+        assert!(bc.blocks.find(3, &child.view().hash()).is_none());
     }
 }

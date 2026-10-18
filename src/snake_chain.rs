@@ -105,7 +105,6 @@ pub(crate) enum TailBinding {
 /// block for FR50, a block carrying a zero-input complex transaction for FR51.
 /// Content equivalence is Stories 9.2 / 9.3 / 9.5. Story 6.0 enforces
 /// `Invalid` as a Tier-3 failure; Story 8.3 consults it on the creator side.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller: Story 6.0
 pub(crate) fn tail_drop_binding(obligation: TailObligation, extension: &BlockView) -> TailBinding {
     let preserved = match obligation {
         TailObligation::None => true,

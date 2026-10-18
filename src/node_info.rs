@@ -152,19 +152,43 @@ impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
         }
     }
 
-    /// Credits `amount` to a node's balance (saturating — FR6 overflow
-    /// validation is Story 5.4; the derivation must not panic).
-    pub(crate) fn credit(&mut self, node_id: u32, amount: u64) {
+    /// Clears a node's slot back to the unseeded baseline — the exact inverse
+    /// of [`Self::register_node`] on a bounded roster, where the registered
+    /// slot `watermark + 1` was empty by construction (Story 6.0 D1).
+    pub(crate) fn clear_node(&mut self, node_id: u32) {
         if let Some(slot) = self.slot(node_id) {
-            self.balances[slot] = self.balances[slot].saturating_add(amount);
+            self.public_keys[slot] = [0u8; PUBLIC_KEY_SIZE];
+            self.balances[slot] = 0;
+            self.seed_source_idx[slot] = NONE_REF;
         }
     }
 
-    /// Debits `amount` from a node's balance (saturating — FR6 negative-balance
-    /// validation is Story 5.4).
+    /// Points a seeded node's FR50 seed source at the block at `seed_idx` (a
+    /// balance block listing it, Story 6.0 D9). No-op for an unseeded node.
+    pub(crate) fn move_seed_source(&mut self, node_id: u32, seed_idx: u32) {
+        if let Some(slot) = self.slot(node_id)
+            && self.seed_source_idx[slot] != NONE_REF
+        {
+            self.seed_source_idx[slot] = seed_idx;
+        }
+    }
+
+    /// Adds `amount` to a node's balance. The per-block step checks the sum
+    /// first (`checked_add`, Story 6.0 D1), so the forward credit is exact;
+    /// the arithmetic wraps so that the same primitive serves as the exact
+    /// inverse of [`Self::debit`] in any order.
+    pub(crate) fn credit(&mut self, node_id: u32, amount: u64) {
+        if let Some(slot) = self.slot(node_id) {
+            self.balances[slot] = self.balances[slot].wrapping_add(amount);
+        }
+    }
+
+    /// Subtracts `amount` from a node's balance. The forward debit is preceded
+    /// by a sufficiency check; wrapping makes it the exact inverse of
+    /// [`Self::credit`] in any order (Story 6.0 D1).
     pub(crate) fn debit(&mut self, node_id: u32, amount: u64) {
         if let Some(slot) = self.slot(node_id) {
-            self.balances[slot] = self.balances[slot].saturating_sub(amount);
+            self.balances[slot] = self.balances[slot].wrapping_sub(amount);
         }
     }
 
@@ -303,8 +327,20 @@ mod tests {
         ni.credit(2, 50);
         ni.debit(2, 30);
         assert_eq!(ni.balance_of(2), 120);
-        ni.debit(2, u64::MAX); // saturating — no panic/underflow
+        // Credit and debit are each other's exact inverse, in either order.
+        ni.credit(2, u64::MAX);
+        ni.debit(2, u64::MAX);
+        assert_eq!(ni.balance_of(2), 120);
+        // Registration inverse and the D9 seed-source move.
+        ni.move_seed_source(2, 9);
+        assert!(ni.is_seed_source(9));
+        ni.move_seed_source(3, 9); // unseeded: no-op
+        assert!(!ni.is_seeded(3));
+        ni.clear_node(2);
+        assert!(!ni.is_seeded(2));
         assert_eq!(ni.balance_of(2), 0);
+        assert!(ni.public_key_of(2).is_none());
+        ni.seed_node(2, &[7u8; PUBLIC_KEY_SIZE], 120, 4);
         ni.set_max_known_node_id(9);
         assert_eq!(ni.max_known_node_id(), 9);
 
