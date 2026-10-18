@@ -16,12 +16,9 @@
 //! preservation-binding decision on a head extension. The `u32::MAX` refusal
 //! rule is Story 8.1; the replay generators are Stories 9.2–9.5.
 
-use moonblokz_chain_types::{
-    BlockView, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
-};
-use moonblokz_storage::StorageTrait;
+use moonblokz_chain_types::{BlockView, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG};
 
-use crate::blocks::{BlockTable, SPENT_BITS_BYTES};
+use crate::blocks::BlockTable;
 use crate::node_info::NodeInfoState;
 
 /// Below-tail retention `R`: how many released blocks stay in the block-tree
@@ -53,9 +50,9 @@ pub(crate) enum TailObligation {
     Utxo,
 }
 
-/// The tail block could not be classified: its slot is empty, or its bytes
-/// could not be read back or framed. Never "no obligation" — a node's own I/O
-/// trouble must not release a block whose state it could not check.
+/// The tail block could not be classified: its slot is empty. Never "no
+/// obligation" — a node's own inconsistency must not release a block whose
+/// state it could not check.
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TailUnreadable;
@@ -65,46 +62,25 @@ pub(crate) struct TailUnreadable;
 /// Fixed order, cheapest first, first match wins:
 /// 1. `ChainConfig` — from the payload type cached in `BlockEntry.flags`;
 /// 2. `SeedSource` — some node's `seed_source_idx` is this slot, O(`MAX_NODES`);
-/// 3. `Utxo` — one storage read to count the block's UTXO outputs, then any
-///    of their spent bits still clear. Only transaction blocks can carry one,
-///    so other payload types are never read.
+/// 3. `Utxo` — any of the block's available-UTXO bits is set. A set bit means
+///    an unspent output exists (DEC-132), and Tier 1 keeps every output within
+///    the bitfield, so no storage read is needed (Story 6.11).
 ///
 /// The inputs are as current as the FR3 snapshot; keeping `seed_source_idx`
-/// and the spent bits current after Ready is Story 7.2.
-pub(crate) fn classify_tail_drop<
-    S: StorageTrait,
-    const MAX_BLOCKS: usize,
-    const MAX_NODES: usize,
->(
+/// and the available-UTXO bits current after Ready is Story 7.2.
+pub(crate) fn classify_tail_drop<const MAX_BLOCKS: usize, const MAX_NODES: usize>(
     blocks: &BlockTable<MAX_BLOCKS>,
     node_info: &NodeInfoState<MAX_NODES>,
-    storage: &S,
     tail_idx: u32,
 ) -> Result<TailObligation, TailUnreadable> {
     let entry = blocks.get(tail_idx).ok_or(TailUnreadable)?;
-    let payload_type = entry.payload_type();
-    if payload_type == PAYLOAD_TYPE_CHAIN_CONFIG {
+    if entry.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG {
         return Ok(TailObligation::ChainConfig);
     }
     if node_info.is_seed_source(tail_idx) {
         return Ok(TailObligation::SeedSource);
     }
-    if payload_type != PAYLOAD_TYPE_TRANSACTION {
-        return Ok(TailObligation::None);
-    }
-    let block = storage.read_block(tail_idx).map_err(|_| TailUnreadable)?;
-    let view = block.view();
-    let txs = view.transactions().ok_or(TailUnreadable)?;
-    let utxo_outputs: usize = txs
-        .iter()
-        .filter_map(|tx| tx.as_complex())
-        .map(|cx| cx.outputs().filter(|o| o.as_utxo().is_some()).count())
-        .sum();
-    // An output beyond the spent-bit capacity has no bit to say it is spent,
-    // and an unknowable state must not count as "no obligation".
-    if utxo_outputs > SPENT_BITS_BYTES * 8
-        || (0..utxo_outputs).any(|bit| blocks.spent_bit(tail_idx, bit) == Some(false))
-    {
+    if blocks.has_available_utxo(tail_idx) == Some(true) {
         return Ok(TailObligation::Utxo);
     }
     Ok(TailObligation::None)
@@ -152,25 +128,13 @@ mod tests {
     use super::*;
     use crate::blocks::{BlockEntry, NONE_REF};
     use moonblokz_chain_types::{
-        Block, BlockBuilder, BlockHeader, ChainConfigPayloadBuilder, ComplexTransaction,
-        MAX_BLOCK_SIZE, NodeInfo, NodeTransfer,
+        Block, BlockBuilder, BlockHeader, ChainConfigPayloadBuilder, ComplexTransaction, NodeInfo,
+        NodeTransfer, PAYLOAD_TYPE_TRANSACTION,
     };
     use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
-    use moonblokz_storage::{INIT_PARAMS_SIZE, backend_memory::MemoryBackend};
-
-    type Storage = MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>;
 
     fn signer() -> Crypto {
         Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
-    }
-
-    fn storage() -> Storage {
-        let mut storage = Storage::new();
-        storage
-            .init([1u8; PRIVATE_KEY_SIZE], 0, [0u8; INIT_PARAMS_SIZE])
-            .ok()
-            .expect("the test backend initializes");
-        storage
     }
 
     fn blocks() -> BlockTable<8> {
@@ -250,10 +214,10 @@ mod tests {
         builder.build_signed(&signer).ok().expect("build signed")
     }
 
-    /// Admits `block` at slot 0 of `table` and durably at slot 0 of `storage`,
-    /// as the intake path would: the payload type is stamped into the entry.
-    fn place(table: &mut BlockTable<8>, storage: &mut Storage, block: &Block) -> u32 {
-        storage.save_block(0, block).ok().expect("save");
+    /// Admits `block` at slot 0 of `table` as the intake path would: the
+    /// payload type is stamped into the entry. Nothing is stored durably — the
+    /// classification takes no storage (Story 6.11).
+    fn place(table: &mut BlockTable<8>, block: &Block) -> u32 {
         let view = block.view();
         let mut entry = BlockEntry::new(view.hash(), NONE_REF, view.sequence());
         entry.set_payload_type(view.payload_type());
@@ -263,16 +227,14 @@ mod tests {
     // --- AC7: classification ------------------------------------------------
 
     #[test]
-    fn classifies_a_chain_config_block_without_a_storage_read() {
+    fn classifies_a_chain_config_block_first() {
         let mut table = blocks();
-        let mut storage = storage();
-        let idx = place(&mut table, &mut storage, &config_block());
+        let idx = place(&mut table, &config_block());
         // Even listed as a seed source, the first rule in the fixed order wins.
         let mut info = node_info();
         info.seed_node(1, &[1u8; 32], 0, idx);
-        // An empty store: had the classifier read the block, it would fail.
         assert_eq!(
-            classify_tail_drop(&table, &info, &self::storage(), idx),
+            classify_tail_drop(&table, &info, idx),
             Ok(TailObligation::ChainConfig)
         );
     }
@@ -280,40 +242,47 @@ mod tests {
     #[test]
     fn classifies_a_seed_source() {
         let mut table = blocks();
-        let mut storage = storage();
-        let idx = place(&mut table, &mut storage, &balance_block());
+        let idx = place(&mut table, &balance_block());
         let mut info = node_info();
         assert_eq!(
-            classify_tail_drop(&table, &info, &storage, idx),
+            classify_tail_drop(&table, &info, idx),
             Ok(TailObligation::None),
             "a balance block nobody is seeded from carries no obligation"
         );
         info.seed_node(1, &[1u8; 32], 50, idx);
         assert_eq!(
-            classify_tail_drop(&table, &info, &storage, idx),
+            classify_tail_drop(&table, &info, idx),
             Ok(TailObligation::SeedSource)
         );
     }
 
+    /// Story 6.11 (AC4): the UTXO obligation is "any available-UTXO bit set",
+    /// decided from RAM alone.
     #[test]
-    fn classifies_an_unspent_utxo_output_and_clears_once_all_are_spent() {
+    fn classifies_an_available_utxo_output_and_clears_once_all_are_spent() {
         let mut table = blocks();
-        let mut storage = storage();
-        let idx = place(&mut table, &mut storage, &complex_block(1));
+        let idx = place(&mut table, &complex_block(1));
         let info = node_info();
         assert_eq!(
-            classify_tail_drop(&table, &info, &storage, idx),
+            classify_tail_drop(&table, &info, idx),
+            Ok(TailObligation::None),
+            "a block never derived has no available output"
+        );
+        table.set_utxo_available(idx, 0, true);
+        table.set_utxo_available(idx, 1, true);
+        assert_eq!(
+            classify_tail_drop(&table, &info, idx),
             Ok(TailObligation::Utxo)
         );
-        table.set_spent_bit(idx, 0, true);
+        table.set_utxo_available(idx, 0, false);
         assert_eq!(
-            classify_tail_drop(&table, &info, &storage, idx),
+            classify_tail_drop(&table, &info, idx),
             Ok(TailObligation::Utxo),
             "output 1 is still unspent"
         );
-        table.set_spent_bit(idx, 1, true);
+        table.set_utxo_available(idx, 1, false);
         assert_eq!(
-            classify_tail_drop(&table, &info, &storage, idx),
+            classify_tail_drop(&table, &info, idx),
             Ok(TailObligation::None),
             "every output spent: nothing to carry forward"
         );
@@ -322,29 +291,20 @@ mod tests {
     #[test]
     fn classifies_a_plain_transfer_block_as_no_obligation() {
         let mut table = blocks();
-        let mut storage = storage();
-        let idx = place(&mut table, &mut storage, &transfer_block());
+        let idx = place(&mut table, &transfer_block());
         assert_eq!(
-            classify_tail_drop(&table, &node_info(), &storage, idx),
+            classify_tail_drop(&table, &node_info(), idx),
             Ok(TailObligation::None)
         );
     }
 
-    /// A read failure is an error, never "no obligation" (retro §3.5).
+    /// An empty slot is an error, never "no obligation" (retro §3.5).
     #[test]
-    fn an_unreadable_block_is_an_error_not_no_obligation() {
-        let mut table = blocks();
-        let mut storage = storage();
-        let idx = place(&mut table, &mut storage, &complex_block(1));
+    fn an_empty_slot_is_an_error_not_no_obligation() {
+        let table = blocks();
         assert_eq!(
-            classify_tail_drop(&table, &node_info(), &self::storage(), idx),
-            Err(TailUnreadable),
-            "the block's bytes are not in this store"
-        );
-        assert_eq!(
-            classify_tail_drop(&table, &node_info(), &storage, 5),
-            Err(TailUnreadable),
-            "an empty slot is not a block"
+            classify_tail_drop(&table, &node_info(), 5),
+            Err(TailUnreadable)
         );
     }
 

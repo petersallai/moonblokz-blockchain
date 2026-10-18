@@ -23,6 +23,7 @@ pub mod api;
 
 // Internal modules — crate-private; never `pub mod` (FR66 boundary).
 pub(crate) mod approval;
+pub(crate) mod available_utxo;
 pub(crate) mod blocks;
 pub(crate) mod branch_value;
 pub(crate) mod chain_heads;
@@ -36,7 +37,6 @@ pub(crate) mod queries;
 pub(crate) mod reconciliation;
 pub(crate) mod scheduler;
 pub(crate) mod snake_chain;
-pub(crate) mod spent_bits;
 pub(crate) mod staged_validation;
 pub(crate) mod uninit;
 
