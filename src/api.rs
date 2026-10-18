@@ -557,13 +557,11 @@ pub(crate) enum ValidationReason {
     /// candidate — an earlier accepted registration (or balance-block seed) on the
     /// candidate already carries the same key (FR6 registration uniqueness).
     DuplicatePublicKey,
-    /// A complex transaction with at least one input has inputs (balance
-    /// amounts plus the referenced UTXO amounts) summing to less than its
-    /// outputs (money creation, FR6).
-    InsufficientTransactionInputs,
-    /// A complex transaction's input sum (balance inputs plus the referenced
-    /// UTXO amounts), or the block's fee total, overflows `u64`. The output sum
-    /// and the declared balance-input sum are bounded at Tier 1.
+    /// A UTXO input's declared amount differs from the referenced output's
+    /// amount (DEC-131).
+    UtxoAmountMismatch,
+    /// The block's fee total overflows `u64`. Every transaction's own sums are
+    /// bounded at Tier 1.
     ValueOverflow,
 }
 
@@ -3122,12 +3120,12 @@ impl<
                             .register_node(node_id, reg.new_public_key(), idx);
                     } else if let Some(cx) = tx.as_complex() {
                         // FR6 value accounting over every input and output
-                        // (Story 6.8, D1), checked: an overflow is `Invalid`.
+                        // (Story 6.8, D1). Every input declares its amount
+                        // (DEC-131) and Tier 1 has checked both sums against `u64`
+                        // and `Σ inputs ≥ Σ outputs` from the bytes (DEC-011), so
+                        // neither sum can overflow and the fee cannot go negative.
                         let mut in_sum: u64 = 0;
                         let mut out_sum: u64 = 0;
-                        // A trusted pre-window UTXO input has no known amount, so
-                        // the sum rule and the fee cannot be evaluated for its tx.
-                        let mut has_unknown_input = false;
                         for input in cx.inputs() {
                             if let Some(bi) = input.as_balance() {
                                 let binit = bi.initializer();
@@ -3155,9 +3153,7 @@ impl<
                                     }
                                     self.node_info.debit(binit, bi.amount());
                                 }
-                                in_sum = in_sum
-                                    .checked_add(bi.amount())
-                                    .ok_or(invalid(ValidationReason::ValueOverflow))?;
+                                in_sum = in_sum.saturating_add(bi.amount());
                             } else if let Some(ui) = input.as_utxo() {
                                 // [H] ADR-016: resolve along this block's own
                                 // ancestry and spend. In the FR3 pass every ancestor
@@ -3165,18 +3161,21 @@ impl<
                                 // flipped here are exactly the ones the pass zeroes
                                 // at entry and rolls back on abort. A window-anchored
                                 // candidate trusts a reference below its anchor
-                                // (DEC-129). The input's signature is Story 7.1 (I-21).
+                                // (DEC-129), declared amount included. The input's
+                                // signature, against the returned address, is Story
+                                // 7.1 (I-21).
                                 let parent = self
                                     .blocks
                                     .get(idx)
                                     .ok_or(ProcessingError::MissingBlock)?
                                     .parent_ref();
-                                let resolved = self
+                                let _address = self
                                     .resolve_and_spend_utxo(
                                         parent,
                                         seq,
                                         ui.block_sequence(),
                                         ui.output_index(),
+                                        ui.amount(),
                                         !genesis_anchored,
                                     )
                                     .map_err(|e| match e {
@@ -3186,19 +3185,10 @@ impl<
                                             ProcessingError::MissingBlock
                                         }
                                     })?;
-                                match resolved {
-                                    Some((_address, amount)) => {
-                                        in_sum = in_sum
-                                            .checked_add(amount)
-                                            .ok_or(invalid(ValidationReason::ValueOverflow))?;
-                                    }
-                                    None => has_unknown_input = true,
-                                }
+                                in_sum = in_sum.saturating_add(ui.amount());
                             }
                         }
                         for output in cx.outputs() {
-                            // Tier 1 bounds Σ outputs to `u64` (byte-decidable,
-                            // DEC-011), so the output sum cannot overflow here.
                             if let Some(uo) = output.as_utxo() {
                                 out_sum = out_sum.saturating_add(uo.amount());
                             } else if let Some(bo) = output.as_balance() {
@@ -3215,15 +3205,11 @@ impl<
                                 out_sum = out_sum.saturating_add(bo.amount());
                             }
                         }
-                        // [D] FR6 total-inputs ≥ total-outputs for every complex
-                        // tx with ≥1 input; a zero-input carry-forward is exempt
-                        // (FR6) and pays no fee. The fee is the surplus over all
-                        // inputs and outputs, UTXO ones included. A tx with a
-                        // trusted pre-window input is trusted whole (FR3 AC4).
-                        if cx.input_count() > 0 && !has_unknown_input {
-                            let fee = in_sum
-                                .checked_sub(out_sum)
-                                .ok_or(invalid(ValidationReason::InsufficientTransactionInputs))?;
+                        // [D] The fee is the surplus over all inputs and outputs,
+                        // UTXO ones included; a zero-input carry-forward pays none
+                        // (FR6). Only the block's fee total can overflow.
+                        if cx.input_count() > 0 {
+                            let fee = in_sum.saturating_sub(out_sum);
                             total_fees = total_fees
                                 .checked_add(fee)
                                 .ok_or(invalid(ValidationReason::ValueOverflow))?;
@@ -3390,8 +3376,9 @@ impl<
     /// ADR-016 UTXO-input resolver (Story 6.8; Story 6.0 reuses it in Ready).
     ///
     /// Resolves `(block_sequence, output_index)` for a block at
-    /// `consuming_seq` whose parent is `parent_idx`, spends the output and
-    /// returns its `(address, amount)`:
+    /// `consuming_seq` whose parent is `parent_idx`, checks the input's
+    /// `declared_amount`, spends the output and returns its address (the key
+    /// the input's signature verifies against, Story 7.1):
     /// 1. causality: `block_sequence` must be below `consuming_seq` (Tier 1
     ///    owns this check; here it is a guard);
     /// 2. distance: `consuming_seq - block_sequence` must not exceed the
@@ -3402,14 +3389,15 @@ impl<
     ///    found (FR39). Reaching `NONE_REF` first means the output lies below
     ///    the anchor: with `trust_below_anchor` (a window-anchored FR3
     ///    candidate) that is trusted pre-window history and returns `Ok(None)`,
-    ///    with no bit to flip and no known amount (DEC-129); otherwise (a
+    ///    with no bit to flip and the declared amount trusted (DEC-129); otherwise (a
     ///    genesis-anchored candidate, or the released tail in Ready) it is
     ///    `UtxoUnresolvable`;
     /// 3. the spent bit: out of bit capacity is `UtxoUnresolvable`, already
     ///    set is `UtxoAlreadySpent`;
     /// 4. exactly one storage read of the referenced block. A failed read is a
     ///    local fault (`StorageRead`), never `Invalid`; an `output_index`
-    ///    beyond the block's UTXO outputs is `UtxoUnresolvable`;
+    ///    beyond the block's UTXO outputs is `UtxoUnresolvable`, and a
+    ///    `declared_amount` other than the output's is `UtxoAmountMismatch`;
     /// 5. the bit is flipped.
     pub(crate) fn resolve_and_spend_utxo(
         &mut self,
@@ -3417,8 +3405,9 @@ impl<
         consuming_seq: u32,
         block_sequence: u32,
         output_index: u8,
+        declared_amount: u64,
         trust_below_anchor: bool,
-    ) -> Result<Option<([u8; 32], u64)>, UtxoSpendError> {
+    ) -> Result<Option<[u8; 32]>, UtxoSpendError> {
         let unresolvable = UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable);
         if block_sequence >= consuming_seq {
             return Err(unresolvable);
@@ -3474,10 +3463,15 @@ impl<
         };
         let view = BlockView::from_bytes(&full[..n]).map_err(|_| UtxoSpendError::StorageRead)?;
         // The read succeeded, so an out-of-bounds index is exact evidence.
-        let output = utxo_output_at(&view, output_index).ok_or(unresolvable)?;
+        let (address, amount) = utxo_output_at(&view, output_index).ok_or(unresolvable)?;
+        if amount != declared_amount {
+            return Err(UtxoSpendError::Invalid(
+                ValidationReason::UtxoAmountMismatch,
+            ));
+        }
 
         self.blocks.set_spent_bit(ref_idx, bit, true);
-        Ok(Some(output))
+        Ok(Some(address))
     }
 
     /// FR4 / FR9 Tier-3 Active-promotion driver (AC9): on a clean FR6 pass, walk
@@ -10332,19 +10326,19 @@ mod tests {
     }
 
     /// One complex transaction (vote 0, the node-#0 exception): the given
-    /// UTXO inputs `(block_sequence, output_index)`, an optional balance input
+    /// UTXO inputs `(block_sequence, output_index, declared amount)`, an optional balance input
     /// `(initializer, amount)` anchored just below `seq`, then the outputs, each
     /// `Ok(amount)` for a UTXO output or `Err((receiver, amount))` for a
     /// balance output, in order.
     fn utxo_tx(
         seq: u32,
-        utxo_inputs: &[(u32, u8)],
+        utxo_inputs: &[(u32, u8, u64)],
         balance_input: Option<(u32, u64)>,
         outputs: &[Result<u64, (u32, u64)>],
     ) -> moonblokz_chain_types::ComplexTransaction {
         let mut cx = moonblokz_chain_types::ComplexTransaction::new(0);
-        for &(block_sequence, output_index) in utxo_inputs {
-            cx.add_utxo_input(block_sequence, output_index, &[0u8; 64])
+        for &(block_sequence, output_index, amount) in utxo_inputs {
+            cx.add_utxo_input(block_sequence, output_index, amount, &[0u8; 64])
                 .ok()
                 .expect("add utxo input");
         }
@@ -10398,7 +10392,7 @@ mod tests {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         let mi = admit(&mut bc, &mint);
-        let tx = utxo_tx(102, &[(101, 1)], None, &[Err((2, 40))]);
+        let tx = utxo_tx(102, &[(101, 1, 40)], None, &[Err((2, 40))]);
         let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
         let si = admit(&mut bc, &spend);
 
@@ -10419,10 +10413,10 @@ mod tests {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         let mi = admit(&mut bc, &mint);
-        let tx = utxo_tx(102, &[(101, 0)], None, &[Err((2, 60))]);
+        let tx = utxo_tx(102, &[(101, 0, 60)], None, &[Err((2, 60))]);
         let first = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
         admit(&mut bc, &first);
-        let tx = utxo_tx(103, &[(101, 0)], None, &[Err((2, 60))]);
+        let tx = utxo_tx(103, &[(101, 0, 60)], None, &[Err((2, 60))]);
         let second = complex_tx_block(103, first.view().hash(), 3, 0, &[&tx]);
         let di = admit(&mut bc, &second);
 
@@ -10438,7 +10432,7 @@ mod tests {
 
     /// Runs the pass over `mint ← spend(inputs)` and returns its verdict and
     /// the spending block's slot.
-    fn spend_verdict(inputs: &[(u32, u8)]) -> (Result<(), ProcessingError>, u32) {
+    fn spend_verdict(inputs: &[(u32, u8, u64)]) -> (Result<(), ProcessingError>, u32) {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         admit(&mut bc, &mint);
@@ -10450,21 +10444,25 @@ mod tests {
 
     /// AC8 (3) / DEC-129 — on a window-anchored candidate a reference below
     /// the anchor (99) is trusted pre-window history when it is at most `W`
-    /// (16) blocks back: no bit, no known amount, so the tx pays no fee and
-    /// its sum rule is not evaluated.
+    /// (16) blocks back: no bit, and the declared amounts are trusted, so the
+    /// fee is still known (DEC-131).
     #[test]
     fn utxo_reference_below_a_window_anchor_is_trusted_within_w() {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         admit(&mut bc, &mint);
-        let tx = utxo_tx(102, &[(98, 0), (86, 3)], None, &[Err((2, 70))]);
+        let tx = utxo_tx(102, &[(98, 0, 50), (86, 3, 30)], None, &[Err((2, 70))]);
         let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
         let si = admit(&mut bc, &spend);
 
         bc.run_processing_pass(si).expect("pass succeeds");
 
         assert_eq!(bc.node_info.balance_of(2), 70, "the output is credited");
-        assert_eq!(bc.node_info.balance_of(3), 0, "no fee from an unknown sum");
+        assert_eq!(
+            bc.node_info.balance_of(3),
+            10,
+            "fee 80 - 70 from the declared amounts"
+        );
     }
 
     /// AC8 (3) / DEC-129 — a reference more than `W` blocks back is
@@ -10472,7 +10470,7 @@ mod tests {
     #[test]
     fn utxo_reference_beyond_w_is_unresolvable() {
         for referenced in [85, 50, 0] {
-            let (verdict, si) = spend_verdict(&[(referenced, 0)]);
+            let (verdict, si) = spend_verdict(&[(referenced, 0, 0)]);
             assert_eq!(
                 verdict,
                 Err(ProcessingError::Invalid {
@@ -10496,7 +10494,7 @@ mod tests {
             let seed = balance_block(100, cfg.view().hash(), &[(2, 0, 0, 0xB2)], 3);
             bc.tier1_admit(&seed.view(), &seed.view().hash(), 0)
                 .expect("seed admitted");
-            let tx = utxo_tx(101, &[(referenced, 0)], None, &[Err((2, 5))]);
+            let tx = utxo_tx(101, &[(referenced, 0, 5)], None, &[Err((2, 5))]);
             let spend = complex_tx_block(101, seed.view().hash(), 3, 0, &[&tx]);
             let si = bc
                 .tier1_admit(&spend.view(), &spend.view().hash(), 0)
@@ -10524,11 +10522,11 @@ mod tests {
         let mint = utxo_mint_block(h100);
         let mi = admit(&mut bc, &mint);
         assert!(matches!(
-            bc.resolve_and_spend_utxo(mi, 102, 98, 0, false),
+            bc.resolve_and_spend_utxo(mi, 102, 98, 0, 0, false),
             Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable))
         ));
         assert!(matches!(
-            bc.resolve_and_spend_utxo(mi, 102, 98, 0, true),
+            bc.resolve_and_spend_utxo(mi, 102, 98, 0, 0, true),
             Ok(None)
         ));
     }
@@ -10539,7 +10537,7 @@ mod tests {
     #[test]
     fn utxo_out_of_bounds_index_is_unresolvable() {
         for (referenced, index) in [(101, 2), (101, 255), (100, 0), (99, 0)] {
-            let (verdict, si) = spend_verdict(&[(referenced, index)]);
+            let (verdict, si) = spend_verdict(&[(referenced, index, 0)]);
             assert_eq!(
                 verdict,
                 Err(ProcessingError::Invalid {
@@ -10562,7 +10560,7 @@ mod tests {
         // The active ancestry's block 101 carries no UTXO output.
         let own = transfer_block(101, h100, 2, 3, 0, 0, 0);
         admit(&mut bc, &own);
-        let tx = utxo_tx(102, &[(101, 0)], None, &[Err((2, 60))]);
+        let tx = utxo_tx(102, &[(101, 0, 60)], None, &[Err((2, 60))]);
         let spend = complex_tx_block(102, own.view().hash(), 3, 0, &[&tx]);
         let si = admit(&mut bc, &spend);
 
@@ -10583,7 +10581,7 @@ mod tests {
         let (mut bc, h100) = utxo_test_chain();
         let stored = bc.blocks.len();
         for referenced in [101, 102] {
-            let tx = utxo_tx(101, &[(referenced, 0)], None, &[Err((2, 1))]);
+            let tx = utxo_tx(101, &[(referenced, 0, 1)], None, &[Err((2, 1))]);
             let block = complex_tx_block(101, h100, 3, 0, &[&tx]);
             assert_eq!(
                 bc.tier1_admit(&block.view(), &block.view().hash(), 0),
@@ -10609,37 +10607,53 @@ mod tests {
         assert_eq!(bc.node_info.balance_of(1), 0);
     }
 
-    /// AC8 (9) / D1 — the referenced UTXO amount is an input: 50 (UTXO) + 10
-    /// (balance) against 55 of outputs pays a fee of 5; outputs above the
-    /// inputs are `InsufficientTransactionInputs` even with a UTXO input.
+    /// AC8 (9) / D1 — the UTXO amount is an input: 50 (UTXO) + 10 (balance)
+    /// against 55 of outputs pays a fee of 5. Outputs above the declared
+    /// inputs never reach the pass: Tier 1 rejects them (DEC-131).
     #[test]
     fn utxo_amount_counts_as_input() {
-        fn run(paid: u64) -> (TestChain, u32, Result<(), ProcessingError>) {
-            let (mut bc, h100) = utxo_test_chain();
-            let tx = utxo_tx(101, &[], Some((1, 50)), &[Ok(50)]);
-            let mint = complex_tx_block(101, h100, 3, 0, &[&tx]);
-            admit(&mut bc, &mint);
-            let tx = utxo_tx(102, &[(101, 0)], Some((1, 10)), &[Err((2, paid))]);
-            let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
-            let si = admit(&mut bc, &spend);
-            let verdict = bc.run_processing_pass(si);
-            (bc, si, verdict)
-        }
+        let (mut bc, h100) = utxo_test_chain();
+        let tx = utxo_tx(101, &[], Some((1, 50)), &[Ok(50)]);
+        let mint = complex_tx_block(101, h100, 3, 0, &[&tx]);
+        admit(&mut bc, &mint);
+        let over = utxo_tx(102, &[(101, 0, 50)], Some((1, 10)), &[Err((2, 61))]);
+        let over = complex_tx_block(102, mint.view().hash(), 3, 0, &[&over]);
+        assert_eq!(
+            bc.tier1_admit(&over.view(), &over.view().hash(), 0),
+            Err(AdmitError::Rejected(Tier1Failure::InputsLessThanOutputs))
+        );
+        let tx = utxo_tx(102, &[(101, 0, 50)], Some((1, 10)), &[Err((2, 55))]);
+        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+        let si = admit(&mut bc, &spend);
 
-        let (bc, _, verdict) = run(55);
-        assert_eq!(verdict, Ok(()));
+        bc.run_processing_pass(si).expect("pass succeeds");
+
         assert_eq!(bc.node_info.balance_of(3), 5, "fee = 60 - 55");
         assert_eq!(bc.node_info.balance_of(2), 55);
         assert_eq!(bc.node_info.balance_of(1), 40, "100 - 50 - 10");
+    }
 
-        let (_, si, verdict) = run(61);
-        assert_eq!(
-            verdict,
-            Err(ProcessingError::Invalid {
-                block_idx: si,
-                reason: ValidationReason::InsufficientTransactionInputs,
-            })
-        );
+    /// DEC-131 — a declared amount that is not the referenced output's is
+    /// `UtxoAmountMismatch`, and the output stays unspent.
+    #[test]
+    fn utxo_declared_amount_mismatch_is_invalid() {
+        for declared in [39, 41] {
+            let (mut bc, h100) = utxo_test_chain();
+            let mint = utxo_mint_block(h100);
+            let mi = admit(&mut bc, &mint);
+            let tx = utxo_tx(102, &[(101, 1, declared)], None, &[Err((2, declared))]);
+            let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+            let si = admit(&mut bc, &spend);
+            assert_eq!(
+                bc.run_processing_pass(si),
+                Err(ProcessingError::Invalid {
+                    block_idx: si,
+                    reason: ValidationReason::UtxoAmountMismatch,
+                }),
+                "declared {declared}, output 40"
+            );
+            assert_eq!(bc.blocks.spent_bit(mi, 1), Some(false));
+        }
     }
 
     /// AC8 (10) / AC2 — `output_index` counts the block's UTXO-output stream
@@ -10652,7 +10666,7 @@ mod tests {
         let second = utxo_tx(101, &[], Some((1, 30)), &[Ok(30)]);
         let mint = complex_tx_block(101, h100, 3, 0, &[&first, &second]);
         let mi = admit(&mut bc, &mint);
-        let tx = utxo_tx(102, &[(101, 2)], None, &[Err((2, 30))]);
+        let tx = utxo_tx(102, &[(101, 2, 30)], None, &[Err((2, 30))]);
         let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
         let si = admit(&mut bc, &spend);
 
@@ -10669,9 +10683,9 @@ mod tests {
     /// `UtxoAlreadySpent`.
     #[test]
     fn utxo_double_spend_within_one_block_is_already_spent() {
-        let same_tx = utxo_tx(102, &[(101, 0), (101, 0)], None, &[Err((2, 60))]);
-        let first = utxo_tx(102, &[(101, 0)], None, &[Err((2, 60))]);
-        let second = utxo_tx(102, &[(101, 0)], None, &[Err((2, 60))]);
+        let same_tx = utxo_tx(102, &[(101, 0, 60), (101, 0, 60)], None, &[Err((2, 60))]);
+        let first = utxo_tx(102, &[(101, 0, 60)], None, &[Err((2, 60))]);
+        let second = utxo_tx(102, &[(101, 0, 60)], None, &[Err((2, 60))]);
         for txs in [&[&same_tx][..], &[&first, &second][..]] {
             let (mut bc, h100) = utxo_test_chain();
             let mint = utxo_mint_block(h100);
@@ -10690,33 +10704,37 @@ mod tests {
         }
     }
 
-    /// AC6 — the input sum (with UTXO amounts) and the block's fee total are
-    /// checked: an overflow is `ValueOverflow`, never a clamped credit.
+    /// AC6 — an input sum beyond `u64` is rejected at Tier 1 (DEC-011,
+    /// DEC-131); the block's fee total, summed across transactions, is checked
+    /// in the pass: `ValueOverflow`, never a clamped credit.
     #[test]
     fn utxo_value_overflow_is_invalid() {
         const HALF: u64 = 1 << 63;
-        let both = utxo_tx(102, &[(101, 0), (101, 1)], None, &[]);
-        let first = utxo_tx(102, &[(101, 0)], None, &[]);
-        let second = utxo_tx(102, &[(101, 1)], None, &[]);
-        for txs in [&[&both][..], &[&first, &second][..]] {
-            let (mut bc, h100) = utxo_test_chain();
-            // Two zero-input carry-forwards, each a UTXO output of 2^63.
-            let a = utxo_tx(101, &[], None, &[Ok(HALF)]);
-            let b = utxo_tx(101, &[], None, &[Ok(HALF)]);
-            let mint = complex_tx_block(101, h100, 3, 0, &[&a, &b]);
-            admit(&mut bc, &mint);
-            let spend = complex_tx_block(102, mint.view().hash(), 3, 0, txs);
-            let si = admit(&mut bc, &spend);
-            assert_eq!(
-                bc.run_processing_pass(si),
-                Err(ProcessingError::Invalid {
-                    block_idx: si,
-                    reason: ValidationReason::ValueOverflow,
-                }),
-                "{} transaction(s)",
-                txs.len()
-            );
-        }
+        let (mut bc, h100) = utxo_test_chain();
+        // Two zero-input carry-forwards, each a UTXO output of 2^63.
+        let a = utxo_tx(101, &[], None, &[Ok(HALF)]);
+        let b = utxo_tx(101, &[], None, &[Ok(HALF)]);
+        let mint = complex_tx_block(101, h100, 3, 0, &[&a, &b]);
+        admit(&mut bc, &mint);
+
+        let both = utxo_tx(102, &[(101, 0, HALF), (101, 1, HALF)], None, &[]);
+        let both = complex_tx_block(102, mint.view().hash(), 3, 0, &[&both]);
+        assert_eq!(
+            bc.tier1_admit(&both.view(), &both.view().hash(), 0),
+            Err(AdmitError::Rejected(Tier1Failure::AmountOverflow))
+        );
+
+        let first = utxo_tx(102, &[(101, 0, HALF)], None, &[]);
+        let second = utxo_tx(102, &[(101, 1, HALF)], None, &[]);
+        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&first, &second]);
+        let si = admit(&mut bc, &spend);
+        assert_eq!(
+            bc.run_processing_pass(si),
+            Err(ProcessingError::Invalid {
+                block_idx: si,
+                reason: ValidationReason::ValueOverflow,
+            })
+        );
     }
 
     /// A storage backend whose reads of one slot start failing after a set
@@ -10804,7 +10822,7 @@ mod tests {
         admit(&seed);
         let mint = utxo_mint_block(seed.view().hash());
         let mi = admit(&mint);
-        let tx = utxo_tx(102, &[(101, 1)], None, &[Err((2, 40))]);
+        let tx = utxo_tx(102, &[(101, 1, 40)], None, &[Err((2, 40))]);
         let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
         let si = admit(&spend);
 

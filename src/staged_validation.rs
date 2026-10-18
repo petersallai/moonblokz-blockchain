@@ -118,8 +118,8 @@ pub(crate) enum Tier1Failure {
     /// `block.sequence ≤ anchor_sequence` for a node-transfer or a complex-tx
     /// balance input (FR9 Tier 1 intake monotonicity).
     AnchorSequenceNotBeforeBlock,
-    /// A complex transaction's output amounts, or its declared balance-input
-    /// amounts, sum beyond `u64::MAX`.
+    /// A complex transaction's output amounts, or its declared input amounts
+    /// (balance and UTXO), sum beyond `u64::MAX`.
     AmountOverflow,
     /// `block.sequence ≤ block_sequence` for a complex-tx UTXO input: the
     /// referenced output's block is not a strict ancestor (ADR-016 causality).
@@ -127,8 +127,8 @@ pub(crate) enum Tier1Failure {
     /// FR6 no-self-vote: a transaction's `initializer` equals its `vote`
     /// (outside the permanent node-#0 and block-#0 exceptions).
     SelfVote,
-    /// A complex transaction (all inputs locally resolvable) whose declared
-    /// input amounts sum to less than its output amounts.
+    /// A complex transaction with inputs whose declared input amounts (balance
+    /// and UTXO) sum to less than its output amounts.
     InputsLessThanOutputs,
     /// A registration's `new_key_signature` does not verify over its
     /// `new_public_key` (or the key/signature bytes are malformed).
@@ -345,7 +345,6 @@ fn tier1_complex_tx(
     block_sequence: u32,
 ) -> Result<(), Tier1Failure> {
     let mut input_seen = 0u32;
-    let mut has_utxo_input = false;
     let mut declared_input_sum: u128 = 0;
 
     for input in cx.inputs() {
@@ -362,7 +361,9 @@ fn tier1_complex_tx(
             if block_sequence <= utxo.block_sequence() {
                 return Err(Tier1Failure::UtxoInputNotBeforeBlock);
             }
-            has_utxo_input = true;
+            // The declared amount (DEC-131); the FR6 pass checks it against
+            // the referenced output.
+            declared_input_sum = declared_input_sum.saturating_add(utxo.amount() as u128);
         } else {
             return Err(Tier1Failure::MalformedPayload);
         }
@@ -398,12 +399,11 @@ fn tier1_complex_tx(
     if input_seen == 0 {
         return Ok(());
     }
-    // The `sum(inputs) ≥ sum(outputs)` rule is exact evidence only when every
-    // input amount is locally resolvable at intake. A UTXO input's amount lives
-    // in its referenced output (not in the input bytes), so any UTXO input makes
-    // the sum incomplete — the check defers to Tier 2 (FR9) rather than becoming
-    // false exact evidence here.
-    if !has_utxo_input && declared_input_sum < output_sum {
+    // Every input declares its amount (a UTXO input since DEC-131), so the
+    // `sum(inputs) ≥ sum(outputs)` rule is decidable from the bytes and is Tier
+    // 1's alone (DEC-011); the FR6 pass checks only that each declared UTXO
+    // amount is the referenced output's.
+    if declared_input_sum < output_sum {
         return Err(Tier1Failure::InputsLessThanOutputs);
     }
 
@@ -933,18 +933,21 @@ mod tests {
     }
 
     #[test]
-    fn tier1_defers_sum_check_with_unresolvable_utxo_input() {
+    fn tier1_counts_declared_utxo_input_amounts() {
+        // DEC-131: a UTXO input declares its amount, so the sum rule is decided
+        // here for every complex transaction with inputs.
         let c = crypto(1);
-        // A UTXO input's amount is not in the input bytes → the sum rule is not
-        // evaluable at Tier 1, so inputs<outputs is NOT exact evidence here.
-        let block = complex_block(5, 3, &c, |cx| {
-            cx.add_utxo_input(4, 0, &DUMMY_SIG).ok().unwrap();
-            cx.add_balance_output(9, 50).ok().unwrap();
-        });
-        assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
-            Ok(())
-        );
+        for (declared, expected) in [(49, Err(Tier1Failure::InputsLessThanOutputs)), (50, Ok(()))] {
+            let block = complex_block(5, 3, &c, |cx| {
+                cx.add_utxo_input(4, 0, declared, &DUMMY_SIG).ok().unwrap();
+                cx.add_balance_output(9, 50).ok().unwrap();
+            });
+            assert_eq!(
+                tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+                expected,
+                "declared {declared}"
+            );
+        }
     }
 
     #[test]
@@ -961,7 +964,12 @@ mod tests {
             cx.add_balance_input(4, 8, 1, 0, &DUMMY_SIG).ok().unwrap();
             cx.add_balance_output(9, 1).ok().unwrap();
         });
-        for block in [outputs, inputs] {
+        let utxo_inputs = complex_block(5, 3, &c, |cx| {
+            cx.add_utxo_input(4, 0, u64::MAX, &DUMMY_SIG).ok().unwrap();
+            cx.add_utxo_input(4, 1, 1, &DUMMY_SIG).ok().unwrap();
+            cx.add_balance_output(9, 1).ok().unwrap();
+        });
+        for block in [outputs, inputs, utxo_inputs] {
             assert_eq!(
                 tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
                 Err(Tier1Failure::AmountOverflow)
@@ -976,7 +984,9 @@ mod tests {
         let c = crypto(1);
         for referenced in [5, 6, u32::MAX] {
             let block = complex_block(5, 3, &c, |cx| {
-                cx.add_utxo_input(referenced, 0, &DUMMY_SIG).ok().unwrap();
+                cx.add_utxo_input(referenced, 0, 50, &DUMMY_SIG)
+                    .ok()
+                    .unwrap();
                 cx.add_balance_output(9, 50).ok().unwrap();
             });
             assert_eq!(
