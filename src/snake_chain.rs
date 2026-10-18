@@ -66,8 +66,9 @@ pub(crate) struct TailUnreadable;
 ///    an unspent output exists (DEC-132), and Tier 1 keeps every output within
 ///    the bitfield, so no storage read is needed (Story 6.11).
 ///
-/// The inputs are as current as the FR3 snapshot; keeping `seed_source_idx`
-/// and the available-UTXO bits current after Ready is Story 7.2.
+/// The shared per-block step keeps both inputs current — `seed_source_idx`
+/// and the available-UTXO bits — in the FR3 pass and on every Ready head
+/// extension (Story 6.0); restoring them on a chain switch is Story 6.3.
 pub(crate) fn classify_tail_drop<const MAX_BLOCKS: usize, const MAX_NODES: usize>(
     blocks: &BlockTable<MAX_BLOCKS>,
     node_info: &NodeInfoState<MAX_NODES>,
