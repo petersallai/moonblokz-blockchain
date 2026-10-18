@@ -32,14 +32,14 @@ use moonblokz_crypto::{
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
-use crate::blocks::{BlockEntry, BlockTable, NONE_REF, SPENT_BITS_BYTES};
+use crate::available_utxo::utxo_output_at;
+use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
 use crate::node_info::NodeInfoState;
 use crate::prng::Prng;
 use crate::snake_chain::classify_tail_drop;
-use crate::spent_bits::utxo_output_at;
 use crate::staged_validation::{
     BlockStatus, Tier1Failure, tier1_chain_config_block, tier1_gate, verify_signature_bytes,
 };
@@ -448,6 +448,12 @@ pub enum TickOutcome {
 // larger block size cannot silently truncate the trim length.
 const _: () = assert!(MAX_BLOCK_SIZE <= u16::MAX as usize);
 
+/// The available-UTXO bitfield width in bits: this build's capacity for a
+/// block's UTXO outputs, stated to the configuration module in `BUILD_LIMITS`
+/// and enforced at Tier 1 before the durable lock (DEC-132).
+const UTXO_BITFIELD_WIDTH: u16 = (AVAILABLE_UTXO_BYTES * 8) as u16;
+const _: () = assert!(AVAILABLE_UTXO_BYTES * 8 <= u16::MAX as usize);
+
 /// Failure modes of the FR3 processing pass (Story 5.3).
 ///
 /// Derive-only: an `Err` routes to the minimal FR5 phase-revert in
@@ -485,7 +491,8 @@ pub(crate) enum ProcessingError {
 pub(crate) enum UtxoSpendError {
     /// The input names no spendable output (exact evidence).
     Invalid(ValidationReason),
-    /// The referenced block could not be read back or no longer parses.
+    /// The referenced block could not be read back, no longer parses, or lacks
+    /// an output its available-UTXO bit says exists (storage and RAM disagree).
     StorageRead,
     /// The in-memory ancestry is inconsistent: a `parent_ref` into a freed
     /// slot, or a walk longer than `MAX_BLOCKS`.
@@ -523,11 +530,16 @@ pub(crate) enum ValidationReason {
     /// (pre-window) actor, whose *existence* is thereby still bounded-checkable.
     NodeIdOutOfRange,
     /// A complex tx UTXO input does not resolve (ADR-016): `block_sequence` is
-    /// not a retained strict ancestor of the consuming block, or `output_index`
-    /// is beyond the referenced block's UTXO-output stream.
+    /// not a retained strict ancestor of the consuming block within `W`.
     UtxoUnresolvable,
-    /// A complex tx UTXO input references an output whose spent-bit is already 1.
-    UtxoAlreadySpent,
+    /// A complex tx UTXO input names an output that is not available on the
+    /// referenced block: already spent, or beyond its UTXO-output stream (its
+    /// bit is 0, DEC-132).
+    UtxoUnavailable,
+    /// A block carries more UTXO outputs than the held configuration's
+    /// `max_block_utxo_output` (I-07; checked against the candidate's own
+    /// preloaded value in the FR3 pass, DEC-133).
+    TooManyUtxoOutputs,
     /// A `payload_type=3` block's config content is not byte-identical to the
     /// configuration this node holds — the durable-locked one when the FR8 lock
     /// is engaged, otherwise the tentatively-loaded one (Story 5.9).
@@ -681,16 +693,15 @@ pub struct Blockchain<
     snake_chain_tail_idx: u32,
     //
     // Deliberately no standalone placeholder for:
-    // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.spent_bits` sizing
-    //   (Story 4.1 fixes that field at a 32-byte constant — see
-    //   `blocks::SPENT_BITS_BYTES` — because deriving an array length from a
+    // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.available_utxo`
+    //   sizing (Story 4.1 fixes that field at a 32-byte constant — see
+    //   `blocks::AVAILABLE_UTXO_BYTES` — because deriving an array length from a
     //   generic const parameter via division requires the unstable
     //   `generic_const_exprs` feature). Story 5.8 settled the ownership instead
     //   of the sizing: the *chain's* value is a configuration parameter read
     //   through the handle, and the *build's* capacity is stated once to the
-    //   configuration module in `BUILD_LIMITS` (`SPENT_BITS_BYTES * 8`), which
-    //   is where the two are now reconciled. Epic 7 gives `spent_bits` its
-    //   semantics.
+    //   configuration module in `BUILD_LIMITS` (`AVAILABLE_UTXO_BYTES * 8`), which
+    //   is where the two are now reconciled.
 }
 
 impl<
@@ -723,13 +734,14 @@ impl<
     /// checks read exactly what this constant says, and drift between the
     /// blockchain's arrays and the module's bounds stays unrepresentable.
     ///
-    /// - `utxo_unspent_bits` — `SPENT_BITS_BYTES * 8`, the per-block spent-bit
-    ///   width of `BlockEntry` (Story 4.1 fixes the field at 32 bytes).
+    /// - `utxo_unspent_bits` — `UTXO_BITFIELD_WIDTH`, the per-block
+    ///   available-UTXO bitfield width of `BlockEntry` (Story 4.1 fixes the
+    ///   field at 32 bytes).
     /// - `snake_chain_length_max` — `SNAKE_CHAIN_LENGTH_MAX`, the active-chain
     ///   capacity. The chain's own window `W` must fit inside it, whether the
     ///   content declares `W` or leaves it at its default.
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
-        utxo_unspent_bits: (SPENT_BITS_BYTES * 8) as u16,
+        utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
             assert!(
                 SNAKE_CHAIN_LENGTH_MAX <= u16::MAX as u32,
@@ -1835,6 +1847,7 @@ impl<
             block,
             &self.node_zero_public_key,
             block_size_limit,
+            self.enforceable_max_utxo_outputs(),
             &self.crypto,
         )
         .map_err(AdmitError::Rejected)?;
@@ -2133,6 +2146,14 @@ impl<
                         if let Some(offender) =
                             self.candidate_block_exceeding_size_limit(candidate_tip_idx)
                         {
+                            // The pass returned `Ok`, so its abort-path clear never
+                            // ran and the derived available-UTXO bits are still set;
+                            // the recovery does not sweep them, and a surviving
+                            // block must not advertise outputs of a chain the node
+                            // did not adopt (DEC-132).
+                            for idx in 0..MAX_BLOCKS {
+                                self.blocks.clear_available_utxo(idx as u32);
+                            }
                             self.recover_from_failed_pass(
                                 ProcessingError::Invalid {
                                     block_idx: offender,
@@ -2147,7 +2168,7 @@ impl<
                         {
                             // The pass returned `Ok`, so it left a complete
                             // derived projection behind and never ran its
-                            // abort-path spent-bit rollback. Abandoning the
+                            // abort-path available-UTXO rollback. Abandoning the
                             // transition has to undo all of it, or the node
                             // returns to Collecting holding the projection of
                             // a chain it did not adopt. Nothing was promoted
@@ -2158,7 +2179,7 @@ impl<
                             self.node_info.reset();
                             self.reset_vote_engine();
                             for idx in 0..MAX_BLOCKS {
-                                self.blocks.clear_spent_bits(idx as u32);
+                                self.blocks.clear_available_utxo(idx as u32);
                             }
                             self.set_lifecycle_phase(LifecyclePhase::Collecting);
                             break;
@@ -2365,7 +2386,7 @@ impl<
     ///   `max_known_node_id` watermark;
     /// - `reset_vote_engine()` — accumulated vote (incl. FR37 anti-capture
     ///   interest) + the FR38 creator-order projection;
-    /// - the marked segment's UTXO spent-bits are **already** back at their
+    /// - the marked segment's available-UTXO bits are **already** back at their
     ///   clean baseline: [`Self::run_processing_pass`] zeroes them at pass entry
     ///   and re-zeroes them on its abort path, which is the only place that
     ///   still holds the marked set. Recovery deliberately does not sweep them a
@@ -2462,7 +2483,7 @@ impl<
     /// the Story-5.10 restart, an Epic-6 deep zone of a *new* branch). A
     /// chain-switch that re-derives over shared blocks must work on a copy — a
     /// failed re-derivation there would zero a shared block's *committed*
-    /// spent-bits instead of restoring them.
+    /// available-UTXO bits instead of restoring them.
     pub(crate) fn recover_from_failed_pass(
         &mut self,
         err: ProcessingError,
@@ -2708,27 +2729,28 @@ impl<
         // candidate's own — which is how a candidate carrying two differing
         // contents is caught, and why it can never be resolved by adopting.
         //
-        // **Ordered after the spent-bit baseline below, not before it.** The FR5
-        // recovery documents itself as relying on this pass having zeroed the
-        // marked segment's spent-bits at entry and re-zeroed them on its abort
-        // path; an early return above that baseline would leave bits from an
+        // **Ordered after the available-UTXO baseline below, not before it.** The
+        // FR5 recovery documents itself as relying on this pass having zeroed the
+        // marked segment's available-UTXO bits at entry and re-zeroed them on its
+        // abort path; an early return above that baseline would leave bits from an
         // earlier uncommitted pass set and quietly break that contract.
         //
-        // AC5 (spent-bit lifecycle): establish the clean all-zero baseline for the
-        // marked segment's spent-bits at entry — matching the `node_info` /
-        // `vote_engine` reset above — so the pass is idempotent on re-entry and the
-        // failure rollback below restores exactly this baseline (not the whole
-        // vector against an unknown prior state). For the MVP join/reconstruct flow
-        // the marked blocks are freshly-admitted `Stored` blocks (spent-bits already
-        // 0); the reset makes the reusable primitive self-consistent for a
-        // re-derivation over a candidate whose blocks are NOT shared with an
-        // already-active chain (fresh join, the Story-5.10 restart, and the Epic-6
-        // deep-zone reconstruction of a *new* branch). A chain-switch that
-        // re-derives over blocks shared with the active chain must operate on a
-        // working copy instead (owned by Epic 6): a failed re-derivation here would
-        // zero a shared block's committed spent-bits rather than restore them.
+        // AC5 (available-UTXO lifecycle): establish the clean all-zero baseline —
+        // "nothing derived" — for the marked segment's bits at entry, matching the
+        // `node_info` / `vote_engine` reset above, so the pass is idempotent on
+        // re-entry and the failure rollback below restores exactly this baseline
+        // (not the whole vector against an unknown prior state). For the MVP
+        // join/reconstruct flow the marked blocks are freshly-admitted `Stored`
+        // blocks (bits already 0); the reset makes the reusable primitive
+        // self-consistent for a re-derivation over a candidate whose blocks are
+        // NOT shared with an already-active chain (fresh join, the Story-5.10
+        // restart, and the Epic-6 deep-zone reconstruction of a *new* branch). A
+        // chain-switch that re-derives over blocks shared with the active chain
+        // must operate on a working copy instead (owned by Epic 6): a failed
+        // re-derivation here would zero a shared block's committed bits rather
+        // than restore them.
         for slot in marked.iter().take(count) {
-            self.blocks.clear_spent_bits(*slot);
+            self.blocks.clear_available_utxo(*slot);
         }
 
         // The preload and the FR8 existence check, both **before** the forward
@@ -2834,9 +2856,9 @@ impl<
         // the state derived from the *preceding* candidate blocks. The earliest
         // offending block aborts with `ProcessingError::Invalid { block_idx, .. }`
         // (the FR5 recovery, Story 5.5, reads `block_idx` as its deletion target).
-        // Spent-bits flipped mid-pass are rolled back below on any abort (the FR5
-        // working-set rollback's UTXO half); on success they persist as the active
-        // chain's UTXO-consumption state.
+        // Available-UTXO bits set or cleared mid-pass are rolled back below on any
+        // abort (the FR5 working-set rollback's UTXO half); on success they persist
+        // as the active chain's unspent-output state.
         let mut saw_balance_block = false;
         let mut prev_hash: Option<[u8; 32]> = None;
         let mut result = Ok(());
@@ -2883,7 +2905,7 @@ impl<
 
         if result.is_err() {
             for slot in marked.iter().take(count) {
-                self.blocks.clear_spent_bits(*slot);
+                self.blocks.clear_available_utxo(*slot);
             }
         }
         result
@@ -2992,6 +3014,12 @@ impl<
                 let txs = view
                     .transactions()
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
+                // The block's UTXO-output stream position (ADR-016): one counter
+                // over the whole block, never reset per transaction. It is also
+                // the output's available-UTXO bit and is held within the
+                // configuration's cap (I-07, DEC-133).
+                let max_utxo_outputs = self.held_max_utxo_outputs() as usize;
+                let mut utxo_position = 0usize;
 
                 for tx in txs.iter() {
                     let vote = tx.vote();
@@ -3157,9 +3185,9 @@ impl<
                             } else if let Some(ui) = input.as_utxo() {
                                 // [H] ADR-016: resolve along this block's own
                                 // ancestry and spend. In the FR3 pass every ancestor
-                                // of a segment block is in the segment, so the bits
-                                // flipped here are exactly the ones the pass zeroes
-                                // at entry and rolls back on abort. A window-anchored
+                                // of a segment block is in the segment, so every bit
+                                // cleared here was set by this pass when it derived
+                                // that ancestor, and the abort resets it. A window-anchored
                                 // candidate trusts a reference below its anchor
                                 // (DEC-129), declared amount included. The input's
                                 // signature, against the returned address, is Story
@@ -3188,8 +3216,16 @@ impl<
                                 in_sum = in_sum.saturating_add(ui.amount());
                             }
                         }
+                        // Outputs after the inputs: a block never spends its own
+                        // outputs (Tier-1 causality), and the bits it sets here
+                        // become spendable only by descendants.
                         for output in cx.outputs() {
                             if let Some(uo) = output.as_utxo() {
+                                if utxo_position >= max_utxo_outputs {
+                                    return Err(invalid(ValidationReason::TooManyUtxoOutputs));
+                                }
+                                self.blocks.set_utxo_available(idx, utxo_position, true);
+                                utxo_position += 1;
                                 out_sum = out_sum.saturating_add(uo.amount());
                             } else if let Some(bo) = output.as_balance() {
                                 // FR6 node-existence bound: the balance-output
@@ -3389,16 +3425,18 @@ impl<
     ///    found (FR39). Reaching `NONE_REF` first means the output lies below
     ///    the anchor: with `trust_below_anchor` (a window-anchored FR3
     ///    candidate) that is trusted pre-window history and returns `Ok(None)`,
-    ///    with no bit to flip and the declared amount trusted (DEC-129); otherwise (a
-    ///    genesis-anchored candidate, or the released tail in Ready) it is
-    ///    `UtxoUnresolvable`;
-    /// 3. the spent bit: out of bit capacity is `UtxoUnresolvable`, already
-    ///    set is `UtxoAlreadySpent`;
-    /// 4. exactly one storage read of the referenced block. A failed read is a
-    ///    local fault (`StorageRead`), never `Invalid`; an `output_index`
-    ///    beyond the block's UTXO outputs is `UtxoUnresolvable`, and a
-    ///    `declared_amount` other than the output's is `UtxoAmountMismatch`;
-    /// 5. the bit is flipped.
+    ///    with no bit to clear and the declared amount trusted (DEC-129);
+    ///    otherwise (a genesis-anchored candidate, or the released tail in
+    ///    Ready) it is `UtxoUnresolvable`;
+    /// 4. the available-UTXO bit, before any read: a bit that is not 1 (the
+    ///    output is spent, or lies beyond the block's outputs or the bitfield)
+    ///    is `UtxoUnavailable` (DEC-132);
+    /// 5. exactly one storage read of the referenced block, for the amount and
+    ///    the address. A failed read is a local fault (`StorageRead`), never
+    ///    `Invalid`, and so is a set bit whose output the bytes do not hold
+    ///    (storage and RAM disagree); a `declared_amount` other than the
+    ///    output's is `UtxoAmountMismatch`;
+    /// 6. the bit is cleared.
     pub(crate) fn resolve_and_spend_utxo(
         &mut self,
         parent_idx: u32,
@@ -3443,12 +3481,8 @@ impl<
         let (ref_idx, stored_len) = found.ok_or(UtxoSpendError::MissingBlock)?;
 
         let bit = output_index as usize;
-        match self.blocks.spent_bit(ref_idx, bit) {
-            Some(false) => {}
-            Some(true) => {
-                return Err(UtxoSpendError::Invalid(ValidationReason::UtxoAlreadySpent));
-            }
-            None => return Err(unresolvable),
+        if self.blocks.utxo_available(ref_idx, bit) != Some(true) {
+            return Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable));
         }
 
         let block = self
@@ -3462,15 +3496,17 @@ impl<
             full.len()
         };
         let view = BlockView::from_bytes(&full[..n]).map_err(|_| UtxoSpendError::StorageRead)?;
-        // The read succeeded, so an out-of-bounds index is exact evidence.
-        let (address, amount) = utxo_output_at(&view, output_index).ok_or(unresolvable)?;
+        // The bit said the output exists; bytes that lack it are the node's own
+        // fault, not evidence against the spending block.
+        let (address, amount) =
+            utxo_output_at(&view, output_index).ok_or(UtxoSpendError::StorageRead)?;
         if amount != declared_amount {
             return Err(UtxoSpendError::Invalid(
                 ValidationReason::UtxoAmountMismatch,
             ));
         }
 
-        self.blocks.set_spent_bit(ref_idx, bit, true);
+        self.blocks.set_utxo_available(ref_idx, bit, false);
         Ok(Some(address))
     }
 
@@ -3586,12 +3622,7 @@ impl<
             if head.sequence().saturating_sub(tail.sequence()) < w {
                 break;
             }
-            let _ = classify_tail_drop(
-                &self.blocks,
-                &self.node_info,
-                &self.storage,
-                self.snake_chain_tail_idx,
-            );
+            let _ = classify_tail_drop(&self.blocks, &self.node_info, self.snake_chain_tail_idx);
             if !self.advance_snake_chain_tail() {
                 break;
             }
@@ -4410,6 +4441,32 @@ impl<
         self.chain_config
             .active_configuration()
             .map(|config| u32::from(config.active_chain_length()))
+    }
+
+    /// The block UTXO-output cap `max_block_utxo_output` the held configuration
+    /// — tentative or durable — declares, or the bitfield width while the node
+    /// holds none (I-07).
+    ///
+    /// The FR6 per-block step enforces this declared value even before the
+    /// durable lock (DEC-133, an exception to DEC-015 like DEC-129's `W`): the
+    /// FR3 preload has made the held configuration the candidate's own, so it is
+    /// exactly the value the lock commits, and a block admitted under the
+    /// tentative bitfield-width bound cannot be adopted past its chain's cap.
+    fn held_max_utxo_outputs(&self) -> u16 {
+        self.chain_config
+            .active_configuration()
+            .map_or(UTXO_BITFIELD_WIDTH, |config| config.max_utxo_outputs())
+    }
+
+    /// The block UTXO-output cap that Tier 1 may **enforce** against an arriving
+    /// block: the chain's value once the configuration is durably locked, and
+    /// the available-UTXO bitfield width before that (FR9; the
+    /// [`Self::enforceable_block_size_limit`] pattern, DEC-132).
+    fn enforceable_max_utxo_outputs(&self) -> u16 {
+        self.chain_config
+            .durable_content()
+            .and_then(|_| self.chain_config.active_configuration())
+            .map_or(UTXO_BITFIELD_WIDTH, |config| config.max_utxo_outputs())
     }
 
     /// The block-size limit **the chain declares**, once any configuration is
@@ -7312,7 +7369,7 @@ mod tests {
 
     /// AC11(c) — the working set is fully rolled back: per-node projection
     /// (balances, keys, watermark), accumulated vote, and the surviving blocks'
-    /// UTXO spent-bit vectors. Driven through the real
+    /// available-UTXO bitfields. Driven through the real
     /// `run_processing_pass` → `recover_from_failed_pass` pair over a
     /// window-anchored candidate that derives state *before* it fails.
     #[test]
@@ -7365,15 +7422,15 @@ mod tests {
             "accumulated vote reset"
         );
         assert_eq!(bc.vote_engine.accumulated_vote_of(2), 0);
-        // The surviving segment's spent-bits are at the clean all-zero baseline
+        // The surviving segment's available-UTXO bits are at the clean all-zero baseline
         // (owned by the pass's entry/abort handling — recovery does not sweep
         // them a second time, and must not need to).
         for idx in [ai, ti] {
             for bit in 0..8 {
                 assert_eq!(
-                    bc.blocks.spent_bit(idx, bit),
+                    bc.blocks.utxo_available(idx, bit),
                     Some(false),
-                    "no spent-bit survives a failed candidate"
+                    "no available-UTXO bit survives a failed candidate"
                 );
             }
         }
@@ -9938,7 +9995,7 @@ mod tests {
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(slot_of(&bc, 106, &orphan.view().hash()), Some(slot_100));
         assert_eq!(
-            classify_tail_drop(&bc.blocks, &bc.node_info, &bc.storage, slot_100),
+            classify_tail_drop(&bc.blocks, &bc.node_info, slot_100),
             Ok(TailObligation::None),
             "the reused slot is not anyone's seed source"
         );
@@ -9968,8 +10025,8 @@ mod tests {
     /// the binding for `extension`, extend, advance. Returns the trace record.
     fn drive_step(bc: &mut W4Chain, extension: &Block, now: u64) -> DriveRecord {
         let released = bc.snake_chain_tail_idx;
-        let obligation = classify_tail_drop(&bc.blocks, &bc.node_info, &bc.storage, released)
-            .expect("the tail is readable");
+        let obligation =
+            classify_tail_drop(&bc.blocks, &bc.node_info, released).expect("the tail is readable");
         let binding = tail_drop_binding(obligation, &extension.view());
         extend_active_head(bc, extension, now);
         assert!(bc.advance_snake_chain_tail(), "the window advances");
@@ -10385,10 +10442,11 @@ mod tests {
         complex_tx_block(101, prev, 3, 0, &[&tx])
     }
 
-    /// AC8 (1) — resolve and spend: the input's bit flips (and only it), and
-    /// the referenced amount reaches the balance output.
+    /// AC8 (1) / Story 6.11 AC6.1 — deriving the mint sets one bit per UTXO
+    /// output; the spend clears the input's bit (and only it), and the
+    /// referenced amount reaches the balance output.
     #[test]
-    fn utxo_spend_flips_the_bit_and_credits_the_amount() {
+    fn utxo_spend_clears_the_bit_and_credits_the_amount() {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         let mi = admit(&mut bc, &mint);
@@ -10398,18 +10456,27 @@ mod tests {
 
         bc.run_processing_pass(si).expect("pass succeeds");
 
-        assert_eq!(bc.blocks.spent_bit(mi, 1), Some(true), "spent output");
-        assert_eq!(bc.blocks.spent_bit(mi, 0), Some(false), "untouched output");
+        assert_eq!(bc.blocks.utxo_available(mi, 1), Some(false), "spent output");
+        assert_eq!(
+            bc.blocks.utxo_available(mi, 0),
+            Some(true),
+            "untouched output"
+        );
+        assert_eq!(
+            bc.blocks.utxo_available(mi, 2),
+            Some(false),
+            "no third output"
+        );
         assert_eq!(bc.node_info.balance_of(1), 0, "minted everything");
         assert_eq!(bc.node_info.balance_of(2), 40, "the UTXO's amount");
         assert_eq!(bc.node_info.balance_of(3), 0, "no fee, nothing mined");
     }
 
     /// AC8 (2) — a second spend of the same output, in a later block, is
-    /// `UtxoAlreadySpent` against that later block; the abort rolls every
-    /// spent bit back.
+    /// `UtxoUnavailable` against that later block; the abort rolls every bit
+    /// back to "nothing derived".
     #[test]
-    fn utxo_double_spend_across_blocks_is_already_spent() {
+    fn utxo_double_spend_across_blocks_is_unavailable() {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         let mi = admit(&mut bc, &mint);
@@ -10424,10 +10491,11 @@ mod tests {
             bc.run_processing_pass(di),
             Err(ProcessingError::Invalid {
                 block_idx: di,
-                reason: ValidationReason::UtxoAlreadySpent,
+                reason: ValidationReason::UtxoUnavailable,
             })
         );
-        assert_eq!(bc.blocks.spent_bit(mi, 0), Some(false), "rolled back");
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "rolled back");
+        assert_eq!(bc.blocks.utxo_available(mi, 1), Some(false), "rolled back");
     }
 
     /// Runs the pass over `mint ← spend(inputs)` and returns its verdict and
@@ -10531,18 +10599,18 @@ mod tests {
         ));
     }
 
-    /// AC8 (5) — an `output_index` within bit capacity but past the
-    /// referenced block's UTXO outputs (or into a block with none) is exact
-    /// evidence, because the read succeeded.
+    /// AC8 (5) / Story 6.11 AC3 — an `output_index` past the referenced
+    /// block's UTXO outputs (or into a block with none) has no available bit:
+    /// exact evidence, decided from RAM.
     #[test]
-    fn utxo_out_of_bounds_index_is_unresolvable() {
+    fn utxo_out_of_bounds_index_is_unavailable() {
         for (referenced, index) in [(101, 2), (101, 255), (100, 0), (99, 0)] {
             let (verdict, si) = spend_verdict(&[(referenced, index, 0)]);
             assert_eq!(
                 verdict,
                 Err(ProcessingError::Invalid {
                     block_idx: si,
-                    reason: ValidationReason::UtxoUnresolvable,
+                    reason: ValidationReason::UtxoUnavailable,
                 }),
                 "({referenced}, {index})"
             );
@@ -10551,7 +10619,8 @@ mod tests {
 
     /// AC8 (4) — ADR-016 trade-off (FR39): an output at the same
     /// `(sequence, index)` on a side branch is never found. The resolver only
-    /// visits the consuming block's ancestors.
+    /// visits the consuming block's ancestors, whose block 101 has no output
+    /// and so no available bit; the side branch was never derived.
     #[test]
     fn utxo_output_on_a_side_branch_is_not_resolvable() {
         let (mut bc, h100) = utxo_test_chain();
@@ -10568,10 +10637,14 @@ mod tests {
             bc.run_processing_pass(si),
             Err(ProcessingError::Invalid {
                 block_idx: si,
-                reason: ValidationReason::UtxoUnresolvable,
+                reason: ValidationReason::UtxoUnavailable,
             })
         );
-        assert_eq!(bc.blocks.spent_bit(side_idx, 0), Some(false));
+        assert_eq!(
+            bc.blocks.has_available_utxo(side_idx),
+            Some(false),
+            "a side branch is never derived: its whole bitfield stays 0"
+        );
     }
 
     /// AC8 (7) / AC5 — Tier 1 rejects a UTXO input whose `block_sequence` is
@@ -10634,7 +10707,7 @@ mod tests {
     }
 
     /// DEC-131 — a declared amount that is not the referenced output's is
-    /// `UtxoAmountMismatch`, and the output stays unspent.
+    /// `UtxoAmountMismatch`; the abort leaves nothing derived.
     #[test]
     fn utxo_declared_amount_mismatch_is_invalid() {
         for declared in [39, 41] {
@@ -10652,7 +10725,7 @@ mod tests {
                 }),
                 "declared {declared}, output 40"
             );
-            assert_eq!(bc.blocks.spent_bit(mi, 1), Some(false));
+            assert_eq!(bc.blocks.utxo_available(mi, 1), Some(false));
         }
     }
 
@@ -10672,17 +10745,23 @@ mod tests {
 
         bc.run_processing_pass(si).expect("pass succeeds");
 
-        assert_eq!(bc.blocks.spent_bit(mi, 2), Some(true));
-        assert_eq!(bc.blocks.spent_bit(mi, 0), Some(false));
+        assert_eq!(bc.blocks.utxo_available(mi, 2), Some(false), "spent");
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true));
+        assert_eq!(bc.blocks.utxo_available(mi, 1), Some(true), "the 45 output");
+        assert_eq!(
+            bc.blocks.utxo_available(mi, 3),
+            Some(false),
+            "no fourth output"
+        );
         assert_eq!(bc.node_info.balance_of(2), 5 + 30, "the 30 output");
         assert_eq!(bc.node_info.balance_of(3), 0, "no fee anywhere");
     }
 
     /// AC8 (2) — the same output named twice in one transaction, or by two
     /// transactions of one block, is spent once: the second is
-    /// `UtxoAlreadySpent`.
+    /// `UtxoUnavailable`.
     #[test]
-    fn utxo_double_spend_within_one_block_is_already_spent() {
+    fn utxo_double_spend_within_one_block_is_unavailable() {
         let same_tx = utxo_tx(102, &[(101, 0, 60), (101, 0, 60)], None, &[Err((2, 60))]);
         let first = utxo_tx(102, &[(101, 0, 60)], None, &[Err((2, 60))]);
         let second = utxo_tx(102, &[(101, 0, 60)], None, &[Err((2, 60))]);
@@ -10696,7 +10775,7 @@ mod tests {
                 bc.run_processing_pass(si),
                 Err(ProcessingError::Invalid {
                     block_idx: si,
-                    reason: ValidationReason::UtxoAlreadySpent,
+                    reason: ValidationReason::UtxoUnavailable,
                 }),
                 "{} transaction(s)",
                 txs.len()
@@ -10787,12 +10866,11 @@ mod tests {
 
     type FailingReadChain = Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, 16, 4, 16>;
 
-    /// AC8 (6) / AC3 step 5 — a failed read of the referenced block is a local
-    /// fault: the pass reports `StorageRead`, never `Invalid`, so nothing is
-    /// charged against the spending block. (The FR5 driver's head fallback for
-    /// `StorageRead` is unchanged here; DEC-037 is Story 6.0.)
-    #[test]
-    fn utxo_read_failure_is_reported_as_storage_read() {
+    /// The UTXO harness on a [`FailingReadChain`] whose reads all succeed
+    /// until a test arms `failing_slot`: chain-config anchor 99, balance block
+    /// 100, and the [`utxo_mint_block`] at 101. Returns the node, the mint and
+    /// its slot.
+    fn failing_read_utxo_chain() -> (FailingReadChain, Block, u32) {
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
         let chain_config = locked_chain_config(&crypto, FailingReadChain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
@@ -10807,24 +10885,35 @@ mod tests {
         // SAFETY: `init` returned, so every field of `slot` is initialized.
         let mut bc = unsafe { slot.assume_init() };
 
-        let mut admit = |block: &Block| {
-            bc.tier1_admit(&block.view(), &block.view().hash(), 0)
-                .expect("block admitted")
-        };
         let cfg = chain_config_anchor_block(99, [0xAB; 32]);
-        admit(&cfg);
+        failing_read_admit(&mut bc, &cfg);
         let seed = balance_block(
             100,
             cfg.view().hash(),
             &[(1, 100, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
             3,
         );
-        admit(&seed);
+        failing_read_admit(&mut bc, &seed);
         let mint = utxo_mint_block(seed.view().hash());
-        let mi = admit(&mint);
+        let mi = failing_read_admit(&mut bc, &mint);
+        (bc, mint, mi)
+    }
+
+    fn failing_read_admit(bc: &mut FailingReadChain, block: &Block) -> u32 {
+        bc.tier1_admit(&block.view(), &block.view().hash(), 0)
+            .expect("block admitted")
+    }
+
+    /// AC8 (6) / AC3 step 5 — a failed read of the referenced block is a local
+    /// fault: the pass reports `StorageRead`, never `Invalid`, so nothing is
+    /// charged against the spending block. (The FR5 driver's head fallback for
+    /// `StorageRead` is unchanged here; DEC-037 is Story 6.0.)
+    #[test]
+    fn utxo_read_failure_is_reported_as_storage_read() {
+        let (mut bc, mint, mi) = failing_read_utxo_chain();
         let tx = utxo_tx(102, &[(101, 1, 40)], None, &[Err((2, 40))]);
         let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
-        let si = admit(&spend);
+        let si = failing_read_admit(&mut bc, &spend);
 
         bc.storage.failing_slot = mi;
         bc.storage.reads_left.set(1);
@@ -10840,5 +10929,254 @@ mod tests {
             "the segment walk read the block, then the resolver's read failed"
         );
         assert_eq!(bc.blocks.len(), stored, "the pass itself deletes nothing");
+    }
+
+    /// Story 6.11 AC3 / AC6.3 — an output whose bit is 0 is rejected before the
+    /// resolver reads the referenced block: past the block's outputs (no read
+    /// at all beyond the segment walk's), or already spent by an earlier block
+    /// (only that earlier spend reads).
+    #[test]
+    fn utxo_unavailable_output_is_rejected_without_a_read() {
+        // (spending blocks' inputs, resolver reads expected on the mint)
+        let past_the_outputs: &[&[(u32, u8, u64)]] = &[&[(101, 2, 0)]];
+        let spent_earlier: &[&[(u32, u8, u64)]] = &[&[(101, 0, 60)], &[(101, 0, 60)]];
+        for (spends, resolver_reads) in [(past_the_outputs, 0), (spent_earlier, 1)] {
+            let (mut bc, mint, mi) = failing_read_utxo_chain();
+            let mut prev = mint.view().hash();
+            let mut tip = mi;
+            for (k, inputs) in spends.iter().enumerate() {
+                let seq = 102 + k as u32;
+                let amount = inputs[0].2;
+                let tx = utxo_tx(seq, inputs, None, &[Err((2, amount))]);
+                let block = complex_tx_block(seq, prev, 3, 0, &[&tx]);
+                prev = block.view().hash();
+                tip = failing_read_admit(&mut bc, &block);
+            }
+            bc.storage.failing_slot = mi;
+            bc.storage.reads_left.set(u32::MAX);
+
+            assert_eq!(
+                bc.run_processing_pass(tip),
+                Err(ProcessingError::Invalid {
+                    block_idx: tip,
+                    reason: ValidationReason::UtxoUnavailable,
+                })
+            );
+            assert_eq!(
+                bc.storage.attempts.get(),
+                1 + resolver_reads,
+                "the segment walk's read, plus {resolver_reads} by the resolver"
+            );
+        }
+    }
+
+    /// Story 6.11 AC3 / D2 — a set bit whose output the stored bytes do not
+    /// hold means storage and RAM disagree: a local fault, never evidence
+    /// against the spending block.
+    #[test]
+    fn utxo_bit_without_its_output_is_a_local_fault() {
+        let (mut bc, h100) = utxo_test_chain();
+        let mint = utxo_mint_block(h100);
+        let mi = admit(&mut bc, &mint);
+        bc.run_processing_pass(mi).expect("the mint derives");
+        assert_eq!(bc.blocks.utxo_available(mi, 2), Some(false));
+        bc.blocks.set_utxo_available(mi, 2, true);
+
+        assert!(matches!(
+            bc.resolve_and_spend_utxo(mi, 102, 101, 2, 0, false),
+            Err(UtxoSpendError::StorageRead)
+        ));
+        assert_eq!(bc.blocks.utxo_available(mi, 2), Some(true), "nothing spent");
+    }
+
+    /// An override set declaring `max_block_utxo_output = 1` and the window
+    /// [`TEST_W`].
+    fn one_utxo_output_config_builder() -> ChainConfigPayloadBuilder {
+        let mut builder = window_config_builder(TEST_W);
+        builder
+            .add_literal(parameter::MAX_BLOCK_UTXO_OUTPUT, &1u16.to_le_bytes())
+            .ok()
+            .expect("a two-byte literal is well-formed");
+        builder
+    }
+
+    /// Story 6.11 AC5 / AC6.7 — the Tier-1 UTXO-output cap enforces the chain's
+    /// value only once it is durably locked; a tentative one leaves the
+    /// bitfield-width bound in force (FR9).
+    #[test]
+    fn tier1_utxo_output_cap_is_the_locked_value_only() {
+        let two_outputs = utxo_mint_block([0xCD; 32]);
+        let one_output = complex_tx_block(
+            101,
+            [0xCD; 32],
+            3,
+            0,
+            &[&utxo_tx(101, &[], Some((1, 9)), &[Ok(9)])],
+        );
+
+        // Tentative: a stray chain-config block declares the cap of 1.
+        let mut bc = new_unconfigured_test_chain();
+        let stray = chain_config_block_from(500, [0xEE; 32], &mut one_utxo_output_config_builder());
+        bc.tier1_admit(&stray.view(), &stray.view().hash(), 0)
+            .expect("the stray is admitted");
+        assert!(bc.chain_config.tentative_content().is_some());
+        assert_eq!(
+            bc.chain_config
+                .active_configuration()
+                .map(|config| config.max_utxo_outputs()),
+            Some(1),
+            "the tentative configuration really declares the cap of 1"
+        );
+        assert!(
+            bc.tier1_admit(&two_outputs.view(), &two_outputs.view().hash(), 0)
+                .is_ok(),
+            "a tentative-only cap must not reject the block (FR9)"
+        );
+
+        // Locked on the same content: the cap is enforced and nothing is stored.
+        let (crypto, storage, _) = test_backends();
+        let mut chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        chain_config
+            .load_durable(one_utxo_output_config_builder().build_signed(&crypto))
+            .ok()
+            .expect("legal content");
+        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+        let stored = bc.blocks.len();
+        assert_eq!(
+            bc.tier1_admit(&two_outputs.view(), &two_outputs.view().hash(), 0),
+            Err(AdmitError::Rejected(Tier1Failure::TooManyUtxoOutputs))
+        );
+        assert_eq!(bc.blocks.len(), stored, "not stored");
+        assert!(
+            bc.tier1_admit(&one_output.view(), &one_output.view().hash(), 0)
+                .is_ok(),
+            "exactly the cap is admitted"
+        );
+    }
+
+    /// Story 6.11 D3 (DEC-133) — the FR3 pass holds a block to its candidate's
+    /// own declared cap even while that configuration is only tentative: the
+    /// preload made it the value the lock is about to commit, so a block that
+    /// Tier 1 admitted under the bitfield-width bound cannot be adopted past it.
+    #[test]
+    fn fr3_pass_enforces_the_candidates_declared_utxo_output_cap() {
+        let (mut bc, h100) = tentative_one_utxo_output_chain();
+        let mint = utxo_mint_block(h100);
+        let mi = admit(&mut bc, &mint);
+
+        assert_eq!(
+            bc.run_processing_pass(mi),
+            Err(ProcessingError::Invalid {
+                block_idx: mi,
+                reason: ValidationReason::TooManyUtxoOutputs,
+            })
+        );
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "rolled back");
+    }
+
+    /// Story 6.11 D3 boundary — exactly the declared cap passes the FR6 step.
+    #[test]
+    fn fr3_pass_admits_exactly_the_declared_utxo_output_cap() {
+        let (mut bc, h100) = tentative_one_utxo_output_chain();
+        let tx = utxo_tx(101, &[], Some((1, 100)), &[Ok(100)]);
+        let block = complex_tx_block(101, h100, 3, 0, &[&tx]);
+        let bi = admit(&mut bc, &block);
+
+        bc.run_processing_pass(bi).expect("one output, cap one");
+        assert_eq!(bc.blocks.utxo_available(bi, 0), Some(true));
+    }
+
+    /// An unconfigured node holding, tentatively, a chain-config anchor at 99
+    /// that declares `max_block_utxo_output = 1`, and the [`utxo_test_chain`]
+    /// balance block at 100 above it. Returns the node and block 100's hash.
+    fn tentative_one_utxo_output_chain() -> (TestChain, [u8; 32]) {
+        let mut bc = new_unconfigured_test_chain();
+        let cfg = chain_config_block_from(99, [0xAB; 32], &mut one_utxo_output_config_builder());
+        admit(&mut bc, &cfg);
+        assert!(
+            bc.chain_config.tentative_content().is_some(),
+            "tentative only"
+        );
+        let seed = balance_block(
+            100,
+            cfg.view().hash(),
+            &[(1, 100, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
+            3,
+        );
+        admit(&mut bc, &seed);
+        (bc, seed.view().hash())
+    }
+
+    /// Story 6.11 AC2 / AC4 end to end — deriving a block sets exactly one bit
+    /// per UTXO output, which gives it the FR51 tail obligation; spending every
+    /// output clears it.
+    #[test]
+    fn utxo_derivation_drives_the_tail_obligation() {
+        let (mut bc, h100) = utxo_test_chain();
+        let mint = utxo_mint_block(h100);
+        let mi = admit(&mut bc, &mint);
+        bc.run_processing_pass(mi).expect("the mint derives");
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true));
+        assert_eq!(bc.blocks.utxo_available(mi, 1), Some(true));
+        assert_eq!(
+            bc.blocks.utxo_available(mi, 2),
+            Some(false),
+            "two outputs only"
+        );
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, mi),
+            Ok(TailObligation::Utxo)
+        );
+
+        let tx = utxo_tx(102, &[(101, 0, 60), (101, 1, 40)], None, &[Err((2, 100))]);
+        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+        let si = admit(&mut bc, &spend);
+        bc.run_processing_pass(si).expect("both outputs spent");
+        assert_eq!(bc.blocks.has_available_utxo(mi), Some(false));
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, mi),
+            Ok(TailObligation::None)
+        );
+    }
+
+    /// Review patch — the lock-time `BlockTooLarge` rollback follows a pass that
+    /// returned `Ok`, so it must clear the derived bits itself: a surviving
+    /// ancestor of the offender may not keep advertising its outputs.
+    #[test]
+    fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
+        let mut bc = new_unconfigured_w4_chain();
+        let base = balance_block(100, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let one = utxo_tx(101, &[], None, &[Ok(5)]);
+        let b101 = complex_tx_block(101, base.view().hash(), 3, 0, &[&one]);
+        let three = utxo_tx(102, &[], None, &[Ok(5), Ok(6), Ok(7)]);
+        let b102 = complex_tx_block(102, b101.view().hash(), 3, 0, &[&three]);
+        let cfg =
+            chain_config_block_from(103, b102.view().hash(), &mut small_limit_config_builder(W4));
+        for small in [&base, &b101, &cfg] {
+            assert!(small.len() <= SMALL_BLOCK_SIZE_LIMIT as usize);
+        }
+        assert!(b102.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
+        for block in [&base, &b101, &b102, &cfg] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
+
+        assert!(
+            !bc.is_ready(),
+            "the re-evaluation at the lock refuses the candidate"
+        );
+        assert!(
+            bc.blocks.find(102, &b102.view().hash()).is_none(),
+            "offender deleted"
+        );
+        let survivor = bc
+            .blocks
+            .find(101, &b101.view().hash())
+            .expect("the offender's ancestor survives");
+        assert_eq!(
+            bc.blocks.has_available_utxo(survivor),
+            Some(false),
+            "no bit of the refused candidate survives"
+        );
     }
 }

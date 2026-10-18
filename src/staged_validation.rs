@@ -130,6 +130,11 @@ pub(crate) enum Tier1Failure {
     /// A complex transaction with inputs whose declared input amounts (balance
     /// and UTXO) sum to less than its output amounts.
     InputsLessThanOutputs,
+    /// A transaction block whose UTXO outputs, summed over all its complex
+    /// transactions, exceed the enforceable `max_block_utxo_output` (I-07,
+    /// DEC-132): the locked value, or the available-UTXO bitfield width before
+    /// the durable lock.
+    TooManyUtxoOutputs,
     /// A registration's `new_key_signature` does not verify over its
     /// `new_public_key` (or the key/signature bytes are malformed).
     InvalidNewKeySignature,
@@ -215,7 +220,8 @@ pub(crate) fn verify_signature_bytes<C: CryptoTrait>(
 // ---------------------------------------------------------------------------
 
 /// Runs the full FR9 Tier 1 gating-check set over `block`, evaluable from the
-/// block bytes alone plus the durable-locked chain-config (`block_size_limit`).
+/// block bytes alone plus the durable-locked chain-config (`block_size_limit`,
+/// `max_utxo_outputs`; each falls back to a structural bound before the lock).
 /// Returns `Ok(())` when no exact evidence of invalidity exists (the block is
 /// admissible at `Stored`), or the first exact-evidence [`Tier1Failure`].
 ///
@@ -225,6 +231,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
     block_size_limit: u16,
+    max_utxo_outputs: u16,
     crypto: &C,
 ) -> Result<(), Tier1Failure> {
     // Header-level checks (payload-independent).
@@ -255,7 +262,13 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
 
     match block.payload_type() {
         PAYLOAD_TYPE_TRANSACTION => {
-            tier1_transaction_block(block, node_zero_public_key, crypto, is_genesis_block_zero)?;
+            tier1_transaction_block(
+                block,
+                node_zero_public_key,
+                max_utxo_outputs,
+                crypto,
+                is_genesis_block_zero,
+            )?;
         }
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
         PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
@@ -273,6 +286,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
 fn tier1_transaction_block<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
+    max_utxo_outputs: u16,
     crypto: &C,
     is_genesis_block_zero: bool,
 ) -> Result<(), Tier1Failure> {
@@ -283,6 +297,7 @@ fn tier1_transaction_block<C: CryptoTrait>(
     let mut seen = 0usize;
     let mut has_registration = false;
     let mut has_complex = false;
+    let mut utxo_outputs = 0u32;
 
     for tx in payload.iter() {
         seen += 1;
@@ -314,7 +329,7 @@ fn tier1_transaction_block<C: CryptoTrait>(
             }
         } else if let Some(cx) = tx.as_complex() {
             has_complex = true;
-            tier1_complex_tx(&cx, vote, is_genesis_block_zero, block_sequence)?;
+            utxo_outputs += tier1_complex_tx(&cx, vote, is_genesis_block_zero, block_sequence)?;
         } else {
             // Unknown transaction discriminator: the iterator yielded a view
             // whose type is none of {node-transfer, registration, complex}.
@@ -335,15 +350,23 @@ fn tier1_transaction_block<C: CryptoTrait>(
         return Err(Tier1Failure::RegistrationComplexMutualExclusion);
     }
 
+    // I-07: the cap counts the block's whole UTXO-output stream, so no output
+    // can fall outside the available-UTXO bitfield (DEC-132).
+    if utxo_outputs > u32::from(max_utxo_outputs) {
+        return Err(Tier1Failure::TooManyUtxoOutputs);
+    }
+
     Ok(())
 }
 
+/// Tier 1 over one complex transaction; returns its UTXO-output count for the
+/// block-wide cap.
 fn tier1_complex_tx(
     cx: &ComplexTransactionView,
     vote: u32,
     is_genesis_block_zero: bool,
     block_sequence: u32,
-) -> Result<(), Tier1Failure> {
+) -> Result<u32, Tier1Failure> {
     let mut input_seen = 0u32;
     let mut declared_input_sum: u128 = 0;
 
@@ -374,10 +397,12 @@ fn tier1_complex_tx(
 
     // Output pass (always, for coherence; amounts used only for the sum rule).
     let mut output_seen = 0u32;
+    let mut utxo_outputs = 0u32;
     let mut output_sum: u128 = 0;
     for output in cx.outputs() {
         output_seen += 1;
         if let Some(u) = output.as_utxo() {
+            utxo_outputs += 1;
             output_sum = output_sum.saturating_add(u.amount() as u128);
         } else if let Some(b) = output.as_balance() {
             output_sum = output_sum.saturating_add(b.amount() as u128);
@@ -397,7 +422,7 @@ fn tier1_complex_tx(
     // Zero-input complex tx (UTXO carry-forward, FR51) is exempt from the
     // structural sum rule entirely.
     if input_seen == 0 {
-        return Ok(());
+        return Ok(utxo_outputs);
     }
     // Every input declares its amount (a UTXO input since DEC-131), so the
     // `sum(inputs) ≥ sum(outputs)` rule is decidable from the bytes and is Tier
@@ -407,7 +432,7 @@ fn tier1_complex_tx(
         return Err(Tier1Failure::InputsLessThanOutputs);
     }
 
-    Ok(())
+    Ok(utxo_outputs)
 }
 
 fn tier1_balance_block(
@@ -511,6 +536,7 @@ mod tests {
     /// Block-size limit used by the "normal" Tier 1 tests (the chain-config
     /// stub's `block_size_limit()`).
     const NORMAL_LIMIT: u16 = 2016;
+    const UTXO_LIMIT: u16 = 256;
     const DUMMY_SIG: [u8; 64] = [0u8; 64];
 
     fn crypto(seed: u8) -> Crypto {
@@ -587,7 +613,7 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
             Err(Tier1Failure::UnsupportedVersion)
         );
     }
@@ -598,7 +624,7 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
             Err(Tier1Failure::UnknownPayloadType)
         );
     }
@@ -610,7 +636,7 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
             Err(Tier1Failure::SequenceCeiling)
         );
     }
@@ -622,7 +648,13 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), 100 /* < 122 */, &c),
+            tier1_gate(
+                &block,
+                &pubkey_bytes(&c),
+                100, /* < 122 */
+                UTXO_LIMIT,
+                &c
+            ),
             Err(Tier1Failure::BlockTooLarge)
         );
     }
@@ -658,7 +690,7 @@ mod tests {
             .ok()
             .expect("parses");
         assert_eq!(
-            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
             Ok(())
         );
     }
@@ -674,7 +706,13 @@ mod tests {
             .ok()
             .expect("parses");
         assert_eq!(
-            tier1_gate(&view, &pubkey_bytes(&node_zero), NORMAL_LIMIT, &node_zero),
+            tier1_gate(
+                &view,
+                &pubkey_bytes(&node_zero),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &node_zero
+            ),
             Err(Tier1Failure::ChainConfigContentSignatureInvalid)
         );
     }
@@ -697,7 +735,7 @@ mod tests {
         bytes[HEADER_SIZE] = 1;
         let view = BlockView::from_bytes(&bytes).ok().expect("parses");
         assert_eq!(
-            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
             Err(Tier1Failure::MalformedPayload)
         );
     }
@@ -711,7 +749,7 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, &c),
+            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
             Err(Tier1Failure::MalformedPayload)
         );
     }
@@ -730,7 +768,13 @@ mod tests {
                 .ok()
                 .expect("parses");
             assert_eq!(
-                tier1_gate(&view, &pubkey_bytes(&node_zero), NORMAL_LIMIT, &node_zero),
+                tier1_gate(
+                    &view,
+                    &pubkey_bytes(&node_zero),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &node_zero
+                ),
                 Err(Tier1Failure::ChainConfigContentSignatureInvalid),
                 "sequence {seq} must not exempt the FR7 gate"
             );
@@ -749,7 +793,13 @@ mod tests {
             &c,
         );
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Ok(())
         );
     }
@@ -760,7 +810,13 @@ mod tests {
         // initializer == vote == 7 (both non-zero) → self-vote.
         let block = node_transfer_block(5, 7, 4, 7, &c);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Err(Tier1Failure::SelfVote)
         );
     }
@@ -771,7 +827,13 @@ mod tests {
         let c = crypto(1);
         let block = node_transfer_block(5, 0, 4, 0, &c);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Ok(())
         );
     }
@@ -783,7 +845,13 @@ mod tests {
         let c = crypto(1);
         let block = node_transfer_block(0, 7, 0, 7, &c);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Ok(())
         );
     }
@@ -794,7 +862,13 @@ mod tests {
         // anchor 10 ≥ block sequence 5.
         let block = node_transfer_block(5, 3, 10, 7, &c);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Err(Tier1Failure::AnchorSequenceNotBeforeBlock)
         );
     }
@@ -821,7 +895,13 @@ mod tests {
             .expect("add registration");
         let block = builder.build_signed(&c).ok().expect("build signed");
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Err(Tier1Failure::SelfVote)
         );
     }
@@ -850,7 +930,10 @@ mod tests {
         let pk_a = pubkey_bytes(&a);
         // new_node_id == 0 → FR69 (i) requires new_public_key == node_zero. Pass pk_a as both.
         let block = registration_block(5, 0, &pk_a, &a);
-        assert_eq!(tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a), Ok(()));
+        assert_eq!(
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            Ok(())
+        );
     }
 
     #[test]
@@ -860,7 +943,13 @@ mod tests {
         let b = crypto(2);
         let block = registration_block(5, 0, &pubkey_bytes(&a), &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&b), NORMAL_LIMIT, &a),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&b),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &a
+            ),
             Err(Tier1Failure::NodeZeroRegistrationKeyMismatch)
         );
     }
@@ -874,7 +963,13 @@ mod tests {
         let b = crypto(2);
         let block = registration_block(5, 9, &pubkey_bytes(&b), &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(3)), NORMAL_LIMIT, &a),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(3)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &a
+            ),
             Err(Tier1Failure::InvalidNewKeySignature)
         );
     }
@@ -897,7 +992,7 @@ mod tests {
             .expect("add complex");
         let block = builder.build_signed(&a).ok().expect("build");
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
             Err(Tier1Failure::RegistrationComplexMutualExclusion)
         );
     }
@@ -918,6 +1013,27 @@ mod tests {
         builder.build_signed(signer).ok().expect("build signed")
     }
 
+    /// Story 6.11 AC5 / AC6.6 — the UTXO-output cap counts the whole block:
+    /// two zero-input transactions of two UTXO outputs each pass a cap of 4 and
+    /// fail a cap of 3, though neither transaction alone exceeds it.
+    #[test]
+    fn tier1_caps_utxo_outputs_across_the_whole_block() {
+        let c = crypto(1);
+        let mut cx = ComplexTransaction::new(3);
+        cx.add_utxo_output(&[1u8; 32], 10).ok().unwrap();
+        cx.add_utxo_output(&[2u8; 32], 20).ok().unwrap();
+        let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
+        builder.add_complex_transaction(&cx).ok().unwrap();
+        builder.add_complex_transaction(&cx).ok().unwrap();
+        let block = builder.build_signed(&c).ok().unwrap();
+        let pk = pubkey_bytes(&crypto(2));
+        assert_eq!(tier1_gate(&block.view(), &pk, NORMAL_LIMIT, 4, &c), Ok(()));
+        assert_eq!(
+            tier1_gate(&block.view(), &pk, NORMAL_LIMIT, 3, &c),
+            Err(Tier1Failure::TooManyUtxoOutputs)
+        );
+    }
+
     #[test]
     fn tier1_rejects_complex_inputs_less_than_outputs() {
         let c = crypto(1);
@@ -927,7 +1043,13 @@ mod tests {
             cx.add_balance_output(9, 50).ok().unwrap();
         });
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Err(Tier1Failure::InputsLessThanOutputs)
         );
     }
@@ -943,7 +1065,13 @@ mod tests {
                 cx.add_balance_output(9, 50).ok().unwrap();
             });
             assert_eq!(
-                tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+                tier1_gate(
+                    &block.view(),
+                    &pubkey_bytes(&crypto(2)),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &c
+                ),
                 expected,
                 "declared {declared}"
             );
@@ -971,7 +1099,13 @@ mod tests {
         });
         for block in [outputs, inputs, utxo_inputs] {
             assert_eq!(
-                tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+                tier1_gate(
+                    &block.view(),
+                    &pubkey_bytes(&crypto(2)),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &c
+                ),
                 Err(Tier1Failure::AmountOverflow)
             );
         }
@@ -990,7 +1124,13 @@ mod tests {
                 cx.add_balance_output(9, 50).ok().unwrap();
             });
             assert_eq!(
-                tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+                tier1_gate(
+                    &block.view(),
+                    &pubkey_bytes(&crypto(2)),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &c
+                ),
                 Err(Tier1Failure::UtxoInputNotBeforeBlock),
                 "block_sequence {referenced} at block 5"
             );
@@ -1006,7 +1146,13 @@ mod tests {
             cx.add_balance_output(9, 40).ok().unwrap();
         });
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&crypto(2)), NORMAL_LIMIT, &c),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
             Err(Tier1Failure::SelfVote)
         );
     }
@@ -1025,7 +1171,10 @@ mod tests {
         let a = crypto(1);
         let pk_a = pubkey_bytes(&a);
         let block = balance_block(5, 0, &pk_a, &a);
-        assert_eq!(tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, &a), Ok(()));
+        assert_eq!(
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1035,7 +1184,13 @@ mod tests {
         let b = crypto(2);
         let block = balance_block(5, 0, &pubkey_bytes(&a), &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pubkey_bytes(&b), NORMAL_LIMIT, &a),
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&b),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &a
+            ),
             Err(Tier1Failure::NodeZeroBalanceKeyMismatch)
         );
     }

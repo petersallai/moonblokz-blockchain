@@ -3,7 +3,7 @@
 //! Owns the bounded `BlockTable<MAX_BLOCKS>` (~45.6 KB at the default
 //! `MAX_BLOCKS = 600`) — every retained block with its ancestry metadata,
 //! the single authoritative `(sequence, block_hash)` duplicate-detection
-//! index, and the co-located ADR-016 spent-bit vectors.
+//! index, and the co-located ADR-016 available-UTXO bitfields.
 //!
 //! Story 4.1 scope: the data layer only — `BlockEntry` layout, duplicate
 //! detection, ancestry recovery, and bounded full-retention. The FR9 status
@@ -23,12 +23,13 @@
 //! *non-identity* metadata**, each a distinct method (never a raw `get_mut`):
 //! `adjust_head_ref_count` / `resolve_parent_ref` (FR19 structural
 //! bookkeeping, Story 4.4), and — added in Story 5.4 — the FR6/FR4 value
-//! setters `set_status` / `set_on_active_chain` / `set_spent_bit`. The last
-//! three are **bidirectional and value-based on purpose**: the FR3 Ready
-//! transition promotes `Stored→Active` + `on_active_chain=true` and flips
-//! UTXO spent-bits `0→1`, while the FR5 recovery (Story 5.5) and the FR23
-//! chain-switch (Epic 6) reverse the very same fields — so a one-way
-//! `promote`/`flip` API would be wrong; both directions reuse one setter.
+//! setters `set_status` / `set_on_active_chain` / `set_utxo_available`. The
+//! last three are **bidirectional and value-based on purpose**: the FR3 Ready
+//! transition promotes `Stored→Active` + `on_active_chain=true`, and the FR6
+//! pass sets a UTXO output's bit on derivation and clears it on the spend,
+//! while the FR5 recovery (Story 5.5) and the FR23 chain-switch (Epic 6)
+//! reverse the very same fields — so a one-way `promote`/`flip` API would be
+//! wrong; both directions reuse one setter.
 //! The block's `hash`/`sequence` stay immutable throughout; `parent_ref` is
 //! only ever resolved (`NONE_REF → idx`) or, since Story 9.1's snake-chain
 //! tail release, unlinked (`idx → NONE_REF`) — never re-pointed to another
@@ -58,23 +59,20 @@ use crate::staged_validation::BlockStatus;
 /// unresolved parent (parent linking / recovery is Story 4.4).
 pub(crate) const NONE_REF: u32 = u32::MAX;
 
-/// ADR-016 spent-bit vector size in bytes, for the architecture §5 default
-/// `MAX_BLOCK_UTXO_OUTPUT = 256` (256 / 8 = 32).
+/// ADR-016 available-UTXO bitfield size in bytes, for the architecture §5
+/// default `MAX_BLOCK_UTXO_OUTPUT = 256` (256 / 8 = 32). Bit *i* is 1 exactly
+/// when the block's *i*-th UTXO output exists and is unspent on the current
+/// derived chain (DEC-132). `AVAILABLE_UTXO_BYTES * 8` is also the Tier-1 cap
+/// on a block's UTXO outputs before the durable lock (Story 6.11).
 ///
-/// Not derived from `Blockchain`'s `MAX_BLOCK_UTXO_OUTPUT` const generic:
-/// sizing a field from `N / 8` where `N` is a generic parameter requires the
-/// unstable `generic_const_exprs` feature, which this workspace does not
-/// enable (the same constraint already documented for
-/// `moonblokz-crypto-lib`'s fixed-size array API). `spent_bits` is reserved
-/// storage only in this story (populated by Epic 7).
-///
-/// **Story 5.8 resolves this** (ratified 2026-08-19), not Epic 7: the const
-/// generic becomes the spent-bit *byte* width, this field is sized `[u8; N]`
-/// directly from it — an array length taken straight from a const generic is
-/// stable, only arithmetic over one is not — and the bit capacity is `N * 8`.
-/// That is what lets the configuration crate's `UTXO_UNSPENT_BITS` be pinned to
-/// a width the build actually chose instead of to a second hand-written literal.
-pub(crate) const SPENT_BITS_BYTES: usize = 32;
+/// A fixed constant, not derived from `Blockchain`'s `MAX_BLOCK_UTXO_OUTPUT`
+/// const generic: sizing a field from `N / 8` where `N` is a generic parameter
+/// requires the unstable `generic_const_exprs` feature, which this workspace
+/// does not enable (the same constraint already documented for
+/// `moonblokz-crypto-lib`'s fixed-size array API). The build states this width
+/// to the configuration module once, in `Blockchain::BUILD_LIMITS`, which is
+/// where a chain's `max_block_utxo_output` is held within it (FR8).
+pub(crate) const AVAILABLE_UTXO_BYTES: usize = 32;
 
 /// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2
 /// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
@@ -112,16 +110,12 @@ const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
 /// field access rather than an accessor surface, keeping the embedded API
 /// surface small — the same discipline `moonblokz-mempool`'s `IndexEntry`
 /// follows.
-// No caller reads `head_ref_count`/`spent_bits` yet (Story 4.2/4.4/Epic 7
-// consume them); silencing dead_code keeps the struct clean until those
-// callers land, matching Story 1.2's scaffold convention.
-#[allow(dead_code)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct BlockEntry {
     hash: [u8; 32],
     parent_ref: u32,
     sequence: u32,
-    spent_bits: [u8; SPENT_BITS_BYTES],
+    available_utxo: [u8; AVAILABLE_UTXO_BYTES],
     head_ref_count: u8,
     flags: u8,
     /// The block's exact serialized length in bytes, recorded at intake (Story
@@ -147,7 +141,7 @@ impl BlockEntry {
             hash: [0; 32],
             parent_ref: NONE_REF,
             sequence: NONE_REF,
-            spent_bits: [0; SPENT_BITS_BYTES],
+            available_utxo: [0; AVAILABLE_UTXO_BYTES],
             head_ref_count: 0,
             flags: 0,
             len: 0,
@@ -163,7 +157,7 @@ impl BlockEntry {
             hash,
             parent_ref,
             sequence,
-            spent_bits: [0; SPENT_BITS_BYTES],
+            available_utxo: [0; AVAILABLE_UTXO_BYTES],
             head_ref_count: 0,
             flags: 0,
             len: 0,
@@ -287,32 +281,32 @@ impl BlockEntry {
             (self.flags & !FLAG_STATUS_MASK) | ((bits << FLAG_STATUS_SHIFT) & FLAG_STATUS_MASK);
     }
 
-    /// ADR-016 UTXO spent-bit read (`bit` = 0-based position in this block's
-    /// UTXO-output stream). An out-of-range bit reads as `true` (spent) — a
-    /// fail-safe so a malformed / oversized reference can never be treated as
-    /// unspent by the FR6 double-spend check (Story 5.4).
-    pub(crate) fn spent_bit(&self, bit: usize) -> bool {
+    /// ADR-016 available-UTXO bit read (`bit` = 0-based position in this
+    /// block's UTXO-output stream). An out-of-range bit reads as `false` (not
+    /// available) — a fail-safe so a malformed / oversized reference can never
+    /// be treated as spendable.
+    pub(crate) fn utxo_available(&self, bit: usize) -> bool {
         let byte = bit / 8;
-        if byte >= SPENT_BITS_BYTES {
-            return true;
+        if byte >= AVAILABLE_UTXO_BYTES {
+            return false;
         }
-        self.spent_bits[byte] & (1u8 << (bit % 8)) != 0
+        self.available_utxo[byte] & (1u8 << (bit % 8)) != 0
     }
 
-    /// Sets UTXO spent-bit `bit` to `value` (ADR-016). Value-based and
-    /// bidirectional (Story 5.4): the FR6 forward pass sets `0→1` on
-    /// consumption, the FR5 rollback (Story 5.5) resets `1→0`. An
-    /// out-of-range `bit` is ignored (the read side already fails safe).
-    pub(crate) fn set_spent_bit(&mut self, bit: usize, value: bool) {
+    /// Sets available-UTXO bit `bit` to `value` (ADR-016). Value-based and
+    /// bidirectional: the FR6 forward pass sets it on deriving the output and
+    /// clears it on the spend; a rollback reverses both. An out-of-range `bit`
+    /// is ignored (the read side already fails safe).
+    pub(crate) fn set_utxo_available(&mut self, bit: usize, value: bool) {
         let byte = bit / 8;
-        if byte >= SPENT_BITS_BYTES {
+        if byte >= AVAILABLE_UTXO_BYTES {
             return;
         }
         let mask = 1u8 << (bit % 8);
         if value {
-            self.spent_bits[byte] |= mask;
+            self.available_utxo[byte] |= mask;
         } else {
-            self.spent_bits[byte] &= !mask;
+            self.available_utxo[byte] &= !mask;
         }
     }
 }
@@ -674,37 +668,44 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         }
     }
 
-    /// ADR-016 UTXO spent-bit read at `bit` on the block at `idx`, or `None`
-    /// for an empty/out-of-bounds slot. Read by the FR6 double-spend check
-    /// (Story 5.4).
-    pub(crate) fn spent_bit(&self, idx: u32, bit: usize) -> Option<bool> {
-        self.get(idx).map(|entry| entry.spent_bit(bit))
+    /// ADR-016 available-UTXO bit read at `bit` on the block at `idx`, or
+    /// `None` for an empty/out-of-bounds slot. Read by the UTXO-input resolver
+    /// before any storage read (Story 6.11).
+    pub(crate) fn utxo_available(&self, idx: u32, bit: usize) -> Option<bool> {
+        self.get(idx).map(|entry| entry.utxo_available(bit))
     }
 
-    /// ADR-016 UTXO spent-bit value setter on an **already-inserted** block
-    /// (Story 5.4). Bidirectional: the FR6 forward pass sets `0→1` on
-    /// consumption; the FR5 rollback (5.5) resets `1→0`. Returns `false` for an
-    /// empty/out-of-bounds slot.
-    pub(crate) fn set_spent_bit(&mut self, idx: u32, bit: usize, value: bool) -> bool {
+    /// Whether any UTXO output of the block at `idx` is still available, or
+    /// `None` for an empty/out-of-bounds slot. The FR51 tail-drop obligation,
+    /// decided without a storage read (Story 6.11).
+    pub(crate) fn has_available_utxo(&self, idx: u32) -> Option<bool> {
+        self.get(idx)
+            .map(|entry| entry.available_utxo.iter().any(|&byte| byte != 0))
+    }
+
+    /// ADR-016 available-UTXO bit value setter on an **already-inserted** block.
+    /// Bidirectional: the FR6 forward pass sets a bit on deriving the output and
+    /// clears it on the spend. Returns `false` for an empty/out-of-bounds slot.
+    pub(crate) fn set_utxo_available(&mut self, idx: u32, bit: usize, value: bool) -> bool {
         match self.blocks.get_mut(idx as usize) {
             Some(entry) if !entry.is_empty_slot() => {
-                entry.set_spent_bit(bit, value);
+                entry.set_utxo_available(bit, value);
                 true
             }
             _ => false,
         }
     }
 
-    /// Clears the entire UTXO spent-bit vector of the block at `idx` back to the
-    /// all-zero construction default (ADR-016). Used by the FR6 pass's aborted-
-    /// run rollback (Story 5.4 — the FR5 working-set-rollback UTXO half): a
-    /// candidate that fails validation must not leave any spent-bit it flipped
-    /// set. No-op for an empty/out-of-bounds slot.
-    pub(crate) fn clear_spent_bits(&mut self, idx: u32) {
+    /// Clears the entire available-UTXO bitfield of the block at `idx` back to
+    /// the all-zero construction default, "nothing derived" (ADR-016). Used at
+    /// FR3 pass entry and by its aborted-run rollback (the FR5 working-set
+    /// rollback UTXO half): a candidate that fails validation must not leave any
+    /// bit it set. No-op for an empty/out-of-bounds slot.
+    pub(crate) fn clear_available_utxo(&mut self, idx: u32) {
         if let Some(entry) = self.blocks.get_mut(idx as usize)
             && !entry.is_empty_slot()
         {
-            entry.spent_bits = [0u8; SPENT_BITS_BYTES];
+            entry.available_utxo = [0u8; AVAILABLE_UTXO_BYTES];
         }
     }
 
@@ -850,9 +851,22 @@ mod tests {
         assert!(blocks[..] == spec_blocks[..]);
     }
 
+    /// Story 6.11 — an available-UTXO bit beyond the bitfield reads as not
+    /// available and cannot be set: no output outside the bitfield is ever
+    /// spendable.
+    #[test]
+    fn available_utxo_bit_out_of_range_is_never_available() {
+        let mut entry = BlockEntry::new([1u8; 32], NONE_REF, 3);
+        let width = AVAILABLE_UTXO_BYTES * 8;
+        entry.set_utxo_available(width - 1, true);
+        entry.set_utxo_available(width, true);
+        assert!(entry.utxo_available(width - 1));
+        assert!(!entry.utxo_available(width));
+    }
+
     #[test]
     fn block_entry_size_is_within_budget() {
-        // 32 hash + 4 parent_ref + 4 sequence + 32 spent_bits +
+        // 32 hash + 4 parent_ref + 4 sequence + 32 available_utxo +
         // 1 head_ref_count + 1 flags + 2 len = 76 B effective, 4-byte aligned
         // (largest field is u32) -> 76 B, matching architecture §6.2. The
         // Story-5.4 `len: u16` field consumed the 2 bytes of tail padding the
