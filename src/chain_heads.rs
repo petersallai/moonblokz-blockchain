@@ -319,6 +319,21 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         }
     }
 
+    /// Recomputes the caches of the entry whose head is `head_idx`, if any —
+    /// for the Ready forward extension (Story 6.0 AC7). Event (i) EXTEND ran
+    /// while the new head was still off the active chain, so its
+    /// `tail_or_connection_idx` still names the old head; once the new head is
+    /// marked it anchors on itself. Entries of side heads are untouched.
+    pub(crate) fn refresh_head<const MAX_BLOCKS: usize>(
+        &mut self,
+        blocks: &BlockTable<MAX_BLOCKS>,
+        head_idx: u32,
+    ) {
+        if let Some(slot) = self.slot_of_head(head_idx) {
+            self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
+        }
+    }
+
     // -- FR19 mutation events (i) + (ii): block admission ---------------------
 
     /// Update the tip table for a just-admitted block (already inserted at
@@ -1364,6 +1379,39 @@ mod tests {
             blocks.get(b).is_none(),
             "the Connected extension B was the victim"
         );
+        assert_eq!(ch.count(), 4, "capacity held");
+    }
+
+    /// Story 6.0 AC7 — once the extension is the active head, refreshing its
+    /// entry anchors it on itself, and the exact-match exclusion protects it
+    /// from eviction again.
+    #[test]
+    fn refreshed_active_head_is_never_the_eviction_victim() {
+        let mut blocks = empty_blocks::<8>();
+        let mut ch = empty_chain_heads::<4>();
+        let mut ge = BlockEntry::new(hash_of(1), NONE_REF, 0);
+        ge.set_on_active_chain(true);
+        let g = blocks.insert(ge).unwrap();
+        ch.on_block_admitted(&mut blocks, g, None, [0; 32], 1, g);
+        let b = put(&mut blocks, 2, g, 1);
+        ch.on_block_admitted(&mut blocks, b, Some(g), hash_of(1), 2, g);
+        assert_eq!(
+            ch.head_at(0).tail_or_connection_idx,
+            g,
+            "EXTEND left the old head as the connection point"
+        );
+        blocks.set_on_active_chain(b, true);
+        ch.refresh_head(&blocks, b);
+        assert_eq!(ch.head_at(0).tail_or_connection_idx, b);
+        for (byte, seq) in [(20u8, 5u32), (30, 6), (40, 7)] {
+            let o = put(&mut blocks, byte, NONE_REF, seq);
+            ch.on_block_admitted(&mut blocks, o, None, hash_of(byte), 3, b);
+        }
+        // B has the smallest sequence, but it is the active head.
+        let extra = put(&mut blocks, 50, NONE_REF, 9);
+        ch.on_block_admitted(&mut blocks, extra, None, hash_of(50), 4, b);
+        assert!(blocks.get(b).is_some(), "the active head survives");
+        assert!(ch.occupied_heads().any(|(h, _)| h == b));
         assert_eq!(ch.count(), 4, "capacity held");
     }
 

@@ -617,7 +617,8 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// Exists for the snake-chain tail release (Story 9.1), the one deletion
     /// that frees a block while a child survives: the new tail is unlinked
     /// `idx → NONE_REF` so no `parent_ref` names the freed slot, which the next
-    /// admission reuses. That is the reverse of
+    /// admission reuses. The index self-repair (DEC-134) unlinks a child whose
+    /// parent slot was freed by a defect the same way. That is the reverse of
     /// [`Self::resolve_parent_ref`]'s `NONE_REF → idx`, so this is a plain value
     /// setter rather than a second one-way op. The link is never re-pointed to a
     /// *different* block: unlinking makes the child a root; it does not change
