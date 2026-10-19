@@ -305,7 +305,9 @@ pub(crate) enum AdmitError {
     TableFull,
     /// A Ready-state direct extension of the active head failed its Tier 2 /
     /// Tier 3 checks or the FR48 binding (Story 6.0 D2) — exact evidence; the
-    /// block is not stored.
+    /// block is not stored. One residual (DEC-138): a vote-arithmetic refusal
+    /// comes after the durable write, so the block is written and then
+    /// deleted before anything links to it, its bytes left in the freed slot.
     InvalidExtension,
     /// The block passed Tier 1 but could not be persisted through the storage
     /// seam — it is not inserted into the tree (storage-first admission).
@@ -2137,6 +2139,26 @@ impl<
             return Err(AdmitError::StorageSaveFailed);
         }
 
+        // The vote apply and the commit tail of a judged extension, before
+        // `chain_heads` learns of the block (DEC-138). The vote apply is the
+        // step's last fallible operation; it refuses atomically and inverts
+        // the step. Without parameters that is the node's own fault and the
+        // block stays Stored. An arithmetic refusal is evidence: the block
+        // leaves again before anything links to it — no child was resolved
+        // onto it and no head evicted for it — so the tree is as it was; only
+        // its bytes stay in the freed slot until reuse, as for every deletion.
+        let mut promote = None;
+        if let Some((advance, derivation)) = extension {
+            match self.commit_block(block, idx, derivation) {
+                Ok(()) => promote = Some(advance),
+                Err(err) if is_evidence(&err) => {
+                    self.blocks.delete(idx);
+                    return Err(AdmitError::InvalidExtension);
+                }
+                Err(_) => {}
+            }
+        }
+
         if is_genesis {
             self.active_chain_head_idx = idx;
             // A Collecting anchor, not a Ready head: no window yet (FR48).
@@ -2160,21 +2182,8 @@ impl<
             active_head,
         );
 
-        if let Some((advance, derivation)) = extension {
-            match self.commit_block(block, idx, derivation) {
-                Ok(()) => self.promote_head_extension(idx, advance),
-                // The vote apply refused and inverted the step. Without
-                // parameters that is the node's own fault and the block stays
-                // Stored; an arithmetic refusal is evidence. The block is
-                // already persisted, so it leaves through the ordinary deletion
-                // (its bytes stay in the freed slot until reuse).
-                Err(err) => {
-                    if is_evidence(&err) {
-                        self.delete_subtree_with_followup(idx);
-                        return Err(AdmitError::InvalidExtension);
-                    }
-                }
-            }
+        if let Some(advance) = promote {
+            self.promote_head_extension(idx, advance);
         }
         Ok(idx)
     }
@@ -12908,5 +12917,32 @@ mod tests {
             Some(ValidationReason::BalanceOverflow)
         );
         assert_same_state(&bc, &twin, "overflow refusal");
+    }
+
+    /// DEC-138 — the vote apply runs before `chain_heads` learns of a direct
+    /// extension. A local refusal there (no vote parameters) keeps the block,
+    /// written and Stored, tracked as a head, with the derivation inverted.
+    #[test]
+    fn local_vote_refusal_after_the_write_keeps_the_extension_stored() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let (twin, _, _) = ready_genesis(16);
+        // An engine that holds no FR37 parameters (the test oracle's state).
+        bc.vote_engine = VoteEngine::new();
+        let a = transfer(2, b1.view().hash(), 0, 7);
+        assert_eq!(receive(&mut bc, &a), ReceiveBlockOutcome::AcceptedSilently);
+        let ai = bc.blocks.find(2, &a.view().hash()).expect("stored");
+        assert_eq!(
+            bc.blocks.get(ai).map(|e| e.status()),
+            Some(BlockStatus::Stored)
+        );
+        assert_eq!(head_of(&bc).0, 1, "the head did not move");
+        assert!(
+            bc.chain_heads.occupied_heads().any(|(h, _)| h == ai),
+            "tracked as a head"
+        );
+        assert!(
+            bc.node_info == twin.node_info,
+            "the derivation was inverted"
+        );
     }
 }
