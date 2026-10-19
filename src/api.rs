@@ -628,6 +628,17 @@ enum Extension {
     Local,
 }
 
+/// What the continuation does with a stored child of the head after the
+/// whole per-block step ran on it (Story 6.0 AC4).
+enum ChildStep {
+    /// Applied: promote it; `advance` moves the tail.
+    Applied { advance: bool },
+    /// Exact evidence: delete it with its descendants.
+    Invalid,
+    /// A local failure: leave it Stored for a later retry.
+    Local,
+}
+
 /// Whether a per-block step error is evidence against the block (Story 6.0
 /// AC3/AC6, DEC-037). A failed read, an inconsistent in-memory ancestry and
 /// an unparameterized vote engine are the node's own faults.
@@ -1724,6 +1735,9 @@ impl<
         // Pass 1 — materialize every readable slot at its own index. Parent
         // linkage is deliberately left unresolved: durable slot order is not
         // topological, so a parent may live at a higher index than its child.
+        // One read buffer for the whole scan; a successful read overwrites
+        // all of it (`read_block_into`), and a failed one is skipped.
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
         for idx in 0..limit {
             // A slot that cannot be read (`BlockAbsent` for an empty one;
             // `IntegrityFailure`, which only the rp2040 backend can produce) or
@@ -1735,7 +1749,6 @@ impl<
             // FR64 — the skipped-slot count is a structured-log event, not a
             // field: surfacing it would mean carrying a counter no caller reads
             // until Epic 11 builds the log sink. Emission point marked here.
-            let mut buf = [0u8; MAX_BLOCK_SIZE];
             match self.storage.read_block_into(idx, &mut buf) {
                 Ok(()) => {}
                 // An empty slot is not damage; anything else is.
@@ -1781,11 +1794,13 @@ impl<
         }
 
         // Pass 2 — resolve parent linkage now that every block is present.
+        // One read buffer for the whole scan; a successful read overwrites
+        // all of it (`read_block_into`), and a failed one is skipped.
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
         for idx in 0..limit {
             if self.blocks.get(idx).is_none() {
                 continue;
             }
-            let mut buf = [0u8; MAX_BLOCK_SIZE];
             if self.storage.read_block_into(idx, &mut buf).is_err() {
                 continue;
             }
@@ -1908,6 +1923,9 @@ impl<
     /// intermediate tentative, is what FR8 can guarantee across orderings.
     fn reestablish_tentative_chain_config(&mut self) {
         let limit = self.durable_scan_limit();
+        // One read buffer for the whole scan; a successful read overwrites
+        // all of it (`read_block_into`), and a failed one is skipped.
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
         for idx in 0..limit {
             let is_config = self
                 .blocks
@@ -1916,7 +1934,6 @@ impl<
             if !is_config {
                 continue;
             }
-            let mut buf = [0u8; MAX_BLOCK_SIZE];
             if self.storage.read_block_into(idx, &mut buf).is_err() {
                 continue;
             }
@@ -3807,7 +3824,6 @@ impl<
     /// bad signature. Only node-transfer / registration transactions have this
     /// fixed trailing-64 layout; balance/UTXO input signatures (embedded, no
     /// `new_signed` convention) are a deferred seam.
-    #[inline(never)]
     fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
         let Some(key) = self.node_info.public_key_of(signer_node_id) else {
             return false;
@@ -4005,42 +4021,40 @@ impl<
             // The child's read copy lives in its own frame, gone before any
             // deletion or tail advance, whose delete-set buffer (2.4 KB) must
             // not share the stack with it (D4, DEC-136).
-            let verdict = match self.apply_stored_child(child) {
-                Some(verdict) => verdict,
-                None => return,
-            };
-            match verdict {
-                Some(advance) => self.promote_head_extension(child, advance),
+            match self.apply_stored_child(child) {
+                ChildStep::Applied { advance } => self.promote_head_extension(child, advance),
+                // A local failure: the child stays Stored for a later retry.
+                ChildStep::Local => return,
                 // AC5: no derived state was touched (D1), the head stays, and
                 // the node stays Ready — never the FR5 recovery.
                 //
                 // FR64 (Epic 11 `LogSink`): emit the deletion event carrying
                 // the child's hash. Deferred — see deferred-work.md.
-                None => {
+                ChildStep::Invalid => {
                     self.delete_subtree_with_followup(child);
                 }
             }
         }
     }
 
-    /// Reads a stored child of the head and runs the whole per-block step on
-    /// it: `Some(Some(advance))` when it applied (promote it), `Some(None)` on
-    /// evidence (delete it), `None` on a local failure (leave it Stored).
+    /// Reads a stored child of the head and runs the whole per-block step on it.
     #[inline(never)]
-    fn apply_stored_child(&mut self, child: u32) -> Option<Option<bool>> {
+    fn apply_stored_child(&mut self, child: u32) -> ChildStep {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
-        let view = self.view_retained(child, &mut buf)?;
+        let Some(view) = self.view_retained(child, &mut buf) else {
+            return ChildStep::Local;
+        };
         match self.judge_head_extension(&view, child) {
             Extension::Valid {
                 advance,
                 derivation,
             } => match self.commit_block(&view, child, derivation) {
-                Ok(()) => Some(Some(advance)),
-                Err(err) if is_evidence(&err) => Some(None),
-                Err(_) => None,
+                Ok(()) => ChildStep::Applied { advance },
+                Err(err) if is_evidence(&err) => ChildStep::Invalid,
+                Err(_) => ChildStep::Local,
             },
-            Extension::Invalid => Some(None),
-            Extension::Local => None,
+            Extension::Invalid => ChildStep::Invalid,
+            Extension::Local => ChildStep::Local,
         }
     }
 
@@ -4589,25 +4603,13 @@ impl<
         (first_config_idx, probe_on_segment)
     }
 
-    /// Reads the block at `idx` back from durable storage, trimmed to its exact
-    /// retained length, as the owned `Block` the storage seam takes.
-    ///
-    /// The trim is not cosmetic: durable backends store blocks in fixed-size
-    /// slots and read them back zero-padded, and every FR7/FR8 comparison here is
-    /// byte-exact over the signed bytes. This is the same trim the forward pass
-    /// applies, factored out because the commitment lifecycle needs it at three
-    /// separate seams.
-    fn read_retained_block(&self, idx: u32) -> Option<Block> {
-        let mut buf = [0u8; MAX_BLOCK_SIZE];
-        let view = self.view_retained(idx, &mut buf)?;
-        Block::from_bytes(view.serialized_bytes()).ok()
-    }
-
     /// Reads the retained block at `idx` into the caller's `buf` and views it
     /// at the length cached at admission (`BlockEntry::len`): durable slots
     /// read back padded, and the FR6 byte-exact checks need the bytes that
-    /// were signed. The caller's buffer is the only copy (stack budget,
-    /// DEC-136). `None` on a failed read or bytes that no longer parse.
+    /// were signed. Without a cached length (no entry, or 0) it views the whole
+    /// buffer, as the padded read always did. The caller's buffer is the only
+    /// copy (stack budget, DEC-136). `None` on a failed read or bytes that no
+    /// longer parse.
     fn view_retained<'b>(
         &self,
         idx: u32,
@@ -4780,7 +4782,11 @@ impl<
     // the acquisition loop's frame.
     #[inline(never)]
     fn commit_durable_chain_config(&mut self, first_config_idx: u32) -> Result<(), ()> {
-        let block = self.read_retained_block(first_config_idx).ok_or(())?;
+        // The control plane takes an owned `Block`, so this one-shot path holds
+        // the read buffer and that copy (both in this frame, DEC-136).
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(first_config_idx, &mut buf).ok_or(())?;
+        let block = Block::from_bytes(view.serialized_bytes()).map_err(|_| ())?;
         // The pass compared content from one read of this slot; this is a second
         // read, and it is the one whose bytes reach the control plane. Check it
         // still carries what the module is about to lock: a divergence between the
@@ -4883,8 +4889,7 @@ impl<
         let Some(view) = self.view_retained(idx, &mut buf) else {
             return ConfigPreload::Unreadable;
         };
-        match Some(view).and_then(|view| view.chain_config().map(|config| config.content() == held))
-        {
+        match view.chain_config().map(|config| config.content() == held) {
             Some(true) => ConfigPreload::Matches,
             Some(false) => ConfigPreload::Differs,
             // Framed when it was admitted, unframeable now: the bytes changed
@@ -4924,9 +4929,7 @@ impl<
         let Some(view) = self.view_retained(idx, &mut buf) else {
             return ConfigPreload::Unreadable;
         };
-        match Some(view)
-            .and_then(|view| view.chain_config().map(|config| config.content() == locked))
-        {
+        match view.chain_config().map(|config| config.content() == locked) {
             Some(true) => ConfigPreload::Matches,
             Some(false) => ConfigPreload::Differs,
             None => ConfigPreload::Unreadable,
