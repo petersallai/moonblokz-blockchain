@@ -591,7 +591,7 @@ pub(crate) enum ValidationReason {
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass
 /// passes its pass-local flags; the Ready forward extension and the genesis
 /// node pass [`Projection::COMPLETE`]. Nothing of it is persisted.
-pub(crate) struct Projection {
+struct Projection {
     /// Every registered node is seeded: an unseeded actor is invalid, with no
     /// pre-seed trust zone (genesis-anchored FR3 pass, Ready, genesis).
     complete: bool,
@@ -640,7 +640,7 @@ fn is_evidence(err: &ProcessingError) -> bool {
 }
 
 /// What [`Blockchain::derive_block`] hands the commit tail.
-pub(crate) struct BlockDerivation {
+struct BlockDerivation {
     /// FR36(b) transaction-fee total.
     total_fees: u64,
     /// The block's UTXO-output count: its available-UTXO bits to set.
@@ -1219,9 +1219,7 @@ impl<
                 )
             });
         if derived.is_err() {
-            self.node_info.reset();
-            self.reset_vote_engine();
-            return Err(GenesisRejectReason::InitialChainConfigRejected);
+            return Err(self.abandon_genesis(GenesisRejectReason::InitialChainConfigRejected));
         }
 
         // Persist both blocks (only after both are built, so a build failure
@@ -1239,7 +1237,7 @@ impl<
         // Block #0 — active-chain anchor (no parent).
         self.storage
             .save_block(0, &block_0)
-            .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+            .map_err(|_| self.abandon_genesis(GenesisRejectReason::StorageSaveFailed))?;
         let mut entry_0 = BlockEntry::new(block_0.hash(), NONE_REF, 0);
         entry_0.set_status(BlockStatus::Active);
         entry_0.set_on_active_chain(true);
@@ -1254,20 +1252,20 @@ impl<
         // Block #1 — chain-config, chained to Block #0; becomes the active tip.
         self.storage
             .save_block(1, &block_1)
-            .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+            .map_err(|_| self.abandon_genesis(GenesisRejectReason::StorageSaveFailed))?;
         // The durable chain-configuration seam (FR54): the blockchain owns the
         // storage handle, so the durable commit is made here rather than by the
         // configuration module (configuration specification §8.2).
         self.storage
             .set_chain_configuration(&block_1)
-            .map_err(|_| GenesisRejectReason::StorageSaveFailed)?;
+            .map_err(|_| self.abandon_genesis(GenesisRejectReason::StorageSaveFailed))?;
         // Every durable write has succeeded: promote the tentative to FR54's
         // set-once lock. `promote_durable` can only fail with `NotLoaded` or
         // `DurableLocked`, and the load above plus the guard at the top of this
         // method rule both out.
         self.chain_config
             .promote_durable()
-            .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
+            .map_err(|_| self.abandon_genesis(GenesisRejectReason::InitialChainConfigRejected))?;
         // The vote engine was parameterized from this same content, tentative,
         // before the derivation above; the lock changes nothing it reads.
         let block_1_prev_hash = block_0.hash();
@@ -1302,6 +1300,14 @@ impl<
             block_zero: block_0,
             block_one: block_1,
         })
+    }
+
+    /// A refused genesis leaves no derived projection behind: the D6 step ran
+    /// before the writes, so every refusal after it resets what it derived.
+    fn abandon_genesis(&mut self, reason: GenesisRejectReason) -> GenesisRejectReason {
+        self.node_info.reset();
+        self.reset_vote_engine();
+        reason
     }
 
     /// Read-only query — returns the current lifecycle phase (FR1–FR4).
@@ -1861,7 +1867,10 @@ impl<
             }
         }
         if unlinked {
-            self.chain_heads.recompute_all_caches(&self.blocks);
+            // The event-(iv) follow-up with nothing deleted: caches and the
+            // FR19 `head_ref_count`s re-derived from the repaired tree.
+            self.chain_heads
+                .on_blocks_deleted(&mut self.blocks, &[], NONE_REF);
             self.seed_missing_parent_hashes();
         }
     }
@@ -3239,7 +3248,9 @@ impl<
                             return Err(invalid(ValidationReason::BalanceSnapshotMismatch));
                         }
                     } else if projection.complete {
-                        // FR50 coverage: every registered node is seeded in a
+                        // Defensive: unreachable while stride-1 registration
+                        // and the owner bound hold. FR50 coverage: every
+                        // registered node is seeded in a
                         // complete projection (D3).
                         return Err(invalid(ValidationReason::UnseededActor));
                     } else {
@@ -3395,7 +3406,10 @@ impl<
                 }
             }
             let fee = nt.fee() as u64;
-            let debit = nt.amount().saturating_add(fee);
+            let debit = nt
+                .amount()
+                .checked_add(fee)
+                .ok_or(invalid(ValidationReason::ValueOverflow))?;
             // FR54(d): the genesis self-transfer *creates* currency — no debit.
             let debits = !is_genesis_zero && self.node_info.is_seeded(init);
             let credits = self.node_info.is_seeded(receiver);
@@ -3439,7 +3453,10 @@ impl<
                 self.check_node_id_in_range(init).map_err(&invalid)?;
             }
             let debits = !is_genesis_zero && self.node_info.is_seeded(init);
-            let debit = reg.registration_price().saturating_add(reg.fee());
+            let debit = reg
+                .registration_price()
+                .checked_add(reg.fee())
+                .ok_or(invalid(ValidationReason::ValueOverflow))?;
             if !is_genesis_zero {
                 // FR6 registration monotonicity: `new_node_id == running
                 // watermark + 1`, authoritative once the watermark is
@@ -3466,13 +3483,17 @@ impl<
             if self.node_info.key_is_registered(reg.new_public_key()) {
                 return Err(invalid(ValidationReason::DuplicatePublicKey));
             }
-            let total_fees = if debits {
+            // The fee goes to the creator whether or not the initializer is
+            // derivable yet, as for every other transaction kind: a seeded
+            // creator's balance must stay exact, or a later balance block
+            // listing it fails the D9 equality.
+            let total_fees = if is_genesis_zero {
+                derivation.total_fees
+            } else {
                 derivation
                     .total_fees
                     .checked_add(reg.fee())
                     .ok_or(invalid(ValidationReason::ValueOverflow))?
-            } else {
-                derivation.total_fees
             };
             // Effects, after every check. `registration_price` is absorbed
             // (debited, credited to no node); the fee goes to the creator.
@@ -3488,20 +3509,11 @@ impl<
                 .register_node(node_id, reg.new_public_key(), idx);
             derivation.total_fees = total_fees;
         } else if let Some(cx) = tx.as_complex() {
-            let mut inputs = 0usize;
-            let mut outputs = 0usize;
-            let result = self.apply_complex(
-                &cx,
-                vote,
-                idx,
-                seq,
-                projection,
-                derivation,
-                &mut inputs,
-                &mut outputs,
-            );
+            // How many inputs and outputs applied, for the partial inversion.
+            let mut applied = (0usize, 0usize);
+            let result = self.apply_complex(tx, idx, seq, projection, derivation, &mut applied);
             if result.is_err() {
-                self.invert_complex(&cx, idx, inputs, outputs, is_genesis_zero);
+                self.invert_complex(&cx, idx, applied.0, applied.1, is_genesis_zero);
             }
             result?;
         } else {
@@ -3513,25 +3525,26 @@ impl<
     /// The complex-transaction arm of [`Self::apply_transaction`]: FR6 value
     /// accounting over every input and output (Story 6.8). Effects apply in
     /// order — a later input of the same initializer sees the earlier debit —
-    /// and `inputs` / `outputs` count how many applied, for the caller's
-    /// partial inversion.
-    #[allow(clippy::too_many_arguments)]
+    /// and `applied` counts how many inputs and outputs applied, for the
+    /// caller's partial inversion.
     fn apply_complex(
         &mut self,
-        cx: &ComplexTransactionView<'_>,
-        vote: u32,
+        tx: &TransactionView<'_>,
         idx: u32,
         seq: u32,
         projection: &Projection,
         derivation: &mut BlockDerivation,
-        inputs: &mut usize,
-        outputs: &mut usize,
+        applied: &mut (usize, usize),
     ) -> Result<(), ProcessingError> {
         let is_genesis_zero = seq == 0;
         let invalid = |reason| ProcessingError::Invalid {
             block_idx: idx,
             reason,
         };
+        let vote = tx.vote();
+        let cx = tx
+            .as_complex()
+            .ok_or(invalid(ValidationReason::MalformedPayload))?;
         // Every input declares its amount (DEC-131) and Tier 1 has checked
         // both sums against `u64` and `Σ inputs ≥ Σ outputs` (DEC-011).
         let mut in_sum: u64 = 0;
@@ -3578,7 +3591,7 @@ impl<
                 })?;
                 in_sum = in_sum.saturating_add(ui.amount());
             }
-            *inputs += 1;
+            applied.0 += 1;
         }
         // Outputs after the inputs. A UTXO output's bit is set in the commit
         // tail; here it only takes its stream position, held within the
@@ -3609,7 +3622,7 @@ impl<
                 }
                 out_sum = out_sum.saturating_add(bo.amount());
             }
-            *outputs += 1;
+            applied.1 += 1;
         }
         // [D] The fee is the surplus over all inputs and outputs; a zero-input
         // carry-forward pays none (FR6).
@@ -3624,8 +3637,12 @@ impl<
     }
 
     /// Inverts the effects of the first `count` transactions of `view` (all of
-    /// them for `usize::MAX`), newest first — the D1 prefix inversion, which
-    /// Story 6.3 reuses to undo a committed block. Each inverse is computed
+    /// them for `usize::MAX`), newest first — the D1 prefix inversion of
+    /// [`Self::derive_block`]'s transaction effects. Undoing a *committed*
+    /// block (Story 6.3) also needs the inverse of [`Self::commit_block`]'s
+    /// effects, which this does not cover: `VoteEngine::undo_block`, the
+    /// creator credit, the block's own output bits, and the seed-source moves
+    /// (the D1 backward scan handed to 6.3). Each inverse is computed
     /// from the transaction bytes plus the current state, which, in reverse
     /// order, is the state right after that transaction applied. O(`count`²)
     /// transaction parses, on failure paths only.
@@ -3644,7 +3661,7 @@ impl<
                     self.node_info.debit(nt.receiver(), nt.amount());
                 }
                 if !is_genesis_zero && self.node_info.is_seeded(nt.initializer()) {
-                    let debit = nt.amount().saturating_add(nt.fee() as u64);
+                    let debit = nt.amount().wrapping_add(nt.fee() as u64);
                     self.node_info.credit(nt.initializer(), debit);
                 }
             } else if let Some(reg) = tx.as_registration() {
@@ -3657,7 +3674,7 @@ impl<
                         .set_max_known_node_id(node_id.saturating_sub(1));
                 }
                 if !is_genesis_zero && self.node_info.is_seeded(reg.initializer()) {
-                    let debit = reg.registration_price().saturating_add(reg.fee());
+                    let debit = reg.registration_price().wrapping_add(reg.fee());
                     self.node_info.credit(reg.initializer(), debit);
                 }
             } else if let Some(cx) = tx.as_complex() {
@@ -3921,7 +3938,7 @@ impl<
                 return Extension::Local;
             };
             // New length `S_head + 1 − S_tail + 1` exceeds `W`.
-            if head.sequence() + 1 - tail.sequence() >= w {
+            if (head.sequence() + 1).saturating_sub(tail.sequence()) >= w {
                 let Ok(obligation) =
                     classify_tail_drop(&self.blocks, &self.node_info, self.snake_chain_tail_idx)
                 else {
@@ -12023,6 +12040,7 @@ mod tests {
             Some(BlockStatus::Active)
         );
         assert!(!bc.chain_heads.has_stored_head());
+        assert_eq!(bc.chain_heads.count(), 1, "no zombie entry for A");
     }
 
     // --- AC10.3: sibling choice (D5) ----------------------------------------
@@ -12820,5 +12838,75 @@ mod tests {
             }
             _ => panic!("a parent-recovery request is due"),
         }
+    }
+
+    // --- Code review 2026-10-18 -------------------------------------------
+
+    /// Review patch — a registration by a not-yet-seeded initializer (a
+    /// window-anchored pass, before its seed source) still pays its fee to a
+    /// seeded creator, so the creator's balance stays exact for D9.
+    #[test]
+    fn registration_fee_reaches_the_creator_when_the_initializer_is_unseeded() {
+        let mut bc = new_test_chain();
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        // Node 0 (the creator) is listed; node 4 exists but is not.
+        let seed = balance_block(100, cfg_hash, &[(0, 1_000, 0, 0)], 4);
+        admit(&mut bc, &seed);
+        let reg = registration_block(101, seed.view().hash(), 4, 5, 0xC5);
+        let tip = admit(&mut bc, &reg);
+        assert_eq!(bc.run_processing_pass(tip), Ok(()));
+        assert!(
+            !bc.node_info.is_seeded(4),
+            "precondition: unseeded initializer"
+        );
+        assert_eq!(
+            bc.node_info.balance_of(0),
+            1_001,
+            "the fee reached the creator"
+        );
+    }
+
+    /// Review patch — a complex transaction that fails after a UTXO spend, a
+    /// balance-input debit and a balance-output credit is inverted exactly.
+    #[test]
+    fn partially_applied_complex_transaction_is_inverted_exactly() {
+        let (mut bc, mint) = utxo_genesis();
+        let (twin, _) = utxo_genesis();
+        // Node 9 does not exist: the second output fails its range check.
+        let cx = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 5)), Err((9, 5))]);
+        let block = complex_tx_block(4, mint.view().hash(), 0, 0, &[&cx]);
+        assert_eq!(
+            step_reason(&mut bc, &block),
+            Some(ValidationReason::NodeIdOutOfRange)
+        );
+        assert_same_state(&bc, &twin, "partial complex inversion");
+    }
+
+    /// Review patch — a credit that would overflow the creator's balance is
+    /// `BalanceOverflow`, and nothing of the block remains applied.
+    #[test]
+    fn creator_credit_overflow_is_invalid() {
+        let build = || {
+            let (crypto, storage, chain_config) = test_backends();
+            let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+            let genesis = bc
+                .process_genesis(u64::MAX, window_config_builder(16).content())
+                .ok()
+                .expect("genesis succeeds");
+            (bc, genesis.block_one)
+        };
+        let (mut bc, b1) = build();
+        let (twin, _) = build();
+        // A self-transfer pays its fee of 1 back to node #0, the creator,
+        // whose balance is then `u64::MAX - 1`; `mined_amount = 2` overflows.
+        let nt = transfer_tx(2, 0, 1);
+        let block = tx_block(2, b1.view().hash(), 2, |b| {
+            b.add_node_transfer(&nt).ok().expect("transfer");
+        });
+        assert_eq!(
+            step_reason(&mut bc, &block),
+            Some(ValidationReason::BalanceOverflow)
+        );
+        assert_same_state(&bc, &twin, "overflow refusal");
     }
 }
