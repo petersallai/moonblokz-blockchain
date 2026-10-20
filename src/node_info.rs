@@ -125,6 +125,16 @@ impl<const MAX_NODES: usize> NodeInfoState<MAX_NODES> {
         self.seed_node(node_id, public_key, 0, seed_idx);
     }
 
+    /// `node_id`'s FR50 seed-source block-table index, or
+    /// [`SEED_SOURCE_RELEASED`] once that block left the tail; `None` while the
+    /// node is unseeded. Read by the ready-state intake's branch-independent-key
+    /// test (Story 6.2 D6).
+    pub(crate) fn seed_source_of(&self, node_id: u32) -> Option<u32> {
+        self.slot(node_id)
+            .map(|slot| self.seed_source_idx[slot])
+            .filter(|&idx| idx != NONE_REF)
+    }
+
     /// Whether `node_id` has been seeded in the current pass (FR3 pre-seed-zone
     /// discrimination, AC4).
     pub(crate) fn is_seeded(&self, node_id: u32) -> bool {

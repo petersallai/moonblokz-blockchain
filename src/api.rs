@@ -39,7 +39,7 @@ use crate::branch_value::{Rank, block_value};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
-use crate::node_info::NodeInfoState;
+use crate::node_info::{NodeInfoState, SEED_SOURCE_RELEASED};
 use crate::prng::Prng;
 use crate::snake_chain::{TailBinding, classify_tail_drop, tail_drop_binding};
 use crate::staged_validation::{
@@ -522,6 +522,10 @@ pub(crate) enum ValidationReason {
     PreviousHashMismatch,
     /// Block-creator signature invalid against the creator's derived key.
     CreatorSignatureInvalid,
+    /// I-09 (FR9 Tier 3, FR37, FR45): `consumed_votes`, `first_voted_node` or
+    /// `consumed_votes_from_first_voted_node` disagrees with the parent-state
+    /// vote snapshots (Story 6.2 D5, DEC-156).
+    VoteHeaderMismatch,
     /// A node-transfer / registration transaction signature is invalid.
     TransactionSignatureInvalid,
     /// A debit (transfer amount+fee, registration price+fee, balance input)
@@ -2074,6 +2078,16 @@ impl<
             return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
         }
 
+        // FR9 Tier 1 case (2) (Story 6.2 D6, DEC-157): in Ready, the creator
+        // signature is exact evidence, before anything is written, whenever the
+        // creator's key is the same on every branch that can connect. A pass
+        // marks the entry, so the per-block step never verifies it again.
+        let signature_verified = self.lifecycle_phase == LifecyclePhase::Ready
+            && self.key_is_branch_independent(block.creator());
+        if signature_verified && self.verify_block_creator_signature(block) != Some(true) {
+            return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
+        }
+
         // Peek the slot; the entry and the durable write both land there
         // (`persist` reconstructs the owned `Block` the storage seam takes).
         let idx = self.blocks.next_free_index().ok_or(AdmitError::TableFull)?;
@@ -2149,6 +2163,9 @@ impl<
         entry.set_status(BlockStatus::Stored);
         entry.set_len(block.len() as u16); // exact length for the FR6 byte-exact checks (Story 5.4)
         entry.set_payload_type(block.payload_type()); // cached in flags for the FR3 floor scan (Story 5.4 review)
+        if signature_verified {
+            entry.set_signature_verified();
+        }
         if is_genesis {
             entry.set_on_active_chain(true);
         }
@@ -3313,12 +3330,23 @@ impl<
         //     yet derivable (pre-seed zone → trusted); node #0 always resolves
         //     to the FR69 trust anchor. In a complete projection a non-derivable
         //     creator past block #0 is exact evidence of invalidity (D3).
-        match self.verify_block_creator_signature(view) {
-            Some(false) => return Err(invalid(ValidationReason::CreatorSignatureInvalid)),
-            None if projection.complete && !is_genesis_zero => {
-                return Err(invalid(ValidationReason::UnseededActor));
+        //     A block whose signature already verified against its own
+        //     ancestry key is not verified again (Story 6.2 D6, DEC-157).
+        if !self
+            .blocks
+            .get(idx)
+            .is_some_and(|entry| entry.is_signature_verified())
+        {
+            match self.verify_block_creator_signature(view) {
+                Some(false) => return Err(invalid(ValidationReason::CreatorSignatureInvalid)),
+                Some(true) => {
+                    self.blocks.mark_signature_verified(idx);
+                }
+                None if projection.complete && !is_genesis_zero => {
+                    return Err(invalid(ValidationReason::UnseededActor));
+                }
+                None => {}
             }
-            _ => {}
         }
 
         let mut derivation = BlockDerivation {
@@ -3431,6 +3459,23 @@ impl<
                 // needs, ADR-015 / FR27/FR28, is unbuilt). The shared tail still
                 // applies this block's FR37 vote effects.
             }
+        }
+
+        // I-09 (FR9 Tier 3; Story 6.2 D5, DEC-156): the vote header snapshots
+        // against the parent state, which the vote engine still holds — its
+        // apply runs in `commit_block`. After the balance-block seeding above,
+        // so a floor-seeded creator is judged. Genesis #0 holds as built: I(0) = 0.
+        let header = self
+            .vote_engine
+            .check_header(view, projection.complete, |node| {
+                self.node_info.is_seeded(node)
+            });
+        if header != Ok(true) {
+            self.invert_transactions(view, idx, applied);
+            return Err(match header {
+                Err(e) => ProcessingError::Vote(e),
+                _ => invalid(ValidationReason::VoteHeaderMismatch),
+            });
         }
 
         // FR36 creator credit, checked here so the commit tail cannot fail.
@@ -3921,6 +3966,29 @@ impl<
             view.signature(),
             &key,
         ))
+    }
+
+    /// Whether `creator`'s key is the same on every branch that can connect
+    /// (FR9 Tier 1 case (2); Story 6.2 D6, DEC-157): node #0 (the FR69 trust
+    /// anchor), or a node seeded at or below `S_tail`. Every branch that can
+    /// connect contains the chain up to `S_tail` (DEC-125), so such a node holds
+    /// one key on all of them; a node registered inside the window may hold
+    /// another key on a side branch. RAM only.
+    fn key_is_branch_independent(&self, creator: u32) -> bool {
+        if creator == 0 {
+            return true;
+        }
+        match self.node_info.seed_source_of(creator) {
+            None => false,
+            Some(SEED_SOURCE_RELEASED) => true,
+            Some(source) => match (
+                self.blocks.get(source),
+                self.blocks.get(self.snake_chain_tail_idx),
+            ) {
+                (Some(source), Some(tail)) => source.sequence() <= tail.sequence(),
+                _ => false,
+            },
+        }
     }
 
     /// Verifies a node-transfer / registration transaction signature (AC3): the
