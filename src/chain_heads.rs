@@ -14,7 +14,8 @@
 //! (Story 9.1), deletes every branch forked at the dropped block through event
 //! (iv) and needs no pass of its own. Event (iii) FR23 chain-switch remains
 //! **specified** (documented below) but **driven** by Epic 6.
-//! `branch_value` (FR21) is present but unpopulated (Epic 6).
+//! `branch_value` (FR21) is a side head's value, valid iff the head block is
+//! Connected; the active branch's value lives on `Blockchain` (Story 6.1 D3).
 //!
 //! ## head_ref_count is a branch-count, not a path-count (KEY DECISION)
 //!
@@ -50,6 +51,7 @@
 
 use crate::api::ParentRecoveryRequest;
 use crate::blocks::{BlockTable, NONE_REF};
+use crate::staged_validation::BlockStatus;
 
 /// `flags` bit 0: the FR19 `connected` cache — the head's ancestry resolves to
 /// the current active chain. `0` = Stored (parent-recovery scheduled), `1` =
@@ -63,7 +65,7 @@ const FLAG_CONNECTED: u8 = 0b0000_0001;
 /// need no durable-storage read)).
 ///
 /// Empty-slot sentinel: `head_idx == u32::MAX` ([`NONE_REF`]).
-#[allow(dead_code)] // `arrival_timestamp`/`branch_value` are Epic-8/Epic-6 consumers.
+#[allow(dead_code)] // `arrival_timestamp` is an Epic-8 consumer.
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct ChainHeadEntry {
     /// Index into `blocks` of the head (tip) block. `head_sequence` /
@@ -87,8 +89,10 @@ pub(crate) struct ChainHeadEntry {
     /// arrival-time difference. **Never** a selection/eviction tie-break input
     /// (FR19/FR63 — wall-clock is non-deterministic across nodes).
     arrival_timestamp: u64,
-    /// FR21 relative branch value (Connected/Active only). Present but
-    /// **unpopulated** in Epic 4 — computed by Epic 6.
+    /// FR21 relative branch value of a side head, meaningful iff the head
+    /// block's status is `Connected` (Story 6.1 D3). A Stored head has none,
+    /// and the active branch's value is `Blockchain::active_branch_value`,
+    /// never this field: the active head is not always a tip.
     branch_value: u64,
     /// State flags (bit 0 = `connected`).
     flags: u8,
@@ -332,6 +336,49 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         if let Some(slot) = self.slot_of_head(head_idx) {
             self.recompute_caches(slot, blocks, NONE_REF, &[0u8; 32]);
         }
+    }
+
+    /// The `branch_value` of the entry whose head is `head_idx`, if one names
+    /// it. Meaningful only while that head block is Connected (Story 6.1 D3).
+    pub(crate) fn branch_value_of(&self, head_idx: u32) -> Option<u64> {
+        self.slot_of_head(head_idx)
+            .map(|slot| self.heads[slot].branch_value)
+    }
+
+    /// Sets the `branch_value` of the entry whose head is `head_idx`, if one
+    /// names it.
+    pub(crate) fn set_branch_value(&mut self, head_idx: u32, value: u64) {
+        if let Some(slot) = self.slot_of_head(head_idx) {
+            self.heads[slot].branch_value = value;
+        }
+    }
+
+    /// FR21 event (iii): subtracts the value of the block that became the new
+    /// `S_tail` from every entry whose head is Connected — the block left every
+    /// sum. Exact by construction: every such sum contains it.
+    pub(crate) fn subtract_branch_value<const MAX_BLOCKS: usize>(
+        &mut self,
+        blocks: &BlockTable<MAX_BLOCKS>,
+        value: u64,
+    ) {
+        for head in self.heads.iter_mut() {
+            if blocks
+                .get(head.head_idx)
+                .is_some_and(|entry| entry.status() == BlockStatus::Connected)
+            {
+                head.branch_value = head.branch_value.saturating_sub(value);
+            }
+        }
+    }
+
+    /// The head block of the entry in `slot`, if that entry exists and its
+    /// `connected` cache says the head's ancestry reaches the active chain —
+    /// the candidates of the Story 6.1 side-branch driver.
+    pub(crate) fn connected_head_at(&self, slot: usize) -> Option<u32> {
+        self.heads
+            .get(slot)
+            .filter(|head| !head.is_empty() && head.is_connected())
+            .map(|head| head.head_idx)
     }
 
     // -- FR19 mutation events (i) + (ii): block admission ---------------------

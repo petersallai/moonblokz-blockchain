@@ -35,6 +35,7 @@ use moonblokz_vote::{VoteEngine, VoteEngineError};
 
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
+use crate::branch_value::{Rank, block_value};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
@@ -304,8 +305,9 @@ pub(crate) enum AdmitError {
     /// exists until Story 4.4 (FR19 chain_heads-eviction).
     TableFull,
     /// A Ready-state direct extension of the active head failed its Tier 2 /
-    /// Tier 3 checks or the FR48 binding (Story 6.0 D2) — exact evidence; the
-    /// block is not stored. One residual (DEC-138): a vote-arithmetic refusal
+    /// Tier 3 checks or the FR48 binding (Story 6.0 D2), or a block whose
+    /// parent is Connected or Active but not the head failed Tier 2 (Story 6.1
+    /// D4) — exact evidence; the block is not stored. One residual (DEC-138): a vote-arithmetic refusal
     /// comes after the durable write, so the block is written and then
     /// deleted before anything links to it, its bytes left in the freed slot.
     InvalidExtension,
@@ -616,10 +618,12 @@ impl Projection {
 
 /// The verdict on a prospective extension of the active head (Story 6.0 D2).
 enum Extension {
-    /// The window gate and the fallible half of the step passed; `advance`
-    /// says whether promoting it moves the tail.
+    /// The window gate and the fallible half of the step passed. `advance`
+    /// is `Some(value)` when promoting it moves the tail: the FR21 value of
+    /// the block that becomes the new `S_tail`, read before any mutation
+    /// (Story 6.1 D1).
     Valid {
-        advance: bool,
+        advance: Option<u64>,
         derivation: BlockDerivation,
     },
     /// Exact evidence of invalidity (Tier 2 / Tier 3, or the FR48 binding).
@@ -631,12 +635,27 @@ enum Extension {
 /// What the continuation does with a stored child of the head after the
 /// whole per-block step ran on it (Story 6.0 AC4).
 enum ChildStep {
-    /// Applied: promote it; `advance` moves the tail.
-    Applied { advance: bool },
+    /// Applied: promote it. `value` is its FR21 value; `advance` moves the
+    /// tail, carrying the new `S_tail` block's value.
+    Applied { advance: Option<u64>, value: u64 },
     /// Exact evidence: delete it with its descendants.
     Invalid,
     /// A local failure: leave it Stored for a later retry.
     Local,
+}
+
+/// What [`Blockchain::walk_side_branch`] found on one side branch (Story 6.1
+/// AC6): the FR21 sums it read and the lowest block whose Tier 2 failed.
+struct SideWalk {
+    /// The values of the active-chain blocks strictly above the connection
+    /// point.
+    active: u64,
+    /// The values of the side blocks from the connection point (exclusive)
+    /// up to the head.
+    branch: u64,
+    /// The lowest-sequence block whose Tier 2 failed, and the sum of the
+    /// values from the head down to it, inclusive.
+    failing: Option<(u32, u64)>,
 }
 
 /// Whether a per-block step error is evidence against the block (Story 6.0
@@ -774,6 +793,16 @@ pub struct Blockchain<
     // chain's root (`parent_ref == NONE_REF`). The capacity stays a `u32` const
     // generic; `BUILD_LIMITS` asserts it fits the module's `u16`.
     snake_chain_tail_idx: u32,
+
+    // FR21 value of the active branch: the sum of the per-block values over
+    // `(S_tail, S_head]` (Story 6.1 D3). It lives here, not in a `chain_heads`
+    // entry, because the active head is not always a tip: a Stored child
+    // makes it interior and FR19 event (i) moves its entry to the child. Side
+    // heads keep theirs in their entries. Seeded at Ready entry by the FR3
+    // forward walk (D5) — 0 on the genesis node, whose block #1 carries no
+    // value — grown on every head extension, reduced by the new `S_tail`
+    // block's value on every tail advance (D1), 0 without a window.
+    active_branch_value: u64,
     //
     // Deliberately no standalone placeholder for:
     // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.available_utxo`
@@ -957,6 +986,7 @@ impl<
             (&raw mut (*p).active_chain_head_idx).write(NONE_REF);
             (&raw mut (*p).tentative_config_block_idx).write(NONE_REF);
             (&raw mut (*p).snake_chain_tail_idx).write(NONE_REF);
+            (&raw mut (*p).active_branch_value).write(0);
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -997,6 +1027,7 @@ impl<
             active_chain_head_idx: NONE_REF,
             tentative_config_block_idx: NONE_REF,
             snake_chain_tail_idx: NONE_REF,
+            active_branch_value: 0,
         }
     }
 
@@ -1299,6 +1330,10 @@ impl<
             active_head,
         );
         self.establish_snake_chain_window();
+        // The window value stays 0 (Story 6.1 D5): block #1, the only block
+        // the window `(#0, #1]` can hold, is built above with
+        // `consumed_votes = 0`. The tree holds nothing else, so there is no
+        // side branch for the driver to connect.
 
         // Node #0 authored a complete, valid chain, so it is immediately Ready:
         // there is no FR2 dominant-chain acquisition or FR3 reconstruction to do
@@ -1651,6 +1686,11 @@ impl<
             self.delete_mismatching_chain_config_blocks();
             self.reevaluate_retained_blocks_against_lock();
         }
+        // Story 6.1 AC3: side branches get their Tier 2 and their values after
+        // the cleanups, so no retarget lands on a value computed before them.
+        if self.is_ready() {
+            self.connect_side_branches();
+        }
 
         let outcome = if self.is_ready() {
             InitOutcome::ResumedReady
@@ -1822,6 +1862,7 @@ impl<
         // walks to a block flagged on-active-chain.
         self.active_chain_head_idx = NONE_REF;
         self.snake_chain_tail_idx = NONE_REF;
+        self.active_branch_value = 0;
         for idx in 0..limit {
             if self
                 .blocks
@@ -2140,6 +2181,31 @@ impl<
             }
         }
 
+        // Story 6.1 D4: in Ready, a block whose parent is Connected or Active
+        // but not the head already reaches the active chain, so its Tier 2
+        // verdict is final now — check first, then write (DEC-019). Only Tier
+        // 2: its Tier 3 is the chain switch's (6.3).
+        let mut side_judged = false;
+        if let Some(p) = parent
+            && self.lifecycle_phase == LifecyclePhase::Ready
+            && p != self.active_chain_head_idx
+            && self
+                .blocks
+                .get(p)
+                .is_some_and(|entry| entry.status() != BlockStatus::Stored)
+        {
+            match self.tier2_check(block, idx, p) {
+                Ok(()) => side_judged = true,
+                Err(err) if is_evidence(&err) => {
+                    self.blocks.delete(idx);
+                    return Err(AdmitError::InvalidExtension);
+                }
+                // No evidence (FR16): stored as Stored; the side-branch
+                // driver judges it again.
+                Err(_) => {}
+            }
+        }
+
         if self.persist(idx, block).is_err() {
             // The durable write is the one step after the load that can still
             // fail. Undo the load rather than keep a configuration whose block
@@ -2189,6 +2255,21 @@ impl<
             self.tentative_config_block_idx = idx;
         }
 
+        // A Connected parent that is a head is extended (FR21 (i)): its value
+        // is read before event (i) moves its entry onto this block.
+        let parent_value = match parent {
+            Some(p)
+                if side_judged
+                    && self
+                        .blocks
+                        .get(p)
+                        .is_some_and(|entry| entry.status() == BlockStatus::Connected) =>
+            {
+                self.chain_heads.branch_value_of(p)
+            }
+            _ => None,
+        };
+
         // FR19 chain_heads mutation events (i) + (ii).
         let active_head = self.active_chain_head_idx;
         self.chain_heads.on_block_admitted(
@@ -2201,7 +2282,10 @@ impl<
         );
 
         if let Some(advance) = promote {
-            self.promote_head_extension(idx, advance);
+            self.promote_head_extension(idx, block_value(block), advance);
+        }
+        if side_judged && let Some(p) = parent {
+            self.connect_judged_side_block(idx, p, block_value(block), parent_value);
         }
         Ok(idx)
     }
@@ -2287,6 +2371,13 @@ impl<
         if outcome == ReceiveBlockOutcome::AcceptedSilently && was_ready {
             self.drive_forward_extension();
         }
+        // Story 6.1 AC6: after the continuation, whose promotion turns a
+        // sibling into a side block, and at the end of a Ready entry, after
+        // the FR8 lock-time cleanups (a cleanup retarget onto a Connected block
+        // must not keep a value the driver computed before it).
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
+            self.connect_side_branches();
+        }
         (outcome, self.next_parent_recovery_call())
     }
 
@@ -2340,7 +2431,7 @@ impl<
             // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
             // the Ready transition below overwrites; it does not pre-empt selection.
             match self.run_processing_pass(candidate_tip_idx) {
-                Ok(()) => {
+                Ok(window_value) => {
                     // FR8 durable set-once lock (Story 5.9, AC4). The pass has
                     // just proved the AC3 final check — the candidate carries
                     // at least one chain-config block and every one of them is
@@ -2419,7 +2510,7 @@ impl<
                         // transition: atomically promote every candidate block
                         // Stored→Active (the Epic-4-deferred FR9 Tier-3
                         // driver) and establish the active head.
-                        self.promote_candidate_active(candidate_tip_idx);
+                        self.promote_candidate_active(candidate_tip_idx, window_value);
                         // AC5: with the lock engaged and the active chain
                         // marked, drop every chain-config block in the tree
                         // that disagrees with what was just locked. Ordered
@@ -2430,12 +2521,14 @@ impl<
                         // that are not on the chain just adopted.
                         self.reevaluate_retained_blocks_against_lock();
                     } else {
-                        self.promote_candidate_active(candidate_tip_idx);
+                        self.promote_candidate_active(candidate_tip_idx, window_value);
                     }
                     // Processing→Ready. The FR40-series ready-only surface
                     // becomes live (its query bodies remain Epic 7/10
                     // `todo!()` — reachable, but this story wires no caller).
                     self.set_lifecycle_phase(LifecyclePhase::Ready);
+                    // Side branches retained while Collecting are connected by
+                    // the caller, after every cleanup (Story 6.1 AC3).
                     break;
                 }
                 Err(err) => {
@@ -2852,6 +2945,7 @@ impl<
         self.active_chain_head_idx = NONE_REF;
         // No window while Collecting (FR48): the tail exists only in Ready.
         self.snake_chain_tail_idx = NONE_REF;
+        self.active_branch_value = 0;
         for idx in 0..MAX_BLOCKS {
             let idx = idx as u32;
             if self
@@ -2903,7 +2997,7 @@ impl<
     pub(crate) fn run_processing_pass(
         &mut self,
         candidate_tip_idx: u32,
-    ) -> Result<(), ProcessingError> {
+    ) -> Result<u64, ProcessingError> {
         // AC5: clean working set on (re-)entry — no partial projection persists.
         self.node_info.reset();
         self.reset_vote_engine();
@@ -3108,6 +3202,16 @@ impl<
             saw_balance_block: false,
         };
         let mut prev_hash: Option<[u8; 32]> = None;
+        // Story 6.1 D5: the FR21 value of the window the promotion will
+        // establish, summed from the blocks this walk reads anyway — no read
+        // and no failure mode of its own at Ready entry.
+        let window_tail = self.window_tail_sequence(
+            self.blocks
+                .get(marked[count - 1])
+                .map_or(0, |e| e.sequence()),
+            self.blocks.get(marked[0]).map_or(0, |e| e.sequence()),
+        );
+        let mut window_value = 0u64;
         let mut result = Ok(());
         for i in (0..count).rev() {
             let idx = marked[i];
@@ -3123,6 +3227,9 @@ impl<
                 result = Err(e);
                 break;
             }
+            if view.sequence() > window_tail {
+                window_value += block_value(&view);
+            }
             prev_hash = Some(this_hash);
         }
 
@@ -3131,7 +3238,7 @@ impl<
                 self.blocks.clear_available_utxo(*slot);
             }
         }
-        result
+        result.map(|()| window_value)
     }
 
     /// The FR6 per-block step (Story 6.0 AC1): validates one block against the
@@ -3874,9 +3981,6 @@ impl<
     ///    (storage and RAM disagree); a `declared_amount` other than the
     ///    output's is `UtxoAmountMismatch`;
     /// 6. the bit is cleared.
-    // Its own frame (stack budget, DEC-136): the read buffer must not merge
-    // into the per-block step's frame with the signature preimage.
-    #[inline(never)]
     pub(crate) fn resolve_and_spend_utxo(
         &mut self,
         parent_idx: u32,
@@ -3886,6 +3990,43 @@ impl<
         declared_amount: u64,
         trust_below_anchor: bool,
     ) -> Result<Option<[u8; 32]>, UtxoSpendError> {
+        let ref_idx = match self.locate_utxo_source(parent_idx, consuming_seq, block_sequence)? {
+            Some(ref_idx) => ref_idx,
+            None if trust_below_anchor => return Ok(None),
+            None => {
+                return Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable));
+            }
+        };
+        let bit = output_index as usize;
+        if self.blocks.utxo_available(ref_idx, bit) != Some(true) {
+            return Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable));
+        }
+
+        // The bit said the output exists; bytes that lack it are the node's own
+        // fault, not evidence against the spending block.
+        let (address, amount) = self
+            .utxo_output_of(ref_idx, output_index)?
+            .ok_or(UtxoSpendError::StorageRead)?;
+        if amount != declared_amount {
+            return Err(UtxoSpendError::Invalid(
+                ValidationReason::UtxoAmountMismatch,
+            ));
+        }
+
+        self.blocks.set_utxo_available(ref_idx, bit, false);
+        Ok(Some(address))
+    }
+
+    /// Steps 1–3 of [`Self::resolve_and_spend_utxo`], shared with the Tier 2
+    /// structural check (Story 6.1 D6): causality, the `W` distance bound and
+    /// the ancestor walk. `Ok(None)` when the walk reaches the anchor first —
+    /// the output lies below it; each caller decides whether that is trusted.
+    fn locate_utxo_source(
+        &self,
+        parent_idx: u32,
+        consuming_seq: u32,
+        block_sequence: u32,
+    ) -> Result<Option<u32>, UtxoSpendError> {
         let unresolvable = UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable);
         if block_sequence >= consuming_seq {
             return Err(unresolvable);
@@ -3898,32 +4039,78 @@ impl<
         {
             return Err(unresolvable);
         }
-        let ref_idx = match self.ancestor_at(parent_idx, block_sequence)? {
-            Some(ref_idx) => ref_idx,
-            None if trust_below_anchor => return Ok(None),
-            None => return Err(unresolvable),
-        };
-        let bit = output_index as usize;
-        if self.blocks.utxo_available(ref_idx, bit) != Some(true) {
-            return Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable));
-        }
+        self.ancestor_at(parent_idx, block_sequence)
+    }
 
+    /// Reads the referenced block once for the output at `output_index`:
+    /// `Ok(None)` when its bytes hold no such output, `StorageRead` on a
+    /// failed read. Its own frame (stack budget, DEC-136): the read buffer
+    /// must not merge into the per-block step's frame with the signature
+    /// preimage.
+    #[inline(never)]
+    fn utxo_output_of(
+        &self,
+        ref_idx: u32,
+        output_index: u8,
+    ) -> Result<Option<([u8; 32], u64)>, UtxoSpendError> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self
             .view_retained(ref_idx, &mut buf)
             .ok_or(UtxoSpendError::StorageRead)?;
-        // The bit said the output exists; bytes that lack it are the node's own
-        // fault, not evidence against the spending block.
-        let (address, amount) =
-            utxo_output_at(&view, output_index).ok_or(UtxoSpendError::StorageRead)?;
-        if amount != declared_amount {
-            return Err(UtxoSpendError::Invalid(
-                ValidationReason::UtxoAmountMismatch,
-            ));
-        }
+        Ok(utxo_output_at(&view, output_index))
+    }
 
-        self.blocks.set_utxo_available(ref_idx, bit, false);
-        Ok(Some(address))
+    /// FR9 Tier 2 of a side block in Ready (Story 6.1 D6): the UTXO-input
+    /// structural completion of every complex transaction, along the block's
+    /// own ancestry from `parent_idx`. A reference within `W` resolves to its
+    /// block, whose bytes must hold the output with the declared amount; one
+    /// below `S_tail` is trusted pre-window history, as in the FR3 pass
+    /// (DEC-129, DEC-131). No available-UTXO bit is read: the bits follow the
+    /// active chain, so whether the output is unspent on this branch is Tier 3.
+    ///
+    /// The other FR9 Tier 2 items join here and in the shared head step
+    /// together: `mined_amount`, fee and price rules (7.2 / 7.3), the approval
+    /// threshold (6.7), the structural `snake_chain` checks (9.2 / 9.3 / 9.5 /
+    /// 6.6). Registration-key uniqueness is Tier 3 on a side branch (D6).
+    fn tier2_check(
+        &self,
+        view: &BlockView<'_>,
+        idx: u32,
+        parent_idx: u32,
+    ) -> Result<(), ProcessingError> {
+        let Some(txs) = view.transactions() else {
+            return Ok(());
+        };
+        for tx in txs.iter() {
+            let Some(cx) = tx.as_complex() else {
+                continue;
+            };
+            for input in cx.inputs() {
+                let Some(ui) = input.as_utxo() else {
+                    continue;
+                };
+                let reason =
+                    match self.locate_utxo_source(parent_idx, view.sequence(), ui.block_sequence())
+                    {
+                        Ok(None) => continue,
+                        Ok(Some(ref_idx)) => {
+                            match self.utxo_output_of(ref_idx, ui.output_index()) {
+                                Ok(Some((_, amount))) if amount == ui.amount() => continue,
+                                Ok(Some(_)) => ValidationReason::UtxoAmountMismatch,
+                                Ok(None) => ValidationReason::UtxoUnresolvable,
+                                Err(_) => return Err(ProcessingError::StorageRead),
+                            }
+                        }
+                        Err(UtxoSpendError::Invalid(reason)) => reason,
+                        Err(_) => return Err(ProcessingError::MissingBlock),
+                    };
+                return Err(ProcessingError::Invalid {
+                    block_idx: idx,
+                    reason,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Judges a prospective extension of the active head — a direct one at
@@ -3940,7 +4127,7 @@ impl<
         // FR48 window gate (9.1): an extension that would make the active
         // chain longer than `W` drops the tail block, which its binding must
         // allow. `W` is read now (FR56), never the capacity.
-        let mut advance = false;
+        let mut advance = None;
         if let Some(w) = self.active_chain_length() {
             let (Some(tail), Some(head)) = (
                 self.blocks.get(self.snake_chain_tail_idx),
@@ -3958,7 +4145,13 @@ impl<
                 if tail_drop_binding(obligation, view) == TailBinding::Invalid {
                     return Extension::Invalid;
                 }
-                advance = true;
+                // FR21 (iii): the block that becomes `S_tail` leaves every
+                // sum; its value is read now, before anything is mutated, so
+                // a failed read is a local failure (Story 6.1 D1).
+                let Some(tail_value) = self.new_tail_value() else {
+                    return Extension::Local;
+                };
+                advance = Some(tail_value);
             }
         }
         let mut projection = Projection::COMPLETE;
@@ -3972,22 +4165,49 @@ impl<
         }
     }
 
+    /// The FR21 value of the block that becomes `S_tail` when the window
+    /// advances: the current tail's active-chain child. `None` on a failed
+    /// read — a local failure. The tail is never the head here: that needs
+    /// `W = 1`, where FR60 refuses every extension (`s_new ≥ s_head + W`).
+    fn new_tail_value(&self) -> Option<u64> {
+        let tail = self.snake_chain_tail_idx;
+        let child = (0..MAX_BLOCKS as u32).find(|idx| {
+            self.blocks
+                .get(*idx)
+                .is_some_and(|entry| entry.parent_ref() == tail && entry.is_on_active_chain())
+        })?;
+        self.block_value_at(child)
+    }
+
+    /// Reads a retained block and returns its FR21 value; `None` on a failed
+    /// read. The read copy lives only in this frame (DEC-136).
+    #[inline(never)]
+    fn block_value_at(&self, idx: u32) -> Option<u64> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        self.view_retained(idx, &mut buf)
+            .map(|view| block_value(&view))
+    }
+
     /// Promotes a block that passed the whole per-block step to the active
     /// head (AC3/AC4, D7: Stored → Active directly), refreshes its
-    /// `chain_heads` entry (AC7) and, when the window gate said so, advances
-    /// the tail (9.1).
-    fn promote_head_extension(&mut self, idx: u32, advance: bool) {
+    /// `chain_heads` entry (AC7), adds its FR21 `value` to the active value
+    /// (event (i)) and, when the window gate said so, advances the tail (9.1)
+    /// and subtracts the new `S_tail` block's value from every value (event
+    /// (iii), Story 6.1 D1).
+    fn promote_head_extension(&mut self, idx: u32, value: u64, advance: Option<u64>) {
         self.blocks.set_status(idx, BlockStatus::Active);
         self.blocks.set_on_active_chain(idx, true);
         self.active_chain_head_idx = idx;
         self.chain_heads.refresh_head(&self.blocks, idx);
-        // Story 6.1 (FR19 event (i)): the head's `branch_value` increment
-        // goes here, once per promoted block.
-        //
+        self.active_branch_value += value;
         // FR64 (Epic 11 `LogSink`): emit the head-extension event carrying the
         // promoted block's hash and sequence. Deferred — see deferred-work.md.
-        if advance {
-            self.advance_snake_chain_tail();
+        if let Some(tail_value) = advance
+            && self.advance_snake_chain_tail()
+        {
+            self.active_branch_value = self.active_branch_value.saturating_sub(tail_value);
+            self.chain_heads
+                .subtract_branch_value(&self.blocks, tail_value);
         }
     }
 
@@ -3996,33 +4216,25 @@ impl<
     /// parent arrived and was promoted, and an earlier local-failure retry.
     /// Runs after every Ready admission and after every direct extension.
     ///
-    /// Each pass picks one Stored child of the head (D5, interim: the lowest
-    /// block hash; Story 6.1 replaces it with the FR22 tie-break), judges it,
-    /// and either promotes it, deletes it with its descendants (its verdict is
-    /// final, D2), or stops on a local failure, leaving it Stored. At most
-    /// `MAX_BLOCKS` passes; each costs an O(`MAX_BLOCKS`) child scan (there is
-    /// no child index) and one storage read.
+    /// Each pass picks one Stored child of the head by the FR21 rank (Story
+    /// 6.1 D9, [`Self::best_stored_child`]), judges it, and either promotes it,
+    /// deletes it with its descendants (its verdict is final, D2), or stops on
+    /// a local failure, leaving it Stored. At most `MAX_BLOCKS` passes. Each
+    /// costs O(`MAX_BLOCKS`) child scans (there is no child index), one read of
+    /// the chosen child, one read per sibling when there are several (their
+    /// rank), and one read of the new tail when the window advances.
     fn drive_forward_extension(&mut self) {
         for _ in 0..MAX_BLOCKS {
-            let head = self.active_chain_head_idx;
-            let mut child: Option<(u32, [u8; 32])> = None;
-            for idx in 0..MAX_BLOCKS as u32 {
-                if let Some(entry) = self.blocks.get(idx)
-                    && entry.parent_ref() == head
-                    && entry.status() == BlockStatus::Stored
-                    && child.is_none_or(|(_, hash)| *entry.hash() < hash)
-                {
-                    child = Some((idx, *entry.hash()));
-                }
-            }
-            let Some((child, _)) = child else {
+            let Some(child) = self.best_stored_child() else {
                 return;
             };
             // The child's read copy lives in its own frame, gone before any
             // deletion or tail advance, whose delete-set buffer (2.4 KB) must
             // not share the stack with it (D4, DEC-136).
             match self.apply_stored_child(child) {
-                ChildStep::Applied { advance } => self.promote_head_extension(child, advance),
+                ChildStep::Applied { advance, value } => {
+                    self.promote_head_extension(child, value, advance);
+                }
                 // A local failure: the child stays Stored for a later retry.
                 ChildStep::Local => return,
                 // AC5: no derived state was touched (D1), the head stays, and
@@ -4037,6 +4249,251 @@ impl<
         }
     }
 
+    /// Story 6.1 AC6 — Tier 2 and Stored → Connected for side blocks in
+    /// Ready, and their FR21 values. Runs after every Ready admission (after
+    /// the continuation, whose promotion turns a sibling into a side block)
+    /// and at every Ready entry.
+    ///
+    /// It handles the blocks stored before their Tier 2 could run — orphans
+    /// connected later, blocks retained while Collecting, local-failure
+    /// retries; a new block with a Connected or Active parent was judged before
+    /// its write (D4). Each pending side head ([`Self::is_pending_side_head`])
+    /// is walked once ([`Self::walk_side_branch`]):
+    /// - every Stored block passes: they become Connected and the head's value
+    ///   is `active − Σ_active + Σ_branch` (FR21 (ii));
+    /// - exact evidence: the lowest failing block goes with its descendants;
+    ///   the passed blocks below it become Connected, and the entry the
+    ///   deletion retargets onto its parent takes the value the same walk
+    ///   gives it (FR21 (v) in Ready, D8). The table changed, so the scan
+    ///   restarts;
+    /// - a local failure leaves the head pending for the next admission.
+    ///
+    /// Bounded: each round connects a head or deletes a block, or ends.
+    fn connect_side_branches(&mut self) {
+        if self.snake_chain_tail_idx == NONE_REF {
+            return;
+        }
+        for _ in 0..MAX_BRANCH_COUNT + MAX_BLOCKS {
+            let mut progressed = false;
+            for slot in 0..MAX_BRANCH_COUNT {
+                let Some(head) = self.chain_heads.connected_head_at(slot) else {
+                    continue;
+                };
+                if !self.is_pending_side_head(head) {
+                    continue;
+                }
+                let Ok(walk) = self.walk_side_branch(head) else {
+                    continue;
+                };
+                progressed = true;
+                match walk.failing {
+                    None => {
+                        // FR64 (Epic 11 `LogSink`): emit the connect event.
+                        // Deferred — see deferred-work.md.
+                        self.mark_connected(head);
+                        let value = self.side_value(walk.active, walk.branch);
+                        self.chain_heads.set_branch_value(head, value);
+                    }
+                    Some((failing, through)) => {
+                        let parent = self
+                            .blocks
+                            .get(failing)
+                            .map_or(NONE_REF, |entry| entry.parent_ref());
+                        self.mark_connected(parent);
+                        // FR64 (Epic 11 `LogSink`): emit the deletion event
+                        // carrying the block's hash. Deferred — see
+                        // deferred-work.md.
+                        self.delete_subtree_with_followup(failing);
+                        if self
+                            .blocks
+                            .get(parent)
+                            .is_some_and(|entry| entry.status() == BlockStatus::Connected)
+                        {
+                            let value = self.side_value(walk.active, walk.branch - through);
+                            self.chain_heads.set_branch_value(parent, value);
+                        }
+                        break;
+                    }
+                }
+            }
+            if !progressed {
+                return;
+            }
+        }
+    }
+
+    /// A pending side head: Stored, and the lowest Stored block of its branch
+    /// is not a child of the active head — those stay with the Story 6.0
+    /// continuation (Tier 2 + 3 in one step), which only extends into Stored
+    /// children. The caller has checked the `connected` cache.
+    fn is_pending_side_head(&self, head: u32) -> bool {
+        let mut lowest = NONE_REF;
+        let mut cur = head;
+        for _ in 0..MAX_BLOCKS {
+            match self.blocks.get(cur) {
+                Some(entry) if entry.status() == BlockStatus::Stored => {
+                    lowest = cur;
+                    cur = entry.parent_ref();
+                }
+                _ => break,
+            }
+        }
+        lowest != NONE_REF && cur != NONE_REF && cur != self.active_chain_head_idx
+    }
+
+    /// Walks the side branch of `head` down to its connection point (the first
+    /// block on the active chain), reading each block once, then the active
+    /// chain from the head down to the same point: the FR21 sums of FR21 (ii).
+    /// Every Stored block runs the Tier 2 check; the lowest failing one is
+    /// reported. `Err` on a local failure — nothing is changed. The read copy lives only in this
+    /// frame (DEC-136), gone before the caller deletes anything.
+    #[inline(never)]
+    fn walk_side_branch(&self, head: u32) -> Result<SideWalk, ()> {
+        // Every FR21 sum adds at most `MAX_BLOCKS` `u32` values (a branch, or
+        // the active window), so plain `u64` additions cannot overflow.
+        const { assert!((MAX_BLOCKS as u128) * (u32::MAX as u128) <= u64::MAX as u128) };
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let mut branch = 0u64;
+        let mut failing = None;
+        let mut cur = head;
+        let mut connection = NONE_REF;
+        for _ in 0..MAX_BLOCKS {
+            let entry = self.blocks.get(cur).ok_or(())?;
+            if entry.is_on_active_chain() {
+                connection = cur;
+                break;
+            }
+            let (stored, parent) = (entry.status() == BlockStatus::Stored, entry.parent_ref());
+            let view = self.view_retained(cur, &mut buf).ok_or(())?;
+            branch += block_value(&view);
+            if stored {
+                match self.tier2_check(&view, cur, parent) {
+                    Ok(()) => {}
+                    // Walking down, a later failure is a lower one.
+                    Err(err) if is_evidence(&err) => failing = Some((cur, branch)),
+                    Err(_) => return Err(()),
+                }
+            }
+            cur = parent;
+        }
+        if connection == NONE_REF {
+            return Err(());
+        }
+        let mut active = 0u64;
+        let mut cur = self.active_chain_head_idx;
+        for _ in 0..MAX_BLOCKS {
+            if cur == connection {
+                return Ok(SideWalk {
+                    active,
+                    branch,
+                    failing,
+                });
+            }
+            let parent = self.blocks.get(cur).ok_or(())?.parent_ref();
+            active += block_value(&self.view_retained(cur, &mut buf).ok_or(())?);
+            cur = parent;
+        }
+        Err(())
+    }
+
+    /// FR21 (ii): a side head's value from the walk's sums. Exact: the active
+    /// blocks above the connection point are part of the active value.
+    fn side_value(&self, active: u64, branch: u64) -> u64 {
+        self.active_branch_value.saturating_sub(active) + branch
+    }
+
+    /// Stored → Connected for `from` and every Stored ancestor below it — the
+    /// blocks a side walk found passing Tier 2.
+    fn mark_connected(&mut self, from: u32) {
+        let mut cur = from;
+        for _ in 0..MAX_BLOCKS {
+            match self.blocks.get(cur) {
+                Some(entry) if entry.status() == BlockStatus::Stored => {
+                    let parent = entry.parent_ref();
+                    self.blocks.set_status(cur, BlockStatus::Connected);
+                    cur = parent;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Story 6.1 D4 — connects a side block judged at Tier 2 before its write,
+    /// once `chain_heads` has seen it: interior after a merge (the surviving
+    /// orphan head is the driver's); the extension of a Connected side head,
+    /// valued incrementally from the parent's value read before the admission
+    /// (FR21 (i)); otherwise a fork, valued by the walk from its Connected or
+    /// Active `parent` plus its own `value` in hand — the block itself is never
+    /// read back. A local failure there leaves it Stored, and the driver judges
+    /// it again.
+    fn connect_judged_side_block(
+        &mut self,
+        idx: u32,
+        parent: u32,
+        value: u64,
+        parent_value: Option<u64>,
+    ) {
+        if self.chain_heads.branch_value_of(idx).is_none() {
+            self.blocks.set_status(idx, BlockStatus::Connected);
+            return;
+        }
+        let value = match parent_value {
+            Some(parent_value) => parent_value + value,
+            None => match self.walk_side_branch(parent) {
+                Ok(walk) => self.side_value(walk.active, walk.branch + value),
+                Err(()) => return,
+            },
+        };
+        self.blocks.set_status(idx, BlockStatus::Connected);
+        self.chain_heads.set_branch_value(idx, value);
+    }
+
+    /// The Stored child of the active head the continuation takes next: the
+    /// only one without a read, else the FR21 rank winner at the child level
+    /// (Story 6.1 D9). All siblings share the active value, so each one's own
+    /// value decides. `None` when there is no child, or when any candidate
+    /// cannot be read — a local failure, never a choice: the continuation stops
+    /// and retries at a later admission (code review 2026-10-20). Greedy per
+    /// level: a heavier deeper subtree is reached by the FR22 trigger (6.2).
+    fn best_stored_child(&self) -> Option<u32> {
+        let head = self.active_chain_head_idx;
+        let is_candidate = |idx: u32| {
+            self.blocks.get(idx).is_some_and(|entry| {
+                entry.parent_ref() == head && entry.status() == BlockStatus::Stored
+            })
+        };
+        let mut candidates = (0..MAX_BLOCKS as u32).filter(|idx| is_candidate(*idx));
+        let first = candidates.next()?;
+        if candidates.next().is_none() {
+            return Some(first);
+        }
+        let mut best: Option<(u32, Rank)> = None;
+        for idx in (0..MAX_BLOCKS as u32).filter(|idx| is_candidate(*idx)) {
+            let rank = self.child_rank(idx)?;
+            if best.as_ref().is_none_or(|(_, top)| rank.outranks(top)) {
+                best = Some((idx, rank));
+            }
+        }
+        best.map(|(idx, _)| idx)
+    }
+
+    /// The FR21 rank of a stored child of the head: its value and creator from
+    /// one read, its size and hash from RAM. The read copy lives only in this
+    /// frame (DEC-136).
+    #[inline(never)]
+    fn child_rank(&self, idx: u32) -> Option<Rank> {
+        let entry = self.blocks.get(idx)?;
+        let (len, hash) = (entry.len(), *entry.hash());
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        Some(Rank {
+            value: block_value(&view),
+            len,
+            creator: view.creator(),
+            hash,
+        })
+    }
+
     /// Reads a stored child of the head and runs the whole per-block step on it.
     #[inline(never)]
     fn apply_stored_child(&mut self, child: u32) -> ChildStep {
@@ -4049,7 +4506,10 @@ impl<
                 advance,
                 derivation,
             } => match self.commit_block(&view, child, derivation) {
-                Ok(()) => ChildStep::Applied { advance },
+                Ok(()) => ChildStep::Applied {
+                    advance,
+                    value: block_value(&view),
+                },
                 Err(err) if is_evidence(&err) => ChildStep::Invalid,
                 Err(_) => ChildStep::Local,
             },
@@ -4085,7 +4545,7 @@ impl<
     /// `active_chain_head_idx = tip` (overwriting any Story-5.2 bootstrap
     /// placeholder) and the FR48 window over it. A pure `parent_ref` walk (no
     /// storage reads), bounded by `MAX_BLOCKS`.
-    fn promote_candidate_active(&mut self, candidate_tip_idx: u32) {
+    fn promote_candidate_active(&mut self, candidate_tip_idx: u32, window_value: u64) {
         // Only the candidate is the active chain. A Collecting genesis anchor
         // that the candidate does not contain (FR2 adopted a window-anchored
         // segment, or a restart re-flagged it) would otherwise keep its flag
@@ -4110,6 +4570,20 @@ impl<
         }
         self.active_chain_head_idx = candidate_tip_idx;
         self.establish_snake_chain_window();
+        // The FR3 walk summed exactly the window just established (D5).
+        self.active_branch_value = window_value;
+    }
+
+    /// The sequence of the tail the window over a chain from `root_seq` to
+    /// `head_seq` lands on: `max(root_seq, head_seq + 1 − W)`, the whole chain
+    /// when no `W` is held. One function for the Ready-entry trim and the FR3
+    /// walk's window value (Story 6.1 D5), so the two cannot disagree. `W` is
+    /// read now (FR56), never the capacity.
+    fn window_tail_sequence(&self, root_seq: u32, head_seq: u32) -> u32 {
+        match self.active_chain_length() {
+            Some(w) => root_seq.max((head_seq + 1).saturating_sub(w)),
+            None => root_seq,
+        }
     }
 
     /// FR48 — establishes the snake-chain window over the active head, at every
@@ -4177,18 +4651,21 @@ impl<
             self.reclaim_stale_fragments(root_seq);
         }
 
-        let Some(w) = self.active_chain_length() else {
+        let (Some(root_seq), Some(head_seq)) = (
+            self.blocks.get(root).map(|entry| entry.sequence()),
+            self.blocks
+                .get(self.active_chain_head_idx)
+                .map(|entry| entry.sequence()),
+        ) else {
             return;
         };
+        let target = self.window_tail_sequence(root_seq, head_seq);
         for _ in 0..MAX_BLOCKS {
-            let (Some(tail), Some(head)) = (
-                self.blocks.get(self.snake_chain_tail_idx),
-                self.blocks.get(self.active_chain_head_idx),
-            ) else {
-                break;
-            };
-            // Length `S_head − S_tail + 1` is at most `W`.
-            if head.sequence().saturating_sub(tail.sequence()) < w {
+            if self
+                .blocks
+                .get(self.snake_chain_tail_idx)
+                .is_none_or(|tail| tail.sequence() >= target)
+            {
                 break;
             }
             let _ = classify_tail_drop(&self.blocks, &self.node_info, self.snake_chain_tail_idx);
@@ -4314,8 +4791,9 @@ impl<
         self.blocks.set_parent_ref(new_tail, NONE_REF);
         self.snake_chain_tail_idx = new_tail;
         self.reclaim_stale_fragments(s_tail);
-        // Story 6.1 adds the FR21 `branch_value` tail-eviction subtraction
-        // (event (iii)) here, once per released block.
+        // The FR21 subtraction of event (iii) is the head-extension caller's
+        // (`promote_head_extension`): this step also serves the Ready-entry
+        // trim, which runs before the window value is seeded.
         true
     }
 
@@ -4682,6 +5160,7 @@ impl<
             // it went with it.
             self.active_chain_head_idx = NONE_REF;
             self.snake_chain_tail_idx = NONE_REF;
+            self.active_branch_value = 0;
         }
         if self.tentative_config_block_idx != NONE_REF
             && deleted.contains(&self.tentative_config_block_idx)
@@ -5564,6 +6043,7 @@ mod tests {
             active_chain_head_idx,
             tentative_config_block_idx,
             snake_chain_tail_idx,
+            active_branch_value,
         } = &*bc;
 
         assert_eq!(*local_node_id, 7);
@@ -5586,6 +6066,7 @@ mod tests {
         assert_eq!(*active_chain_head_idx, NONE_REF);
         assert_eq!(*tentative_config_block_idx, NONE_REF);
         assert_eq!(*snake_chain_tail_idx, NONE_REF);
+        assert_eq!(*active_branch_value, 0);
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -5637,6 +6118,7 @@ mod tests {
             active_chain_head_idx,
             tentative_config_block_idx,
             snake_chain_tail_idx,
+            active_branch_value,
         } = &*built;
         let Blockchain {
             crypto: _,
@@ -5655,6 +6137,7 @@ mod tests {
             active_chain_head_idx: spec_active_chain_head_idx,
             tentative_config_block_idx: spec_tentative_config_block_idx,
             snake_chain_tail_idx: spec_snake_chain_tail_idx,
+            active_branch_value: spec_active_branch_value,
         } = &spec;
 
         assert_eq!(local_node_id, spec_local_node_id);
@@ -5673,6 +6156,7 @@ mod tests {
         assert_eq!(active_chain_head_idx, spec_active_chain_head_idx);
         assert_eq!(tentative_config_block_idx, spec_tentative_config_block_idx);
         assert_eq!(snake_chain_tail_idx, spec_snake_chain_tail_idx);
+        assert_eq!(active_branch_value, spec_active_branch_value);
     }
 
     /// AC2 — the neutrality proof: with the base override set (the window alone)
@@ -8462,7 +8946,7 @@ mod tests {
             .tier1_admit(&tx.view(), &tx.view().hash(), 0)
             .expect("tx admitted");
         assert_eq!(
-            bc.run_processing_pass(ti),
+            bc.run_processing_pass(ti).map(|_| ()),
             Ok(()),
             "a vote for an in-range node is accepted even if not individually seeded"
         );
@@ -8510,7 +8994,7 @@ mod tests {
             .tier1_admit(&bal.view(), &bal.view().hash(), 0)
             .expect("balance admitted");
         assert_eq!(
-            bc.run_processing_pass(bi),
+            bc.run_processing_pass(bi).map(|_| ()),
             Ok(()),
             "a window-anchored pre-first-balance registration is trusted, not \
              rejected against a 0 watermark"
@@ -11105,7 +11589,7 @@ mod tests {
         let tx = utxo_tx(102, inputs, None, &[]);
         let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
         let si = admit(&mut bc, &spend);
-        (bc.run_processing_pass(si), si)
+        (bc.run_processing_pass(si).map(|_| ()), si)
     }
 
     /// AC8 (3) / DEC-129 — on a window-anchored candidate a reference below
@@ -11165,7 +11649,7 @@ mod tests {
             let si = bc
                 .tier1_admit(&spend.view(), &spend.view().hash(), 0)
                 .expect("spend admitted");
-            (bc.run_processing_pass(si), si)
+            (bc.run_processing_pass(si).map(|_| ()), si)
         }
         assert_eq!(verdict(97).0, Ok(()), "101 - 97 = W");
         let (result, si) = verdict(96);
@@ -12082,7 +12566,7 @@ mod tests {
     // --- AC10.3: sibling choice (D5) ----------------------------------------
 
     #[test]
-    fn forward_extension_takes_the_lowest_hash_sibling() {
+    fn forward_extension_takes_the_lowest_hash_sibling_on_an_equal_rank() {
         let (mut bc, _, b1) = ready_genesis(16);
         let a = transfer(2, b1.view().hash(), 0, 7);
         let c1 = transfer(3, a.view().hash(), 0, 8);
@@ -12096,11 +12580,13 @@ mod tests {
         } else {
             (&c2, &c1)
         };
+        // Equal value, size and creator: the FR21 rank falls to the hash.
         assert_eq!(head_of(&bc), (3, low.view().hash()), "the lower hash wins");
         let hi = bc.blocks.find(3, &high.view().hash()).expect("loser kept");
+        // Story 6.1: the loser is a side block the driver connected.
         assert_eq!(
             bc.blocks.get(hi).map(|e| e.status()),
-            Some(BlockStatus::Stored)
+            Some(BlockStatus::Connected)
         );
         assert!(
             bc.chain_heads.occupied_heads().any(|(h, _)| h == hi),
@@ -12778,7 +13264,7 @@ mod tests {
         let tip = (0..16u32)
             .find(|&i| bc.blocks.get(i).is_some_and(|e| e.sequence() == 100))
             .expect("#100");
-        assert_eq!(bc.run_processing_pass(tip), Ok(()));
+        assert_eq!(bc.run_processing_pass(tip).map(|_| ()), Ok(()));
         assert!(bc.node_info.is_seeded(1));
         assert_eq!(bc.node_info.balance_of(1), 100);
     }
@@ -12894,7 +13380,7 @@ mod tests {
         admit(&mut bc, &seed);
         let reg = registration_block(101, seed.view().hash(), 4, 5, 0xC5);
         let tip = admit(&mut bc, &reg);
-        assert_eq!(bc.run_processing_pass(tip), Ok(()));
+        assert_eq!(bc.run_processing_pass(tip).map(|_| ()), Ok(()));
         assert!(
             !bc.node_info.is_seeded(4),
             "precondition: unseeded initializer"
@@ -12975,5 +13461,758 @@ mod tests {
             bc.node_info == twin.node_info,
             "the derivation was inverted"
         );
+    }
+
+    // ===================================================================
+    // Story 6.1 — FR21 branch value and side-block Tier 2
+    // ===================================================================
+
+    /// `block` rebuilt with header `consumed_votes` — its FR21 value — and
+    /// re-signed by node #0. Transaction and chain-config payloads.
+    fn revalue(block: &Block, consumed_votes: u32) -> Block {
+        let view = block.view();
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let header = BlockHeader {
+            version: view.version(),
+            sequence: view.sequence(),
+            creator: view.creator(),
+            mined_amount: view.mined_amount(),
+            payload_type: view.payload_type(),
+            consumed_votes,
+            first_voted_node: view.first_voted_node(),
+            consumed_votes_from_first_voted_node: view.consumed_votes_from_first_voted_node(),
+            previous_hash: view.previous_hash().try_into().expect("32 bytes"),
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        if let Some(txs) = view.transactions() {
+            for tx in txs.iter() {
+                builder
+                    .add_transaction_bytes(tx.as_bytes())
+                    .ok()
+                    .expect("transaction");
+            }
+        } else {
+            builder
+                .set_chain_config_payload(view.payload())
+                .ok()
+                .expect("chain-config payload");
+        }
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// A node #0 self-transfer of `amount` at `seq`, worth `value`.
+    fn valued(seq: u32, prev: [u8; 32], value: u32, amount: u64) -> Block {
+        revalue(&transfer(seq, prev, 0, amount), value)
+    }
+
+    /// FR21 by brute force: the values of `head`'s ancestry above `S_tail`,
+    /// read back from storage block by block.
+    fn brute_value<
+        C: CryptoTrait,
+        S: StorageTrait,
+        G: ChainConfigTrait,
+        const N: usize,
+        const L: u32,
+        const B: usize,
+        const H: usize,
+        const U: usize,
+    >(
+        bc: &Blockchain<C, S, G, N, L, B, H, U>,
+        head: u32,
+    ) -> u64 {
+        let tail = bc
+            .blocks
+            .get(bc.snake_chain_tail_idx)
+            .expect("a tail")
+            .sequence();
+        let mut sum = 0;
+        let mut cur = head;
+        loop {
+            let entry = bc.blocks.get(cur).expect("on the path");
+            if entry.sequence() <= tail {
+                return sum;
+            }
+            let mut buf = [0u8; MAX_BLOCK_SIZE];
+            sum += u64::from(
+                bc.view_retained(cur, &mut buf)
+                    .expect("readable")
+                    .consumed_votes(),
+            );
+            cur = entry.parent_ref();
+        }
+    }
+
+    fn slot<
+        C: CryptoTrait,
+        S: StorageTrait,
+        G: ChainConfigTrait,
+        const N: usize,
+        const L: u32,
+        const B: usize,
+        const H: usize,
+        const U: usize,
+    >(
+        bc: &Blockchain<C, S, G, N, L, B, H, U>,
+        block: &Block,
+    ) -> u32 {
+        let view = block.view();
+        bc.blocks
+            .find(view.sequence(), &view.hash())
+            .expect("retained")
+    }
+
+    fn status_of<S: StorageTrait>(bc: &Chain16<S>, block: &Block) -> Option<BlockStatus> {
+        let view = block.view();
+        bc.blocks
+            .find(view.sequence(), &view.hash())
+            .and_then(|idx| bc.blocks.get(idx))
+            .map(|entry| entry.status())
+    }
+
+    /// The window-anchored W4 segment `100..=103` with the values 2 (the
+    /// chain-config anchor), 3, 5, 7, Ready through FR3. Returns the node and
+    /// the four blocks.
+    fn valued_w4() -> (W4Chain, [Block; 4]) {
+        let mut bc = new_w4_chain();
+        let anchor = revalue(&w4_config_anchor_block(100, [0xAB; 32]), 2);
+        let b101 = revalue(&linked_transfer_block(101, anchor.view().hash()), 3);
+        let b102 = revalue(&linked_transfer_block(102, b101.view().hash()), 5);
+        let b103 = revalue(&linked_transfer_block(103, b102.view().hash()), 7);
+        for blk in [&anchor, &b101, &b102, &b103] {
+            bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
+                .expect("admitted");
+        }
+        bc.drive_dominant_chain_acquisition();
+        assert!(bc.is_ready(), "precondition: the segment validated");
+        (bc, [anchor, b101, b102, b103])
+    }
+
+    /// AC10.1 / AC3 — seeding at every Ready entry: the genesis node holds 0
+    /// (its block #1 carries no value), a genesis-anchored mesh join sums
+    /// `(#0, #1]`, a window-anchored FR3 join sums its window — each equal to
+    /// the brute force.
+    #[test]
+    fn branch_value_is_seeded_at_every_ready_entry() {
+        let (genesis, _, _) = ready_genesis(16);
+        assert_eq!(genesis.active_branch_value, 0);
+        assert_eq!(
+            genesis.active_branch_value,
+            brute_value(&genesis, genesis.active_chain_head_idx)
+        );
+        let mut mesh = new_unconfigured_test_chain();
+        let b0 = node_transfer_block(0, 0, 0, 0);
+        let b1 = revalue(&chain_config_anchor_block(1, b0.view().hash()), 5);
+        for blk in [&b1, &b0] {
+            assert_eq!(
+                receive(&mut mesh, blk),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(mesh.is_ready());
+        assert_eq!(mesh.active_branch_value, 5, "#1 counts, #0 is S_tail");
+        assert_eq!(
+            mesh.active_branch_value,
+            brute_value(&mesh, mesh.active_chain_head_idx)
+        );
+        let (w4, _) = valued_w4();
+        assert_eq!(w4.active_branch_value, 3 + 5 + 7, "the anchor is S_tail");
+        assert_eq!(
+            w4.active_branch_value,
+            brute_value(&w4, w4.active_chain_head_idx)
+        );
+    }
+
+    /// AC10.3 / AC5 / AC9 — a tail advance subtracts the block that becomes
+    /// `S_tail`, from the active value and from a side head forked at it; a
+    /// fresh node reaching Ready through FR3 over the same blocks holds the
+    /// same values.
+    #[test]
+    fn tail_advance_subtracts_the_new_tail_everywhere() {
+        let (mut a, [anchor, b101, b102, b103]) = valued_w4();
+        // A fork at #101, judged before its write (D4) and valued by the walk.
+        let side = revalue(&salted_linked_block(102, b101.view().hash(), 6), 13);
+        assert_eq!(
+            a.receive_block(side.view(), 0).0,
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let si = slot(&a, &side);
+        assert_eq!(
+            a.blocks.get(si).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(3 + 13));
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
+
+        // Dropping the chain-config anchor needs a chain-config extension.
+        let b104 = revalue(&w4_config_anchor_block(104, b103.view().hash()), 11);
+        extend_active_head(&mut a, &b104, 0);
+        assert_eq!(a.active_snake_chain_window(), Ok((101, 104)));
+        assert_eq!(
+            a.active_branch_value,
+            5 + 7 + 11,
+            "#101 left the sum, #100 never was in it"
+        );
+        assert_eq!(
+            a.active_branch_value,
+            brute_value(&a, a.active_chain_head_idx)
+        );
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(13));
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
+
+        // A fresh node, orphans first, reaches the same values through FR3 —
+        // on `101..=104`, already `W` long, so the anchor is never needed.
+        let _ = anchor;
+        let mut b = new_w4_chain();
+        for blk in [&side, &b104, &b103, &b102, &b101] {
+            assert_eq!(
+                b.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(b.is_ready());
+        assert_eq!(b.active_branch_value, a.active_branch_value);
+        let bs = slot(&b, &side);
+        assert_eq!(
+            b.blocks.get(bs).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
+        assert_eq!(b.chain_heads.branch_value_of(bs), Some(13));
+    }
+
+    /// A genesis node on a [`FaultyStorage`] whose faults are disarmed, on
+    /// `W = w`.
+    fn faulty_genesis(w: u16) -> (Chain16<FaultyStorage>, Block) {
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let storage = FaultyStorage {
+            inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
+            failing_read_slot: NONE_REF,
+            fail_saves: false,
+        };
+        let mut slot = core::mem::MaybeUninit::<Chain16<FaultyStorage>>::uninit();
+        Chain16::<FaultyStorage>::init(&mut slot, crypto, storage, chain_config, 0, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut bc = unsafe { slot.assume_init() };
+        let genesis = bc
+            .process_genesis(CURRENCY, window_config_builder(w).content())
+            .ok()
+            .expect("genesis");
+        (bc, genesis.block_one)
+    }
+
+    /// AC10.3 / AC5 — the new tail's value is read before anything changes: a
+    /// failed read is a local failure, and the next admission extends.
+    #[test]
+    fn failed_new_tail_read_is_a_local_failure() {
+        let (mut bc, b1) = faulty_genesis(4);
+        let b2 = valued(2, b1.view().hash(), 2, 7);
+        let b3 = valued(3, b2.view().hash(), 3, 8);
+        for blk in [&b2, &b3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let before = bc.active_branch_value;
+        let snapshot = snapshot_block(&bc, 4, b3.view().hash());
+        bc.storage.failing_read_slot = 1; // #1 becomes the tail
+        assert_eq!(
+            receive(&mut bc, &snapshot),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc), (3, b3.view().hash()), "not extended");
+        assert_eq!(status_of(&bc, &snapshot), Some(BlockStatus::Stored));
+        assert_eq!(bc.active_branch_value, before);
+        assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
+
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = node_transfer_block(3, 3, 2, 7);
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            head_of(&bc),
+            (4, snapshot.view().hash()),
+            "the retry extended"
+        );
+        assert_eq!(bc.active_snake_chain_window(), Ok((1, 4)));
+        assert_eq!(bc.active_branch_value, 2 + 3);
+        assert_eq!(
+            bc.active_branch_value,
+            brute_value(&bc, bc.active_chain_head_idx)
+        );
+    }
+
+    /// AC10.2 / AC4 — event (i) for both entry points: a direct extension, and
+    /// a continuation over a stored orphan.
+    #[test]
+    fn branch_value_follows_direct_and_continuation_extensions() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let b2 = valued(2, b1.view().hash(), 5, 7);
+        assert_eq!(receive(&mut bc, &b2), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(bc.active_branch_value, 5);
+        let b3 = valued(3, b2.view().hash(), 3, 8);
+        let b4 = valued(4, b3.view().hash(), 7, 9);
+        assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut bc, &b3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (4, b4.view().hash()));
+        assert_eq!(bc.active_branch_value, 5 + 3 + 7);
+        assert_eq!(
+            bc.active_branch_value,
+            brute_value(&bc, bc.active_chain_head_idx)
+        );
+    }
+
+    /// Two siblings of `parent` at `seq` worth `high` and `low`, where the
+    /// higher-valued one has the higher hash — so the hash alone would pick
+    /// the other. Returns `(high, low)`.
+    fn ranked_pair(seq: u32, parent: [u8; 32], high: u32, low: u32) -> (Block, Block) {
+        for amount in 10..200 {
+            let h = valued(seq, parent, high, amount);
+            let l = valued(seq, parent, low, amount + 1000);
+            if h.view().hash() > l.view().hash() {
+                return (h, l);
+            }
+        }
+        panic!("no pair found");
+    }
+
+    /// AC10.6 / AC8 — the continuation's sibling choice is the FR21 rank: the
+    /// higher value wins over a lower hash, and on an equal value the larger
+    /// block wins. The other sibling becomes a Connected side head.
+    #[test]
+    fn sibling_choice_follows_the_fr21_rank() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let parent = valued(2, b1.view().hash(), 1, 7);
+        let (high, low) = ranked_pair(3, parent.view().hash(), 9, 4);
+        for blk in [&low, &high, &parent] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(head_of(&bc), (3, high.view().hash()), "value before hash");
+        let li = slot(&bc, &low);
+        assert_eq!(status_of(&bc, &low), Some(BlockStatus::Connected));
+        assert_eq!(bc.chain_heads.branch_value_of(li), Some(1 + 4));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(li),
+            Some(brute_value(&bc, li))
+        );
+
+        // Equal value: the larger block wins, even with the higher hash.
+        let (mut bc, _, b1) = ready_genesis(16);
+        let parent = valued(2, b1.view().hash(), 1, 7);
+        let prev = parent.view().hash();
+        let (large, small) = (0..200)
+            .find_map(|amount| {
+                let large = revalue(
+                    &tx_block(3, prev, 0, |b| {
+                        b.add_node_transfer(&transfer_tx(3, 0, amount))
+                            .ok()
+                            .expect("one");
+                        b.add_node_transfer(&transfer_tx(3, 0, 1))
+                            .ok()
+                            .expect("two");
+                    }),
+                    6,
+                );
+                let small = valued(3, prev, 6, amount + 1000);
+                (large.view().hash() > small.view().hash()).then_some((large, small))
+            })
+            .expect("a pair");
+        for blk in [&small, &large, &parent] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(head_of(&bc), (3, large.view().hash()), "size before hash");
+    }
+
+    /// AC8 (code review 2026-10-20) — an unreadable sibling is a local
+    /// failure, never a choice: the continuation stops with both siblings
+    /// Stored, and ranks them once the fault clears.
+    #[test]
+    fn unreadable_sibling_stops_the_continuation() {
+        let (mut bc, b1) = faulty_genesis(16);
+        let parent = valued(2, b1.view().hash(), 1, 7);
+        let (high, low) = ranked_pair(3, parent.view().hash(), 9, 4);
+        for blk in [&low, &high] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        bc.storage.failing_read_slot = slot(&bc, &high);
+        assert_eq!(
+            receive(&mut bc, &parent),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            head_of(&bc),
+            (2, parent.view().hash()),
+            "the continuation stopped"
+        );
+        assert_eq!(status_of(&bc, &high), Some(BlockStatus::Stored));
+        assert_eq!(
+            status_of(&bc, &low),
+            Some(BlockStatus::Stored),
+            "not taken instead"
+        );
+
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = node_transfer_block(9, 3, 8, 7);
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            head_of(&bc),
+            (3, high.view().hash()),
+            "ranked after the fault"
+        );
+        let li = slot(&bc, &low);
+        assert_eq!(status_of(&bc, &low), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(li),
+            Some(brute_value(&bc, li))
+        );
+    }
+
+    /// AC10.4 / AC10.12 / D4 — side blocks with a Connected or Active parent
+    /// are judged before their write: a fork from an older active block, the
+    /// extension of a Connected side head (incremental, no read of it), and a
+    /// fork from an interior Connected block — each Connected and valued as
+    /// the brute force; the active value is untouched.
+    #[test]
+    fn side_blocks_are_judged_before_their_write_and_valued() {
+        let (mut bc, b1) = faulty_genesis(16);
+        let a2 = valued(2, b1.view().hash(), 2, 7);
+        let a3 = valued(3, a2.view().hash(), 3, 8);
+        for blk in [&a2, &a3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let active = bc.active_branch_value;
+
+        let f3 = valued(3, a2.view().hash(), 9, 20);
+        assert_eq!(receive(&mut bc, &f3), ReceiveBlockOutcome::AcceptedSilently);
+        let fi = slot(&bc, &f3);
+        assert_eq!(status_of(&bc, &f3), Some(BlockStatus::Connected));
+        assert_eq!(bc.chain_heads.branch_value_of(fi), Some(2 + 9));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(fi),
+            Some(brute_value(&bc, fi))
+        );
+
+        // The extension reads nothing of itself: its slot's reads fail.
+        let f4 = valued(4, f3.view().hash(), 4, 21);
+        bc.storage.failing_read_slot = bc.blocks.next_free_index().expect("a slot");
+        assert_eq!(receive(&mut bc, &f4), ReceiveBlockOutcome::AcceptedSilently);
+        bc.storage.failing_read_slot = NONE_REF;
+        let f4i = slot(&bc, &f4);
+        assert_eq!(status_of(&bc, &f4), Some(BlockStatus::Connected));
+        assert_eq!(bc.chain_heads.branch_value_of(f4i), Some(2 + 9 + 4));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(f4i),
+            Some(brute_value(&bc, f4i))
+        );
+
+        // f3 is interior now: a second child of it is a fork, walked.
+        let g4 = valued(4, f3.view().hash(), 6, 22);
+        assert_eq!(receive(&mut bc, &g4), ReceiveBlockOutcome::AcceptedSilently);
+        let gi = slot(&bc, &g4);
+        assert_eq!(status_of(&bc, &g4), Some(BlockStatus::Connected));
+        assert_eq!(bc.chain_heads.branch_value_of(gi), Some(2 + 9 + 6));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(gi),
+            Some(brute_value(&bc, gi))
+        );
+        assert_eq!(
+            bc.active_branch_value, active,
+            "side blocks leave the active value"
+        );
+        assert_eq!(head_of(&bc), (3, a3.view().hash()));
+    }
+
+    /// [`faulty_utxo_genesis`] with one more active block, so the mint at #3
+    /// is an older active block a side branch can fork from. Returns the node,
+    /// the mint and #4.
+    fn utxo_side_fixture() -> (Chain16<FaultyStorage>, Block, Block) {
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let b4 = valued(4, mint.view().hash(), 4, 7);
+        assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
+        (bc, mint, b4)
+    }
+
+    /// A side block at `seq` on `prev` spending `(3, index)` with the declared
+    /// `amount` into one UTXO output.
+    fn side_spend(seq: u32, prev: [u8; 32], index: u8, amount: u64) -> Block {
+        let tx = utxo_tx(seq, &[(3, index, amount)], None, &[Ok(amount)]);
+        complex_tx_block(seq, prev, 0, 0, &[&tx])
+    }
+
+    /// AC10.7 / AC10.12 — a side block failing Tier 2 at intake is refused and
+    /// nothing is stored: a declared amount other than the output's, an output
+    /// index beyond the referenced block's outputs, and a fork from an interior
+    /// Connected block.
+    #[test]
+    fn side_block_failing_tier2_at_intake_is_not_stored() {
+        for (index, amount) in [(0, 61), (5, 60)] {
+            let (mut bc, mint, _) = utxo_side_fixture();
+            let (twin, _, _) = utxo_side_fixture();
+            let bad = side_spend(4, mint.view().hash(), index, amount);
+            let free = bc.blocks.next_free_index().expect("a free slot");
+            assert_eq!(
+                receive(&mut bc, &bad),
+                ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+            );
+            assert_same_state(&bc, &twin, "refused side block");
+            assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
+            assert!(same_slot(&bc, &twin, free), "storage unchanged");
+        }
+
+        // A fork from an interior Connected block is refused the same way.
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let p4 = valued(4, mint.view().hash(), 4, 30);
+        let p5 = valued(5, p4.view().hash(), 5, 31);
+        for blk in [&p4, &p5] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let free = bc.blocks.next_free_index().expect("a free slot");
+        let bad = side_spend(5, p4.view().hash(), 0, 61);
+        assert_eq!(
+            receive(&mut bc, &bad),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
+
+        // The matching amount passes: Connected, no bit touched.
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let good = side_spend(4, mint.view().hash(), 0, 60);
+        assert_eq!(
+            receive(&mut bc, &good),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(status_of(&bc, &good), Some(BlockStatus::Connected));
+        assert_eq!(bc.blocks.utxo_available(slot(&bc, &mint), 0), Some(true));
+    }
+
+    /// AC6 / D4 — a local failure inside the pre-store Tier 2 is no evidence:
+    /// the block is stored Stored, and the driver connects it once the fault
+    /// clears.
+    #[test]
+    fn tier2_read_failure_at_intake_is_retried_by_the_driver() {
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let good = side_spend(4, mint.view().hash(), 0, 60);
+        bc.storage.failing_read_slot = slot(&bc, &mint);
+        assert_eq!(
+            receive(&mut bc, &good),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            status_of(&bc, &good),
+            Some(BlockStatus::Stored),
+            "not blamed"
+        );
+
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = node_transfer_block(9, 3, 8, 7);
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let gi = slot(&bc, &good);
+        assert_eq!(status_of(&bc, &good), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(gi),
+            Some(brute_value(&bc, gi))
+        );
+    }
+
+    /// AC10.5 / AC10.7 / D8 — an orphan side chain stored before its Tier 2
+    /// could run: its parent's arrival connects it, the driver finds the
+    /// failing block, deletes it with its descendants, and values the entry
+    /// retargeted onto the surviving Connected parent. The active state is
+    /// untouched and the node stays Ready. Each failure kind: a declared amount
+    /// other than the output's, an output index beyond it, a reference more
+    /// than `W` back.
+    #[test]
+    fn driver_deletes_a_failing_side_block_and_values_the_retarget() {
+        for (index, amount) in [(0, 61), (5, 60)] {
+            let (mut bc, mint, _) = utxo_side_fixture();
+            let (twin, _, _) = utxo_side_fixture();
+            let p4 = valued(4, mint.view().hash(), 4, 30);
+            let bad5 = revalue(&side_spend(5, p4.view().hash(), index, amount), 5);
+            let c6 = valued(6, bad5.view().hash(), 6, 31);
+            for blk in [&c6, &bad5, &p4] {
+                assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+            }
+            assert_eq!(status_of(&bc, &bad5), None, "deleted");
+            assert_eq!(status_of(&bc, &c6), None, "with its descendant");
+            let pi = slot(&bc, &p4);
+            assert_eq!(status_of(&bc, &p4), Some(BlockStatus::Connected));
+            assert_eq!(
+                bc.chain_heads.branch_value_of(pi),
+                Some(brute_value(&bc, pi))
+            );
+            assert!(bc.is_ready());
+            assert!(bc.node_info == twin.node_info);
+            assert!(bc.vote_engine == twin.vote_engine);
+            assert_eq!(bc.active_branch_value, twin.active_branch_value);
+            for bit in 0..2 {
+                assert_eq!(
+                    bc.blocks.utxo_available(slot(&bc, &mint), bit),
+                    twin.blocks.utxo_available(slot(&twin, &mint), bit),
+                    "active available-UTXO bits untouched"
+                );
+            }
+        }
+
+        // A reference more than `W` back, on the W4 window.
+        let (mut bc, [_, b101, _, _]) = valued_w4();
+        let p102 = revalue(&salted_linked_block(102, b101.view().hash(), 6), 13);
+        let tx = utxo_tx(103, &[(97, 0, 50)], None, &[Ok(50)]);
+        let far = complex_tx_block(103, p102.view().hash(), 0, 0, &[&tx]);
+        for blk in [&far, &p102] {
+            assert_eq!(
+                bc.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(
+            bc.blocks.find(103, &far.view().hash()).is_none(),
+            "deleted by the driver"
+        );
+        let pi = slot(&bc, &p102);
+        assert_eq!(
+            bc.blocks.get(pi).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
+        assert_eq!(
+            bc.chain_heads.branch_value_of(pi),
+            Some(brute_value(&bc, pi))
+        );
+
+        // A valid orphan chain connects whole.
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let p4 = valued(4, mint.view().hash(), 4, 30);
+        let q5 = valued(5, p4.view().hash(), 5, 31);
+        let q6 = valued(6, q5.view().hash(), 6, 32);
+        for blk in [&q6, &q5, &p4] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        for blk in [&p4, &q5, &q6] {
+            assert_eq!(status_of(&bc, blk), Some(BlockStatus::Connected));
+        }
+        let qi = slot(&bc, &q6);
+        assert_eq!(
+            bc.chain_heads.branch_value_of(qi),
+            Some(brute_value(&bc, qi))
+        );
+    }
+
+    /// AC10.8 / D6 — a UTXO reference below `S_tail` but within `W` is trusted
+    /// pre-window history (DEC-129); more than `W` back it is evidence.
+    #[test]
+    fn side_reference_below_the_tail_within_w_is_trusted() {
+        let (mut bc, [_, b101, _, _]) = valued_w4();
+        let tx = utxo_tx(102, &[(99, 0, 50)], None, &[Ok(50)]);
+        let trusted = complex_tx_block(102, b101.view().hash(), 0, 0, &[&tx]);
+        assert_eq!(
+            bc.receive_block(trusted.view(), 0).0,
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let ti = slot(&bc, &trusted);
+        assert_eq!(
+            bc.blocks.get(ti).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
+
+        let tx = utxo_tx(102, &[(97, 0, 50)], None, &[Ok(50)]);
+        let too_far = complex_tx_block(102, b101.view().hash(), 0, 0, &[&tx]);
+        assert_eq!(
+            bc.receive_block(too_far.view(), 0).0,
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+    }
+
+    /// AC10.9 — a read failure during the side walk changes nothing; the next
+    /// admission connects the branch.
+    #[test]
+    fn side_walk_read_failure_is_retried() {
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let p4 = valued(4, mint.view().hash(), 4, 30);
+        let q5 = valued(5, p4.view().hash(), 5, 31);
+        assert_eq!(receive(&mut bc, &q5), ReceiveBlockOutcome::AcceptedSilently);
+        bc.storage.failing_read_slot = slot(&bc, &q5);
+        assert_eq!(receive(&mut bc, &p4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(status_of(&bc, &p4), Some(BlockStatus::Connected));
+        assert_eq!(
+            status_of(&bc, &q5),
+            Some(BlockStatus::Stored),
+            "left pending"
+        );
+
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = node_transfer_block(9, 3, 8, 7);
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let qi = slot(&bc, &q5);
+        assert_eq!(status_of(&bc, &q5), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(qi),
+            Some(brute_value(&bc, qi))
+        );
+    }
+
+    /// AC10.11 / AC9.3 — two admission orders of one block set hold the same
+    /// values and statuses; a restart rebuilds them.
+    #[test]
+    fn branch_values_are_order_independent_and_survive_a_restart() {
+        let build = |order: &[usize]| {
+            let (mut bc, _, b1) = ready_genesis(16);
+            let a2 = valued(2, b1.view().hash(), 2, 7);
+            let a3 = valued(3, a2.view().hash(), 3, 8);
+            let a4 = valued(4, a3.view().hash(), 4, 9);
+            let a5 = valued(5, a4.view().hash(), 5, 10);
+            let f3 = valued(3, a2.view().hash(), 9, 20);
+            let f4 = valued(4, f3.view().hash(), 6, 21);
+            let blocks = [a2, a3, a4, a5, f3, f4];
+            for &i in order {
+                assert_eq!(
+                    receive(&mut bc, &blocks[i]),
+                    ReceiveBlockOutcome::AcceptedSilently
+                );
+            }
+            (bc, blocks)
+        };
+        let (x, blocks) = build(&[0, 1, 2, 3, 4, 5]);
+        // The side branch before the active extensions, child first.
+        let (y, _) = build(&[0, 1, 5, 4, 2, 3]);
+        assert_eq!(x.active_branch_value, y.active_branch_value);
+        assert_eq!(
+            x.active_branch_value,
+            brute_value(&x, x.active_chain_head_idx)
+        );
+        for blk in &blocks {
+            assert_eq!(status_of(&x, blk), status_of(&y, blk));
+            let (xi, yi) = (slot(&x, blk), slot(&y, blk));
+            if x.blocks.get(xi).map(|e| e.status()) == Some(BlockStatus::Connected) {
+                assert_eq!(
+                    x.chain_heads.branch_value_of(xi),
+                    y.chain_heads.branch_value_of(yi)
+                );
+            }
+        }
+        let f4 = &blocks[5];
+        let fi = slot(&x, f4);
+        assert_eq!(x.chain_heads.branch_value_of(fi), Some(brute_value(&x, fi)));
+
+        let reference_active = x.active_branch_value;
+        let reference_side = x.chain_heads.branch_value_of(fi);
+        let mut restarted = restart(x);
+        let _ = restarted.initialize_from_storage(0);
+        assert!(restarted.is_ready());
+        assert_eq!(restarted.active_branch_value, reference_active);
+        let ri = slot(&restarted, f4);
+        assert_eq!(
+            restarted.blocks.get(ri).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
+        assert_eq!(restarted.chain_heads.branch_value_of(ri), reference_side);
     }
 }
