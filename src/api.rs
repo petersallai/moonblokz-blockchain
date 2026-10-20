@@ -13468,19 +13468,28 @@ mod tests {
     // ===================================================================
 
     /// `block` rebuilt with header `consumed_votes` — its FR21 value — and
-    /// re-signed by node #0. Transaction and chain-config payloads.
+    /// re-signed by node #0. Transaction and chain-config payloads. On the
+    /// active chain the value must be real (I-09, Story 6.2): use [`alt`] or
+    /// [`real_on`] there; `revalue` serves side blocks, which get no Tier 3.
     fn revalue(block: &Block, consumed_votes: u32) -> Block {
         let view = block.view();
-        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        resign(block, view.creator(), consumed_votes, 1)
+    }
+
+    /// `block`'s payload under a header by `creator` (signed with the key
+    /// `[key; 32]`) in the normal vote form, worth `consumed_votes`.
+    fn resign(block: &Block, creator: u32, consumed_votes: u32, key: u8) -> Block {
+        let view = block.view();
+        let signer = Crypto::new([key; PRIVATE_KEY_SIZE]).ok().expect("test key");
         let header = BlockHeader {
             version: view.version(),
             sequence: view.sequence(),
-            creator: view.creator(),
+            creator,
             mined_amount: view.mined_amount(),
             payload_type: view.payload_type(),
             consumed_votes,
-            first_voted_node: view.first_voted_node(),
-            consumed_votes_from_first_voted_node: view.consumed_votes_from_first_voted_node(),
+            first_voted_node: creator,
+            consumed_votes_from_first_voted_node: 0,
             previous_hash: view.previous_hash().try_into().expect("32 bytes"),
             signature: [0u8; 64],
         };
@@ -13501,9 +13510,106 @@ mod tests {
         builder.build_signed(&signer).ok().expect("build signed")
     }
 
-    /// A node #0 self-transfer of `amount` at `seq`, worth `value`.
+    /// A node #0 self-transfer of `amount` at `seq`, worth `value` — a free
+    /// header value, so for side blocks only (see [`revalue`]).
     fn valued(seq: u32, prev: [u8; 32], value: u32, amount: u64) -> Block {
         revalue(&transfer(seq, prev, 0, amount), value)
+    }
+
+    // ===================================================================
+    // Story 6.2 — real vote headers for active-chain fixtures (I-09)
+    // ===================================================================
+
+    /// Node #1's key byte wherever these fixtures register it.
+    const NODE_ONE_KEY: u8 = 0xB1;
+
+    /// `I(av)`: FR37 step 1 under the test configuration (`vote_scale` 1000,
+    /// `vote_interest` 5, so the bump is `min(⌊av / 200⌋, 1000)`) — the
+    /// post-interest, pre-credit snapshot a block's `consumed_votes` carries
+    /// (DEC-156).
+    fn vote_snapshot(av: u32) -> u32 {
+        av + (av / 200).min(1000)
+    }
+
+    /// The FR21 value of `block`: its header `consumed_votes`.
+    fn v(block: &Block) -> u64 {
+        u64::from(block.view().consumed_votes())
+    }
+
+    /// `n` node-#0 self-transfers at `seq` whose `vote` names `target`, their
+    /// amounts from `salt` (distinct transactions).
+    fn votes_for(seq: u32, target: u32, n: u32, salt: u64) -> impl FnOnce(&mut BlockBuilder) {
+        move |b| {
+            let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+            for i in 0..n {
+                let nt = NodeTransfer::new_signed(
+                    target,
+                    seq - 1,
+                    0,
+                    0,
+                    salt + u64::from(i),
+                    1,
+                    0,
+                    &signer,
+                );
+                b.add_node_transfer(&nt).ok().expect("add vote");
+            }
+        }
+    }
+
+    /// An active-chain block by node `creator` (#0 or #1) carrying its real
+    /// FR21 value on a chain whose creators alternate between #0 and #1, each
+    /// block crediting only the next creator. `received` is the number of
+    /// credits the previous block gave `creator` — its whole accumulated vote,
+    /// since its own last block reset it — so `consumed_votes =
+    /// I(1000 · received)` (= `1005 · received`). The block casts `out` credits
+    /// for the other node (or, with `out == 0`, one for its own creator, which
+    /// the reset wipes). `register` puts node #1's registration first.
+    fn alt(
+        seq: u32,
+        prev: [u8; 32],
+        creator: u32,
+        received: u32,
+        out: u32,
+        salt: u64,
+        register: bool,
+    ) -> Block {
+        let other = 1 - creator;
+        let template = tx_block(seq, prev, 0, |b| {
+            if register {
+                b.add_registration(&registration_tx(0, 1, NODE_ONE_KEY))
+                    .ok()
+                    .expect("add registration");
+            }
+            if out == 0 {
+                votes_for(seq, creator, 1, salt)(b);
+            } else {
+                votes_for(seq, other, out, salt)(b);
+            }
+        });
+        let key = if creator == 0 { 1 } else { NODE_ONE_KEY };
+        resign(&template, creator, vote_snapshot(1000 * received), key)
+    }
+
+    /// `block` as `creator`'s (signed with `key`), worth its real FR21 value on
+    /// `state` — the chain whose active head is the block's parent (I-09).
+    fn real_on<
+        C: CryptoTrait,
+        S: StorageTrait,
+        G: ChainConfigTrait,
+        const N: usize,
+        const L: u32,
+        const B: usize,
+        const H: usize,
+        const U: usize,
+    >(
+        state: &Blockchain<C, S, G, N, L, B, H, U>,
+        block: &Block,
+        creator: u32,
+        key: u8,
+    ) -> Block {
+        let av = state.vote_engine.accumulated_vote_of(creator);
+        resign(block, creator, vote_snapshot(av), key)
     }
 
     /// FR21 by brute force: the values of `head`'s ancestry above `S_tail`,
@@ -13600,17 +13706,27 @@ mod tests {
             genesis.active_branch_value,
             brute_value(&genesis, genesis.active_chain_head_idx)
         );
+        // A genesis-anchored mesh join over #0..#3, orphans first: #1 and #2
+        // are node #0's (worth 0), #3 node #1's after 3 credits (real values,
+        // I-09).
+        let (_, b0, b1) = ready_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 3, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 3, 0, 8, false);
         let mut mesh = new_unconfigured_test_chain();
-        let b0 = node_transfer_block(0, 0, 0, 0);
-        let b1 = revalue(&chain_config_anchor_block(1, b0.view().hash()), 5);
-        for blk in [&b1, &b0] {
+        for blk in [&a3, &a2, &b1, &b0] {
             assert_eq!(
                 receive(&mut mesh, blk),
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
         assert!(mesh.is_ready());
-        assert_eq!(mesh.active_branch_value, 5, "#1 counts, #0 is S_tail");
+        assert_eq!(head_of(&mesh), (3, a3.view().hash()));
+        assert_eq!(v(&a3), 3015);
+        assert_eq!(
+            mesh.active_branch_value,
+            v(&b1) + v(&a2) + v(&a3),
+            "#1..#3 count, #0 is S_tail"
+        );
         assert_eq!(
             mesh.active_branch_value,
             brute_value(&mesh, mesh.active_chain_head_idx)
@@ -13645,12 +13761,12 @@ mod tests {
         assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
 
         // Dropping the chain-config anchor needs a chain-config extension.
-        let b104 = revalue(&w4_config_anchor_block(104, b103.view().hash()), 11);
+        let b104 = real_on(&a, &w4_config_anchor_block(104, b103.view().hash()), 0, 1);
         extend_active_head(&mut a, &b104, 0);
         assert_eq!(a.active_snake_chain_window(), Ok((101, 104)));
         assert_eq!(
             a.active_branch_value,
-            5 + 7 + 11,
+            5 + 7 + v(&b104),
             "#101 left the sum, #100 never was in it"
         );
         assert_eq!(
@@ -13707,8 +13823,8 @@ mod tests {
     #[test]
     fn failed_new_tail_read_is_a_local_failure() {
         let (mut bc, b1) = faulty_genesis(4);
-        let b2 = valued(2, b1.view().hash(), 2, 7);
-        let b3 = valued(3, b2.view().hash(), 3, 8);
+        let b2 = alt(2, b1.view().hash(), 0, 0, 2, 7, true);
+        let b3 = alt(3, b2.view().hash(), 1, 2, 0, 8, false);
         for blk in [&b2, &b3] {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
         }
@@ -13736,7 +13852,8 @@ mod tests {
             "the retry extended"
         );
         assert_eq!(bc.active_snake_chain_window(), Ok((1, 4)));
-        assert_eq!(bc.active_branch_value, 2 + 3);
+        assert_eq!(v(&b3), 2010);
+        assert_eq!(bc.active_branch_value, v(&b2) + v(&b3) + v(&snapshot));
         assert_eq!(
             bc.active_branch_value,
             brute_value(&bc, bc.active_chain_head_idx)
@@ -13748,27 +13865,30 @@ mod tests {
     #[test]
     fn branch_value_follows_direct_and_continuation_extensions() {
         let (mut bc, _, b1) = ready_genesis(16);
-        let b2 = valued(2, b1.view().hash(), 5, 7);
+        let b2 = alt(2, b1.view().hash(), 0, 0, 5, 7, true);
         assert_eq!(receive(&mut bc, &b2), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(bc.active_branch_value, 5);
-        let b3 = valued(3, b2.view().hash(), 3, 8);
-        let b4 = valued(4, b3.view().hash(), 7, 9);
+        assert_eq!(bc.active_branch_value, v(&b2));
+        let b3 = alt(3, b2.view().hash(), 1, 5, 3, 8, false);
+        let b4 = alt(4, b3.view().hash(), 0, 3, 7, 9, false);
         assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(receive(&mut bc, &b3), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(head_of(&bc), (4, b4.view().hash()));
-        assert_eq!(bc.active_branch_value, 5 + 3 + 7);
+        assert_eq!((v(&b3), v(&b4)), (5025, 3015), "distinct real values");
+        assert_eq!(bc.active_branch_value, v(&b2) + v(&b3) + v(&b4));
         assert_eq!(
             bc.active_branch_value,
             brute_value(&bc, bc.active_chain_head_idx)
         );
     }
 
-    /// Two siblings of `parent` at `seq` worth `high` and `low`, where the
-    /// higher-valued one has the higher hash — so the hash alone would pick
-    /// the other. Returns `(high, low)`.
-    fn ranked_pair(seq: u32, parent: [u8; 32], high: u32, low: u32) -> (Block, Block) {
+    /// Two siblings of `parent` (node #0's, which gave node #1 `credits`) at
+    /// `seq`: node #1's, worth its real `I(1000 · credits)`, and node #0's side
+    /// block with the free value `low`, where the higher-valued one has the
+    /// higher hash — so the hash alone would pick the other. Returns
+    /// `(high, low)`.
+    fn ranked_pair(seq: u32, parent: [u8; 32], credits: u32, low: u32) -> (Block, Block) {
         for amount in 10..200 {
-            let h = valued(seq, parent, high, amount);
+            let h = alt(seq, parent, 1, credits, 0, amount, false);
             let l = valued(seq, parent, low, amount + 1000);
             if h.view().hash() > l.view().hash() {
                 return (h, l);
@@ -13783,7 +13903,7 @@ mod tests {
     #[test]
     fn sibling_choice_follows_the_fr21_rank() {
         let (mut bc, _, b1) = ready_genesis(16);
-        let parent = valued(2, b1.view().hash(), 1, 7);
+        let parent = alt(2, b1.view().hash(), 0, 0, 9, 7, true);
         let (high, low) = ranked_pair(3, parent.view().hash(), 9, 4);
         for blk in [&low, &high, &parent] {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
@@ -13791,30 +13911,29 @@ mod tests {
         assert_eq!(head_of(&bc), (3, high.view().hash()), "value before hash");
         let li = slot(&bc, &low);
         assert_eq!(status_of(&bc, &low), Some(BlockStatus::Connected));
-        assert_eq!(bc.chain_heads.branch_value_of(li), Some(1 + 4));
+        assert_eq!(bc.chain_heads.branch_value_of(li), Some(v(&parent) + 4));
         assert_eq!(
             bc.chain_heads.branch_value_of(li),
             Some(brute_value(&bc, li))
         );
 
         // Equal value: the larger block wins, even with the higher hash.
+        // `large` is node #1's real block (two transactions); `small` a side
+        // block with the same free value.
         let (mut bc, _, b1) = ready_genesis(16);
-        let parent = valued(2, b1.view().hash(), 1, 7);
+        let parent = alt(2, b1.view().hash(), 0, 0, 6, 7, true);
         let prev = parent.view().hash();
         let (large, small) = (0..200)
             .find_map(|amount| {
-                let large = revalue(
+                let large = resign(
                     &tx_block(3, prev, 0, |b| {
-                        b.add_node_transfer(&transfer_tx(3, 0, amount))
-                            .ok()
-                            .expect("one");
-                        b.add_node_transfer(&transfer_tx(3, 0, 1))
-                            .ok()
-                            .expect("two");
+                        votes_for(3, 1, 2, amount)(b);
                     }),
-                    6,
+                    1,
+                    vote_snapshot(6000),
+                    NODE_ONE_KEY,
                 );
-                let small = valued(3, prev, 6, amount + 1000);
+                let small = valued(3, prev, vote_snapshot(6000), amount + 1000);
                 (large.view().hash() > small.view().hash()).then_some((large, small))
             })
             .expect("a pair");
@@ -13830,7 +13949,7 @@ mod tests {
     #[test]
     fn unreadable_sibling_stops_the_continuation() {
         let (mut bc, b1) = faulty_genesis(16);
-        let parent = valued(2, b1.view().hash(), 1, 7);
+        let parent = alt(2, b1.view().hash(), 0, 0, 9, 7, true);
         let (high, low) = ranked_pair(3, parent.view().hash(), 9, 4);
         for blk in [&low, &high] {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
@@ -13879,18 +13998,19 @@ mod tests {
     #[test]
     fn side_blocks_are_judged_before_their_write_and_valued() {
         let (mut bc, b1) = faulty_genesis(16);
-        let a2 = valued(2, b1.view().hash(), 2, 7);
-        let a3 = valued(3, a2.view().hash(), 3, 8);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 2, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 2, 0, 8, false);
         for blk in [&a2, &a3] {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
         }
         let active = bc.active_branch_value;
+        assert_eq!(active, v(&a2) + v(&a3));
 
         let f3 = valued(3, a2.view().hash(), 9, 20);
         assert_eq!(receive(&mut bc, &f3), ReceiveBlockOutcome::AcceptedSilently);
         let fi = slot(&bc, &f3);
         assert_eq!(status_of(&bc, &f3), Some(BlockStatus::Connected));
-        assert_eq!(bc.chain_heads.branch_value_of(fi), Some(2 + 9));
+        assert_eq!(bc.chain_heads.branch_value_of(fi), Some(v(&a2) + 9));
         assert_eq!(
             bc.chain_heads.branch_value_of(fi),
             Some(brute_value(&bc, fi))
@@ -13903,7 +14023,7 @@ mod tests {
         bc.storage.failing_read_slot = NONE_REF;
         let f4i = slot(&bc, &f4);
         assert_eq!(status_of(&bc, &f4), Some(BlockStatus::Connected));
-        assert_eq!(bc.chain_heads.branch_value_of(f4i), Some(2 + 9 + 4));
+        assert_eq!(bc.chain_heads.branch_value_of(f4i), Some(v(&a2) + 9 + 4));
         assert_eq!(
             bc.chain_heads.branch_value_of(f4i),
             Some(brute_value(&bc, f4i))
@@ -13914,7 +14034,7 @@ mod tests {
         assert_eq!(receive(&mut bc, &g4), ReceiveBlockOutcome::AcceptedSilently);
         let gi = slot(&bc, &g4);
         assert_eq!(status_of(&bc, &g4), Some(BlockStatus::Connected));
-        assert_eq!(bc.chain_heads.branch_value_of(gi), Some(2 + 9 + 6));
+        assert_eq!(bc.chain_heads.branch_value_of(gi), Some(v(&a2) + 9 + 6));
         assert_eq!(
             bc.chain_heads.branch_value_of(gi),
             Some(brute_value(&bc, gi))
@@ -13931,7 +14051,9 @@ mod tests {
     /// the mint and #4.
     fn utxo_side_fixture() -> (Chain16<FaultyStorage>, Block, Block) {
         let (mut bc, mint) = faulty_utxo_genesis();
-        let b4 = valued(4, mint.view().hash(), 4, 7);
+        // Node #0 created #2 and #3, so its own block holds no vote: worth 0
+        // (I-09); the side blocks of these tests carry the free values.
+        let b4 = valued(4, mint.view().hash(), 0, 7);
         assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
         (bc, mint, b4)
     }
@@ -14165,10 +14287,10 @@ mod tests {
     fn branch_values_are_order_independent_and_survive_a_restart() {
         let build = |order: &[usize]| {
             let (mut bc, _, b1) = ready_genesis(16);
-            let a2 = valued(2, b1.view().hash(), 2, 7);
-            let a3 = valued(3, a2.view().hash(), 3, 8);
-            let a4 = valued(4, a3.view().hash(), 4, 9);
-            let a5 = valued(5, a4.view().hash(), 5, 10);
+            let a2 = alt(2, b1.view().hash(), 0, 0, 2, 7, true);
+            let a3 = alt(3, a2.view().hash(), 1, 2, 3, 8, false);
+            let a4 = alt(4, a3.view().hash(), 0, 3, 4, 9, false);
+            let a5 = alt(5, a4.view().hash(), 1, 4, 0, 10, false);
             let f3 = valued(3, a2.view().hash(), 9, 20);
             let f4 = valued(4, f3.view().hash(), 6, 21);
             let blocks = [a2, a3, a4, a5, f3, f4];
