@@ -799,8 +799,9 @@ pub struct Blockchain<
     // entry, because the active head is not always a tip: a Stored child
     // makes it interior and FR19 event (i) moves its entry to the child. Side
     // heads keep theirs in their entries. Seeded at Ready entry by the FR3
-    // forward walk (D5), grown on every head extension, reduced by the new
-    // `S_tail` block's value on every tail advance (D1), 0 without a window.
+    // forward walk (D5) — 0 on the genesis node, whose block #1 carries no
+    // value — grown on every head extension, reduced by the new `S_tail`
+    // block's value on every tail advance (D1), 0 without a window.
     active_branch_value: u64,
     //
     // Deliberately no standalone placeholder for:
@@ -1329,12 +1330,10 @@ impl<
             active_head,
         );
         self.establish_snake_chain_window();
-        // The window value over `(S_tail, #1]` (Story 6.1 D5): block #1's, or
-        // nothing when `W = 1` released #0 and #1 is the tail. The tree holds
-        // nothing else, so there is no side branch for the driver to connect.
-        if self.window_tail_sequence(0, 1) < 1 {
-            self.active_branch_value = block_value(&block_1.view());
-        }
+        // The window value stays 0 (Story 6.1 D5): block #1, the only block
+        // the window `(#0, #1]` can hold, is built above with
+        // `consumed_votes = 0`. The tree holds nothing else, so there is no
+        // side branch for the driver to connect.
 
         // Node #0 authored a complete, valid chain, so it is immediately Ready:
         // there is no FR2 dominant-chain acquisition or FR3 reconstruction to do
@@ -1686,6 +1685,11 @@ impl<
         if self.chain_config.is_durable_locked() {
             self.delete_mismatching_chain_config_blocks();
             self.reevaluate_retained_blocks_against_lock();
+        }
+        // Story 6.1 AC3: side branches get their Tier 2 and their values after
+        // the cleanups, so no retarget lands on a value computed before them.
+        if self.is_ready() {
+            self.connect_side_branches();
         }
 
         let outcome = if self.is_ready() {
@@ -2280,8 +2284,8 @@ impl<
         if let Some(advance) = promote {
             self.promote_head_extension(idx, block_value(block), advance);
         }
-        if side_judged {
-            self.connect_judged_side_block(idx, block_value(block), parent_value);
+        if side_judged && let Some(p) = parent {
+            self.connect_judged_side_block(idx, p, block_value(block), parent_value);
         }
         Ok(idx)
     }
@@ -2366,8 +2370,12 @@ impl<
         }
         if outcome == ReceiveBlockOutcome::AcceptedSilently && was_ready {
             self.drive_forward_extension();
-            // After the continuation: its promotion turns a sibling into a
-            // side block (Story 6.1 AC6).
+        }
+        // Story 6.1 AC6: after the continuation, whose promotion turns a
+        // sibling into a side block, and at the end of a Ready entry, after
+        // the FR8 lock-time cleanups (a cleanup retarget onto a Connected block
+        // must not keep a value the driver computed before it).
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
             self.connect_side_branches();
         }
         (outcome, self.next_parent_recovery_call())
@@ -2519,9 +2527,8 @@ impl<
                     // becomes live (its query bodies remain Epic 7/10
                     // `todo!()` — reachable, but this story wires no caller).
                     self.set_lifecycle_phase(LifecyclePhase::Ready);
-                    // Story 6.1 AC3: side branches retained while Collecting
-                    // get their Tier 2 and their values once the window exists.
-                    self.connect_side_branches();
+                    // Side branches retained while Collecting are connected by
+                    // the caller, after every cleanup (Story 6.1 AC3).
                     break;
                 }
                 Err(err) => {
@@ -4141,7 +4148,7 @@ impl<
                 // FR21 (iii): the block that becomes `S_tail` leaves every
                 // sum; its value is read now, before anything is mutated, so
                 // a failed read is a local failure (Story 6.1 D1).
-                let Some(tail_value) = self.new_tail_value(view) else {
+                let Some(tail_value) = self.new_tail_value() else {
                     return Extension::Local;
                 };
                 advance = Some(tail_value);
@@ -4159,14 +4166,11 @@ impl<
     }
 
     /// The FR21 value of the block that becomes `S_tail` when the window
-    /// advances over the extension `view`: the current tail's active-chain
-    /// child, or the extension itself when the tail is the head. `None` on a
-    /// failed read — a local failure.
-    fn new_tail_value(&self, view: &BlockView<'_>) -> Option<u64> {
+    /// advances: the current tail's active-chain child. `None` on a failed
+    /// read — a local failure. The tail is never the head here: that needs
+    /// `W = 1`, where FR60 refuses every extension (`s_new ≥ s_head + W`).
+    fn new_tail_value(&self) -> Option<u64> {
         let tail = self.snake_chain_tail_idx;
-        if tail == self.active_chain_head_idx {
-            return Some(block_value(view));
-        }
         let child = (0..MAX_BLOCKS as u32).find(|idx| {
             self.blocks
                 .get(*idx)
@@ -4213,11 +4217,12 @@ impl<
     /// Runs after every Ready admission and after every direct extension.
     ///
     /// Each pass picks one Stored child of the head by the FR21 rank (Story
-    /// 6.1 D9, [`Self::best_stored_child`]), judges it,
-    /// and either promotes it, deletes it with its descendants (its verdict is
-    /// final, D2), or stops on a local failure, leaving it Stored. At most
-    /// `MAX_BLOCKS` passes; each costs an O(`MAX_BLOCKS`) child scan (there is
-    /// no child index) and one storage read.
+    /// 6.1 D9, [`Self::best_stored_child`]), judges it, and either promotes it,
+    /// deletes it with its descendants (its verdict is final, D2), or stops on
+    /// a local failure, leaving it Stored. At most `MAX_BLOCKS` passes. Each
+    /// costs O(`MAX_BLOCKS`) child scans (there is no child index), one read of
+    /// the chosen child, one read per sibling when there are several (their
+    /// rank), and one read of the new tail when the window advances.
     fn drive_forward_extension(&mut self) {
         for _ in 0..MAX_BLOCKS {
             let Some(child) = self.best_stored_child() else {
@@ -4277,7 +4282,7 @@ impl<
                 if !self.is_pending_side_head(head) {
                     continue;
                 }
-                let Ok(walk) = self.walk_side_branch(head, NONE_REF) else {
+                let Ok(walk) = self.walk_side_branch(head) else {
                     continue;
                 };
                 progressed = true;
@@ -4339,12 +4344,11 @@ impl<
     /// Walks the side branch of `head` down to its connection point (the first
     /// block on the active chain), reading each block once, then the active
     /// chain from the head down to the same point: the FR21 sums of FR21 (ii).
-    /// Every Stored block except `judged` (one already judged before its write,
-    /// D4) runs the Tier 2 check; the lowest failing one is reported. `Err` on a
-    /// local failure — nothing is changed. The read copy lives only in this
+    /// Every Stored block runs the Tier 2 check; the lowest failing one is
+    /// reported. `Err` on a local failure — nothing is changed. The read copy lives only in this
     /// frame (DEC-136), gone before the caller deletes anything.
     #[inline(never)]
-    fn walk_side_branch(&self, head: u32, judged: u32) -> Result<SideWalk, ()> {
+    fn walk_side_branch(&self, head: u32) -> Result<SideWalk, ()> {
         // Every FR21 sum adds at most `MAX_BLOCKS` `u32` values (a branch, or
         // the active window), so plain `u64` additions cannot overflow.
         const { assert!((MAX_BLOCKS as u128) * (u32::MAX as u128) <= u64::MAX as u128) };
@@ -4362,7 +4366,7 @@ impl<
             let (stored, parent) = (entry.status() == BlockStatus::Stored, entry.parent_ref());
             let view = self.view_retained(cur, &mut buf).ok_or(())?;
             branch += block_value(&view);
-            if stored && cur != judged {
+            if stored {
                 match self.tier2_check(&view, cur, parent) {
                     Ok(()) => {}
                     // Walking down, a later failure is a lower one.
@@ -4418,17 +4422,25 @@ impl<
     /// once `chain_heads` has seen it: interior after a merge (the surviving
     /// orphan head is the driver's); the extension of a Connected side head,
     /// valued incrementally from the parent's value read before the admission
-    /// (FR21 (i)); otherwise a fork, valued by the walk. A local failure there
-    /// leaves it Stored, and the driver judges it again.
-    fn connect_judged_side_block(&mut self, idx: u32, value: u64, parent_value: Option<u64>) {
+    /// (FR21 (i)); otherwise a fork, valued by the walk from its Connected or
+    /// Active `parent` plus its own `value` in hand — the block itself is never
+    /// read back. A local failure there leaves it Stored, and the driver judges
+    /// it again.
+    fn connect_judged_side_block(
+        &mut self,
+        idx: u32,
+        parent: u32,
+        value: u64,
+        parent_value: Option<u64>,
+    ) {
         if self.chain_heads.branch_value_of(idx).is_none() {
             self.blocks.set_status(idx, BlockStatus::Connected);
             return;
         }
         let value = match parent_value {
             Some(parent_value) => parent_value + value,
-            None => match self.walk_side_branch(idx, idx) {
-                Ok(walk) => self.side_value(walk.active, walk.branch),
+            None => match self.walk_side_branch(parent) {
+                Ok(walk) => self.side_value(walk.active, walk.branch + value),
                 Err(()) => return,
             },
         };
@@ -4439,8 +4451,9 @@ impl<
     /// The Stored child of the active head the continuation takes next: the
     /// only one without a read, else the FR21 rank winner at the child level
     /// (Story 6.1 D9). All siblings share the active value, so each one's own
-    /// value decides; a sibling whose read fails is skipped. `None` when there
-    /// is no child, or no candidate could be read — a local failure. Greedy per
+    /// value decides. `None` when there is no child, or when any candidate
+    /// cannot be read — a local failure, never a choice: the continuation stops
+    /// and retries at a later admission (code review 2026-10-20). Greedy per
     /// level: a heavier deeper subtree is reached by the FR22 trigger (6.2).
     fn best_stored_child(&self) -> Option<u32> {
         let head = self.active_chain_head_idx;
@@ -4456,9 +4469,7 @@ impl<
         }
         let mut best: Option<(u32, Rank)> = None;
         for idx in (0..MAX_BLOCKS as u32).filter(|idx| is_candidate(*idx)) {
-            let Some(rank) = self.child_rank(idx) else {
-                continue;
-            };
+            let rank = self.child_rank(idx)?;
             if best.as_ref().is_none_or(|(_, top)| rank.outranks(top)) {
                 best = Some((idx, rank));
             }
@@ -13577,18 +13588,29 @@ mod tests {
         (bc, [anchor, b101, b102, b103])
     }
 
-    /// AC10.1 / AC3 — seeding at every Ready entry: the genesis node over
-    /// `(#0, #1]` (nothing when `W = 1` makes #1 the tail), a mesh-joined node
-    /// and a window-anchored FR3 join, each equal to the brute force.
+    /// AC10.1 / AC3 — seeding at every Ready entry: the genesis node holds 0
+    /// (its block #1 carries no value), a genesis-anchored mesh join sums
+    /// `(#0, #1]`, a window-anchored FR3 join sums its window — each equal to
+    /// the brute force.
     #[test]
     fn branch_value_is_seeded_at_every_ready_entry() {
         let (genesis, _, _) = ready_genesis(16);
+        assert_eq!(genesis.active_branch_value, 0);
         assert_eq!(
             genesis.active_branch_value,
             brute_value(&genesis, genesis.active_chain_head_idx)
         );
-        assert_eq!(genesis_node_with_window(1).active_branch_value, 0);
-        let (mesh, _, _) = node_ready_from_the_mesh();
+        let mut mesh = new_unconfigured_test_chain();
+        let b0 = node_transfer_block(0, 0, 0, 0);
+        let b1 = revalue(&chain_config_anchor_block(1, b0.view().hash()), 5);
+        for blk in [&b1, &b0] {
+            assert_eq!(
+                receive(&mut mesh, blk),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(mesh.is_ready());
+        assert_eq!(mesh.active_branch_value, 5, "#1 counts, #0 is S_tail");
         assert_eq!(
             mesh.active_branch_value,
             brute_value(&mesh, mesh.active_chain_head_idx)
@@ -13802,10 +13824,11 @@ mod tests {
         assert_eq!(head_of(&bc), (3, large.view().hash()), "size before hash");
     }
 
-    /// AC8 — a sibling whose read fails is skipped; it is connected once the
-    /// fault clears.
+    /// AC8 (code review 2026-10-20) — an unreadable sibling is a local
+    /// failure, never a choice: the continuation stops with both siblings
+    /// Stored, and ranks them once the fault clears.
     #[test]
-    fn unreadable_sibling_is_skipped() {
+    fn unreadable_sibling_stops_the_continuation() {
         let (mut bc, b1) = faulty_genesis(16);
         let parent = valued(2, b1.view().hash(), 1, 7);
         let (high, low) = ranked_pair(3, parent.view().hash(), 9, 4);
@@ -13819,13 +13842,14 @@ mod tests {
         );
         assert_eq!(
             head_of(&bc),
-            (3, low.view().hash()),
-            "the unreadable one is skipped"
+            (2, parent.view().hash()),
+            "the continuation stopped"
         );
+        assert_eq!(status_of(&bc, &high), Some(BlockStatus::Stored));
         assert_eq!(
-            status_of(&bc, &high),
+            status_of(&bc, &low),
             Some(BlockStatus::Stored),
-            "a local failure"
+            "not taken instead"
         );
 
         bc.storage.failing_read_slot = NONE_REF;
@@ -13834,11 +13858,16 @@ mod tests {
             receive(&mut bc, &unrelated),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        let hi = slot(&bc, &high);
-        assert_eq!(status_of(&bc, &high), Some(BlockStatus::Connected));
         assert_eq!(
-            bc.chain_heads.branch_value_of(hi),
-            Some(brute_value(&bc, hi))
+            head_of(&bc),
+            (3, high.view().hash()),
+            "ranked after the fault"
+        );
+        let li = slot(&bc, &low);
+        assert_eq!(status_of(&bc, &low), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(li),
+            Some(brute_value(&bc, li))
         );
     }
 
@@ -13915,8 +13944,9 @@ mod tests {
     }
 
     /// AC10.7 / AC10.12 — a side block failing Tier 2 at intake is refused and
-    /// nothing is stored: a declared amount other than the output's, and an
-    /// output index beyond the referenced block's outputs.
+    /// nothing is stored: a declared amount other than the output's, an output
+    /// index beyond the referenced block's outputs, and a fork from an interior
+    /// Connected block.
     #[test]
     fn side_block_failing_tier2_at_intake_is_not_stored() {
         for (index, amount) in [(0, 61), (5, 60)] {
@@ -13932,6 +13962,22 @@ mod tests {
             assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
             assert!(same_slot(&bc, &twin, free), "storage unchanged");
         }
+
+        // A fork from an interior Connected block is refused the same way.
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let p4 = valued(4, mint.view().hash(), 4, 30);
+        let p5 = valued(5, p4.view().hash(), 5, 31);
+        for blk in [&p4, &p5] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let free = bc.blocks.next_free_index().expect("a free slot");
+        let bad = side_spend(5, p4.view().hash(), 0, 61);
+        assert_eq!(
+            receive(&mut bc, &bad),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
+
         // The matching amount passes: Connected, no bit touched.
         let (mut bc, mint, _) = utxo_side_fixture();
         let good = side_spend(4, mint.view().hash(), 0, 60);
@@ -13943,33 +13989,101 @@ mod tests {
         assert_eq!(bc.blocks.utxo_available(slot(&bc, &mint), 0), Some(true));
     }
 
+    /// AC6 / D4 — a local failure inside the pre-store Tier 2 is no evidence:
+    /// the block is stored Stored, and the driver connects it once the fault
+    /// clears.
+    #[test]
+    fn tier2_read_failure_at_intake_is_retried_by_the_driver() {
+        let (mut bc, mint, _) = utxo_side_fixture();
+        let good = side_spend(4, mint.view().hash(), 0, 60);
+        bc.storage.failing_read_slot = slot(&bc, &mint);
+        assert_eq!(
+            receive(&mut bc, &good),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            status_of(&bc, &good),
+            Some(BlockStatus::Stored),
+            "not blamed"
+        );
+
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = node_transfer_block(9, 3, 8, 7);
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let gi = slot(&bc, &good);
+        assert_eq!(status_of(&bc, &good), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(gi),
+            Some(brute_value(&bc, gi))
+        );
+    }
+
     /// AC10.5 / AC10.7 / D8 — an orphan side chain stored before its Tier 2
     /// could run: its parent's arrival connects it, the driver finds the
     /// failing block, deletes it with its descendants, and values the entry
     /// retargeted onto the surviving Connected parent. The active state is
-    /// untouched and the node stays Ready.
+    /// untouched and the node stays Ready. Each failure kind: a declared amount
+    /// other than the output's, an output index beyond it, a reference more
+    /// than `W` back.
     #[test]
     fn driver_deletes_a_failing_side_block_and_values_the_retarget() {
-        let (mut bc, mint, _) = utxo_side_fixture();
-        let (twin, _, _) = utxo_side_fixture();
-        let p4 = valued(4, mint.view().hash(), 4, 30);
-        let bad5 = revalue(&side_spend(5, p4.view().hash(), 0, 61), 5);
-        let c6 = valued(6, bad5.view().hash(), 6, 31);
-        for blk in [&c6, &bad5, &p4] {
-            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        for (index, amount) in [(0, 61), (5, 60)] {
+            let (mut bc, mint, _) = utxo_side_fixture();
+            let (twin, _, _) = utxo_side_fixture();
+            let p4 = valued(4, mint.view().hash(), 4, 30);
+            let bad5 = revalue(&side_spend(5, p4.view().hash(), index, amount), 5);
+            let c6 = valued(6, bad5.view().hash(), 6, 31);
+            for blk in [&c6, &bad5, &p4] {
+                assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+            }
+            assert_eq!(status_of(&bc, &bad5), None, "deleted");
+            assert_eq!(status_of(&bc, &c6), None, "with its descendant");
+            let pi = slot(&bc, &p4);
+            assert_eq!(status_of(&bc, &p4), Some(BlockStatus::Connected));
+            assert_eq!(
+                bc.chain_heads.branch_value_of(pi),
+                Some(brute_value(&bc, pi))
+            );
+            assert!(bc.is_ready());
+            assert!(bc.node_info == twin.node_info);
+            assert!(bc.vote_engine == twin.vote_engine);
+            assert_eq!(bc.active_branch_value, twin.active_branch_value);
+            for bit in 0..2 {
+                assert_eq!(
+                    bc.blocks.utxo_available(slot(&bc, &mint), bit),
+                    twin.blocks.utxo_available(slot(&twin, &mint), bit),
+                    "active available-UTXO bits untouched"
+                );
+            }
         }
-        assert_eq!(status_of(&bc, &bad5), None, "deleted");
-        assert_eq!(status_of(&bc, &c6), None, "with its descendant");
-        let pi = slot(&bc, &p4);
-        assert_eq!(status_of(&bc, &p4), Some(BlockStatus::Connected));
+
+        // A reference more than `W` back, on the W4 window.
+        let (mut bc, [_, b101, _, _]) = valued_w4();
+        let p102 = revalue(&salted_linked_block(102, b101.view().hash(), 6), 13);
+        let tx = utxo_tx(103, &[(97, 0, 50)], None, &[Ok(50)]);
+        let far = complex_tx_block(103, p102.view().hash(), 0, 0, &[&tx]);
+        for blk in [&far, &p102] {
+            assert_eq!(
+                bc.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(
+            bc.blocks.find(103, &far.view().hash()).is_none(),
+            "deleted by the driver"
+        );
+        let pi = slot(&bc, &p102);
+        assert_eq!(
+            bc.blocks.get(pi).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
         assert_eq!(
             bc.chain_heads.branch_value_of(pi),
             Some(brute_value(&bc, pi))
         );
-        assert!(bc.is_ready());
-        assert!(bc.node_info == twin.node_info);
-        assert!(bc.vote_engine == twin.vote_engine);
-        assert_eq!(bc.active_branch_value, twin.active_branch_value);
 
         // A valid orphan chain connects whole.
         let (mut bc, mint, _) = utxo_side_fixture();
@@ -14067,7 +14181,8 @@ mod tests {
             (bc, blocks)
         };
         let (x, blocks) = build(&[0, 1, 2, 3, 4, 5]);
-        let (y, _) = build(&[0, 1, 5, 2, 3, 4]);
+        // The side branch before the active extensions, child first.
+        let (y, _) = build(&[0, 1, 5, 4, 2, 3]);
         assert_eq!(x.active_branch_value, y.active_branch_value);
         assert_eq!(
             x.active_branch_value,
