@@ -807,6 +807,11 @@ pub struct Blockchain<
     // value — grown on every head extension, reduced by the new `S_tail`
     // block's value on every tail advance (D1), 0 without a window.
     active_branch_value: u64,
+    // Test-only observation of the FR22 decision (Story 6.2 D2, DEC-153): the
+    // last head `switch_toward` was called with. Story 6.3 removes it once the
+    // switch is observable through the active head.
+    #[cfg(test)]
+    last_switch_target: Option<u32>,
     //
     // Deliberately no standalone placeholder for:
     // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.available_utxo`
@@ -991,6 +996,8 @@ impl<
             (&raw mut (*p).tentative_config_block_idx).write(NONE_REF);
             (&raw mut (*p).snake_chain_tail_idx).write(NONE_REF);
             (&raw mut (*p).active_branch_value).write(0);
+            #[cfg(test)]
+            (&raw mut (*p).last_switch_target).write(None);
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -1032,6 +1039,8 @@ impl<
             tentative_config_block_idx: NONE_REF,
             snake_chain_tail_idx: NONE_REF,
             active_branch_value: 0,
+            #[cfg(test)]
+            last_switch_target: None,
         }
     }
 
@@ -1692,8 +1701,13 @@ impl<
         }
         // Story 6.1 AC3: side branches get their Tier 2 and their values after
         // the cleanups, so no retarget lands on a value computed before them.
+        // Every head valued here went Stored → Connected, an FR22 trigger
+        // (Story 6.2 D1): one comparison follows.
         if self.is_ready() {
-            self.connect_side_branches();
+            let driver_best = self.connect_side_branches();
+            if let Some(head) = self.switch_target([None, driver_best]) {
+                self.switch_toward(head);
+            }
         }
 
         let outcome = if self.is_ready() {
@@ -2358,7 +2372,7 @@ impl<
         // Read before the Collecting branch below, which can reach Ready
         // inside this same call (AC4).
         let was_ready = self.lifecycle_phase == LifecyclePhase::Ready;
-        let outcome = classify_block(self, &block, window, now);
+        let (outcome, admitted) = classify_block(self, &block, window, now);
         // FR2 dominant-chain acquisition (Story 5.2): a successful collecting-phase
         // admission may complete a candidate segment. Evaluate the stopping
         // condition and, on success, transition Collecting→Processing. Runs only
@@ -2392,8 +2406,20 @@ impl<
         // sibling into a side block, and at the end of a Ready entry, after
         // the FR8 lock-time cleanups (a cleanup retarget onto a Connected block
         // must not keep a value the driver computed before it).
+        let mut driver_best = None;
         if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
-            self.connect_side_branches();
+            driver_best = self.connect_side_branches();
+        }
+        // Story 6.2 D1 (DEC-152): FR22 — one comparison at the end of the
+        // admission, after the continuation and the driver, between the active
+        // branch and the higher-ranked admissible of the block judged at intake
+        // and the driver's best. Never inside the loops: a switch (6.3) rewrites
+        // `chain_heads` and the active chain under them.
+        if outcome == ReceiveBlockOutcome::AcceptedSilently
+            && self.is_ready()
+            && let Some(head) = self.switch_target([admitted, driver_best])
+        {
+            self.switch_toward(head);
         }
         (outcome, self.next_parent_recovery_call())
     }
@@ -4337,9 +4363,15 @@ impl<
     /// - a local failure leaves the head pending for the next admission.
     ///
     /// Bounded: each round connects a head or deletes a block, or ends.
-    fn connect_side_branches(&mut self) {
+    ///
+    /// Returns the highest-ranked admissible head it valued (FR22 (ii) and the
+    /// FR21 (v) retarget; Story 6.2 D1): filtered by admissibility before the
+    /// choice, so an inadmissible top cannot hide an admissible runner-up.
+    /// The continuation ran before, so the window is final here.
+    fn connect_side_branches(&mut self) -> Option<u32> {
+        let mut best = None;
         if self.snake_chain_tail_idx == NONE_REF {
-            return;
+            return None;
         }
         for _ in 0..MAX_BRANCH_COUNT + MAX_BLOCKS {
             let mut progressed = false;
@@ -4361,6 +4393,7 @@ impl<
                         self.mark_connected(head);
                         let value = self.side_value(walk.active, walk.branch);
                         self.chain_heads.set_branch_value(head, value);
+                        self.consider(&mut best, head);
                     }
                     Some((failing, through)) => {
                         let parent = self
@@ -4379,14 +4412,99 @@ impl<
                         {
                             let value = self.side_value(walk.active, walk.branch - through);
                             self.chain_heads.set_branch_value(parent, value);
+                            self.consider(&mut best, parent);
                         }
                         break;
                     }
                 }
             }
             if !progressed {
-                return;
+                return best.map(|(head, _)| head);
             }
+        }
+        best.map(|(head, _)| head)
+    }
+
+    /// The FR21 rank of a valued side head — Connected, and named by a
+    /// `chain_heads` entry with its value (DEC-144) — from RAM only (D4).
+    fn head_rank(&self, head: u32) -> Option<Rank> {
+        let entry = self.blocks.get(head)?;
+        if entry.status() != BlockStatus::Connected {
+            return None;
+        }
+        Some(Rank {
+            value: self.chain_heads.branch_value_of(head)?,
+            len: entry.len(),
+            hash: *entry.hash(),
+        })
+    }
+
+    /// The FR21 rank of the active branch: `active_branch_value` (never an
+    /// entry, DEC-144) with the active tip's size and hash.
+    fn active_rank(&self) -> Option<Rank> {
+        let entry = self.blocks.get(self.active_chain_head_idx)?;
+        Some(Rank {
+            value: self.active_branch_value,
+            len: entry.len(),
+            hash: *entry.hash(),
+        })
+    }
+
+    /// FR21 operational admissibility of a side head on the current window
+    /// (Story 6.2 D3, DEC-154; [`crate::branch_value::is_admissible`]).
+    fn is_admissible_head(&self, head: u32) -> bool {
+        let (Some(tail), Some(top), Some(tip), Some(w)) = (
+            self.blocks.get(self.snake_chain_tail_idx),
+            self.blocks.get(self.active_chain_head_idx),
+            self.blocks.get(head),
+            self.active_chain_length(),
+        ) else {
+            return false;
+        };
+        crate::branch_value::is_admissible(tail.sequence(), top.sequence(), tip.sequence(), w)
+    }
+
+    /// Keeps the higher-ranked admissible valued side head in `best`.
+    fn consider(&self, best: &mut Option<(u32, Rank)>, head: u32) {
+        if head == self.active_chain_head_idx || !self.is_admissible_head(head) {
+            return;
+        }
+        let Some(rank) = self.head_rank(head) else {
+            return;
+        };
+        if best.as_ref().is_none_or(|(_, top)| rank.outranks(top)) {
+            *best = Some((head, rank));
+        }
+    }
+
+    /// FR22 (Story 6.2 D1, DEC-152): the head an FR23 switch should go to,
+    /// if any. `candidates` are the heads this admission valued — the block
+    /// judged at intake and the side-branch driver's best; anything no longer
+    /// a valued Connected head (the active extension, a Stored block, a block
+    /// an orphan merged away, a fork the tail advance released) drops out.
+    /// The higher-ranked admissible one wins iff it outranks the active
+    /// branch. RAM only; with no candidate, nothing is read.
+    fn switch_target(&self, candidates: [Option<u32>; 2]) -> Option<u32> {
+        let mut best = None;
+        for head in candidates.into_iter().flatten() {
+            self.consider(&mut best, head);
+        }
+        let (head, rank) = best?;
+        rank.outranks(&self.active_rank()?).then_some(head)
+    }
+
+    /// The FR23 chain switch toward `head` (FR22): the entry point Story 6.3
+    /// implements (with `reconciliation.rs`'s walk). Until then a win is
+    /// detected and not acted on (Story 6.2 D2, DEC-153); it is reconsidered at
+    /// the head's next trigger or at a restart, whose Ready entry re-values
+    /// every side head. No pending-switch state is kept.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn switch_toward(&mut self, head: u32) {
+        // FR64 (Epic 11 `LogSink`): emit the active-branch change per FR22
+        // with the common ancestor. Deferred — see deferred-work.md.
+        #[cfg(test)]
+        {
+            self.last_switch_target = Some(head);
         }
     }
 
@@ -4522,7 +4640,8 @@ impl<
     /// value decides. `None` when there is no child, or when any candidate
     /// cannot be read — a local failure, never a choice: the continuation stops
     /// and retries at a later admission (code review 2026-10-20). Greedy per
-    /// level: a heavier deeper subtree is reached by the FR22 trigger (6.2).
+    /// level: a heavier deeper subtree is reached by the FR22 comparison at the
+    /// end of the admission (Story 6.2) and the FR23 switch (6.3).
     fn best_stored_child(&self) -> Option<u32> {
         let head = self.active_chain_head_idx;
         let is_candidate = |idx: u32| {
@@ -4545,9 +4664,9 @@ impl<
         best.map(|(idx, _)| idx)
     }
 
-    /// The FR21 rank of a stored child of the head: its value and creator from
-    /// one read, its size and hash from RAM. The read copy lives only in this
-    /// frame (DEC-136).
+    /// The FR21 rank of a stored child of the head: its value from one read,
+    /// its size and hash from RAM. The read copy lives only in this frame
+    /// (DEC-136).
     #[inline(never)]
     fn child_rank(&self, idx: u32) -> Option<Rank> {
         let entry = self.blocks.get(idx)?;
@@ -4557,7 +4676,6 @@ impl<
         Some(Rank {
             value: block_value(&view),
             len,
-            creator: view.creator(),
             hash,
         })
     }
@@ -6112,6 +6230,7 @@ mod tests {
             tentative_config_block_idx,
             snake_chain_tail_idx,
             active_branch_value,
+            last_switch_target,
         } = &*bc;
 
         assert_eq!(*local_node_id, 7);
@@ -6135,6 +6254,7 @@ mod tests {
         assert_eq!(*tentative_config_block_idx, NONE_REF);
         assert_eq!(*snake_chain_tail_idx, NONE_REF);
         assert_eq!(*active_branch_value, 0);
+        assert_eq!(*last_switch_target, None);
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -6187,6 +6307,7 @@ mod tests {
             tentative_config_block_idx,
             snake_chain_tail_idx,
             active_branch_value,
+            last_switch_target,
         } = &*built;
         let Blockchain {
             crypto: _,
@@ -6206,6 +6327,7 @@ mod tests {
             tentative_config_block_idx: spec_tentative_config_block_idx,
             snake_chain_tail_idx: spec_snake_chain_tail_idx,
             active_branch_value: spec_active_branch_value,
+            last_switch_target: spec_last_switch_target,
         } = &spec;
 
         assert_eq!(local_node_id, spec_local_node_id);
@@ -6225,6 +6347,7 @@ mod tests {
         assert_eq!(tentative_config_block_idx, spec_tentative_config_block_idx);
         assert_eq!(snake_chain_tail_idx, spec_snake_chain_tail_idx);
         assert_eq!(active_branch_value, spec_active_branch_value);
+        assert_eq!(last_switch_target, spec_last_switch_target);
     }
 
     /// AC2 — the neutrality proof: with the base override set (the window alone)
