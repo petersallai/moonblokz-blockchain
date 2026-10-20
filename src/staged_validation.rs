@@ -7,8 +7,11 @@
 //! function ([`is_legal_transition`]) — but their **drivers are tagged
 //! forward**: no Connected/Active promotion is executed anywhere in Epic 4.
 //! Tier 2 ancestry/lookup completion is realized by the FR3 processing pass
-//! (Epic 5) and FR23 chain-switch (Epic 6); Tier 3 derived-state replay by
-//! the same paths plus transaction/balance/UTXO validation (Epic 7).
+//! (Epic 5), the Ready head extension (Story 6.0), the Ready side-block Tier 2
+//! (Story 6.1, `Blockchain::tier2_check` in `api.rs` — it reads storage, so it
+//! is not one of this module's stateless checks) and FR23 chain-switch (6.3);
+//! Tier 3 derived-state replay by the same paths plus transaction/balance/UTXO
+//! validation (Epic 7).
 //!
 //! **Statelessness.** Architecture §4.2 characterizes this module as
 //! "stateless tier 1/2/3 checks." The check functions here hold that property
@@ -58,7 +61,9 @@ pub(crate) enum BlockStatus {
     /// gating check passed. The only status assigned in Epic 4.
     Stored,
     /// A Stored block whose ancestry reaches the active chain and which passed
-    /// Tier 2. *Driver tagged forward (Epic 6/7).*
+    /// Tier 2 — a side block in Ready, set by the Story 6.1 side-branch
+    /// driver or at intake when its parent is Connected or Active
+    /// (`Blockchain::tier2_check`, `api.rs`).
     Connected,
     /// A Connected block (or a Stored block promoted in one FR3 step) that is
     /// on the selected active chain, Tier 3-verified. *Driver tagged forward
