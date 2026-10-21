@@ -98,6 +98,9 @@ pub(crate) fn chain_config_content_matches(block: &BlockView<'_>, locked_content
 /// snake-chain window (Story 9.1); the dispatcher takes it as a parameter so it
 /// stays stateless, and the unit tests below pass a window directly.
 ///
+/// Also returns the admitted block's slot, so the caller can hand it to the
+/// FR22 comparison at the end of the admission (Story 6.2 D1, DEC-152).
+///
 /// Check order — FR11 dedup → FR60 window → FR17 chain-config → Tier 1 — is
 /// load-bearing: FR11 is the authoritative duplicate index and must win over a
 /// window that has since advanced past a still-retained block's sequence; the
@@ -126,7 +129,7 @@ pub(crate) fn classify_block<
     block: &BlockView<'_>,
     window: Option<(u32, u32)>,
     now: u64,
-) -> ReceiveBlockOutcome
+) -> (ReceiveBlockOutcome, Option<u32>)
 where
     C: CryptoTrait,
     S: StorageTrait,
@@ -139,7 +142,7 @@ where
     //    retained).
     let hash = block.hash();
     if bc.block_tree_contains(block.sequence(), &hash) {
-        return ReceiveBlockOutcome::DuplicateKnown;
+        return (ReceiveBlockOutcome::DuplicateKnown, None);
     }
 
     // 2. FR60 out-of-snake-chain-window discard — ready state only. `None`
@@ -163,10 +166,16 @@ where
                 // FR64 (Epic 11 `LogSink`): emit `long-disconnect-detected`
                 // carrying S_new = block.sequence(), the incoming block hash,
                 // and the local (S_tail, S_head). Deferred — see deferred-work.md.
-                return ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow);
+                return (
+                    ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
+                    None,
+                );
             }
             WindowVerdict::BelowTail => {
-                return ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow);
+                return (
+                    ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
+                    None,
+                );
             }
             WindowVerdict::InWindow => {}
         }
@@ -186,7 +195,10 @@ where
         // FR64 (Epic 11 `LogSink`): emit `chain-config-mismatch-discarded`
         // carrying the discarded block hash, block.sequence(), and
         // block.creator(). Deferred — see deferred-work.md.
-        return ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence);
+        return (
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            None,
+        );
     }
 
     // 4. Story 4.2 Tier 1 admission. `hash` (computed once in step 1) is
@@ -195,16 +207,18 @@ where
     //    runs the Story 4.4 FR19 chain_heads mutation events (`now` stamps the
     //    head arrival timestamp / bootstrap scheduling).
     match bc.tier1_admit(block, &hash, now) {
-        Ok(_) => ReceiveBlockOutcome::AcceptedSilently,
-        Err(AdmitError::Rejected(_)) | Err(AdmitError::InvalidExtension) => {
-            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
-        }
+        Ok(idx) => (ReceiveBlockOutcome::AcceptedSilently, Some(idx)),
+        Err(AdmitError::Rejected(_)) | Err(AdmitError::InvalidExtension) => (
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            None,
+        ),
         // Operational (capacity/persistence) refusal — NOT an FR10 validity
         // classification. `TableFull` becomes unreachable once Story 4.4
         // `chain_heads` eviction lands.
-        Err(AdmitError::TableFull) | Err(AdmitError::StorageSaveFailed) => {
-            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable)
-        }
+        Err(AdmitError::TableFull) | Err(AdmitError::StorageSaveFailed) => (
+            ReceiveBlockOutcome::Rejected(RejectReason::Unstorable),
+            None,
+        ),
     }
 }
 
@@ -582,12 +596,12 @@ mod tests {
         let block = node_transfer_block(5, 3, 4, 7);
         // Store it first (collecting path, no window).
         assert_eq!(
-            classify_block(&mut bc, &block.view(), None, 0),
+            classify_block(&mut bc, &block.view(), None, 0).0,
             ReceiveBlockOutcome::AcceptedSilently
         );
         // Now inject a window under which seq 5 is out-of-window (below tail);
         // FR11 dedup must still win.
-        let outcome = classify_block(&mut bc, &block.view(), Some((100, 200)), 0);
+        let outcome = classify_block(&mut bc, &block.view(), Some((100, 200)), 0).0;
         assert_eq!(outcome, ReceiveBlockOutcome::DuplicateKnown);
     }
 
@@ -598,7 +612,7 @@ mod tests {
         let mut bc = new_test_chain();
         // S_tail=0, S_head=5, W=16 → out-of-window forward at seq >= 21.
         let block = node_transfer_block(21, 3, 4, 7);
-        let outcome = classify_block(&mut bc, &block.view(), Some((0, 5)), 0);
+        let outcome = classify_block(&mut bc, &block.view(), Some((0, 5)), 0).0;
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)
@@ -615,11 +629,11 @@ mod tests {
         let mut bc = locked_test_chain(&W8_CONFIG_CONTENT);
 
         let last_in = node_transfer_block(12, 3, 4, 7);
-        let outcome = classify_block(&mut bc, &last_in.view(), Some((0, 5)), 0);
+        let outcome = classify_block(&mut bc, &last_in.view(), Some((0, 5)), 0).0;
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
 
         let first_out = node_transfer_block(13, 3, 4, 7);
-        let outcome = classify_block(&mut bc, &first_out.view(), Some((0, 5)), 0);
+        let outcome = classify_block(&mut bc, &first_out.view(), Some((0, 5)), 0).0;
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
@@ -632,7 +646,7 @@ mod tests {
         let mut bc = new_test_chain();
         // S_tail=10 → seq 5 is below tail.
         let block = node_transfer_block(5, 3, 4, 7);
-        let outcome = classify_block(&mut bc, &block.view(), Some((10, 20)), 0);
+        let outcome = classify_block(&mut bc, &block.view(), Some((10, 20)), 0).0;
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)
@@ -645,7 +659,7 @@ mod tests {
         let mut bc = new_test_chain();
         // seq 5 within [S_tail=0, S_head+W=21).
         let block = node_transfer_block(5, 3, 4, 7);
-        let outcome = classify_block(&mut bc, &block.view(), Some((0, 5)), 0);
+        let outcome = classify_block(&mut bc, &block.view(), Some((0, 5)), 0).0;
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(bc.block_tree_len(), 1);
     }
@@ -658,7 +672,7 @@ mod tests {
         // A high sequence that WOULD be out-of-window under any small window is
         // admitted in collecting state (window == None).
         let block = node_transfer_block(9_999, 3, 4, 7);
-        let outcome = classify_block(&mut bc, &block.view(), None, 0);
+        let outcome = classify_block(&mut bc, &block.view(), None, 0).0;
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(bc.block_tree_len(), 1);
     }
@@ -674,7 +688,7 @@ mod tests {
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
             .expect("valid raw block");
-        let outcome = classify_block(&mut bc, &view, None, 0);
+        let outcome = classify_block(&mut bc, &view, None, 0).0;
         // payload_type=3 is a recognized schema; Tier 1 stores it.
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(
@@ -693,7 +707,7 @@ mod tests {
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
             .expect("valid raw block");
-        let outcome = classify_block(&mut bc, &view, None, 0);
+        let outcome = classify_block(&mut bc, &view, None, 0).0;
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
@@ -717,7 +731,7 @@ mod tests {
         let view = BlockView::from_bytes(&bytes[..len])
             .ok()
             .expect("valid raw block");
-        let outcome = classify_block(&mut bc, &view, None, 0);
+        let outcome = classify_block(&mut bc, &view, None, 0).0;
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(bc.block_tree_len(), 1);
     }

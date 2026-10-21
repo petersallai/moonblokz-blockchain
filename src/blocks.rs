@@ -77,7 +77,8 @@ pub(crate) const AVAILABLE_UTXO_BYTES: usize = 32;
 /// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2
 /// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
 /// bits 3-4 carry the block's `payload_type` (Story 5.4 review, see
-/// [`FLAG_PAYLOAD_TYPE_MASK`]); bits 5-7 are unused.
+/// [`FLAG_PAYLOAD_TYPE_MASK`]); bit 5 marks a verified creator signature
+/// ([`FLAG_SIGNATURE_VERIFIED`]); bits 6-7 are unused.
 const FLAG_ON_ACTIVE_CHAIN: u8 = 0b0000_0001;
 
 /// FR9 status bits (bits 1-2 of `flags`). Story 4.1 reserved these; Story 4.2
@@ -103,6 +104,14 @@ const FLAG_STATUS_MASK: u8 = 0b0000_0110;
 /// as `transaction`, which the balance-only floor scan simply skips).
 const FLAG_PAYLOAD_TYPE_SHIFT: u8 = 3;
 const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
+
+/// Bit 5 of `flags` (Story 6.2 D6, DEC-157): the block's creator signature
+/// verified against the key derived along the block's own ancestry, so the
+/// per-block step never verifies it again (a chain-switch replay or restore,
+/// the continuation). A block's ancestry never changes, so the verdict holds
+/// for the block's lifetime. RAM-only: a new entry starts with `flags == 0`,
+/// and nothing persists it.
+const FLAG_SIGNATURE_VERIFIED: u8 = 0b0010_0000;
 
 /// Per-block ancestry and status metadata (FR18).
 ///
@@ -199,6 +208,18 @@ impl BlockEntry {
 
     pub(crate) fn is_on_active_chain(&self) -> bool {
         self.flags & FLAG_ON_ACTIVE_CHAIN != 0
+    }
+
+    /// See [`FLAG_SIGNATURE_VERIFIED`].
+    pub(crate) fn is_signature_verified(&self) -> bool {
+        self.flags & FLAG_SIGNATURE_VERIFIED != 0
+    }
+
+    /// Marks a not-yet-inserted entry's creator signature verified (the
+    /// ready-state intake check, FR9 Tier 1). One-way: nothing unverifies a
+    /// block. See [`FLAG_SIGNATURE_VERIFIED`].
+    pub(crate) fn set_signature_verified(&mut self) {
+        self.flags |= FLAG_SIGNATURE_VERIFIED;
     }
 
     pub(crate) fn set_on_active_chain(&mut self, value: bool) {
@@ -648,6 +669,20 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         match self.blocks.get_mut(idx as usize) {
             Some(entry) if !entry.is_empty_slot() => {
                 entry.set_status(status);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Marks the creator signature of an **already-inserted** block verified
+    /// (the per-block step, FR9 Tier 3). One-way, non-identity metadata, like
+    /// the setters below. Returns `false` for an empty/out-of-bounds slot. See
+    /// [`FLAG_SIGNATURE_VERIFIED`].
+    pub(crate) fn mark_signature_verified(&mut self, idx: u32) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.set_signature_verified();
                 true
             }
             _ => false,

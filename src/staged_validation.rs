@@ -129,6 +129,17 @@ pub(crate) enum Tier1Failure {
     /// `block.sequence ≤ block_sequence` for a complex-tx UTXO input: the
     /// referenced output's block is not a strict ancestor (ADR-016 causality).
     UtxoInputNotBeforeBlock,
+    /// FR9 Tier 1 header vote form (Story 6.2 D6, DEC-157): a normal block
+    /// (`first_voted_node == creator`) with a non-zero
+    /// `consumed_votes_from_first_voted_node`, or a deviation block whose
+    /// `consumed_votes` exceeds it. Every valid block satisfies the form in
+    /// every phase (the FR37 pre-credit snapshots and FR38, DEC-156).
+    VoteHeaderForm,
+    /// FR9 Tier 1 case (2) (Story 6.2 D6, DEC-157): in ready state, the block
+    /// creator signature fails against a key that is the same on every branch
+    /// that can connect (node #0, or a node seeded at or below `S_tail`).
+    /// Produced in `Blockchain::tier1_admit`, which holds the key state.
+    CreatorSignatureInvalid,
     /// FR6 no-self-vote: a transaction's `initializer` equals its `vote`
     /// (outside the permanent node-#0 and block-#0 exceptions).
     SelfVote,
@@ -248,6 +259,16 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
     }
     if block.len() > block_size_limit as usize {
         return Err(Tier1Failure::BlockTooLarge); // AC8 (durable-locked config)
+    }
+    // Header vote form (Story 6.2 D6, DEC-157): implied by the FR37 snapshots
+    // and FR38 for every valid block, so it is exact evidence in every phase.
+    let form_holds = if block.first_voted_node() == block.creator() {
+        block.consumed_votes_from_first_voted_node() == 0
+    } else {
+        block.consumed_votes() <= block.consumed_votes_from_first_voted_node()
+    };
+    if !form_holds {
+        return Err(Tier1Failure::VoteHeaderForm);
     }
 
     // FR54 exception (i)+(c): block #0 waives the no-self-vote and the
