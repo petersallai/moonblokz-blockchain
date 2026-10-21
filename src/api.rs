@@ -2097,10 +2097,15 @@ impl<
         // creator's key is the same on every branch that can connect. A pass
         // marks the entry, so the per-block step never verifies it again.
         let signature_verified = self.lifecycle_phase == LifecyclePhase::Ready
-            && self.key_is_branch_independent(block.creator());
-        if signature_verified && self.verify_block_creator_signature(block) != Some(true) {
-            return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
-        }
+            && self.key_is_branch_independent(block.creator())
+            && match self.verify_block_creator_signature(block) {
+                Some(false) => {
+                    return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
+                }
+                Some(true) => true,
+                // No key verdict: nothing is judged or marked here.
+                None => false,
+            };
 
         // Peek the slot; the entry and the durable write both land there
         // (`persist` reconstructs the owned `Block` the storage seam takes).
@@ -3491,6 +3496,16 @@ impl<
         // against the parent state, which the vote engine still holds — its
         // apply runs in `commit_block`. After the balance-block seeding above,
         // so a floor-seeded creator is judged. Genesis #0 holds as built: I(0) = 0.
+        // A deviation's first-voted node must exist, as every node id a
+        // transaction names must (FR6): a partial projection cannot judge its
+        // snapshot, but it can bound the id.
+        let first_voted = view.first_voted_node();
+        if first_voted != view.creator()
+            && let Err(reason) = self.check_node_id_in_range(first_voted)
+        {
+            self.invert_transactions(view, idx, applied);
+            return Err(invalid(reason));
+        }
         let header = self
             .vote_engine
             .check_header(view, projection.complete, |node| {
@@ -13753,7 +13768,8 @@ mod tests {
     /// block crediting only the next creator. `received` is the number of
     /// credits the previous block gave `creator` — its whole accumulated vote,
     /// since its own last block reset it — so `consumed_votes =
-    /// I(1000 · received)` (= `1005 · received`). The block casts `out` credits
+    /// I(1000 · received)` (= `1005 · received` while `received ≤ 200`, below
+    /// the interest cap). The block casts `out` credits
     /// for the other node (or, with `out == 0`, one for its own creator, which
     /// the reset wipes). `register` puts node #1's registration first.
     fn alt(
@@ -14132,6 +14148,12 @@ mod tests {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
         }
         assert_eq!(head_of(&bc), (3, large.view().hash()), "size before hash");
+        // Chosen by rank, not left over by a Tier 3 refusal of `small`.
+        assert_eq!(status_of(&bc, &small), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(slot(&bc, &small)),
+            Some(v(&parent) + v(&small))
+        );
     }
 
     /// AC8 (code review 2026-10-20) — an unreadable sibling is a local
@@ -14609,11 +14631,58 @@ mod tests {
         let g4 = valued(4, g3.view().hash(), 600, 21);
         assert_eq!(receive(&mut bc, &g4), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(switched_to(&bc), Some(g4.view().hash()));
+        // The comparison itself (AC4): a valued head that outranks, one that
+        // is no longer a head, the active head, and no candidate.
+        let (g3i, g4i) = (slot(&bc, &g3), slot(&bc, &g4));
+        assert_eq!(bc.switch_target([Some(g4i), None]), Some(g4i));
+        assert_eq!(bc.switch_target([None, Some(g4i)]), Some(g4i));
+        assert_eq!(bc.switch_target([Some(g3i), None]), None, "interior now");
+        assert_eq!(
+            bc.switch_target([Some(bc.active_chain_head_idx), None]),
+            None
+        );
+        assert_eq!(bc.switch_target([None, None]), None);
         // FORK from an older active block (#1).
         bc.last_switch_target = None;
         let f2 = valued(2, b1.view().hash(), 5000, 22);
         assert_eq!(receive(&mut bc, &f2), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(switched_to(&bc), Some(f2.view().hash()));
+    }
+
+    /// AC10.1 / D4 — on an equal value the larger tip wins: a smaller side
+    /// tip does not switch whatever its hash, a larger one does.
+    #[test]
+    fn fr22_equal_value_goes_to_the_larger_tip() {
+        // The active tip `a3` carries two transactions.
+        let (mut bc, _, b1) = ready_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 1, 2, 8, false);
+        for blk in [&a2, &a3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let tip = a3.view();
+        for lower_hash in [true, false] {
+            let smaller = (100..400)
+                .map(|amount| valued(3, a2.view().hash(), 1005, amount))
+                .find(|blk| (blk.view().hash() < tip.hash()) == lower_hash)
+                .expect("a one-transaction sibling");
+            assert!(smaller.view().len() < tip.len());
+            assert_eq!(
+                receive(&mut bc, &smaller),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(switched_to(&bc), None, "smaller, lower hash: {lower_hash}");
+        }
+        let larger = revalue(
+            &tx_block(3, a2.view().hash(), 0, votes_for(3, 0, 3, 500)),
+            1005,
+        );
+        assert!(larger.view().len() > tip.len());
+        assert_eq!(
+            receive(&mut bc, &larger),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(switched_to(&bc), Some(larger.view().hash()));
     }
 
     /// AC10.1 / D4 — on an equal value and size the lower tip hash wins,
@@ -14773,9 +14842,9 @@ mod tests {
         let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
         assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
         // A fork from #1 (an older active block) that wins: dropped (D2).
-        let f3 = valued(2, b1.view().hash(), 5000, 20);
-        assert_eq!(receive(&mut bc, &f3), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(switched_to(&bc), Some(f3.view().hash()), "a dropped win");
+        let f2 = valued(2, b1.view().hash(), 5000, 20);
+        assert_eq!(receive(&mut bc, &f2), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(switched_to(&bc), Some(f2.view().hash()), "a dropped win");
         bc.last_switch_target = None;
         let a3 = alt(3, a2.view().hash(), 1, 1, 1, 8, false);
         assert_eq!(receive(&mut bc, &a3), ReceiveBlockOutcome::AcceptedSilently);
@@ -14785,12 +14854,12 @@ mod tests {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
         }
         assert_eq!(head_of(&bc), (5, a5.view().hash()));
-        let fi = slot(&bc, &f3);
-        assert!(
-            bc.chain_heads.branch_value_of(fi) > Some(bc.active_branch_value),
-            "it would still win"
-        );
+        let fi = slot(&bc, &f2);
+        let fv = bc.chain_heads.branch_value_of(fi).expect("valued");
+        assert!(fv > bc.active_branch_value, "it would still win");
         assert_eq!(switched_to(&bc), None, "active extensions compare nothing");
+        // A side block worth 0 (a replay-like value, FR22 (b)) is an ordinary
+        // trigger (i) and cannot win.
         let zero = valued(3, a2.view().hash(), 0, 23);
         assert_eq!(
             receive(&mut bc, &zero),
@@ -14873,7 +14942,11 @@ mod tests {
         assert_eq!(receive(&mut bc, &x), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(head_of(&bc), (5, c5.view().hash()), "the continuation ran");
         assert_eq!(bc.active_branch_value, v(&b4) + v(&c5));
-        assert!(bc.chain_heads.branch_value_of(slot(&bc, &x)) < Some(bc.active_branch_value));
+        let xv = bc
+            .chain_heads
+            .branch_value_of(slot(&bc, &x))
+            .expect("x is a valued side head");
+        assert!(xv < bc.active_branch_value);
         assert_eq!(switched_to(&bc), None);
     }
 
@@ -14942,29 +15015,129 @@ mod tests {
     fn i09_mismatch_in_the_fr3_pass_is_deleted() {
         let (_, b0, b1) = ready_genesis(16);
         let a2 = alt(2, b1.view().hash(), 0, 0, 3, 7, true);
-        let bad3 = headed(
-            3,
-            a2.view().hash(),
-            1,
-            NODE_ONE_KEY,
-            2000,
-            1,
-            0,
-            votes_for(3, 0, 1, 50),
-        );
-        let mut mesh = new_unconfigured_test_chain();
-        for blk in [&bad3, &a2, &b1, &b0] {
-            assert_eq!(
-                receive(&mut mesh, blk),
-                ReceiveBlockOutcome::AcceptedSilently
+        let prev = a2.view().hash();
+        let bad = [
+            // A wrong normal value.
+            headed(3, prev, 1, NODE_ONE_KEY, 2000, 1, 0, votes_for(3, 0, 1, 50)),
+            // A deviation naming a node that is not the top.
+            headed(3, prev, 0, 1, 0, 2, 10, votes_for(3, 0, 1, 51)),
+            // A deviation with a wrong snapshot of the top.
+            headed(3, prev, 0, 1, 0, 1, 3000, votes_for(3, 0, 1, 52)),
+            // A deviation counting its own credit (AR-005).
+            headed(3, prev, 0, 1, 1000, 1, 3015, votes_for(3, 0, 1, 53)),
+        ];
+        for (i, bad3) in bad.iter().enumerate() {
+            let mut mesh = new_unconfigured_test_chain();
+            for blk in [bad3, &a2, &b1, &b0] {
+                assert_eq!(
+                    receive(&mut mesh, blk),
+                    ReceiveBlockOutcome::AcceptedSilently,
+                    "case {i}"
+                );
+            }
+            assert!(mesh.is_ready(), "case {i}");
+            assert_eq!(head_of(&mesh), (2, a2.view().hash()), "case {i}");
+            assert!(
+                mesh.blocks.find(3, &bad3.view().hash()).is_none(),
+                "case {i}: deleted"
             );
         }
-        assert!(mesh.is_ready());
-        assert_eq!(head_of(&mesh), (2, a2.view().hash()));
-        assert!(
-            mesh.blocks.find(3, &bad3.view().hash()).is_none(),
-            "deleted"
+    }
+
+    /// AC6 — the header vote form is Tier 1 in every phase: a Collecting node
+    /// refuses a malformed header and stores nothing.
+    #[test]
+    fn header_vote_form_is_refused_while_collecting() {
+        let mut bc = new_unconfigured_test_chain();
+        assert!(!bc.is_ready());
+        for bad in [
+            headed(5, [0x33; 32], 0, 1, 10, 1, 5, votes_for(5, 0, 1, 60)),
+            headed(5, [0x33; 32], 0, 1, 0, 0, 7, votes_for(5, 0, 1, 61)),
+        ] {
+            let free = bc.blocks.next_free_index();
+            assert_eq!(
+                receive(&mut bc, &bad),
+                ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+            );
+            assert_eq!(bc.blocks.next_free_index(), free, "nothing stored");
+        }
+    }
+
+    /// AC10.11 / D6 — branch-independent keys beyond node #0: a node seeded at
+    /// or below `S_tail` (by its seed-source block's sequence) and a node whose
+    /// seed source was released are judged at intake; a node seeded inside the
+    /// window is not. A direct head extension and a good orphan by node #0 are
+    /// stored marked.
+    #[test]
+    fn branch_independent_keys_beyond_node_zero() {
+        let (mut bc, b0, b1) = ready_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+        assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
+        let key = |byte: u8| {
+            *Crypto::new([byte; PRIVATE_KEY_SIZE])
+                .ok()
+                .expect("key")
+                .public_key()
+                .serialize()
+        };
+        // Test seeding (white box): node 5 at #0, which is `S_tail`; node 6
+        // with its source released; node 7 at #2, inside the window.
+        let (b0i, a2i) = (slot(&bc, &b0), slot(&bc, &a2));
+        bc.node_info.seed_node(5, &key(0x55), 0, b0i);
+        bc.node_info
+            .seed_node(6, &key(0x56), 0, SEED_SOURCE_RELEASED);
+        bc.node_info.seed_node(7, &key(0x57), 0, a2i);
+        let side = |creator: u32, signer: u8, salt: u64| {
+            resign(&valued(2, b1.view().hash(), 3, salt), creator, 3, signer)
+        };
+        for (creator, salt) in [(5, 30), (6, 31)] {
+            let free = bc.blocks.next_free_index();
+            assert_eq!(
+                receive(&mut bc, &side(creator, 0x77, salt)),
+                ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+                "node {creator}: forged"
+            );
+            assert_eq!(bc.blocks.next_free_index(), free);
+            let good = side(creator, 0x50 + creator as u8, salt + 10);
+            assert_eq!(
+                receive(&mut bc, &good),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            let gi = slot(&bc, &good);
+            assert!(
+                bc.blocks.get(gi).is_some_and(|e| e.is_signature_verified()),
+                "node {creator}: marked"
+            );
+        }
+        let inside = side(7, 0x77, 40);
+        assert_eq!(
+            receive(&mut bc, &inside),
+            ReceiveBlockOutcome::AcceptedSilently
         );
+        let ii = slot(&bc, &inside);
+        assert!(
+            bc.blocks
+                .get(ii)
+                .is_some_and(|e| !e.is_signature_verified())
+        );
+
+        // Node #0: a direct head extension and a good orphan, each marked.
+        let a3 = alt(3, a2.view().hash(), 0, 0, 0, 41, false);
+        assert_eq!(receive(&mut bc, &a3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, a3.view().hash()));
+        let orphan = transfer(9, [0x44; 32], 0, 5);
+        assert_eq!(
+            receive(&mut bc, &orphan),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        for blk in [&a3, &orphan] {
+            let idx = slot(&bc, blk);
+            assert!(
+                bc.blocks
+                    .get(idx)
+                    .is_some_and(|e| e.is_signature_verified())
+            );
+        }
     }
 
     /// AC10.10 / FR28 — the two-stage scoring end to end. With `av(u) = 3000`
@@ -15017,25 +15190,37 @@ mod tests {
         assert_eq!(status_of(&bc, &d), Some(BlockStatus::Connected));
         assert_eq!(switched_to(&bc), None, "the deviation does not overtake");
 
-        // The tie: the all-zero state, node #0 on top; node #1 deviates.
-        let (mut bc, a2) = setup(0);
-        assert_eq!(bc.vote_engine.top_creator(), Some(0));
-        let d = headed(
-            3,
-            a2.view().hash(),
-            1,
-            NODE_ONE_KEY,
-            0,
-            0,
-            0,
-            votes_for(3, 1, 1, 70),
-        );
-        let n = alt(3, a2.view().hash(), 0, 0, 0, 71, false);
-        assert_eq!(receive(&mut bc, &d), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(receive(&mut bc, &n), ReceiveBlockOutcome::AcceptedSilently);
-        let (dv, nv) = (d.view(), n.view());
-        let n_wins = nv.len() > dv.len() || (nv.len() == dv.len() && nv.hash() < dv.hash());
-        assert_eq!(switched_to(&bc), n_wins.then(|| n.view().hash()));
+        // The tie: the all-zero state, node #0 on top; node #1 deviates. Both
+        // are worth 0 and carry one transaction, so the hash decides: pinned
+        // for each order of the two hashes.
+        for n_lower in [true, false] {
+            let (mut bc, a2) = setup(0);
+            assert_eq!(bc.vote_engine.top_creator(), Some(0));
+            let d = headed(
+                3,
+                a2.view().hash(),
+                1,
+                NODE_ONE_KEY,
+                0,
+                0,
+                0,
+                votes_for(3, 1, 1, 70),
+            );
+            let n = (71..400)
+                .map(|salt| alt(3, a2.view().hash(), 0, 0, 0, salt, false))
+                .find(|n| {
+                    n.view().len() == d.view().len()
+                        && (n.view().hash() < d.view().hash()) == n_lower
+                })
+                .expect("a same-size normal block");
+            assert_eq!(receive(&mut bc, &d), ReceiveBlockOutcome::AcceptedSilently);
+            assert_eq!(receive(&mut bc, &n), ReceiveBlockOutcome::AcceptedSilently);
+            assert_eq!(
+                switched_to(&bc),
+                n_lower.then(|| n.view().hash()),
+                "n has the lower hash: {n_lower}"
+            );
+        }
     }
 
     /// AC10.11 / AC6 / D6 — Ready intake: a bad creator signature under a
