@@ -2948,11 +2948,11 @@ impl<
     ///
     /// **Reuse constraint** (inherited from [`Self::run_processing_pass`]): this
     /// rollback is self-consistent only for a re-derivation over a candidate
-    /// whose blocks are **not shared** with an already-active chain (fresh join,
-    /// the Story-5.10 restart, an Epic-6 deep zone of a *new* branch). A
-    /// chain-switch that re-derives over shared blocks must work on a copy — a
-    /// failed re-derivation there would zero a shared block's *committed*
-    /// available-UTXO bits instead of restoring them.
+    /// whose blocks are **not shared** with an already-active chain (a fresh
+    /// join, the Story-5.10 restart). A ready-state chain switch does not
+    /// re-derive: it walks the shared chain in place by exact per-block
+    /// inverses (Story 6.3, DEC-168), and ready state has no
+    /// full-reconstruction path (DEC-159).
     // Its own frame: the 2.4 KB delete-set never merges with the pass's
     // buffers into the acquisition loop's frame (stack budget, DEC-136).
     #[inline(never)]
@@ -2997,7 +2997,7 @@ impl<
         // phase reversion still happen, nothing is deleted, nothing panics.
         //
         // Stack: `[u32; MAX_BLOCKS]` is 2.4 KB at the default `MAX_BLOCKS = 600`
-        // on the 6 KB blockchain-task stack. It does not coexist with
+        // on the 24 KB blockchain-task stack (DEC-137). It does not coexist with
         // `run_processing_pass`'s equally-sized `marked` buffer — that is a local
         // of *that* function, whose frame is already released at this seam. This
         // must be re-checked if the recovery call ever moves inside the pass.
@@ -3234,12 +3234,10 @@ impl<
         // join/reconstruct flow the marked blocks are freshly-admitted `Stored`
         // blocks (bits already 0); the reset makes the reusable primitive
         // self-consistent for a re-derivation over a candidate whose blocks are
-        // NOT shared with an already-active chain (fresh join, the Story-5.10
-        // restart, and the Epic-6 deep-zone reconstruction of a *new* branch). A
-        // chain-switch that re-derives over blocks shared with the active chain
-        // must operate on a working copy instead (owned by Epic 6): a failed
-        // re-derivation here would zero a shared block's committed bits rather
-        // than restore them.
+        // NOT shared with an already-active chain (a fresh join, the Story-5.10
+        // restart). A ready-state chain switch never re-derives: it walks the
+        // shared chain in place by exact per-block inverses (Story 6.3,
+        // DEC-168), and ready state has no full-reconstruction path (DEC-159).
         for slot in marked.iter().take(count) {
             self.blocks.clear_available_utxo(*slot);
         }
@@ -16361,9 +16359,7 @@ mod tests {
             vote_snapshot(1000),
             NODE_ONE_KEY,
         );
-        for node in [&mut bc] {
-            assert_eq!(receive(node, &o4), ReceiveBlockOutcome::AcceptedSilently);
-        }
+        assert_eq!(receive(&mut bc, &o4), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(
             receive(&mut twin, &o4),
             ReceiveBlockOutcome::AcceptedSilently

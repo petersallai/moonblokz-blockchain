@@ -68,7 +68,8 @@ pub(crate) struct TailUnreadable;
 ///
 /// The shared per-block step keeps both inputs current — `seed_source_idx`
 /// and the available-UTXO bits — in the FR3 pass and on every Ready head
-/// extension (Story 6.0); restoring them on a chain switch is Story 6.3.
+/// extension (Story 6.0), and the chain switch restores them through its exact
+/// inverses (Story 6.3).
 pub(crate) fn classify_tail_drop<const MAX_BLOCKS: usize, const MAX_NODES: usize>(
     blocks: &BlockTable<MAX_BLOCKS>,
     node_info: &NodeInfoState<MAX_NODES>,

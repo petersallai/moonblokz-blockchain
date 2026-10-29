@@ -12,8 +12,9 @@
 //! Event (iv) FR5 deletion is driven by [`ChainHeadsTable::on_blocks_deleted`]
 //! (Story 5.5, the FR5 atomic recovery). Event (v), the snake-chain tail release
 //! (Story 9.1), deletes every branch forked at the dropped block through event
-//! (iv) and needs no pass of its own. Event (iii) FR23 chain-switch remains
-//! **specified** (documented below) but **driven** by Epic 6.
+//! (iv) and needs no pass of its own. Event (iii), the FR23 chain switch, is
+//! driven by the Story 6.3 walk's commit through
+//! [`ChainHeadsTable::recompute_all_caches`].
 //! `branch_value` (FR21) is a side head's value, valid iff the head block is
 //! Connected; the active branch's value lives on `Blockchain` (Story 6.1 D3).
 //!
@@ -286,7 +287,10 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// **Direction of travel.** Every caller of this function either grows a
     /// head's ancestry (event (i) extend, event (ii) tail resolution), builds a
     /// fresh entry (`insert_head`), or recomputes after a child-closed deletion
-    /// (event (iv)), so the only transition it performs is Stored→Connected. The
+    /// (event (iv)), so the only status transition it performs is
+    /// Stored→Connected; on an FR23 chain switch (event (iii)) it also moves a
+    /// Connected head's connection point, down to the common ancestor or up the
+    /// new active branch, without demoting it. The
     /// `Anchor::Tail` arm serves new Stored heads, extended Stored branches and
     /// deepened tail-points; it cannot re-derive a missing-parent hash for an
     /// entry that *was* Connected — and no path demotes one: the snake-chain
@@ -815,14 +819,13 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         }
     }
 
-    // -- Event (iii): specified, not driven (Story 4.4 AC8) -------------------
+    // -- Event (iii): FR23 chain switch (driven by Story 6.3) ------------------
     //
-    // (iii) FR23 chain-switch reconciliation (Epic 6): on an active-chain switch
-    //       every Connected/Active head's `connected` flag + connection-point are
-    //       recomputed (`recompute_caches`); `head_ref_count` is unaffected
+    // (iii) On an active-chain switch the walk's commit recomputes every
+    //       Connected/Active head's `connected` flag and connection point
+    //       (`recompute_all_caches`); `head_ref_count` is unaffected
     //       (structural). The switch walks back to the common ancestor, which
     //       stays on the active chain, so a switch alone demotes no head.
-    //       Driver owned by Epic 6.
     //
     // (v) snake-chain tail release (Story 9.1): every branch forked at the
     //     dropped block is deleted as a child-closed subtree (event (iv)) before
