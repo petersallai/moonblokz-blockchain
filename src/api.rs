@@ -15981,4 +15981,871 @@ mod tests {
             }
         }
     }
+
+    // ===================================================================
+    // Story 6.3 — FR23 reversible chain switch
+    // ===================================================================
+
+    /// AC10 / AC11 — `a`'s derived state equals `b`'s for every block `b`
+    /// holds (matched by sequence and hash, since slots differ): `node_info`,
+    /// the vote engine, the active value and the window, and per block its
+    /// status, chain flag and available-UTXO bits, ignoring the one-way
+    /// signature mark (DEC-157). Every block only `a` holds is off the active
+    /// chain with no bit set (no phantom bits, 6.11).
+    fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
+        a: &Chain16<S>,
+        b: &Chain16<T>,
+        what: &str,
+    ) {
+        // `node_info` per node: seed sources are slots, so they are compared
+        // as the blocks they name.
+        let source = |bc_blocks: &BlockTable<16>, src: Option<u32>| match src {
+            Some(idx) if idx != SEED_SOURCE_RELEASED => {
+                bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
+            }
+            other => Some(other.map(|_| (u32::MAX, [0u8; 32]))),
+        };
+        assert_eq!(
+            a.node_info.max_known_node_id(),
+            b.node_info.max_known_node_id(),
+            "{what}: watermark"
+        );
+        for node in 0..16u32 {
+            assert_eq!(
+                a.node_info.balance_of(node),
+                b.node_info.balance_of(node),
+                "{what}: balance {node}"
+            );
+            assert_eq!(
+                a.node_info.public_key_of(node),
+                b.node_info.public_key_of(node),
+                "{what}: key {node}"
+            );
+            assert_eq!(
+                source(&a.blocks, a.node_info.seed_source_of(node)),
+                source(&b.blocks, b.node_info.seed_source_of(node)),
+                "{what}: seed source {node}"
+            );
+        }
+        assert!(a.vote_engine == b.vote_engine, "{what}: votes");
+        assert_eq!(
+            a.active_branch_value, b.active_branch_value,
+            "{what}: value"
+        );
+        let hash_of = |bc_blocks: &BlockTable<16>, idx: u32| bc_blocks.get(idx).map(|e| *e.hash());
+        assert_eq!(
+            hash_of(&a.blocks, a.active_chain_head_idx),
+            hash_of(&b.blocks, b.active_chain_head_idx),
+            "{what}: head"
+        );
+        assert_eq!(
+            hash_of(&a.blocks, a.snake_chain_tail_idx),
+            hash_of(&b.blocks, b.snake_chain_tail_idx),
+            "{what}: tail"
+        );
+        let mut matched = [false; 16];
+        for idx in 0..16u32 {
+            let Some(eb) = b.blocks.get(idx) else {
+                continue;
+            };
+            let ai = a
+                .blocks
+                .find(eb.sequence(), eb.hash())
+                .unwrap_or_else(|| panic!("{what}: #{} missing", eb.sequence()));
+            matched[ai as usize] = true;
+            let ea = a.blocks.get(ai).expect("found");
+            assert_eq!(
+                ea.status(),
+                eb.status(),
+                "{what}: status of #{}",
+                eb.sequence()
+            );
+            assert_eq!(
+                ea.is_on_active_chain(),
+                eb.is_on_active_chain(),
+                "{what}: flag of #{}",
+                eb.sequence()
+            );
+            for bit in 0..AVAILABLE_UTXO_BYTES * 8 {
+                assert_eq!(
+                    a.blocks.utxo_available(ai, bit),
+                    b.blocks.utxo_available(idx, bit),
+                    "{what}: bit {bit} of #{}",
+                    eb.sequence()
+                );
+            }
+        }
+        for idx in 0..16u32 {
+            if let Some(ea) = a.blocks.get(idx)
+                && !matched[idx as usize]
+            {
+                assert!(
+                    !ea.is_on_active_chain(),
+                    "{what}: extra #{} off chain",
+                    ea.sequence()
+                );
+                assert_eq!(
+                    a.blocks.has_available_utxo(idx),
+                    Some(false),
+                    "{what}: extra #{} holds no bit",
+                    ea.sequence()
+                );
+            }
+        }
+    }
+
+    /// [`two_creator_chain`] on a [`FailingReadStorage`] node, unarmed.
+    fn failing_two_creator_chain() -> (Chain16<FailingReadStorage>, Block, Block, Block) {
+        let (mut bc, b1) = failing_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+        for blk in [&a2, &a3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        (bc, b1, a2, a3)
+    }
+
+    /// [`two_creator_chain`] on a [`FaultyStorage`] node.
+    fn faulty_two_creator_chain() -> (Chain16<FaultyStorage>, Block, Block, Block) {
+        let (mut bc, b1) = faulty_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+        for blk in [&a2, &a3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        (bc, b1, a2, a3)
+    }
+
+    /// A genesis node on `W = w` over a [`FailingReadStorage`], unarmed.
+    fn failing_genesis(w: u16) -> (Chain16<FailingReadStorage>, Block) {
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+        let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let storage = FailingReadStorage {
+            inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
+            failing_slot: NONE_REF,
+            reads_left: core::cell::Cell::new(0),
+            attempts: core::cell::Cell::new(0),
+        };
+        let mut slot = core::mem::MaybeUninit::<Chain16<FailingReadStorage>>::uninit();
+        Chain16::<FailingReadStorage>::init(
+            &mut slot,
+            crypto,
+            storage,
+            chain_config,
+            0,
+            node_zero,
+            0,
+        );
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut bc = unsafe { slot.assume_init() };
+        let genesis = bc
+            .process_genesis(CURRENCY, window_config_builder(w).content())
+            .ok()
+            .expect("genesis");
+        (bc, genesis.block_one)
+    }
+
+    /// On [`two_creator_chain`], `s3`: node #1's sibling of `a3`, worth the
+    /// same 1005 but larger (three credits for node #0), so it wins.
+    fn heavier_sibling(a2: &Block) -> Block {
+        alt(3, a2.view().hash(), 1, 1, 3, 40, false)
+    }
+
+    /// AC11.1 / AC10 — depth 1 and depth 2: the switch lands on the state a
+    /// fresh node derives on the new chain alone; the abandoned blocks are
+    /// Connected, off the chain, with no bit; the old head keeps the old
+    /// active value; the replayed blocks carry the signature mark.
+    #[test]
+    fn fr23_switch_matches_a_fresh_node_on_the_new_chain() {
+        let (mut bc, _, a2, a3) = two_creator_chain();
+        let s3 = heavier_sibling(&a2);
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, s3.view().hash()));
+        assert_eq!(status_of(&bc, &a3), Some(BlockStatus::Connected));
+        assert_eq!(bc.chain_heads.branch_value_of(slot(&bc, &a3)), Some(1005));
+        assert!(
+            bc.blocks
+                .get(slot(&bc, &s3))
+                .is_some_and(|e| e.is_signature_verified())
+        );
+        let (mut fresh, _, b1) = ready_genesis(16);
+        for blk in [&a2, &s3] {
+            assert_eq!(
+                receive(&mut fresh, blk),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_same_projection(&bc, &fresh, "depth 1");
+        let _ = b1;
+
+        // Depth 2: `g3` ties `a3` and loses by hash; `g4` makes it win.
+        let (mut bc, _, a2, a3) = two_creator_chain();
+        let g3 = (20..400)
+            .map(|salt| alt(3, a2.view().hash(), 1, 1, 1, salt, false))
+            .find(|g| g.view().len() == a3.view().len() && g.view().hash() > a3.view().hash())
+            .expect("a same-size sibling with a higher hash");
+        let g4 = alt(4, g3.view().hash(), 0, 1, 0, 21, false);
+        for blk in [&g3, &g4] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(head_of(&bc), (4, g4.view().hash()));
+        let (mut fresh, _, _) = ready_genesis(16);
+        for blk in [&a2, &g3, &g4] {
+            assert_eq!(
+                receive(&mut fresh, blk),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_same_projection(&bc, &fresh, "depth 2");
+    }
+
+    /// AC2 — the committed-block undo is the exact inverse of the per-block
+    /// step, for every block kind: applied as a head extension and undone,
+    /// the node equals a twin that never saw the block; genesis #1 undone and
+    /// re-applied equals itself.
+    #[test]
+    fn fr23_undo_inverts_every_block_kind() {
+        fn check<S: StorageTrait, T: StorageTrait>(
+            mut bc: Chain16<S>,
+            twin: &Chain16<T>,
+            block: &Block,
+            what: &str,
+        ) {
+            assert_eq!(
+                receive(&mut bc, block),
+                ReceiveBlockOutcome::AcceptedSilently,
+                "{what}"
+            );
+            assert_eq!(head_of(&bc).1, block.view().hash(), "{what}: applied");
+            let idx = bc.active_chain_head_idx;
+            assert_eq!(bc.undo_active_head(), Ok(()), "{what}: undone");
+            assert_eq!(
+                bc.blocks.get(idx).map(|e| e.status()),
+                Some(BlockStatus::Connected)
+            );
+            assert_same_projection(&bc, twin, what);
+        }
+        // A registration (node #0's `a2`).
+        let (bc, _, b1) = ready_genesis(16);
+        let (twin, _, _) = ready_genesis(16);
+        check(
+            bc,
+            &twin,
+            &alt(2, b1.view().hash(), 0, 0, 1, 7, true),
+            "registration",
+        );
+        // A transfer crediting its creator a fee (node #1's `a3`).
+        let (bc, _, a2, _) = {
+            let (mut bc, _, b1) = ready_genesis(16);
+            let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+            assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
+            (bc, (), a2, ())
+        };
+        let twin = {
+            let (mut twin, _, _) = ready_genesis(16);
+            assert_eq!(
+                receive(&mut twin, &a2),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            twin
+        };
+        check(
+            bc,
+            &twin,
+            &alt(3, a2.view().hash(), 1, 1, 2, 8, false),
+            "creator credit",
+        );
+        // A balance block: node #0's seed source moves back to #0.
+        let (bc, _, b1) = ready_genesis(16);
+        let (twin, _, _) = ready_genesis(16);
+        let snapshot = snapshot_block(&bc, 2, b1.view().hash());
+        check(bc, &twin, &snapshot, "balance");
+        // A deviation (node #0 on node #1's top rank, fr28's `d`).
+        let setup = || {
+            let (mut bc, _, b1) = ready_genesis(16);
+            let a2 = alt(2, b1.view().hash(), 0, 0, 3, 7, true);
+            assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
+            (bc, a2)
+        };
+        let ((bc, a2), (twin, _)) = (setup(), setup());
+        let d = headed(
+            3,
+            a2.view().hash(),
+            0,
+            1,
+            0,
+            1,
+            3015,
+            votes_for(3, 1, 2, 60),
+        );
+        check(bc, &twin, &d, "deviation");
+        // A complex block spending a UTXO into two outputs.
+        let (bc, mint) = faulty_utxo_genesis();
+        let (twin, _) = faulty_utxo_genesis();
+        let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(30), Ok(30)]);
+        check(
+            bc,
+            &twin,
+            &complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]),
+            "utxo",
+        );
+
+        // Genesis #1: undone, then re-applied by the same step.
+        let (mut bc, _, b1) = ready_genesis(16);
+        let (twin, _, _) = ready_genesis(16);
+        let idx = slot(&bc, &b1);
+        assert_eq!(bc.undo_active_head(), Ok(()));
+        let tail = bc.snake_chain_tail_idx;
+        match bc.apply_stored_child(idx, tail) {
+            ChildStep::Applied {
+                advance: None,
+                value,
+            } => bc.promote_replayed(idx, value),
+            _ => panic!("genesis #1 re-applies"),
+        }
+        assert_same_projection(&bc, &twin, "genesis #1");
+    }
+
+    /// AC11.3 / FR39 — the replay resolves UTXO references against the chain
+    /// it builds: a shared output the abandoned branch spent is spendable on
+    /// the new one, and the abandoned branch's outputs leave no bit; an
+    /// output that exists only on the abandoned branch is unresolvable, so
+    /// the block spending it is refused, the original chain restored and the
+    /// block deleted.
+    #[test]
+    fn fr23_replay_resolves_utxo_against_the_new_chain() {
+        // `o4`: node #1 spends (3, 0) into one output (worth 1005).
+        let spend = |outputs: &[Result<u64, (u32, u64)>]| {
+            let tx = utxo_tx(4, &[(3, 0, 60)], None, outputs);
+            move |mint: &Block| complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx])
+        };
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let o4 = resign(
+            &spend(&[Ok(60)])(&mint),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        assert_eq!(receive(&mut bc, &o4), ReceiveBlockOutcome::AcceptedSilently);
+        let (mi, oi) = (slot(&bc, &mint), slot(&bc, &o4));
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false));
+        assert_eq!(bc.blocks.utxo_available(oi, 0), Some(true));
+        // `n4` spends the same (3, 0) into two outputs: same value, larger.
+        let n4 = resign(
+            &spend(&[Ok(30), Ok(30)])(&mint),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        assert_eq!(receive(&mut bc, &n4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (4, n4.view().hash()));
+        let ni = slot(&bc, &n4);
+        assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "spent by n4");
+        assert_eq!(bc.blocks.utxo_available(mi, 1), Some(true));
+        assert_eq!(
+            bc.blocks.has_available_utxo(oi),
+            Some(false),
+            "o4 holds no bit"
+        );
+        assert_eq!(bc.blocks.utxo_available(ni, 0), Some(true));
+        assert_eq!(bc.blocks.utxo_available(ni, 1), Some(true));
+
+        // An output only the abandoned branch holds: `x5` spends (4, 0),
+        // which on its own branch is `x4`, a block without outputs.
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let (mut twin, _) = faulty_utxo_genesis();
+        let o4 = resign(
+            &spend(&[Ok(60)])(&mint),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        for node in [&mut bc] {
+            assert_eq!(receive(node, &o4), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(
+            receive(&mut twin, &o4),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let x4 = resign(
+            &tx_block(4, mint.view().hash(), 0, votes_for(4, 0, 1, 90)),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        let tx = utxo_tx(5, &[(4, 0, 60)], None, &[Ok(60)]);
+        let x5 = resign(
+            &complex_tx_block(5, x4.view().hash(), 0, 0, &[&tx]),
+            0,
+            vote_snapshot(1000),
+            1,
+        );
+        for blk in [&x5, &x4] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(head_of(&bc), (4, o4.view().hash()), "restored");
+        assert_eq!(status_of(&bc, &x5), None, "refused and deleted");
+        assert_eq!(status_of(&bc, &x4), Some(BlockStatus::Connected));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(slot(&bc, &x4)),
+            Some(brute_value(&bc, slot(&bc, &x4)))
+        );
+        assert_same_projection(&bc, &twin, "restored after a bad reference");
+    }
+
+    /// AC11.4 / D4 — switching back over a balance block restores each
+    /// listed owner's previous seed source: node #0 its registration in #0,
+    /// node #1 its registration block; a node no block names is released.
+    #[test]
+    fn fr23_seed_sources_are_restored_by_the_backward_scan() {
+        let (mut bc, b0, b1) = ready_genesis(16);
+        let b0i = slot(&bc, &b0);
+        assert_eq!(bc.node_info.seed_source_of(0), Some(b0i));
+        let r2 = register(2, b1.view().hash(), 1, NODE_ONE_KEY);
+        assert_eq!(receive(&mut bc, &r2), ReceiveBlockOutcome::AcceptedSilently);
+        let r2i = slot(&bc, &r2);
+        let (_, balance0, vote0, _) = node_zero_snapshot(&bc);
+        let s3 = {
+            use moonblokz_chain_types::NodeInfo;
+            let key = |byte: u8| {
+                *Crypto::new([byte; PRIVATE_KEY_SIZE])
+                    .ok()
+                    .expect("key")
+                    .public_key()
+                    .serialize()
+            };
+            let header = BlockHeader {
+                version: 1,
+                sequence: 3,
+                creator: 0,
+                mined_amount: 0,
+                payload_type: PAYLOAD_TYPE_BALANCE,
+                consumed_votes: 0,
+                first_voted_node: 0,
+                consumed_votes_from_first_voted_node: 0,
+                previous_hash: r2.view().hash(),
+                signature: [0u8; 64],
+            };
+            let mut builder = BlockBuilder::new().header(header);
+            for (owner, balance, vote, byte) in [(0, balance0, vote0, 1), (1, 0, 0, NODE_ONE_KEY)] {
+                builder
+                    .add_node_info(&NodeInfo::new(owner, balance, vote, &key(byte)))
+                    .ok()
+                    .expect("add node info");
+            }
+            builder.set_max_node_id(1).ok().expect("max node id");
+            let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+            builder.build_signed(&signer).ok().expect("build signed")
+        };
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        let s3i = slot(&bc, &s3);
+        assert_eq!(bc.node_info.seed_source_of(0), Some(s3i));
+        assert_eq!(bc.node_info.seed_source_of(1), Some(s3i));
+        // A larger sibling of `s3` (worth 0 as well) wins.
+        let n3 = tx_block(3, r2.view().hash(), 0, votes_for(3, 0, 3, 80));
+        assert_eq!(receive(&mut bc, &n3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, n3.view().hash()));
+        assert_eq!(bc.node_info.seed_source_of(0), Some(b0i));
+        assert_eq!(bc.node_info.seed_source_of(1), Some(r2i));
+        let (mut fresh, _, _) = ready_genesis(16);
+        for blk in [&r2, &n3] {
+            assert_eq!(
+                receive(&mut fresh, blk),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_same_projection(&bc, &fresh, "seed sources");
+        // No block below names node 9: released.
+        let mut out = [NONE_REF];
+        assert_eq!(
+            bc.previous_seed_sources(bc.active_chain_head_idx, &[9], &mut out),
+            Ok(())
+        );
+        assert_eq!(out, [SEED_SOURCE_RELEASED]);
+    }
+
+    /// AC11.5 / DEC-147 — registration-key uniqueness on the new branch: a key
+    /// the shared chain registered is refused at the replay; a key only the
+    /// abandoned branch registered is free.
+    #[test]
+    fn fr23_replay_checks_key_uniqueness_on_the_new_branch() {
+        let (mut bc, _, a2, a3) = two_creator_chain();
+        let (twin, _, _, _) = two_creator_chain();
+        let dup = resign(
+            &tx_block(3, a2.view().hash(), 0, |b| {
+                b.add_registration(&registration_tx(0, 2, NODE_ONE_KEY))
+                    .ok()
+                    .expect("add registration");
+            }),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        assert!(dup.view().len() > a3.view().len());
+        assert_eq!(
+            receive(&mut bc, &dup),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            status_of(&bc, &dup),
+            None,
+            "a duplicate key on its own branch"
+        );
+        assert_same_projection(&bc, &twin, "duplicate key");
+
+        let (mut bc, _, b1) = ready_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+        for blk in [&a2, &a3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let n2 = alt(2, b1.view().hash(), 0, 0, 1, 99, true);
+        let n3 = alt(3, n2.view().hash(), 1, 1, 3, 98, false);
+        for blk in [&n3, &n2] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(
+            head_of(&bc),
+            (3, n3.view().hash()),
+            "the abandoned key is free"
+        );
+    }
+
+    /// AC11.6 / AC6 — exact evidence at the first, a middle and the last new
+    /// block: the original chain is restored exactly, the offender goes with
+    /// its descendants, and the entry retargeted onto its parent carries the
+    /// parent's value.
+    #[test]
+    fn fr23_evidence_restores_and_deletes_the_offender() {
+        for bad in 0..3 {
+            let (mut bc, _, a2, a3) = two_creator_chain();
+            let (twin, _, _, _) = two_creator_chain();
+            let forge = |i: usize, block: Block, creator: u32, key: u8| {
+                if i == bad {
+                    resign(&block, creator, block.view().consumed_votes() + 7, key)
+                } else {
+                    block
+                }
+            };
+            let x3 = forge(
+                0,
+                alt(3, a2.view().hash(), 1, 1, 1, 50, false),
+                1,
+                NODE_ONE_KEY,
+            );
+            let x4 = forge(1, alt(4, x3.view().hash(), 0, 1, 1, 51, false), 0, 1);
+            let x5 = forge(
+                2,
+                alt(5, x4.view().hash(), 1, 1, 0, 52, false),
+                1,
+                NODE_ONE_KEY,
+            );
+            let blocks = [&x3, &x4, &x5];
+            for blk in [&x5, &x4, &x3] {
+                assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+            }
+            assert_eq!(head_of(&bc), (3, a3.view().hash()), "bad #{}", bad + 3);
+            for (i, blk) in blocks.iter().enumerate() {
+                if i >= bad {
+                    assert_eq!(status_of(&bc, blk), None, "bad #{}: deleted", bad + 3);
+                } else {
+                    assert_eq!(status_of(&bc, blk), Some(BlockStatus::Connected));
+                }
+            }
+            if bad > 0 {
+                let pi = slot(&bc, blocks[bad - 1]);
+                assert_eq!(
+                    bc.chain_heads.branch_value_of(pi),
+                    Some(brute_value(&bc, pi)),
+                    "bad #{}: the retarget's value",
+                    bad + 3
+                );
+            }
+            assert_same_projection(&bc, &twin, "after evidence");
+        }
+    }
+
+    /// AC11.6 / AC6 — local failures restore with no deletion: a read in the
+    /// backward walk, in the forward replay (a UTXO output below the common
+    /// ancestor) and in the seed-source scan. The candidate switches at its
+    /// next trigger. A save never happens: the switch writes nothing.
+    #[test]
+    fn fr23_local_failures_keep_the_candidate() {
+        // Backward walk: `a3` reads once (`s3`'s FORK valuation), then
+        // fails for the undo.
+        let (mut bc, _, a2, a3) = failing_two_creator_chain();
+        let s3 = heavier_sibling(&a2);
+        bc.storage.failing_slot = slot(&bc, &a3);
+        bc.storage.reads_left.set(1);
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, a3.view().hash()));
+        assert_eq!(status_of(&bc, &s3), Some(BlockStatus::Connected), "kept");
+        assert_eq!(bc.storage.attempts.get(), 2, "valued, then the undo failed");
+        bc.storage.failing_slot = NONE_REF;
+        let si = slot(&bc, &s3);
+        assert_eq!(
+            bc.switch_toward(si),
+            SwitchOutcome::Switched,
+            "at the next try"
+        );
+        assert_eq!(head_of(&bc), (3, s3.view().hash()));
+
+        // No durable write: with every save failing, a switch still succeeds.
+        let (mut bc, _, a2, a3) = faulty_two_creator_chain();
+        let s3 = heavier_sibling(&a2);
+        bc.storage.failing_read_slot = slot(&bc, &a3);
+        // The FORK valuation cannot read `a3`: `s3` stays Stored, uncompared.
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        bc.storage.failing_read_slot = NONE_REF;
+        let unrelated = transfer(9, [0x33; 32], 0, 3);
+        bc.storage.fail_saves = false;
+        assert_eq!(
+            receive(&mut bc, &unrelated),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        if head_of(&bc).1 != s3.view().hash() {
+            bc.storage.fail_saves = true;
+            let si = slot(&bc, &s3);
+            assert_eq!(bc.switch_toward(si), SwitchOutcome::Switched);
+            bc.storage.fail_saves = false;
+        }
+        assert_eq!(head_of(&bc), (3, s3.view().hash()));
+
+        // Forward replay: `n4` spends from the mint, which cannot be read.
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let o4 = real_on(&bc, &transfer(4, mint.view().hash(), 0, 7), 1, NODE_ONE_KEY);
+        assert_eq!(receive(&mut bc, &o4), ReceiveBlockOutcome::AcceptedSilently);
+        let tx = utxo_tx_vote(1, 4, &[(3, 0, 60)], None, &[Ok(60)]);
+        let n4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
+        assert_eq!(receive(&mut bc, &n4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(status_of(&bc, &n4), Some(BlockStatus::Connected));
+        let n5 = resign(
+            &transfer(5, n4.view().hash(), 0, 9),
+            1,
+            vote_snapshot(vote_snapshot(1000) + 1000),
+            NODE_ONE_KEY,
+        );
+        bc.storage.failing_read_slot = slot(&bc, &mint);
+        assert_eq!(receive(&mut bc, &n5), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (4, o4.view().hash()), "kept");
+        assert_eq!(status_of(&bc, &n5), Some(BlockStatus::Connected));
+        bc.storage.failing_read_slot = NONE_REF;
+        // `n5`'s transfer credited node #0 once.
+        let n6 = resign(
+            &transfer(6, n5.view().hash(), 0, 10),
+            0,
+            vote_snapshot(1000),
+            1,
+        );
+        assert_eq!(receive(&mut bc, &n6), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            head_of(&bc),
+            (6, n6.view().hash()),
+            "switched at the next trigger"
+        );
+
+        // Seed-source scan: #0 cannot be read.
+        let (mut bc, b1) = faulty_genesis(16);
+        let a2 = snapshot_block(&bc, 2, b1.view().hash());
+        assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
+        let n2 = tx_block(2, b1.view().hash(), 0, votes_for(2, 0, 3, 81));
+        bc.storage.failing_read_slot = 0;
+        assert_eq!(receive(&mut bc, &n2), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (2, a2.view().hash()), "kept");
+        assert_eq!(status_of(&bc, &n2), Some(BlockStatus::Connected));
+        assert_eq!(bc.node_info.seed_source_of(0), Some(slot(&bc, &a2)));
+    }
+
+    /// AC11.6 / AC6 — a restore failure: the third read of `a3` fails while
+    /// the original chain is re-applied, so the head stops at `a2` with an exact
+    /// state, `a3` is a Connected head with the old value, and nothing of the
+    /// original chain is deleted. A later switch toward `a3`'s extension has
+    /// its common ancestor at the head: a forward replay only.
+    #[test]
+    fn fr23_restore_failure_stops_at_the_highest_block_reached() {
+        let (mut bc, b1) = failing_genesis(16);
+        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+        let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+        for blk in [&a2, &a3] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let forged = resign(&heavier_sibling(&a2), 1, 2000, NODE_ONE_KEY);
+        assert_eq!(
+            receive(&mut bc, &forged),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(status_of(&bc, &forged), None, "attempted once, deleted");
+        // A second forgery, now with `a3` readable once (the undo) only.
+        let forged = resign(&heavier_sibling(&a2), 1, 2001, NODE_ONE_KEY);
+        bc.storage.failing_slot = slot(&bc, &a3);
+        // `a3` is read for the FORK valuation and for the undo; the restore's
+        // re-read fails.
+        bc.storage.reads_left.set(2);
+        assert_eq!(
+            receive(&mut bc, &forged),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc), (2, a2.view().hash()), "stopped at a2");
+        assert_eq!(status_of(&bc, &a3), Some(BlockStatus::Connected));
+        assert_eq!(
+            status_of(&bc, &forged),
+            None,
+            "the offender is still deleted"
+        );
+        assert_eq!(bc.chain_heads.branch_value_of(slot(&bc, &a3)), Some(1005));
+        let (mut fresh, _, _) = ready_genesis(16);
+        assert_eq!(
+            receive(&mut fresh, &a2),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_same_projection(&bc, &fresh, "exact at a2");
+
+        bc.storage.failing_slot = NONE_REF;
+        // `a3` credited only its own creator, so node #0's `a4` is worth 0.
+        let a4 = alt(4, a3.view().hash(), 0, 0, 0, 9, false);
+        assert_eq!(receive(&mut bc, &a4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (4, a4.view().hash()));
+    }
+
+    /// AC11.7 / D3 — on W4 (`#0, #1, b2, b3`, tail not advanced) the new
+    /// branch from `b2` crosses `W`: its replay advances a virtual tail past
+    /// #0, #1 and finally `b2`, the common ancestor. A failure after the
+    /// first advance restores the original branch exactly — impossible had
+    /// the advances released their blocks, since releasing `b2` deletes the
+    /// branches forked at it. On success the commit releases all three and
+    /// the abandoned branch with `b2`. A block skipping its due replay (the
+    /// chain-config replay #1 needs) is exact evidence.
+    #[test]
+    fn fr23_tail_advances_wait_for_the_commit() {
+        // Every block is node #0's and worth 0; `n6` drops `b2`, which holds
+        // no obligation, and makes the tip larger than `b3`.
+        let branch = |bc: &TestChain, b2: &Block, last_is_replay: bool| {
+            let n3 = transfer(3, b2.view().hash(), 0, 51);
+            let n4 = snapshot_block(bc, 4, n3.view().hash());
+            let n5 = if last_is_replay {
+                w4_config_anchor_block(5, n4.view().hash())
+            } else {
+                tx_block(5, n4.view().hash(), 0, votes_for(5, 0, 3, 52))
+            };
+            let n6 = tx_block(6, n5.view().hash(), 0, votes_for(6, 0, 3, 53));
+            [n3, n4, n5, n6]
+        };
+        let (_, _, b1) = ready_genesis(4);
+        let b2 = transfer(2, b1.view().hash(), 0, 7);
+        for last_is_replay in [false, true] {
+            let (mut bc, b3) = full_w4_genesis();
+            let (twin, _) = full_w4_genesis();
+            let blocks = branch(&bc, &b2, last_is_replay);
+            assert!(blocks[3].view().len() > b3.view().len());
+            for blk in [&blocks[3], &blocks[2], &blocks[1], &blocks[0]] {
+                assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+            }
+            if last_is_replay {
+                assert_eq!(head_of(&bc), (6, blocks[3].view().hash()));
+                assert_eq!(bc.active_snake_chain_window(), Ok((3, 6)));
+                assert_eq!(status_of(&bc, &b3), None, "released with b2's forks");
+                let (mut fresh, _, _) = ready_genesis(4);
+                assert_eq!(
+                    receive(&mut fresh, &b2),
+                    ReceiveBlockOutcome::AcceptedSilently
+                );
+                for blk in &blocks {
+                    assert_eq!(
+                        receive(&mut fresh, blk),
+                        ReceiveBlockOutcome::AcceptedSilently
+                    );
+                }
+                assert_same_projection(&bc, &fresh, "committed");
+            } else {
+                assert_eq!(head_of(&bc), (3, b3.view().hash()), "restored");
+                assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
+                assert_eq!(status_of(&bc, &blocks[2]), None, "skipped replay: deleted");
+                assert_eq!(status_of(&bc, &blocks[3]), None, "with its descendant");
+                assert_eq!(status_of(&bc, &blocks[1]), Some(BlockStatus::Connected));
+                assert_same_projection(&bc, &twin, "restored after the advances");
+            }
+        }
+    }
+
+    /// AC11.8 / DEC-204 — once the tail has advanced, a heavier admissible
+    /// fork inside `H` is not switched to: its replayed block would drop a
+    /// released block. Nothing changes and nothing is read.
+    #[test]
+    fn fr23_no_switch_once_the_tail_has_advanced() {
+        let (mut bc, b3) = full_w4_genesis();
+        let (mut twin, _) = full_w4_genesis();
+        let r4 = snapshot_block(&bc, 4, b3.view().hash());
+        for node in [&mut bc, &mut twin] {
+            assert_eq!(receive(node, &r4), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(bc.active_snake_chain_window(), Ok((1, 4)));
+        let s4 = tx_block(4, b3.view().hash(), 0, votes_for(4, 0, 3, 60));
+        assert_eq!(receive(&mut bc, &s4), ReceiveBlockOutcome::AcceptedSilently);
+        let si = slot(&bc, &s4);
+        assert_eq!(bc.switch_target([Some(si), None]), Some(si), "it would win");
+        assert_eq!(bc.switch_toward(si), SwitchOutcome::NotAdmitted);
+        assert_same_projection(&bc, &twin, "not admitted");
+    }
+
+    /// AC11.9 / D5 — the pre-pass: a bad signature by a creator registered at
+    /// or below the common ancestor is deleted before anything is touched (no
+    /// read of the old head beyond its FORK valuation); one by a creator
+    /// registered above it is refused by the replay instead, which restores
+    /// and deletes it.
+    #[test]
+    fn fr23_signature_prepass() {
+        let (mut bc, _, a2, a3) = failing_two_creator_chain();
+        let bad = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x77);
+        bc.storage.failing_slot = slot(&bc, &a3);
+        bc.storage.reads_left.set(1);
+        assert_eq!(
+            receive(&mut bc, &bad),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(status_of(&bc, &bad), None, "deleted by the pre-pass");
+        assert_eq!(head_of(&bc), (3, a3.view().hash()));
+        assert_eq!(
+            bc.storage.attempts.get(),
+            1,
+            "only the FORK valuation read a3"
+        );
+        bc.storage.failing_slot = NONE_REF;
+
+        let (mut bc, b1, _, a3) = two_creator_chain();
+        let (twin, _, _, _) = two_creator_chain();
+        let n2 = alt(2, b1.view().hash(), 0, 0, 1, 55, true);
+        let n3 = resign(
+            &alt(3, n2.view().hash(), 1, 1, 3, 56, false),
+            1,
+            vote_snapshot(1000),
+            0x77,
+        );
+        for blk in [&n3, &n2] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        assert_eq!(head_of(&bc), (3, a3.view().hash()));
+        assert_eq!(status_of(&bc, &n3), None, "refused by the replay");
+        let n2i = slot(&bc, &n2);
+        assert!(
+            bc.blocks
+                .get(n2i)
+                .is_some_and(|e| e.is_signature_verified())
+        );
+        assert_same_projection(&bc, &twin, "after the replay's refusal");
+    }
+
+    /// AC10 — switch, then restart: FR2 picks a sequence-3 tip by hash, and
+    /// the restart's comparison switches to the heavier one again.
+    #[test]
+    fn fr23_switch_survives_a_restart() {
+        let (mut bc, _, a2, _) = two_creator_chain();
+        let s3 = heavier_sibling(&a2);
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, s3.view().hash()));
+        let mut restarted = restart(bc);
+        let _ = restarted.initialize_from_storage(0);
+        assert!(restarted.is_ready());
+        assert_eq!(head_of(&restarted), (3, s3.view().hash()));
+    }
 }
