@@ -667,8 +667,9 @@ enum SwitchOutcome {
     /// Exact evidence: the original chain stands and the offending block was
     /// deleted with its descendants.
     Deleted,
-    /// A fault while re-applying the original chain: the active head stopped
-    /// at the highest block re-applied, with its state exact (AC6).
+    /// A second fault while restoring: the active head stopped where the
+    /// restore was — on the original chain or on a prefix of the new one —
+    /// with its state exact for that chain and its window at most `W` (AC6).
     RestoreFailed,
 }
 
@@ -683,18 +684,21 @@ enum PrePass {
     Local,
 }
 
-/// The upper bound of a balance block's entries: the owner list a
-/// committed-block undo copies before its seed-source scan (Story 6.3 AC2).
+/// An upper bound on a balance block's entries (the payload also carries
+/// its header): the owner list a committed-block undo copies before its
+/// seed-source scan (Story 6.3 AC2).
 const MAX_BALANCE_ENTRIES: usize = MAX_PAYLOAD_SIZE / NODE_INFO_SIZE;
 
 /// FR36(b): the transaction-fee total the per-block step credited to the
 /// block's creator, recomputed from the payload for the committed-block undo
 /// (Story 6.3 AC2) — the sums of `apply_transaction` / `apply_complex`, whose
-/// checks made them exact.
-fn block_fees(view: &BlockView<'_>) -> u64 {
+/// checks made them exact — and the block's UTXO-output count, its own
+/// available-UTXO bits (the AC2 precondition of the undo).
+fn fees_and_utxo_outputs(view: &BlockView<'_>) -> (u64, usize) {
     let Some(txs) = view.transactions() else {
-        return 0;
+        return (0, 0);
     };
+    let mut outputs = 0usize;
     let is_genesis_zero = view.sequence() == 0;
     let mut total = 0u64;
     for tx in txs.iter() {
@@ -704,9 +708,14 @@ fn block_fees(view: &BlockView<'_>) -> u64 {
             if !is_genesis_zero {
                 total = total.wrapping_add(reg.fee());
             }
-        } else if let Some(cx) = tx.as_complex()
-            && cx.input_count() > 0
-        {
+        } else if let Some(cx) = tx.as_complex() {
+            outputs += cx
+                .outputs()
+                .filter(|output| output.as_utxo().is_some())
+                .count();
+            if cx.input_count() == 0 {
+                continue;
+            }
             let mut in_sum: u64 = 0;
             for input in cx.inputs() {
                 if let Some(bi) = input.as_balance() {
@@ -726,7 +735,7 @@ fn block_fees(view: &BlockView<'_>) -> u64 {
             total = total.wrapping_add(in_sum.saturating_sub(out_sum));
         }
     }
-    total
+    (total, outputs)
 }
 
 /// What [`Blockchain::walk_side_branch`] found on one side branch (Story 6.1
@@ -3962,10 +3971,10 @@ impl<
     /// Inverts the effects of the first `count` transactions of `view` (all of
     /// them for `usize::MAX`), newest first — the D1 prefix inversion of
     /// [`Self::derive_block`]'s transaction effects. Undoing a *committed*
-    /// block (Story 6.3) also needs the inverse of [`Self::commit_block`]'s
-    /// effects, which this does not cover: `VoteEngine::undo_block`, the
-    /// creator credit, the block's own output bits, and the seed-source moves
-    /// (the D1 backward scan handed to 6.3). Each inverse is computed
+    /// block also needs the inverse of [`Self::commit_block`]'s effects, which
+    /// [`Self::undo_committed_block`] adds around this call (Story 6.3):
+    /// `VoteEngine::undo_block`, the block's own output bits, the seed-source
+    /// restore by backward scan, and the creator credit. Each inverse is computed
     /// from the transaction bytes plus the current state, which, in reverse
     /// order, is the state right after that transaction applied. O(`count`²)
     /// transaction parses, on failure paths only.
@@ -4645,8 +4654,9 @@ impl<
     /// The FR23 chain switch toward `head` (FR22; Story 6.3, DEC-166..171,
     /// DEC-204): an atomic, in-place walk — back from the active head to the
     /// common ancestor by exact per-block inverses, then forward to `head`
-    /// through the shared Tier-3 step — that either completes or leaves the
-    /// original chain exactly as it was (AC6). It runs inside this call, so no
+    /// through the shared Tier-3 step — that completes, or restores the
+    /// original chain exactly, or, after a second fault while restoring, stops
+    /// on a valid shorter chain (AC6). It runs inside this call, so no
     /// query or event surface sees a blend of the two branches (FR24), and it
     /// writes no block bytes. The walk is these `Blockchain` methods, not
     /// `reconciliation.rs` (D6, DEC-171): the fields are private to `api`.
@@ -4672,8 +4682,9 @@ impl<
             PrePass::Clean => {}
             PrePass::Local => return SwitchOutcome::Kept,
             PrePass::Invalid { block, through } => {
-                // Nothing was mutated: delete the forgery, and give the entry
-                // retargeted onto its parent the value below it.
+                // No projection was mutated (the pre-pass only marked the
+                // signatures it verified): delete the forgery, and give the
+                // entry retargeted onto its parent the value below it.
                 let value = self
                     .chain_heads
                     .branch_value_of(head)
@@ -4689,7 +4700,7 @@ impl<
         // transactions to the mempool here (FR32 (1)).
         while self.active_chain_head_idx != ancestor {
             if self.undo_active_head().is_err() {
-                return self.restore_original(old_head, old_value, None);
+                return self.restore_original(ancestor, old_head, old_value, None);
             }
         }
 
@@ -4702,14 +4713,14 @@ impl<
         let mut released_value = 0u64;
         while self.active_chain_head_idx != head {
             let Some(next) = self.next_toward(head) else {
-                return self.restore_original(old_head, old_value, None);
+                return self.restore_original(ancestor, old_head, old_value, None);
             };
             match self.apply_stored_child(next, virtual_tail) {
                 ChildStep::Applied { advance, value } => {
                     self.promote_replayed(next, value);
                     if let Some(tail_value) = advance {
                         let Some(successor) = self.tail_successor(virtual_tail) else {
-                            return self.restore_original(old_head, old_value, None);
+                            return self.restore_original(ancestor, old_head, old_value, None);
                         };
                         virtual_tail = successor;
                         advances += 1;
@@ -4720,18 +4731,50 @@ impl<
                     // `next`'s parent is the current head: its value is the
                     // active value now, before anything is undone.
                     let parent_value = self.active_branch_value;
-                    return self.restore_original(old_head, old_value, Some((next, parent_value)));
+                    return self.restore_original(
+                        ancestor,
+                        old_head,
+                        old_value,
+                        Some((next, parent_value)),
+                    );
                 }
-                ChildStep::Local => return self.restore_original(old_head, old_value, None),
+                ChildStep::Local => {
+                    return self.restore_original(ancestor, old_head, old_value, None);
+                }
             }
         }
         // The walk must land on the value the comparison ranked (FR21): a
         // mismatch means an inconsistent table — a local failure.
         if self.chain_heads.branch_value_of(head) != Some(self.active_branch_value) {
-            return self.restore_original(old_head, old_value, None);
+            return self.restore_original(ancestor, old_head, old_value, None);
+        }
+        // Every deferred release must succeed, so the commit's summed FR21
+        // (iii) subtraction is exact (AC5): the physical tail is the flagged
+        // root and the virtual tail lies on the new head's ancestry, the chain
+        // `advance_snake_chain_tail` walks. A breach is a local failure,
+        // before anything is committed.
+        if advances > 0 && !self.releases_will_succeed(head, virtual_tail) {
+            return self.restore_original(ancestor, old_head, old_value, None);
         }
         self.commit_switch(head, old_head, old_value, advances, released_value);
         SwitchOutcome::Switched
+    }
+
+    /// Whether the commit's deferred releases, from the physical tail up to
+    /// `virtual_tail`, will all succeed: the tail is the active chain's flagged
+    /// root and `virtual_tail` is a proper ancestor of `head`, so every block
+    /// released has a flagged child on the way to `head`. RAM only.
+    fn releases_will_succeed(&self, head: u32, virtual_tail: u32) -> bool {
+        let tail = self.snake_chain_tail_idx;
+        let tail_is_root = self
+            .blocks
+            .get(tail)
+            .is_some_and(|entry| entry.is_on_active_chain() && entry.parent_ref() == NONE_REF);
+        tail_is_root
+            && virtual_tail != head
+            && self.blocks.get(virtual_tail).is_some_and(|entry| {
+                matches!(self.ancestor_at(head, entry.sequence()), Ok(Some(idx)) if idx == virtual_tail)
+            })
     }
 
     /// The common ancestor of the active chain and `head`'s branch: the first
@@ -4877,17 +4920,22 @@ impl<
 
     /// Story 6.3 D4 (DEC-169): each owner's previous FR50 seed source — the
     /// nearest block at or below `from` that lists it in a balance block or
-    /// registers it, walking down to the root; `SEED_SOURCE_RELEASED` when the
-    /// root misses too. One scan for every owner, bounded by the window (FR50
-    /// coverage); a block that can hold neither is skipped unread. Its own
-    /// read buffer (DEC-136). `Err` on a failed read: a local failure.
+    /// registers it, walking down to the root (the lowest retained block);
+    /// `SEED_SOURCE_RELEASED` when the root misses too. One scan for every
+    /// owner; FR50 coverage puts each previous source within `W` of `from`,
+    /// and the walk stops once every owner is found. A block that can hold
+    /// neither is skipped unread. Its own read buffer (DEC-136). `Err` on a
+    /// failed read or a walk that does not reach the root (a corrupt
+    /// `parent_ref` cycle): a local failure.
     #[inline(never)]
     fn previous_seed_sources(&self, from: u32, owners: &[u32], out: &mut [u32]) -> Result<(), ()> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let mut remaining = owners.len();
         let mut cur = from;
-        for _ in 0..MAX_BLOCKS {
+        let mut ended = false;
+        for _ in 0..=MAX_BLOCKS {
             if remaining == 0 || cur == NONE_REF {
+                ended = true;
                 break;
             }
             let entry = self.blocks.get(cur).ok_or(())?;
@@ -4916,6 +4964,9 @@ impl<
             }
             cur = parent;
         }
+        if !ended {
+            return Err(());
+        }
         for source in out.iter_mut() {
             if *source == NONE_REF {
                 *source = SEED_SOURCE_RELEASED;
@@ -4943,6 +4994,15 @@ impl<
         let view = self.view_retained(idx, &mut buf).ok_or(())?;
         let value = block_value(&view);
         let remaining_value = self.active_branch_value.checked_sub(value).ok_or(())?;
+        // AC2 precondition, a real check: undone top-down, the block's bits are
+        // exactly its own outputs, all set (every later spend of them is undone
+        // already).
+        let (fees, outputs) = fees_and_utxo_outputs(&view);
+        if (0..AVAILABLE_UTXO_BYTES * 8)
+            .any(|bit| self.blocks.utxo_available(idx, bit) != Some(bit < outputs))
+        {
+            return Err(());
+        }
         // The vote engine refuses atomically; its errors are the node's own
         // state, never evidence against the block (AC2 step 2).
         if let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
@@ -4956,10 +5016,8 @@ impl<
             self.node_info.move_seed_source(*owner, *source);
         }
         if view.sequence() > 1 && self.node_info.is_seeded(view.creator()) {
-            self.node_info.debit(
-                view.creator(),
-                view.mined_amount() as u64 + block_fees(&view),
-            );
+            self.node_info
+                .debit(view.creator(), view.mined_amount() as u64 + fees);
         }
         self.invert_transactions(&view, idx, usize::MAX);
         self.active_branch_value = remaining_value;
@@ -5010,19 +5068,21 @@ impl<
     }
 
     /// AC6 — restores the original chain after a failed walk: undoes every
-    /// block above the original chain's path, re-applies the original branch
-    /// up to `old_head` by the same step (its blocks are marked, so no
-    /// signature is verified again), and, for exact evidence at `offender`,
-    /// deletes it with its descendants. Any error while re-applying stops the
-    /// restore where it is (a restore failure), whatever its kind.
+    /// block above the original chain's path (never below `ancestor`),
+    /// re-applies the original branch up to `old_head` by the same step (its
+    /// blocks are marked, so no signature is verified again), and, for exact
+    /// evidence at `offender`, deletes it with its descendants. Any error
+    /// while restoring stops it where it is (a restore failure), whatever its
+    /// kind.
     fn restore_original(
         &mut self,
+        ancestor: u32,
         old_head: u32,
         old_value: u64,
         offender: Option<(u32, u64)>,
     ) -> SwitchOutcome {
         while !self.on_path_to(old_head) {
-            if self.undo_active_head().is_err() {
+            if self.active_chain_head_idx == ancestor || self.undo_active_head().is_err() {
                 return self.stop_restore(old_head, old_value, offender);
             }
         }
@@ -5032,12 +5092,15 @@ impl<
                 return self.stop_restore(old_head, old_value, offender);
             };
             match self.apply_stored_child(next, tail) {
-                // The original chain fit the window, so re-applying it never
-                // advances the tail.
-                ChildStep::Applied {
-                    advance: None,
-                    value,
-                } => self.promote_replayed(next, value),
+                ChildStep::Applied { advance, value } => {
+                    // Its effects are committed: promote it either way. The
+                    // original chain fit the window, so an advance means an
+                    // inconsistent window — stop (the stop releases the excess).
+                    self.promote_replayed(next, value);
+                    if advance.is_some() {
+                        return self.stop_restore(old_head, old_value, offender);
+                    }
+                }
                 _ => return self.stop_restore(old_head, old_value, offender),
             }
         }
@@ -5063,21 +5126,48 @@ impl<
         })
     }
 
-    /// AC6 restore failure: the active head stays at the highest block the
-    /// restore reached — every step is atomic, so its state is exact for that
-    /// chain — the original head's entry takes the original value (in RAM),
-    /// and nothing of the original chain is deleted. The offender, if any, is
-    /// still exact evidence.
+    /// AC6 restore failure: the active head stays where the restore reached
+    /// — on the original chain, or on a prefix of the new one when an undo
+    /// failed — and every step is atomic, so its state is exact for that
+    /// chain. The active value is never an entry, the original head's entry
+    /// takes the original value (in RAM), and a window the stop left longer
+    /// than `W` (pending virtual advances, never released) is brought back to
+    /// `W` by the ordinary release step, as head extensions would have done;
+    /// a failed read of a new tail's value stops that early. Nothing of the
+    /// original chain is deleted; the offender, if any, is still exact
+    /// evidence.
     fn stop_restore(
         &mut self,
         old_head: u32,
         old_value: u64,
         offender: Option<(u32, u64)>,
     ) -> SwitchOutcome {
-        self.chain_heads.recompute_all_caches(&self.blocks);
-        self.chain_heads.set_branch_value(old_head, old_value);
+        // The offender first: its deletion may retarget an entry onto the
+        // active head, whose value is cleared below.
         if let Some((block, parent_value)) = offender {
             self.delete_offender(block, Some(parent_value));
+        }
+        self.chain_heads.recompute_all_caches(&self.blocks);
+        if self.active_chain_head_idx != old_head {
+            self.chain_heads.set_branch_value(old_head, old_value);
+        }
+        self.chain_heads
+            .set_branch_value(self.active_chain_head_idx, 0);
+        while let (Some(w), Some(head), Some(tail)) = (
+            self.active_chain_length(),
+            self.blocks.get(self.active_chain_head_idx),
+            self.blocks.get(self.snake_chain_tail_idx),
+        ) && (head.sequence() + 1).saturating_sub(tail.sequence()) > w
+        {
+            let Some(tail_value) = self.new_tail_value(self.snake_chain_tail_idx) else {
+                break;
+            };
+            if !self.advance_snake_chain_tail() {
+                break;
+            }
+            self.active_branch_value = self.active_branch_value.saturating_sub(tail_value);
+            self.chain_heads
+                .subtract_branch_value(&self.blocks, tail_value);
         }
         SwitchOutcome::RestoreFailed
     }
@@ -6404,12 +6494,9 @@ impl<
     /// the same value. While Collecting or Processing there is no active chain,
     /// and every read declines.
     ///
-    /// **Until Story 7.2 maintains the projections on forward extension (FR35),
-    /// this is a per-node snapshot**: a Ready node's `node_info` is the state at
-    /// its Ready transition, and node #0, made Ready by genesis without a pass,
-    /// stays at the genesis count. Harmless for the one bound consumer, the
-    /// parent-recovery cadence, which is not consensus-relevant; Story 7.2 owns
-    /// keeping the watermark current before a consensus-relevant consumer binds.
+    /// The head extension (Story 6.0) and the chain switch (Story 6.3) keep
+    /// `node_info` — the watermark included — at the active head's state;
+    /// Story 7.2 completes the per-block update set (FR35).
     fn chain_info_at_head(&self) -> ChainInfoAtHead {
         ChainInfoAtHead {
             registered_node_count: self
@@ -16041,6 +16128,62 @@ mod tests {
             hash_of(&b.blocks, b.snake_chain_tail_idx),
             "{what}: tail"
         );
+        assert_eq!(
+            a.complete_from_sequence, b.complete_from_sequence,
+            "{what}: completeness horizon"
+        );
+        // `chain_heads`, by head block: every entry `b` holds is in `a` with
+        // the same connection, the same anchor block and — for a Connected
+        // side head — the same value (FR19 event (iii), no demotion, FR21
+        // (iv)). An entry only `a` holds names a side head off the chain. The
+        // active head's own entry is skipped: it carries no value (DEC-144),
+        // and it exists only while the head has no side child.
+        type Entry = Option<((u32, [u8; 32]), bool, Option<[u8; 32]>, Option<u64>)>;
+        let entries = |bc_blocks: &BlockTable<16>, heads: &ChainHeadsTable<4>| {
+            let mut out: [Entry; 4] = [None; 4];
+            for (slot, (head, anchor)) in heads.occupied_heads().enumerate() {
+                let entry = bc_blocks.get(head).expect("an entry names a block");
+                if entry.status() == BlockStatus::Active {
+                    continue;
+                }
+                let connected = (0..4).any(|s| heads.connected_head_at(s) == Some(head));
+                let value = if entry.status() == BlockStatus::Connected {
+                    heads.branch_value_of(head)
+                } else {
+                    None
+                };
+                out[slot] = Some((
+                    (entry.sequence(), *entry.hash()),
+                    connected,
+                    bc_blocks.get(anchor).map(|e| *e.hash()),
+                    value,
+                ));
+            }
+            out
+        };
+        let (ha, hb) = (
+            entries(&a.blocks, &a.chain_heads),
+            entries(&b.blocks, &b.chain_heads),
+        );
+        for eb in hb.iter().flatten() {
+            assert!(
+                ha.iter().flatten().any(|ea| ea == eb),
+                "{what}: chain_heads entry #{} missing or different",
+                (eb.0).0
+            );
+        }
+        for ea in ha.iter().flatten() {
+            if !hb.iter().flatten().any(|eb| eb.0 == ea.0) {
+                let ((seq, hash), ..) = *ea;
+                assert!(
+                    a.blocks
+                        .find(seq, &hash)
+                        .and_then(|i| a.blocks.get(i))
+                        .is_some_and(|e| !e.is_on_active_chain()),
+                    "{what}: an extra entry #{seq} names a side head"
+                );
+            }
+        }
         let mut matched = [false; 16];
         for idx in 0..16u32 {
             let Some(eb) = b.blocks.get(idx) else {
@@ -16175,7 +16318,7 @@ mod tests {
             );
         }
         assert_same_projection(&bc, &fresh, "depth 1");
-        let _ = b1;
+        let _ = b1; // the fresh node's own genesis
 
         // Depth 2: `g3` ties `a3` and loses by hash; `g4` makes it win.
         let (mut bc, _, a2, a3) = two_creator_chain();
@@ -16287,6 +16430,16 @@ mod tests {
             &twin,
             &complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]),
             "utxo",
+        );
+        // A complex block paying its creator a fee (60 in, 50 out).
+        let (bc, mint) = faulty_utxo_genesis();
+        let (twin, _) = faulty_utxo_genesis();
+        let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(50)]);
+        check(
+            bc,
+            &twin,
+            &complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]),
+            "utxo fee",
         );
 
         // Genesis #1: undone, then re-applied by the same step.
@@ -16587,26 +16740,19 @@ mod tests {
         );
         assert_eq!(head_of(&bc), (3, s3.view().hash()));
 
-        // No durable write: with every save failing, a switch still succeeds.
+        // No durable write (AC7): `s3`'s switch is kept once (its pre-pass
+        // cannot read it back), then runs with every save failing.
         let (mut bc, _, a2, a3) = faulty_two_creator_chain();
         let s3 = heavier_sibling(&a2);
-        bc.storage.failing_read_slot = slot(&bc, &a3);
-        // The FORK valuation cannot read `a3`: `s3` stays Stored, uncompared.
+        bc.storage.failing_read_slot = bc.blocks.next_free_index().expect("a free slot");
         assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, a3.view().hash()), "kept");
         bc.storage.failing_read_slot = NONE_REF;
-        let unrelated = transfer(9, [0x33; 32], 0, 3);
-        bc.storage.fail_saves = false;
-        assert_eq!(
-            receive(&mut bc, &unrelated),
-            ReceiveBlockOutcome::AcceptedSilently
-        );
-        if head_of(&bc).1 != s3.view().hash() {
-            bc.storage.fail_saves = true;
-            let si = slot(&bc, &s3);
-            assert_eq!(bc.switch_toward(si), SwitchOutcome::Switched);
-            bc.storage.fail_saves = false;
-        }
+        bc.storage.fail_saves = true;
+        let si = slot(&bc, &s3);
+        assert_eq!(bc.switch_toward(si), SwitchOutcome::Switched);
         assert_eq!(head_of(&bc), (3, s3.view().hash()));
+        bc.storage.fail_saves = false;
 
         // Forward replay: `n4` spends from the mint, which cannot be read.
         let (mut bc, mint) = faulty_utxo_genesis();
@@ -16706,12 +16852,14 @@ mod tests {
 
     /// AC11.7 / D3 — on W4 (`#0, #1, b2, b3`, tail not advanced) the new
     /// branch from `b2` crosses `W`: its replay advances a virtual tail past
-    /// #0, #1 and finally `b2`, the common ancestor. A failure after the
-    /// first advance restores the original branch exactly — impossible had
-    /// the advances released their blocks, since releasing `b2` deletes the
-    /// branches forked at it. On success the commit releases all three and
-    /// the abandoned branch with `b2`. A block skipping its due replay (the
-    /// chain-config replay #1 needs) is exact evidence.
+    /// #0, #1 and finally `b2`, the common ancestor. The failing case: `n5`
+    /// skips the chain-config replay #1 needs (exact evidence) after the
+    /// virtual tail passed #0, and the original branch is restored exactly,
+    /// #0 still retained. The success case: the commit releases #0, #1 and
+    /// `b2`, the common ancestor, and with it the abandoned branch — the
+    /// release a failure after it could not have undone. (The test backend's
+    /// eight slots leave no room for a failure after the ancestor's own
+    /// virtual release.)
     #[test]
     fn fr23_tail_advances_wait_for_the_commit() {
         // Every block is node #0's and worth 0; `n6` drops `b2`, which holds
@@ -16766,7 +16914,8 @@ mod tests {
 
     /// AC11.8 / DEC-204 — once the tail has advanced, a heavier admissible
     /// fork inside `H` is not switched to: its replayed block would drop a
-    /// released block. Nothing changes and nothing is read.
+    /// released block. Nothing changes (the gate is RAM-only and runs before
+    /// the pre-pass).
     #[test]
     fn fr23_no_switch_once_the_tail_has_advanced() {
         let (mut bc, b3) = full_w4_genesis();
@@ -16831,12 +16980,108 @@ mod tests {
         assert_same_projection(&bc, &twin, "after the replay's refusal");
     }
 
-    /// AC10 — switch, then restart: FR2 picks a sequence-3 tip by hash, and
-    /// the restart's comparison switches to the heavier one again.
+    /// AC10 — the same block set in three admission orders ends on the same
+    /// head with the same derived state, through zero, one or two switches.
+    #[test]
+    fn fr23_admission_order_does_not_change_the_outcome() {
+        let base = || {
+            let (mut bc, _, b1) = ready_genesis(16);
+            let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+            assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
+            (bc, a2)
+        };
+        let (_, a2) = base();
+        let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+        let g3 = (20..400)
+            .map(|salt| alt(3, a2.view().hash(), 1, 1, 1, salt, false))
+            .find(|g| g.view().len() == a3.view().len() && g.view().hash() > a3.view().hash())
+            .expect("a same-size sibling with a higher hash");
+        let g4 = alt(4, g3.view().hash(), 0, 1, 0, 21, false);
+        let orders = [[&a3, &g3, &g4], [&g4, &g3, &a3], [&g3, &a3, &g4]];
+        let run = |order: &[&Block; 3]| {
+            let (mut bc, _) = base();
+            for blk in order {
+                assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+            }
+            assert_eq!(head_of(&bc), (4, g4.view().hash()));
+            bc
+        };
+        let first = run(&orders[0]);
+        for (i, order) in orders.iter().enumerate().skip(1) {
+            let other = run(order);
+            assert_same_projection(&other, &first, if i == 1 { "order 2" } else { "order 3" });
+        }
+    }
+
+    /// AC11.6 / AC6 — a restore failure while undoing the replayed prefix: the
+    /// head stays on the new branch at `x3`, exact for that chain, the
+    /// offender `x4` is deleted, and the original `a3` is a Connected head
+    /// with the original value.
+    #[test]
+    fn fr23_restore_failure_on_the_new_branch_leaves_an_exact_prefix() {
+        let blocks = |a2: &Block| {
+            let x3 = alt(3, a2.view().hash(), 1, 1, 1, 70, false);
+            let x4 = resign(&alt(4, x3.view().hash(), 0, 1, 0, 71, false), 0, 9, 1);
+            (x3, x4)
+        };
+        // Count `x3`'s reads on a twin, then fail its last one: the
+        // restore's undo.
+        let reads = {
+            let (mut twin, _, a2, _) = failing_two_creator_chain();
+            let (x3, x4) = blocks(&a2);
+            assert_eq!(
+                receive(&mut twin, &x4),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            twin.storage.failing_slot = twin.blocks.next_free_index().expect("a free slot");
+            twin.storage.reads_left.set(1000);
+            assert_eq!(
+                receive(&mut twin, &x3),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(head_of(&twin).0, 3, "the twin restored fully");
+            twin.storage.attempts.get()
+        };
+        let (mut bc, _, a2, a3) = failing_two_creator_chain();
+        let (x3, x4) = blocks(&a2);
+        assert_eq!(receive(&mut bc, &x4), ReceiveBlockOutcome::AcceptedSilently);
+        bc.storage.failing_slot = bc.blocks.next_free_index().expect("a free slot");
+        bc.storage.reads_left.set(reads - 1);
+        assert_eq!(receive(&mut bc, &x3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            head_of(&bc),
+            (3, x3.view().hash()),
+            "stopped on the new branch"
+        );
+        assert_eq!(status_of(&bc, &x4), None, "the offender is deleted");
+        assert_eq!(status_of(&bc, &a3), Some(BlockStatus::Connected));
+        assert_eq!(bc.chain_heads.branch_value_of(slot(&bc, &a3)), Some(1005));
+        assert_eq!(
+            bc.chain_heads.branch_value_of(slot(&bc, &x3)).unwrap_or(0),
+            0,
+            "the active value is never an entry"
+        );
+        bc.storage.failing_slot = NONE_REF;
+        let (mut fresh, _, _) = ready_genesis(16);
+        for blk in [&a2, &x3] {
+            assert_eq!(
+                receive(&mut fresh, blk),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_same_projection(&bc, &fresh, "the new-branch prefix");
+    }
+
+    /// AC10 — switch, then restart: FR2 picks the sequence-3 tip with the
+    /// lower hash, `a3`, so only the restart's comparison can bring the head
+    /// back to the heavier `s3`.
     #[test]
     fn fr23_switch_survives_a_restart() {
-        let (mut bc, _, a2, _) = two_creator_chain();
-        let s3 = heavier_sibling(&a2);
+        let (mut bc, _, a2, a3) = two_creator_chain();
+        let s3 = (40..400)
+            .map(|salt| alt(3, a2.view().hash(), 1, 1, 3, salt, false))
+            .find(|s| s.view().hash() > a3.view().hash())
+            .expect("a heavier sibling with a higher hash");
         assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(head_of(&bc), (3, s3.view().hash()));
         let mut restarted = restart(bc);

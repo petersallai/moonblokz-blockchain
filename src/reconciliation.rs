@@ -34,7 +34,7 @@ pub(crate) fn switch_admitted(
     ancestor >= root
         && ancestor.saturating_add(h) >= head
         && ancestor >= complete_from
-        && (ancestor + 1).saturating_sub(w) >= root
+        && ancestor.saturating_add(1).saturating_sub(w) >= root
 }
 
 #[cfg(test)]
