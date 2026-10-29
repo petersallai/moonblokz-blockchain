@@ -55,7 +55,6 @@ const NODE_ZERO_ID: u32 = 0;
 /// bits 1-2 (see `blocks.rs`).
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Connected/Active are set only by Epic 5/6/7 promotion drivers.
 pub(crate) enum BlockStatus {
     /// Bytes parse, `payload_type` is a known schema, every applicable Tier 1
     /// gating check passed. The only status assigned in Epic 4.
@@ -65,9 +64,10 @@ pub(crate) enum BlockStatus {
     /// driver or at intake when its parent is Connected or Active
     /// (`Blockchain::tier2_check`, `api.rs`).
     Connected,
-    /// A Connected block (or a Stored block promoted in one FR3 step) that is
-    /// on the selected active chain, Tier 3-verified. *Driver tagged forward
-    /// (Epic 5/6/7).*
+    /// A block on the selected active chain, Tier 3-verified: promoted by the
+    /// FR3 pass or a Ready head extension (from Stored), or by an FR23 chain
+    /// switch's replay (from Connected); a switch demotes the abandoned branch
+    /// back to Connected (Story 6.3).
     Active,
 }
 
