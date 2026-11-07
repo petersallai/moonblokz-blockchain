@@ -71,9 +71,11 @@ pub enum LifecyclePhase {
 
 /// Legal lifecycle transitions (FR1/FR4). The only runtime edges are
 /// `Collecting → Processing` (FR2 stopping condition met, Story 5.2),
-/// `Processing → Ready` (FR6 validation passed, FR4, Story 5.4), and
-/// `Processing → Collecting` (FR5 atomic recovery, Story 5.5). There is **no**
-/// direct `Collecting → Ready` edge, no `Ready → *` edge, and no self-loop.
+/// `Processing → Ready` (FR6 validation passed, FR4, Story 5.4),
+/// `Processing → Collecting` (FR5 atomic recovery, Story 5.5), and
+/// `Ready → Collecting` (a chain switch whose restore failed re-enters
+/// collecting, FR23, DEC-205). There is **no** direct `Collecting → Ready`
+/// edge, no `Ready → Processing` edge, and no self-loop.
 ///
 /// Genesis (`Blockchain::process_genesis`) establishes the *initial* phase
 /// `Ready` directly at bootstrap — that is initialization, not a runtime
@@ -88,6 +90,7 @@ pub(crate) fn is_legal_transition(from: &LifecyclePhase, to: &LifecyclePhase) ->
         (LifecyclePhase::Collecting, LifecyclePhase::Processing)
             | (LifecyclePhase::Processing, LifecyclePhase::Ready)
             | (LifecyclePhase::Processing, LifecyclePhase::Collecting)
+            | (LifecyclePhase::Ready, LifecyclePhase::Collecting)
     )
 }
 
@@ -109,6 +112,11 @@ mod tests {
             &LifecyclePhase::Processing,
             &LifecyclePhase::Collecting
         ));
+        // A chain switch whose restore failed (FR23, DEC-205).
+        assert!(is_legal_transition(
+            &LifecyclePhase::Ready,
+            &LifecyclePhase::Collecting
+        ));
     }
 
     #[test]
@@ -118,12 +126,7 @@ mod tests {
             &LifecyclePhase::Collecting,
             &LifecyclePhase::Ready
         ));
-        // Ready is terminal at runtime in Story 5.1 (chain-switch/recovery
-        // that leave Ready arrive in later stories via their own edges).
-        assert!(!is_legal_transition(
-            &LifecyclePhase::Ready,
-            &LifecyclePhase::Collecting
-        ));
+        // Ready leaves only to Collecting (DEC-205), never to Processing.
         assert!(!is_legal_transition(
             &LifecyclePhase::Ready,
             &LifecyclePhase::Processing

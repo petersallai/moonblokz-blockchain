@@ -667,9 +667,10 @@ enum SwitchOutcome {
     /// Exact evidence: the original chain stands and the offending block was
     /// deleted with its descendants.
     Deleted,
-    /// A second fault while restoring: the active head stopped where the
-    /// restore was — on the original chain or on a prefix of the new one —
-    /// with its state exact for that chain and its window at most `W` (AC6).
+    /// A second fault while restoring: the walk stopped where the restore
+    /// was, a chain shorter than the window and horizon every ready-state
+    /// rule assumes, so the caller re-enters collecting (DEC-205); the
+    /// offender, if any, was deleted.
     RestoreFailed,
 }
 
@@ -1795,9 +1796,7 @@ impl<
         // (Story 6.2 D1): one comparison follows.
         if self.is_ready() {
             let driver_best = self.connect_side_branches();
-            if let Some(head) = self.switch_target([None, driver_best]) {
-                self.switch_toward(head);
-            }
+            self.compare_and_switch([None, driver_best], now);
         }
 
         let outcome = if self.is_ready() {
@@ -2516,11 +2515,8 @@ impl<
         // branch and the higher-ranked admissible of the block judged at intake
         // and the driver's best. Never inside the loops: a switch (6.3) rewrites
         // `chain_heads` and the active chain under them.
-        if outcome == ReceiveBlockOutcome::AcceptedSilently
-            && self.is_ready()
-            && let Some(head) = self.switch_target([admitted, driver_best])
-        {
-            self.switch_toward(head);
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
+            self.compare_and_switch([admitted, driver_best], now);
         }
         (outcome, self.next_parent_recovery_call())
     }
@@ -4651,12 +4647,83 @@ impl<
         rank.outranks(&self.active_rank()?).then_some(head)
     }
 
+    /// FR22's one comparison and the FR23 switch it may run. A switch whose
+    /// restore failed leaves a chain shorter than the window and horizon that
+    /// every ready-state rule assumes, so the node re-enters collecting
+    /// (DEC-205); a re-entry that reaches `Ready` again runs the restart's one
+    /// comparison, and a second restore failure re-enters without a further
+    /// one (the next FR22 trigger compares). At most two switches per call.
+    fn compare_and_switch(&mut self, candidates: [Option<u32>; 2], now: u64) {
+        let mut candidates = candidates;
+        for comparisons_left in [true, false] {
+            let Some(head) = self.switch_target(candidates) else {
+                return;
+            };
+            if !matches!(self.switch_toward(head), SwitchOutcome::RestoreFailed) {
+                return;
+            }
+            let Some(driver_best) = self.reenter_collecting(now) else {
+                return;
+            };
+            if !comparisons_left {
+                return;
+            }
+            candidates = [None, driver_best];
+        }
+    }
+
+    /// DEC-205: `Ready → Collecting` over the retained tree, then the
+    /// acquisition spine a restart drives (FR59 steps 2–5). Nothing durable
+    /// changed — a switch writes no block bytes and defers its releases — so
+    /// the tree is the node's durable footprint, and the FR2 stopping
+    /// condition applies unchanged: a window-anchored segment qualifies at
+    /// `W + H` (DEC-177). The derived state is discarded as the FR5 recovery
+    /// discards it, the marking and statuses go back to collecting's (every
+    /// block Stored, block #0 the root if retained), and `chain_heads` is
+    /// rebuilt from the tree. The FR8 lock is irrevocable and stays. Returns
+    /// the side-branch driver's best when the spine reached `Ready`.
+    fn reenter_collecting(&mut self, now: u64) -> Option<Option<u32>> {
+        self.node_info.reset();
+        self.reset_vote_engine();
+        for idx in 0..MAX_BLOCKS as u32 {
+            self.blocks.clear_available_utxo(idx);
+            self.blocks.set_on_active_chain(idx, false);
+            self.blocks.set_status(idx, BlockStatus::Stored);
+        }
+        self.active_chain_head_idx = NONE_REF;
+        self.snake_chain_tail_idx = NONE_REF;
+        self.active_branch_value = 0;
+        self.complete_from_sequence = 0;
+        for idx in 0..MAX_BLOCKS as u32 {
+            if self
+                .blocks
+                .get(idx)
+                .is_some_and(|entry| entry.sequence() == 0)
+            {
+                self.blocks.set_on_active_chain(idx, true);
+                self.active_chain_head_idx = idx;
+                break; // the single-genesis guard admits at most one block #0
+            }
+        }
+        self.chain_heads.clear();
+        self.chain_heads
+            .rebuild_from_blocks(&mut self.blocks, now, self.active_chain_head_idx);
+        self.seed_missing_parent_hashes();
+        self.set_lifecycle_phase(LifecyclePhase::Collecting);
+        if self.chain_config.active_configuration().is_some() {
+            self.drive_dominant_chain_acquisition();
+        }
+        // Story 6.1 AC3: side branches are valued after the Ready entry.
+        self.is_ready().then(|| self.connect_side_branches())
+    }
+
     /// The FR23 chain switch toward `head` (FR22; Story 6.3, DEC-166..171,
     /// DEC-204): an atomic, in-place walk — back from the active head to the
     /// common ancestor by exact per-block inverses, then forward to `head`
     /// through the shared Tier-3 step — that completes, or restores the
     /// original chain exactly, or, after a second fault while restoring, stops
-    /// on a valid shorter chain (AC6). It runs inside this call, so no
+    /// for [`Self::compare_and_switch`] to re-enter collecting (AC6, DEC-205).
+    /// It runs inside this call, so no
     /// query or event surface sees a blend of the two branches (FR24), and it
     /// writes no block bytes. The walk is these `Blockchain` methods, not
     /// `reconciliation.rs` (D6, DEC-171): the fields are private to `api`.
@@ -5083,13 +5150,13 @@ impl<
     ) -> SwitchOutcome {
         while !self.on_path_to(old_head) {
             if self.active_chain_head_idx == ancestor || self.undo_active_head().is_err() {
-                return self.stop_restore(old_head, old_value, offender);
+                return self.stop_restore(offender);
             }
         }
         let tail = self.snake_chain_tail_idx;
         while self.active_chain_head_idx != old_head {
             let Some(next) = self.next_toward(old_head) else {
-                return self.stop_restore(old_head, old_value, offender);
+                return self.stop_restore(offender);
             };
             match self.apply_stored_child(next, tail) {
                 ChildStep::Applied { advance, value } => {
@@ -5098,10 +5165,10 @@ impl<
                     // inconsistent window — stop (the stop releases the excess).
                     self.promote_replayed(next, value);
                     if advance.is_some() {
-                        return self.stop_restore(old_head, old_value, offender);
+                        return self.stop_restore(offender);
                     }
                 }
-                _ => return self.stop_restore(old_head, old_value, offender),
+                _ => return self.stop_restore(offender),
             }
         }
         // FR64: a recomputed value differing from the recorded one is an
@@ -5126,48 +5193,16 @@ impl<
         })
     }
 
-    /// AC6 restore failure: the active head stays where the restore reached
-    /// — on the original chain, or on a prefix of the new one when an undo
-    /// failed — and every step is atomic, so its state is exact for that
-    /// chain. The active value is never an entry, the original head's entry
-    /// takes the original value (in RAM), and a window the stop left longer
-    /// than `W` (pending virtual advances, never released) is brought back to
-    /// `W` by the ordinary release step, as head extensions would have done;
-    /// a failed read of a new tail's value stops that early. Nothing of the
-    /// original chain is deleted; the offender, if any, is still exact
-    /// evidence.
-    fn stop_restore(
-        &mut self,
-        old_head: u32,
-        old_value: u64,
-        offender: Option<(u32, u64)>,
-    ) -> SwitchOutcome {
-        // The offender first: its deletion may retarget an entry onto the
-        // active head, whose value is cleared below.
+    /// AC6 restore failure: the walk stops where the restore reached — on
+    /// the original chain, or on a prefix of the new one when an undo failed.
+    /// Every step is atomic, so nothing is half-applied, but the chain is
+    /// shorter than the window and horizon the ready-state rules assume: the
+    /// caller re-enters collecting (DEC-205), which rebuilds every derived
+    /// structure from the tree. Nothing of the original chain is deleted; the
+    /// offender, if any, is still exact evidence and goes first.
+    fn stop_restore(&mut self, offender: Option<(u32, u64)>) -> SwitchOutcome {
         if let Some((block, parent_value)) = offender {
             self.delete_offender(block, Some(parent_value));
-        }
-        self.chain_heads.recompute_all_caches(&self.blocks);
-        if self.active_chain_head_idx != old_head {
-            self.chain_heads.set_branch_value(old_head, old_value);
-        }
-        self.chain_heads
-            .set_branch_value(self.active_chain_head_idx, 0);
-        while let (Some(w), Some(head), Some(tail)) = (
-            self.active_chain_length(),
-            self.blocks.get(self.active_chain_head_idx),
-            self.blocks.get(self.snake_chain_tail_idx),
-        ) && (head.sequence() + 1).saturating_sub(tail.sequence()) > w
-        {
-            let Some(tail_value) = self.new_tail_value(self.snake_chain_tail_idx) else {
-                break;
-            };
-            if !self.advance_snake_chain_tail() {
-                break;
-            }
-            self.active_branch_value = self.active_branch_value.saturating_sub(tail_value);
-            self.chain_heads
-                .subtract_branch_value(&self.blocks, tail_value);
         }
         SwitchOutcome::RestoreFailed
     }
@@ -12794,11 +12829,13 @@ mod tests {
     }
 
     /// A storage backend whose reads of one slot start failing after a set
-    /// number of successful ones, counting every attempt on that slot.
+    /// number of successful ones, counting every attempt on that slot. The
+    /// fault lasts `failures_left` reads (persistent by default).
     struct FailingReadStorage {
         inner: MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
         failing_slot: u32,
         reads_left: core::cell::Cell<u32>,
+        failures_left: core::cell::Cell<u32>,
         attempts: core::cell::Cell<u32>,
     }
 
@@ -12825,9 +12862,14 @@ mod tests {
                 self.attempts.set(self.attempts.get() + 1);
                 let left = self.reads_left.get();
                 if left == 0 {
-                    return Err(StorageError::BackendIo { code: 9 });
+                    let failures = self.failures_left.get();
+                    if failures > 0 {
+                        self.failures_left.set(failures - 1);
+                        return Err(StorageError::BackendIo { code: 9 });
+                    }
+                } else {
+                    self.reads_left.set(left - 1);
                 }
-                self.reads_left.set(left - 1);
             }
             self.inner.read_block_into(idx, out)
         }
@@ -12859,6 +12901,7 @@ mod tests {
             inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
             failing_slot: NONE_REF,
             reads_left: core::cell::Cell::new(0),
+            failures_left: core::cell::Cell::new(u32::MAX),
             attempts: core::cell::Cell::new(0),
         };
         let mut slot = core::mem::MaybeUninit::<FailingReadChain>::uninit();
@@ -16266,6 +16309,7 @@ mod tests {
             inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
             failing_slot: NONE_REF,
             reads_left: core::cell::Cell::new(0),
+            failures_left: core::cell::Cell::new(u32::MAX),
             attempts: core::cell::Cell::new(0),
         };
         let mut slot = core::mem::MaybeUninit::<Chain16<FailingReadStorage>>::uninit();
@@ -16799,55 +16843,74 @@ mod tests {
         assert_eq!(bc.node_info.seed_source_of(0), Some(slot(&bc, &a2)));
     }
 
-    /// AC11.6 / AC6 — a restore failure: the third read of `a3` fails while
-    /// the original chain is re-applied, so the head stops at `a2` with an exact
-    /// state, `a3` is a Connected head with the old value, and nothing of the
-    /// original chain is deleted. A later switch toward `a3`'s extension has
-    /// its common ancestor at the head: a forward replay only.
+    /// AC11.6 / AC6, DEC-205 — a restore failure: `a3`'s re-read fails
+    /// while the original chain is re-applied, and the node re-enters
+    /// collecting over the retained tree. A transient fault: the re-entry
+    /// reaches `Ready` again in the same call, on `a3`, equal to a node that
+    /// never saw the forgery. A persistent one: the re-entry's pass fails
+    /// locally, the node stays collecting with nothing of the original chain
+    /// deleted, and the next admission after the fault clears it brings the
+    /// node back to `Ready`.
     #[test]
-    fn fr23_restore_failure_stops_at_the_highest_block_reached() {
-        let (mut bc, b1) = failing_genesis(16);
-        let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
-        let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
-        for blk in [&a2, &a3] {
-            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
-        }
-        let forged = resign(&heavier_sibling(&a2), 1, 2000, NODE_ONE_KEY);
-        assert_eq!(
-            receive(&mut bc, &forged),
-            ReceiveBlockOutcome::AcceptedSilently
-        );
-        assert_eq!(status_of(&bc, &forged), None, "attempted once, deleted");
-        // A second forgery, now with `a3` readable once (the undo) only.
-        let forged = resign(&heavier_sibling(&a2), 1, 2001, NODE_ONE_KEY);
-        bc.storage.failing_slot = slot(&bc, &a3);
-        // `a3` is read for the FORK valuation and for the undo; the restore's
-        // re-read fails.
-        bc.storage.reads_left.set(2);
-        assert_eq!(
-            receive(&mut bc, &forged),
-            ReceiveBlockOutcome::AcceptedSilently
-        );
-        assert_eq!(head_of(&bc), (2, a2.view().hash()), "stopped at a2");
-        assert_eq!(status_of(&bc, &a3), Some(BlockStatus::Connected));
-        assert_eq!(
-            status_of(&bc, &forged),
-            None,
-            "the offender is still deleted"
-        );
-        assert_eq!(bc.chain_heads.branch_value_of(slot(&bc, &a3)), Some(1005));
+    fn fr23_restore_failure_reenters_collecting() {
         let (mut fresh, _, _) = ready_genesis(16);
-        assert_eq!(
-            receive(&mut fresh, &a2),
-            ReceiveBlockOutcome::AcceptedSilently
-        );
-        assert_same_projection(&bc, &fresh, "exact at a2");
-
-        bc.storage.failing_slot = NONE_REF;
-        // `a3` credited only its own creator, so node #0's `a4` is worth 0.
-        let a4 = alt(4, a3.view().hash(), 0, 0, 0, 9, false);
-        assert_eq!(receive(&mut bc, &a4), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(head_of(&bc), (4, a4.view().hash()));
+        for transient in [true, false] {
+            let (mut bc, b1) = failing_genesis(16);
+            let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+            let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+            for blk in [&a2, &a3] {
+                assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+                if transient {
+                    assert_eq!(
+                        receive(&mut fresh, blk),
+                        ReceiveBlockOutcome::AcceptedSilently
+                    );
+                }
+            }
+            let forged = resign(&heavier_sibling(&a2), 1, 2000, NODE_ONE_KEY);
+            assert_eq!(
+                receive(&mut bc, &forged),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(status_of(&bc, &forged), None, "attempted once, deleted");
+            // A second forgery, now with `a3` readable twice only: the FORK
+            // valuation and the undo; the restore's re-read fails.
+            let forged = resign(&heavier_sibling(&a2), 1, 2001, NODE_ONE_KEY);
+            bc.storage.failing_slot = slot(&bc, &a3);
+            bc.storage.reads_left.set(2);
+            bc.storage
+                .failures_left
+                .set(if transient { 1 } else { u32::MAX });
+            assert_eq!(
+                receive(&mut bc, &forged),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(
+                status_of(&bc, &forged),
+                None,
+                "the offender is still deleted"
+            );
+            if transient {
+                assert!(bc.is_ready(), "re-entered ready in the same call");
+                assert_eq!(head_of(&bc), (3, a3.view().hash()));
+                assert_same_projection(&bc, &fresh, "re-entered on a3");
+                continue;
+            }
+            assert!(!bc.is_ready(), "the re-entry's pass failed locally");
+            for blk in [&a2, &a3] {
+                assert_eq!(status_of(&bc, blk), Some(BlockStatus::Stored));
+            }
+            bc.storage.failing_slot = NONE_REF;
+            let a4 = alt(4, a3.view().hash(), 0, 0, 0, 9, false);
+            assert_eq!(receive(&mut bc, &a4), ReceiveBlockOutcome::AcceptedSilently);
+            assert!(bc.is_ready());
+            assert_eq!(head_of(&bc), (4, a4.view().hash()));
+            assert_eq!(
+                receive(&mut fresh, &a4),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_same_projection(&bc, &fresh, "ready again on a4");
+        }
     }
 
     /// AC11.7 / D3 — on W4 (`#0, #1, b2, b3`, tail not advanced) the new
@@ -17013,12 +17076,14 @@ mod tests {
         }
     }
 
-    /// AC11.6 / AC6 — a restore failure while undoing the replayed prefix: the
-    /// head stays on the new branch at `x3`, exact for that chain, the
-    /// offender `x4` is deleted, and the original `a3` is a Connected head
-    /// with the original value.
+    /// AC11.6 / AC6, DEC-205 — a restore failure while undoing the replayed
+    /// prefix: the walk stops on the new branch at `x3`, the offender `x4`
+    /// is deleted, and the node re-enters collecting over the retained tree.
+    /// The fault is transient, so the re-entry reaches `Ready` again in the
+    /// same call, and its comparison leaves the node equal to one fed the
+    /// same blocks without the offender, whichever tip FR2 picked.
     #[test]
-    fn fr23_restore_failure_on_the_new_branch_leaves_an_exact_prefix() {
+    fn fr23_restore_failure_on_the_new_branch_reenters_collecting() {
         let blocks = |a2: &Block| {
             let x3 = alt(3, a2.view().hash(), 1, 1, 1, 70, false);
             let x4 = resign(&alt(4, x3.view().hash(), 0, 1, 0, 71, false), 0, 9, 1);
@@ -17047,29 +17112,24 @@ mod tests {
         assert_eq!(receive(&mut bc, &x4), ReceiveBlockOutcome::AcceptedSilently);
         bc.storage.failing_slot = bc.blocks.next_free_index().expect("a free slot");
         bc.storage.reads_left.set(reads - 1);
+        bc.storage.failures_left.set(1);
         assert_eq!(receive(&mut bc, &x3), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(
-            head_of(&bc),
-            (3, x3.view().hash()),
-            "stopped on the new branch"
+            bc.storage.failures_left.get(),
+            0,
+            "the restore's undo failed"
         );
         assert_eq!(status_of(&bc, &x4), None, "the offender is deleted");
-        assert_eq!(status_of(&bc, &a3), Some(BlockStatus::Connected));
-        assert_eq!(bc.chain_heads.branch_value_of(slot(&bc, &a3)), Some(1005));
-        assert_eq!(
-            bc.chain_heads.branch_value_of(slot(&bc, &x3)).unwrap_or(0),
-            0,
-            "the active value is never an entry"
-        );
-        bc.storage.failing_slot = NONE_REF;
+        assert!(bc.is_ready(), "re-entered ready in the same call");
         let (mut fresh, _, _) = ready_genesis(16);
-        for blk in [&a2, &x3] {
+        for blk in [&a2, &a3, &x3] {
             assert_eq!(
                 receive(&mut fresh, blk),
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
-        assert_same_projection(&bc, &fresh, "the new-branch prefix");
+        assert_eq!(head_of(&bc), head_of(&fresh));
+        assert_same_projection(&bc, &fresh, "re-entered without the offender");
     }
 
     /// AC10 — switch, then restart: FR2 picks the sequence-3 tip with the

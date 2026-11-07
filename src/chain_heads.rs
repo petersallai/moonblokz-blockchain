@@ -200,6 +200,15 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         }
     }
 
+    /// Empties every entry in place, for a rebuild over a retained tree:
+    /// a chain switch whose restore failed re-enters collecting (FR23,
+    /// DEC-205) and rebuilds the table the way the FR59 restart does.
+    pub(crate) fn clear(&mut self) {
+        for head in self.heads.iter_mut() {
+            *head = ChainHeadEntry::new_empty();
+        }
+    }
+
     /// Number of occupied tip entries.
     pub(crate) fn count(&self) -> usize {
         self.heads.iter().filter(|h| !h.is_empty()).count()
