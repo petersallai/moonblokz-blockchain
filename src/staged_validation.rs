@@ -55,7 +55,6 @@ const NODE_ZERO_ID: u32 = 0;
 /// bits 1-2 (see `blocks.rs`).
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Connected/Active are set only by Epic 5/6/7 promotion drivers.
 pub(crate) enum BlockStatus {
     /// Bytes parse, `payload_type` is a known schema, every applicable Tier 1
     /// gating check passed. The only status assigned in Epic 4.
@@ -65,23 +64,25 @@ pub(crate) enum BlockStatus {
     /// driver or at intake when its parent is Connected or Active
     /// (`Blockchain::tier2_check`, `api.rs`).
     Connected,
-    /// A Connected block (or a Stored block promoted in one FR3 step) that is
-    /// on the selected active chain, Tier 3-verified. *Driver tagged forward
-    /// (Epic 5/6/7).*
+    /// A block on the selected active chain, Tier 3-verified: promoted by the
+    /// FR3 pass or a Ready head extension (from Stored), or by an FR23 chain
+    /// switch's replay (from Connected); a switch demotes the abandoned branch
+    /// back to Connected (Story 6.3).
     Active,
 }
 
 /// The FR9 status-transition map. Returns whether `from → to` is one of the
-/// declared legal promotion/demotion edges. **Declared, not driven in Epic 4:**
-/// no caller performs any of these transitions within Epic 4 — the drivers are
-/// the FR3 processing pass (`Stored → Active`, Epic 5), FR23 chain-switch
-/// (`Connected → Active`, `Active → Connected`, Epic 6), and FR35 forward
-/// extension (`Stored → Connected → Active`, Epic 6/7). The deletion edges
+/// declared legal promotion/demotion edges. **A reference map, not an
+/// enforcement point:** the drivers set statuses through the narrow
+/// `BlockTable::set_status` — the FR3 processing pass and the Ready head
+/// extension (`Stored → Active`), the side-branch driver (`Stored →
+/// Connected`), and the FR23 chain switch (`Connected → Active`, `Active →
+/// Connected`, Story 6.3); the tests hold the map to that set. The deletion edges
 /// (`Stored/Connected/Active → terminal Invalid removal`) are not modeled as
 /// status transitions — entering Invalid *is* removal from the tree, so it has
 /// no target status; those paths are Tier 1 gating failure (this story), Tier
 /// 2/3 gating failure, and FR5/FR8/FR17/FR19/FR57 (later epics).
-#[allow(dead_code)] // exercised by tests; drivers land in Epic 5/6/7.
+#[allow(dead_code)] // a reference map exercised by tests (see above).
 pub(crate) fn is_legal_transition(from: BlockStatus, to: BlockStatus) -> bool {
     use BlockStatus::{Active, Connected, Stored};
     matches!(

@@ -283,15 +283,9 @@ impl BlockEntry {
     /// Writes the FR9 status into bits 1-2 without disturbing bit 0
     /// (`is_on_active_chain`) or the unused high bits.
     ///
-    /// **Reserved for the Epic 5/6/7 promotion drivers; not exercised in
-    /// Epic 4.** Within Epic 4 the only status ever assigned is `Stored`,
-    /// which is already the `new()` default — so in practice this is only
-    /// called (if at all) to set `Stored` explicitly at admission. A future
-    /// promotion story that must change an *already-inserted* entry's status
-    /// does so through the delete-then-`insert` discipline of Story 4.1 (no
-    /// `get_mut` on `BlockTable`), not by mutating a stored entry in place;
-    /// this setter is for stamping the status onto a `BlockEntry` value
-    /// *before* it is inserted.
+    /// Stamps the status onto a `BlockEntry` value; an inserted entry changes
+    /// status through the narrow [`BlockTable::set_status`] (no `get_mut`),
+    /// which the promotion drivers and the FR23 chain switch use.
     pub(crate) fn set_status(&mut self, status: BlockStatus) {
         let bits: u8 = match status {
             BlockStatus::Stored => 0b00,
