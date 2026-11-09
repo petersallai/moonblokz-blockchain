@@ -29,33 +29,40 @@ use moonblokz_configuration::ChainConfigTrait;
 /// current active-chain `(S_tail, S_head)` bounds.
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) enum WindowVerdict {
-    /// `S_tail <= S_new < S_head + W` — the block can coexist with the active
-    /// chain inside one `snake_chain` window; admit it to staged validation.
+    /// `S_new < S_head + W`, `S_new ≥ S_tail` and `S_new > S_head − H` — the
+    /// block can coexist with the active chain inside one `snake_chain`
+    /// window and lies inside FR58's switch bound; admit it to staged
+    /// validation.
     InWindow,
     /// `S_new >= S_head + W` — too far ahead to be bridged by any reachable
     /// ancestor chain (FR60 forward case; drives the `long-disconnect-detected`
     /// diagnostic).
     TooFarAhead,
-    /// `S_new < S_tail` — older than the local active-chain tail (FR60 backward
-    /// case).
-    BelowTail,
+    /// `S_new < S_tail` (FR60 backward case) or `S_new ≤ S_head − H`. A block
+    /// that is not already known differs from the active chain at or below
+    /// `S_new`, so it can only belong to a branch diverging outside FR58's
+    /// switch bound, which can never become active (DEC-208). Under `H < W`
+    /// (DEC-207) the bound subsumes the tail once the chain has matured.
+    BelowBound,
 }
 
-/// FR60 window classification. `w` is the chain-configured `snake_chain` window
-/// length `W` — never the build's capacity. `s_head + w` is widened to `u64` so
-/// a head sequence near the FR53 `u32::MAX` ceiling cannot wrap (FR53's
-/// `u32::MAX` refusal is Epic 8; this function must be correct without relying
-/// on it).
+/// FR60 window classification, with FR58's switch bound. `w` is the
+/// chain-configured `snake_chain` window length `W` — never the build's
+/// capacity — and `h` the chain-configured verification horizon `H`. The sums
+/// are widened to `u64` so a head sequence near the FR53 `u32::MAX` ceiling
+/// cannot wrap (FR53's `u32::MAX` refusal is Epic 8; this function must be
+/// correct without relying on it).
 pub(crate) fn snake_chain_window_verdict(
     s_new: u32,
     s_tail: u32,
     s_head: u32,
     w: u32,
+    h: u32,
 ) -> WindowVerdict {
     if u64::from(s_new) >= u64::from(s_head) + u64::from(w) {
         WindowVerdict::TooFarAhead
-    } else if s_new < s_tail {
-        WindowVerdict::BelowTail
+    } else if s_new < s_tail || u64::from(s_new) + u64::from(h) <= u64::from(s_head) {
+        WindowVerdict::BelowBound
     } else {
         WindowVerdict::InWindow
     }
@@ -160,8 +167,9 @@ where
     );
     if let Some((s_tail, s_head)) = window
         && let Some(w) = bc.active_chain_length()
+        && let Some(h) = bc.verification_horizon()
     {
-        match snake_chain_window_verdict(block.sequence(), s_tail, s_head, w) {
+        match snake_chain_window_verdict(block.sequence(), s_tail, s_head, w, h) {
             WindowVerdict::TooFarAhead => {
                 // FR64 (Epic 11 `LogSink`): emit `long-disconnect-detected`
                 // carrying S_new = block.sequence(), the incoming block hash,
@@ -171,7 +179,7 @@ where
                     None,
                 );
             }
-            WindowVerdict::BelowTail => {
+            WindowVerdict::BelowBound => {
                 return (
                     ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
                     None,
@@ -415,21 +423,31 @@ mod tests {
     }
 
     // --- AC6: pure window verdict -------------------------------------------
+    //
+    // `(S_tail, S_head) = (5, 20)`, `W = 16`, `HZ = 2`: in window and in bound is
+    // `19 ..= 35`.
+
+    const HZ: u32 = H as u32;
 
     #[test]
     fn window_verdict_in_window_interior() {
         assert_eq!(
-            snake_chain_window_verdict(10, 5, 20, W),
+            snake_chain_window_verdict(25, 5, 20, W, HZ),
             WindowVerdict::InWindow
         );
     }
 
     #[test]
-    fn window_verdict_in_window_at_tail_boundary() {
-        // S_new == S_tail is in-window (inclusive lower bound).
+    fn window_verdict_in_bound_at_lower_boundary() {
+        // `S_head − H + 1` is the lowest in-bound sequence (Story 6.14 AC5);
+        // `S_head − H` is out, although it lies above the tail.
         assert_eq!(
-            snake_chain_window_verdict(5, 5, 20, W),
+            snake_chain_window_verdict(20 - HZ + 1, 5, 20, W, HZ),
             WindowVerdict::InWindow
+        );
+        assert_eq!(
+            snake_chain_window_verdict(20 - HZ, 5, 20, W, HZ),
+            WindowVerdict::BelowBound
         );
     }
 
@@ -437,7 +455,7 @@ mod tests {
     fn window_verdict_in_window_just_below_ahead_boundary() {
         // S_head + W - 1 is the last in-window sequence.
         assert_eq!(
-            snake_chain_window_verdict(20 + W - 1, 5, 20, W),
+            snake_chain_window_verdict(20 + W - 1, 5, 20, W, HZ),
             WindowVerdict::InWindow
         );
     }
@@ -446,7 +464,7 @@ mod tests {
     fn window_verdict_too_far_ahead_at_boundary() {
         // S_new == S_head + W is the first out-of-window (exclusive upper bound).
         assert_eq!(
-            snake_chain_window_verdict(20 + W, 5, 20, W),
+            snake_chain_window_verdict(20 + W, 5, 20, W, HZ),
             WindowVerdict::TooFarAhead
         );
     }
@@ -454,8 +472,13 @@ mod tests {
     #[test]
     fn window_verdict_below_tail() {
         assert_eq!(
-            snake_chain_window_verdict(4, 5, 20, W),
-            WindowVerdict::BelowTail
+            snake_chain_window_verdict(4, 5, 20, W, HZ),
+            WindowVerdict::BelowBound
+        );
+        // A young genesis chain: the bound is below #0, the tail decides.
+        assert_eq!(
+            snake_chain_window_verdict(0, 0, 1, W, HZ),
+            WindowVerdict::InWindow
         );
     }
 
@@ -466,12 +489,12 @@ mod tests {
         // would compute the bound as 12 and misclassify MAX as TooFarAhead — so
         // InWindow proves the widening prevents the wrap.
         assert_eq!(
-            snake_chain_window_verdict(u32::MAX, 0, u32::MAX - 3, W),
+            snake_chain_window_verdict(u32::MAX, 0, u32::MAX - 3, W, HZ),
             WindowVerdict::InWindow
         );
         // Upper bound still within range (MAX-20 + 16 = MAX-4): MAX is out ahead.
         assert_eq!(
-            snake_chain_window_verdict(u32::MAX, 0, u32::MAX - 20, W),
+            snake_chain_window_verdict(u32::MAX, 0, u32::MAX - 20, W, HZ),
             WindowVerdict::TooFarAhead
         );
     }

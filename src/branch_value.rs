@@ -59,11 +59,12 @@ impl Rank {
 /// past it advances the tail once), so no maturity flag is kept: the chain has
 /// matured iff `head − tail + 1 ≥ w`. Before that every candidate is
 /// genesis-anchored and spans `#0` to its tip — the bootstrap case, always
-/// admissible. Once matured, a candidate forks at or above `S_tail` (DEC-125)
-/// and the active chain is retained down to `S_tail` (below-tail retention 0,
-/// `snake_chain::BELOW_TAIL_RETENTION`), so its continuous tip-ending segment
-/// is `[tail, tip]`: admissible iff it covers `w`, i.e. `tip ≥ tail + w − 1`.
-/// Story 9.7 revisits this if it retains blocks below `S_tail`.
+/// admissible. Once matured, a candidate forks at or above `S_head − H ≥
+/// S_tail` (DEC-207, DEC-208), and its continuous tip-ending segment counts
+/// from `S_tail`: the verification horizon below the tail is retained but not
+/// counted (DEC-209), because a switch to a shorter tip would leave a matured
+/// chain with a window shorter than `W` (DEC-205). So it is `[tail, tip]`:
+/// admissible iff it covers `w`, i.e. `tip ≥ tail + w − 1`.
 pub(crate) fn is_admissible(tail: u32, head: u32, tip: u32, w: u32) -> bool {
     let matured = u64::from(head) + 1 >= u64::from(tail) + u64::from(w);
     !matured || u64::from(tip) + 1 >= u64::from(tail) + u64::from(w)
