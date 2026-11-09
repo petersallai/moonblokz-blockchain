@@ -940,7 +940,7 @@ impl<
     >
 {
     /// This build's capacities, stated for the configuration module's §6
-    /// acceptance checks — the two bounds that crate cannot derive because the
+    /// acceptance checks — the bounds that crate cannot derive because the
     /// capacities live here (specification §6, `BuildLimits`).
     ///
     /// Hand this to `ChainConfiguration::new` rather than restating the numbers
@@ -954,6 +954,9 @@ impl<
     /// - `snake_chain_length_max` — `SNAKE_CHAIN_LENGTH_MAX`, the active-chain
     ///   capacity. The chain's own window `W` must fit inside it, whether the
     ///   content declares `W` or leaves it at its default.
+    /// - `max_blocks` — `MAX_BLOCKS`, the block table. The window, the FR58
+    ///   verification horizon and one competing branch of depth `H` must fit:
+    ///   `W + 2·H ≤ MAX_BLOCKS` (§6 check 16).
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
         utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
@@ -976,6 +979,13 @@ impl<
                 "SNAKE_CHAIN_LENGTH_MAX must fit the block table (MAX_BLOCKS)"
             );
             SNAKE_CHAIN_LENGTH_MAX as u16
+        },
+        max_blocks: {
+            assert!(
+                MAX_BLOCKS <= u16::MAX as usize,
+                "MAX_BLOCKS must fit the configuration module's u16 capacity"
+            );
+            MAX_BLOCKS as u16
         },
     };
 
@@ -4861,11 +4871,12 @@ impl<
     /// Whether a switch with common ancestor `ancestor` may run in place
     /// (Story 6.3 AC1; [`crate::reconciliation::switch_admitted`]).
     fn in_place_switch_allowed(&self, ancestor: u32) -> bool {
-        let (Some(ancestor), Some(root), Some(top), Some(w)) = (
+        let (Some(ancestor), Some(root), Some(top), Some(w), Some(h)) = (
             self.blocks.get(ancestor),
             self.blocks.get(self.snake_chain_tail_idx),
             self.blocks.get(self.active_chain_head_idx),
             self.active_chain_length(),
+            self.verification_horizon(),
         ) else {
             return false;
         };
@@ -4874,15 +4885,9 @@ impl<
             root.sequence(),
             top.sequence(),
             w,
-            self.verification_horizon(),
+            h,
             self.complete_from_sequence,
         )
-    }
-
-    /// FR58's `H` (DEC-160, DEC-166): the registry default until Story 6.14
-    /// reads `verification_horizon` (ID 30) from the active configuration.
-    fn verification_horizon(&self) -> u32 {
-        50
     }
 
     /// The next block toward `target` above the active head: `target`'s
@@ -6416,6 +6421,16 @@ impl<
             .map(|config| u32::from(config.active_chain_length()))
     }
 
+    /// FR58's verification horizon `H` (DEC-160) the held configuration —
+    /// tentative or durable — declares, or `None` while the node holds none.
+    /// Read where it is needed and never cached (FR56); acceptance holds it
+    /// to `1 ≤ H < W` and `W + 2·H ≤ MAX_BLOCKS`.
+    pub(crate) fn verification_horizon(&self) -> Option<u32> {
+        self.chain_config
+            .active_configuration()
+            .map(|config| u32::from(config.verification_horizon()))
+    }
+
     /// The block UTXO-output cap `max_block_utxo_output` the held configuration
     /// — tentative or durable — declares, or the bitfield width while the node
     /// holds none (I-07).
@@ -6588,41 +6603,76 @@ mod tests {
     /// capacity keeps every other parameter at its code-baked default.
     const TEST_W: u16 = 16;
 
+    /// The verification horizon the suite's configurations declare beside the
+    /// window: `H = min(W − 1, TEST_H)` (configuration §6 check 15, `H < W`).
+    /// The default 50 is not below any test window, so a content must declare
+    /// it. The test backend stores eight blocks, so a `TEST_W` chain never
+    /// holds a head above #7: at 7 the FR58 bound never binds there, and the
+    /// bound, the horizon and the reclamation are exercised on the W4 harness,
+    /// which declares `H = 3` or its own.
+    const TEST_H: u16 = 7;
+
+    /// The horizon a test configuration with window `w` declares.
+    const fn test_horizon(w: u16) -> u16 {
+        let below = w.saturating_sub(1);
+        if below < TEST_H { below } else { TEST_H }
+    }
+
+    /// The block table of the `TEST_W` harnesses: the window, the horizon and
+    /// one competing branch of depth `H` (configuration §6 check 16). The test
+    /// backend stores eight blocks, so the size only has to pass the check.
+    const TEST_MAX_BLOCKS: usize = TEST_W as usize + 2 * TEST_H as usize;
+
     /// The base override set as a **content region**: one literal entry
     /// declaring `active_chain_length = TEST_W`. Every other parameter resolves
     /// to its code-baked default, and those defaults are exactly the constants
     /// the retired `FixedChainConfig` returned — which is why the suite's
     /// expected values are unchanged.
-    const BASE_CONFIG_CONTENT: [u8; 6] = [
-        1,
+    const BASE_CONFIG_CONTENT: [u8; 10] = [
+        2,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
         TEST_W.to_le_bytes()[0],
         TEST_W.to_le_bytes()[1],
+        parameter::VERIFICATION_HORIZON,
+        2,
+        test_horizon(TEST_W).to_le_bytes()[0],
+        test_horizon(TEST_W).to_le_bytes()[1],
     ];
 
     /// A second content region, valid and **distinct in bytes** but resolving
     /// identically: the base entry plus a literal declaring `vote_interest`'s
     /// own default. Used where a test needs two different chain-config contents.
-    const OTHER_CONFIG_CONTENT: [u8; 9] = [
-        2,
+    const OTHER_CONFIG_CONTENT: [u8; 13] = [
+        3,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
         TEST_W.to_le_bytes()[0],
         TEST_W.to_le_bytes()[1],
+        parameter::VERIFICATION_HORIZON,
+        2,
+        test_horizon(TEST_W).to_le_bytes()[0],
+        test_horizon(TEST_W).to_le_bytes()[1],
         parameter::VOTE_INTEREST,
         1,
         5,
     ];
 
-    /// An override set declaring only the window `w` — the base every fixture
-    /// builder starts from.
+    /// An override set declaring the window `w` and its test horizon — the
+    /// base every fixture builder starts from.
     fn window_config_builder(w: u16) -> ChainConfigPayloadBuilder {
         let mut builder = ChainConfigPayloadBuilder::new();
         builder
             .add_literal(parameter::ACTIVE_CHAIN_LENGTH, &w.to_le_bytes())
+            .ok()
+            .expect("a two-byte literal is well-formed");
+        builder
+            .add_literal(
+                parameter::VERIFICATION_HORIZON,
+                &test_horizon(w).to_le_bytes(),
+            )
             .ok()
             .expect("a two-byte literal is well-formed");
         builder
@@ -6892,7 +6942,7 @@ mod tests {
         TestConfig,
         16,
         16,
-        16,
+        TEST_MAX_BLOCKS,
         4,
         16,
     > {
@@ -6929,8 +6979,8 @@ mod tests {
     fn init_sets_expected_defaults() {
         let (crypto, storage, chain_config) = construction_backends();
         let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut bc_slot,
             crypto,
             storage,
@@ -6997,8 +7047,9 @@ mod tests {
     #[test]
     fn init_is_equivalent_to_new() {
         let (crypto, storage, chain_config) = construction_backends();
-        let mut slot = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let built = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let built = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut slot,
             crypto,
             storage,
@@ -7008,7 +7059,7 @@ mod tests {
             0xDEAD_BEEF,
         );
         let (crypto, storage, chain_config) = construction_backends();
-        let spec = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::new(
+        let spec = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::new(
             crypto,
             storage,
             chain_config,
@@ -7441,8 +7492,8 @@ mod tests {
         let node_zero = *crypto.public_key().serialize();
 
         let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut bc_slot,
             crypto,
             BlockWriteFailsStorage,
@@ -7520,8 +7571,9 @@ mod tests {
         // (> HEADER_SIZE, <= MAX_BLOCK_SIZE), smaller than Block #0. The window
         // entry is the one every content on this harness carries.
         let w = TEST_W.to_le_bytes();
+        let h = test_horizon(TEST_W).to_le_bytes();
         let content = [
-            2u8,
+            3u8,
             0,
             parameter::BLOCK_SIZE_LIMIT,
             2,
@@ -7531,6 +7583,10 @@ mod tests {
             2,
             w[0],
             w[1],
+            parameter::VERIFICATION_HORIZON,
+            2,
+            h[0],
+            h[1],
         ];
 
         let outcome = bc.process_genesis(1_000_000_000, &content);
@@ -7574,7 +7630,7 @@ mod tests {
         TestConfig,
         16,
         16,
-        16,
+        TEST_MAX_BLOCKS,
         4,
         16,
     >;
@@ -10688,8 +10744,8 @@ mod tests {
                 bc.receive_block(block.view(), 0);
             }
             // The locked content as a fingerprint: its first two bytes are the
-            // `config_value_count`, which is 1 for the base override set config A
-            // carries and 2 for config B's.
+            // `config_value_count`, which is 2 for the base override set config A
+            // carries (window and horizon) and 3 for config B's.
             let locked = bc
                 .chain_config
                 .durable_content()
@@ -10706,7 +10762,7 @@ mod tests {
         );
         assert_eq!(
             a_first,
-            (true, 4, [1, 0]),
+            (true, 4, [2, 0]),
             "and they converge on config A — the candidate's own — with the side branch gone"
         );
     }
@@ -11609,8 +11665,9 @@ mod tests {
             .expect("test private key");
         let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
-        let mut slot = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut slot,
             crypto,
             CorruptSlotsStorage,
@@ -11786,8 +11843,9 @@ mod tests {
             .ok()
             .expect("test private key");
         let node_zero = *crypto.public_key().serialize();
-        let mut slot = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut slot,
             crypto,
             CorruptSlotsStorage,
@@ -11911,22 +11969,19 @@ mod tests {
         assert_eq!(bc.block_tree_len(), 2);
     }
 
-    /// AC2 — `W = 1` (legal: acceptance only demands `W ≥ 1`): the tail is
-    /// block #1 and block #0 is released. Its chain-config replay would be
-    /// FR49's business (Story 9.2); the new root requests nothing.
+    /// AC2 — `W = 1` admits no verification horizon (`1 ≤ H < W` is empty,
+    /// DEC-207), so genesis refuses the content before anything is written.
     #[test]
-    fn snake_genesis_at_w_one_releases_block_zero() {
-        let bc = genesis_node_with_window(1);
-        assert_eq!(bc.active_snake_chain_window(), Ok((1, 1)));
-        assert_eq!(bc.block_tree_len(), 1);
-        assert!(bc.blocks.get(0).is_none(), "block #0's slot is free");
-        let tail = bc.blocks.get(1).expect("block #1 survives");
-        assert_eq!(tail.parent_ref(), NONE_REF, "unlinked from the freed slot");
-        assert!(tail.is_on_active_chain());
-        assert!(
-            !bc.chain_heads.has_stored_head(),
-            "the new root does not request the block it replaced"
-        );
+    fn snake_genesis_at_w_one_is_refused() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        let builder = window_config_builder(1);
+        assert!(matches!(
+            bc.process_genesis(1_000_000_000, builder.content()),
+            Err(GenesisRejectReason::InitialChainConfigRejected)
+        ));
+        assert_eq!(bc.block_tree_len(), 0, "nothing was written");
+        assert!(!bc.chain_config.is_durable_locked());
     }
 
     /// AC10.2 / AC3 — Ready entry on a genesis-anchored segment of length
@@ -12887,7 +12942,8 @@ mod tests {
         }
     }
 
-    type FailingReadChain = Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, 16, 4, 16>;
+    type FailingReadChain =
+        Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
 
     /// The UTXO harness on a [`FailingReadChain`] whose reads all succeed
     /// until a test arms `failing_slot`: chain-config anchor 99, balance block
@@ -13210,7 +13266,7 @@ mod tests {
 
     /// Every chain of this section shares `TestChain`'s capacities; only the
     /// storage differs (the fault-injecting one of AC6).
-    type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, 16, 4, 16>;
+    type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
 
     /// The FR54 currency of every genesis node in this section.
     const CURRENCY: u64 = 1_000_000_000;
@@ -16127,7 +16183,7 @@ mod tests {
     ) {
         // `node_info` per node: seed sources are slots, so they are compared
         // as the blocks they name.
-        let source = |bc_blocks: &BlockTable<16>, src: Option<u32>| match src {
+        let source = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, src: Option<u32>| match src {
             Some(idx) if idx != SEED_SOURCE_RELEASED => {
                 bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
             }
@@ -16160,7 +16216,9 @@ mod tests {
             a.active_branch_value, b.active_branch_value,
             "{what}: value"
         );
-        let hash_of = |bc_blocks: &BlockTable<16>, idx: u32| bc_blocks.get(idx).map(|e| *e.hash());
+        let hash_of = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, idx: u32| {
+            bc_blocks.get(idx).map(|e| *e.hash())
+        };
         assert_eq!(
             hash_of(&a.blocks, a.active_chain_head_idx),
             hash_of(&b.blocks, b.active_chain_head_idx),
@@ -16182,7 +16240,7 @@ mod tests {
         // active head's own entry is skipped: it carries no value (DEC-144),
         // and it exists only while the head has no side child.
         type Entry = Option<((u32, [u8; 32]), bool, Option<[u8; 32]>, Option<u64>)>;
-        let entries = |bc_blocks: &BlockTable<16>, heads: &ChainHeadsTable<4>| {
+        let entries = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, heads: &ChainHeadsTable<4>| {
             let mut out: [Entry; 4] = [None; 4];
             for (slot, (head, anchor)) in heads.occupied_heads().enumerate() {
                 let entry = bc_blocks.get(head).expect("an entry names a block");

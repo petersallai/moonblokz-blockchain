@@ -243,33 +243,49 @@ mod tests {
         TestConfig,
         16,
         16,
-        16,
+        TEST_MAX_BLOCKS,
         4,
         16,
     >;
+
+    /// The verification horizon the configurations declare beside `W`
+    /// (configuration §6 check 15, `H < W`).
+    const H: u16 = 2;
+
+    /// `W + 2·H` (configuration §6 check 16); the test backend stores eight
+    /// blocks, so the size only has to pass the check.
+    const TEST_MAX_BLOCKS: usize = W as usize + 2 * H as usize;
 
     /// The base override set as a **content region**: the window `W` declared
     /// at `TestChain`'s capacity, every other parameter at its code-baked
     /// default. Leaving the window out would resolve it to the default 500,
     /// which this harness cannot hold, so acceptance would refuse it (FR8).
-    const BASE_CONFIG_CONTENT: [u8; 6] = [
-        1,
+    const BASE_CONFIG_CONTENT: [u8; 10] = [
+        2,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
         W.to_le_bytes()[0],
         W.to_le_bytes()[1],
+        parameter::VERIFICATION_HORIZON,
+        2,
+        H.to_le_bytes()[0],
+        H.to_le_bytes()[1],
     ];
 
     /// A second content region, equally valid and distinct in bytes: the base
     /// entry plus a literal declaring `vote_interest`'s own default value.
-    const OTHER_CONFIG_CONTENT: [u8; 9] = [
-        2,
+    const OTHER_CONFIG_CONTENT: [u8; 13] = [
+        3,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
         W.to_le_bytes()[0],
         W.to_le_bytes()[1],
+        parameter::VERIFICATION_HORIZON,
+        2,
+        H.to_le_bytes()[0],
+        H.to_le_bytes()[1],
         parameter::VOTE_INTEREST,
         1,
         5,
@@ -564,8 +580,8 @@ mod tests {
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<0>::new();
         let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut bc_slot,
             c,
             storage,
@@ -625,7 +641,18 @@ mod tests {
     /// out-of-window sequence.
     #[test]
     fn classify_window_width_is_the_configured_w() {
-        const W8_CONFIG_CONTENT: [u8; 6] = [1, 0, parameter::ACTIVE_CHAIN_LENGTH, 2, 8, 0];
+        const W8_CONFIG_CONTENT: [u8; 10] = [
+            2,
+            0,
+            parameter::ACTIVE_CHAIN_LENGTH,
+            2,
+            8,
+            0,
+            parameter::VERIFICATION_HORIZON,
+            2,
+            H.to_le_bytes()[0],
+            H.to_le_bytes()[1],
+        ];
         let mut bc = locked_test_chain(&W8_CONFIG_CONTENT);
 
         let last_in = node_transfer_block(12, 3, 4, 7);
