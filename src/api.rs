@@ -4221,7 +4221,7 @@ impl<
     /// node seeded at or below `bound`, or whose seed source was released. Its
     /// registration then lies on the shared chain, and a key never changes
     /// after registration. Intake passes `S_tail` — every branch that can
-    /// connect contains the chain up to it (DEC-125) — and the chain-switch
+    /// connect forks at or above `S_head − H ≥ S_tail` (DEC-207, DEC-208) — and the chain-switch
     /// pre-pass passes the common ancestor. RAM only.
     fn key_is_branch_independent(&self, creator: u32, bound: u32) -> bool {
         if creator == 0 {
@@ -4377,9 +4377,11 @@ impl<
     /// FR9 Tier 2 of a side block in Ready (Story 6.1 D6): the UTXO-input
     /// structural completion of every complex transaction, along the block's
     /// own ancestry from `parent_idx`. A reference within `W` resolves to its
-    /// block, whose bytes must hold the output with the declared amount; one
-    /// below `S_tail` is trusted pre-window history, as in the FR3 pass
-    /// (DEC-129, DEC-131). No available-UTXO bit is read: the bits follow the
+    /// block — in the window or the verification horizon — whose bytes must
+    /// hold the output with the declared amount; one below the retained root
+    /// is trusted pre-window history, as in the FR3 pass (DEC-129, DEC-131),
+    /// which a side block inside FR58's bound never reaches once the horizon
+    /// is full (Story 6.14). No available-UTXO bit is read: the bits follow the
     /// active chain, so whether the output is unspent on this branch is Tier 3.
     ///
     /// The other FR9 Tier 2 items join here and in the shared head step

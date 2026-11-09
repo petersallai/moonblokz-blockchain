@@ -10,9 +10,10 @@
 //! parent-recovery scheduler (deterministic selection + tie-breaks), and the
 //! FR19 bounded eviction (the block-tree's first authorized deletion path).
 //! Event (iv) FR5 deletion is driven by [`ChainHeadsTable::on_blocks_deleted`]
-//! (Story 5.5, the FR5 atomic recovery). Event (v), the snake-chain tail release
-//! (Story 9.1), deletes every branch forked at the dropped block through event
-//! (iv) and needs no pass of its own. Event (iii), the FR23 chain switch, is
+//! (Story 5.5, the FR5 atomic recovery). Event (v), the snake-chain tail
+//! advance (Story 9.1), deletes nothing: the FR58 reclamation (Story 6.14,
+//! DEC-208) has already deleted, through event (iv), every branch forked below
+//! `S_head − H`, and the horizon release frees only active-path blocks. Event (iii), the FR23 chain switch, is
 //! driven by the Story 6.3 walk's commit through
 //! [`ChainHeadsTable::recompute_all_caches`].
 //! `branch_value` (FR21) is a side head's value, valid iff the head block is
@@ -302,10 +303,10 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// new active branch, without demoting it. The
     /// `Anchor::Tail` arm serves new Stored heads, extended Stored branches and
     /// deepened tail-points; it cannot re-derive a missing-parent hash for an
-    /// entry that *was* Connected — and no path demotes one: the snake-chain
-    /// tail release, the one deletion that could strand a Connected branch,
-    /// deletes every branch forked at the dropped block instead (FR58, Story
-    /// 9.1). Read the `last_request_timestamp = 0` below as the *promotion*
+    /// entry that *was* Connected — and no path demotes one: the horizon
+    /// release, the one deletion that could strand a Connected branch, frees
+    /// only active-path blocks, because the FR58 reclamation deleted every
+    /// branch forked below `S_head − H` first (Story 6.14, DEC-208). Read the `last_request_timestamp = 0` below as the *promotion*
     /// rule (a connected branch has nothing left to request).
     fn recompute_caches<const MAX_BLOCKS: usize>(
         &mut self,
@@ -836,11 +837,12 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     //       (structural). The switch walks back to the common ancestor, which
     //       stays on the active chain, so a switch alone demotes no head.
     //
-    // (v) snake-chain tail release (Story 9.1): every branch forked at the
-    //     dropped block is deleted as a child-closed subtree (event (iv)) before
-    //     the block is freed — FR58 stale reclamation, since its divergence point
-    //     is then below `S_tail`. No surviving head's walk passes through the
-    //     freed slot, so no head demotes and no pass of its own is needed.
+    // (v) snake-chain tail advance (Story 9.1, 6.14): the dropped block enters
+    //     the horizon and the block leaving it is freed. Every branch forked
+    //     below `S_head − H` was already deleted as a child-closed subtree
+    //     (event (iv), FR58 reclamation, DEC-208), so no surviving head's walk
+    //     passes through the freed slot, no head demotes and no pass of its own
+    //     is needed.
 
     /// Recomputes every entry's caches against the current active-chain
     /// marking. Called once at Ready entry (Story 9.1, O-024 ruling): the
@@ -947,8 +949,8 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// anchor can move. (FR23's chain switch cannot demote either: it walks back
     /// to a common ancestor that stays on the active chain, and
     /// [`Self::locate_anchor`] stops at the **first** flagged block. The
-    /// snake-chain tail release cannot either: it first deletes, through this
-    /// function, every branch forked at the dropped block.)
+    /// horizon release cannot either: the FR58 reclamation deletes, through
+    /// this function, every branch forked below `S_head − H` first.)
     ///
     /// The `flags &= !FLAG_CONNECTED` in `recompute_caches`' `Anchor::Tail` arm
     /// is therefore an idempotent write on this path, not a demotion. That arm
