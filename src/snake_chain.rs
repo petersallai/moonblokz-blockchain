@@ -11,7 +11,9 @@
 //!
 //! The window state and the release step live on `Blockchain` (Story 9.1):
 //! establishing the tail wherever the node enters Ready, and the window-advance
-//! step that releases the dropped tail block. This module holds the pure parts
+//! step. The block the tail leaves enters the FR58 verification horizon — the
+//! `H` blocks below `S_tail`, still linked and flagged (Story 6.14, DEC-206) —
+//! and the block that leaves the horizon is released. This module holds the pure parts
 //! of the FR48 tail drop: the classification of the dropping block and the
 //! preservation-binding decision on a head extension. The `u32::MAX` refusal
 //! rule is Story 8.1; the replay generators are Stories 9.2–9.5.
@@ -20,17 +22,6 @@ use moonblokz_chain_types::{BlockView, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_
 
 use crate::blocks::BlockTable;
 use crate::node_info::NodeInfoState;
-
-/// Below-tail retention `R`: how many released blocks stay in the block-tree
-/// below `S_tail`. A code constant, not chain configuration and not a const
-/// generic. `0` means the release step frees the dropped block at once, which
-/// is what it does; Story 9.7 derives `R` from the verification horizon `H`
-/// and brings the retention that a non-zero value needs.
-pub(crate) const BELOW_TAIL_RETENTION: u32 = 0;
-const _: () = assert!(
-    BELOW_TAIL_RETENTION == 0,
-    "the tail release frees immediately; a non-zero R needs Story 9.7's retention"
-);
 
 /// FR48 essential-state obligation of the block about to drop off the tail.
 /// At most one applies to a block (single-block conservation: a chain-config

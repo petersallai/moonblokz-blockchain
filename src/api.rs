@@ -594,6 +594,10 @@ pub(crate) enum ValidationReason {
     /// A balance-block entry for a seeded node disagrees with the derived
     /// pre-state `(balance, vote_count, public_key)` (FR50, Story 6.0 D9).
     BalanceSnapshotMismatch,
+    /// FR48: the block drops a block whose essential state it does not
+    /// replay — evaluated in the FR3 pass wherever the dropped block lies in
+    /// the segment (Story 6.14 AC9, DEC-204).
+    TailDropUnpreserved,
 }
 
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass
@@ -609,9 +613,15 @@ struct Projection {
     /// A non-complete FR3 pass has met its first balance block, which
     /// initialized the watermark.
     saw_balance_block: bool,
-    /// The highest sequence at which a non-complete FR3 pass floor-seeded a
-    /// node; 0 while none (Story 6.3 D2, DEC-167).
-    last_floor_seed: u32,
+    /// DEC-177 (Story 6.14 AC8): the lowest sequence from which a balance
+    /// entry seeds a node's accumulated vote — `a + H` on a window-anchored
+    /// candidate with earliest block `a`, 0 when complete. Before it, the
+    /// FR37 liveness credit of a block depends on a creator below the segment.
+    vote_seed_from: u32,
+    /// The first node id registered inside the segment, `u32::MAX` while
+    /// none: ids are contiguous, so every node from it on was registered here
+    /// and its vote (0 at registration) is exact.
+    first_segment_registration: u32,
 }
 
 impl Projection {
@@ -620,7 +630,8 @@ impl Projection {
         complete: true,
         roster_bounded: true,
         saw_balance_block: true,
-        last_floor_seed: 0,
+        vote_seed_from: 0,
+        first_segment_registration: u32::MAX,
     };
 }
 
@@ -658,9 +669,9 @@ enum ChildStep {
 enum SwitchOutcome {
     /// The new branch is active.
     Switched,
-    /// Not attempted: outside FR58's bound, below the completeness horizon,
-    /// or a dropped or referenced block not retained (DEC-159, DEC-167,
-    /// DEC-204). Nothing changed.
+    /// Not attempted: outside FR58's bound, an ancestor below the tail, or a
+    /// dropped or referenced block not retained (DEC-159, DEC-204). Nothing
+    /// changed.
     NotAdmitted,
     /// A local failure: the original chain stands, nothing was deleted.
     Kept,
@@ -884,9 +895,11 @@ pub struct Blockchain<
     // nothing is sized by `SNAKE_CHAIN_LENGTH_MAX` and nothing restricts itself
     // to its first `W` entries. The tail is established wherever the node
     // enters Ready and advanced by the release step, over the chain-configured
-    // `W`, never over the capacity (`snake_chain.rs`). It is always the active
-    // chain's root (`parent_ref == NONE_REF`). The capacity stays a `u32` const
-    // generic; `BUILD_LIMITS` asserts it fits the module's `u16`.
+    // `W`, never over the capacity (`snake_chain.rs`). Below it lie the FR58
+    // verification horizon's `H` blocks, still linked and flagged, down to the
+    // active chain's root (`parent_ref == NONE_REF`), which is found by a walk
+    // (Story 6.14 D1, DEC-206). The capacity stays a `u32` const generic;
+    // `BUILD_LIMITS` asserts it fits the module's `u16`.
     snake_chain_tail_idx: u32,
 
     // FR21 value of the active branch: the sum of the per-block values over
@@ -898,13 +911,11 @@ pub struct Blockchain<
     // value — grown on every head extension, reduced by the new `S_tail`
     // block's value on every tail advance (D1), 0 without a window.
     active_branch_value: u64,
-    // FR23 completeness horizon `C` (Story 6.3 D2, DEC-167): the highest
-    // sequence at which the Ready-entry FR3 pass floor-seeded a node — 0 on a
-    // genesis-anchored chain. Floor seeding has no inverse, and below it the
-    // projection was partial, so a chain switch never walks back across it.
-    // Set at every FR3 promotion, 0 without an active chain; once the tail
-    // passes it, it constrains nothing.
-    complete_from_sequence: u32,
+    // No completeness horizon (Story 6.14 D6, DEC-211, withdrawing DEC-167):
+    // a balance entry is a snapshot of its node at its position, so the undo
+    // of a seed is identity on the values, and every state below it follows
+    // from the exact inverses. A chain switch may walk back across the FR3
+    // pass's seed points; FR58's bound keeps it above `a + H`.
     //
     // Deliberately no standalone placeholder for:
     // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.available_utxo`
@@ -940,7 +951,7 @@ impl<
     >
 {
     /// This build's capacities, stated for the configuration module's §6
-    /// acceptance checks — the two bounds that crate cannot derive because the
+    /// acceptance checks — the bounds that crate cannot derive because the
     /// capacities live here (specification §6, `BuildLimits`).
     ///
     /// Hand this to `ChainConfiguration::new` rather than restating the numbers
@@ -954,6 +965,9 @@ impl<
     /// - `snake_chain_length_max` — `SNAKE_CHAIN_LENGTH_MAX`, the active-chain
     ///   capacity. The chain's own window `W` must fit inside it, whether the
     ///   content declares `W` or leaves it at its default.
+    /// - `max_blocks` — `MAX_BLOCKS`, the block table. The window, the FR58
+    ///   verification horizon and one competing branch of depth `H` must fit:
+    ///   `W + 2·H ≤ MAX_BLOCKS` (§6 check 16).
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
         utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
@@ -976,6 +990,13 @@ impl<
                 "SNAKE_CHAIN_LENGTH_MAX must fit the block table (MAX_BLOCKS)"
             );
             SNAKE_CHAIN_LENGTH_MAX as u16
+        },
+        max_blocks: {
+            assert!(
+                MAX_BLOCKS <= u16::MAX as usize,
+                "MAX_BLOCKS must fit the configuration module's u16 capacity"
+            );
+            MAX_BLOCKS as u16
         },
     };
 
@@ -1089,7 +1110,6 @@ impl<
             (&raw mut (*p).tentative_config_block_idx).write(NONE_REF);
             (&raw mut (*p).snake_chain_tail_idx).write(NONE_REF);
             (&raw mut (*p).active_branch_value).write(0);
-            (&raw mut (*p).complete_from_sequence).write(0);
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -1131,7 +1151,6 @@ impl<
             tentative_config_block_idx: NONE_REF,
             snake_chain_tail_idx: NONE_REF,
             active_branch_value: 0,
-            complete_from_sequence: 0,
         }
     }
 
@@ -1512,14 +1531,15 @@ impl<
     /// configuration; no `now`, no PRNG, no mutation — FR63/NFR5 determinism). A
     /// candidate is an occupied `chain_heads` tip whose continuous segment is
     /// either **genesis-anchored** (earliest block has `sequence == 0`, FR54) or
-    /// **active-length-satisfying** (segment length `≥ W`), and which carries at
+    /// **active-length-satisfying** (segment length `≥ W + H`: the window and
+    /// the FR58 horizon below it, DEC-177), and which carries at
     /// least one chain-config block. The last condition is the FR8 final check's
     /// precondition applied *before* the pass rather than as its failure: a
     /// segment naming no configuration stays a non-candidate, with nothing
     /// deleted, until a chain-config block on it arrives (Story 5.13).
     ///
-    /// `W` is the window the held configuration — tentative or durable — declares,
-    /// never the build's capacity `SNAKE_CHAIN_LENGTH_MAX`, which would make the
+    /// `W` and `H` are what the held configuration — tentative or durable —
+    /// declares, never the build's capacity `SNAKE_CHAIN_LENGTH_MAX`, which would make the
     /// moment a node stops collecting depend on how it was built. With no
     /// configuration held the active-length condition is not evaluated: the
     /// chain's window is unknown, and such a segment could not pass the FR8 final
@@ -1547,9 +1567,14 @@ impl<
     pub(crate) fn evaluate_stopping_condition(&self) -> Option<u32> {
         // (head_idx, tip_sequence, tip_hash) of the best qualifying candidate.
         let mut best: Option<(u32, u32, [u8; 32])> = None;
-        // The chain's window, once for the whole evaluation. With no
+        // The length a window-anchored segment needs, once for the whole
+        // evaluation: the window and the horizon below it (DEC-177). With no
         // configuration held the active-length condition is not evaluated.
-        let window = self.active_chain_length();
+        // Acceptance keeps `W + 2·H` within a `u16` capacity, so the sum fits.
+        let required = self
+            .active_chain_length()
+            .zip(self.verification_horizon())
+            .map(|(w, h)| w + h);
         for (head_idx, earliest_idx) in self.chain_heads.occupied_heads() {
             let (Some(tip), Some(earliest)) =
                 (self.blocks.get(head_idx), self.blocks.get(earliest_idx))
@@ -1570,7 +1595,7 @@ impl<
             // length exact. `saturating_add(1)` keeps the reserved `u32::MAX`
             // sequence sentinel (rejected at intake per FR53) from ever overflowing.
             let segment_len = tip_seq.saturating_sub(earliest_seq).saturating_add(1);
-            let active_length = window.is_some_and(|w| segment_len >= w);
+            let active_length = required.is_some_and(|len| segment_len >= len);
             if !(genesis_anchored || active_length) {
                 continue;
             }
@@ -1970,7 +1995,6 @@ impl<
         self.active_chain_head_idx = NONE_REF;
         self.snake_chain_tail_idx = NONE_REF;
         self.active_branch_value = 0;
-        self.complete_from_sequence = 0;
         for idx in 0..limit {
             if self
                 .blocks
@@ -2571,7 +2595,7 @@ impl<
             // bootstrap-anchored genesis's `active_chain_head_idx` is a placeholder
             // the Ready transition below overwrites; it does not pre-empt selection.
             match self.run_processing_pass(candidate_tip_idx) {
-                Ok((window_value, complete_from)) => {
+                Ok(window_value) => {
                     // FR8 durable set-once lock (Story 5.9, AC4). The pass has
                     // just proved the AC3 final check — the candidate carries
                     // at least one chain-config block and every one of them is
@@ -2650,11 +2674,7 @@ impl<
                         // transition: atomically promote every candidate block
                         // Stored→Active (the Epic-4-deferred FR9 Tier-3
                         // driver) and establish the active head.
-                        self.promote_candidate_active(
-                            candidate_tip_idx,
-                            window_value,
-                            complete_from,
-                        );
+                        self.promote_candidate_active(candidate_tip_idx, window_value);
                         // AC5: with the lock engaged and the active chain
                         // marked, drop every chain-config block in the tree
                         // that disagrees with what was just locked. Ordered
@@ -2665,11 +2685,7 @@ impl<
                         // that are not on the chain just adopted.
                         self.reevaluate_retained_blocks_against_lock();
                     } else {
-                        self.promote_candidate_active(
-                            candidate_tip_idx,
-                            window_value,
-                            complete_from,
-                        );
+                        self.promote_candidate_active(candidate_tip_idx, window_value);
                     }
                     // Processing→Ready. The FR40-series ready-only surface
                     // becomes live (its query bodies remain Epic 7/10
@@ -2723,7 +2739,7 @@ impl<
                             // instead of stranded in Processing.
                             //
                             // The re-evaluation returns the same tip unless the
-                            // adopted content declares a larger `W` than the one
+                            // adopted content declares a larger `W + H` than the one
                             // held before, in which case the segment may no
                             // longer qualify and it yields no candidate (Story
                             // 5.11) — the reverted phase covers that. Otherwise
@@ -3094,7 +3110,6 @@ impl<
         // No window while Collecting (FR48): the tail exists only in Ready.
         self.snake_chain_tail_idx = NONE_REF;
         self.active_branch_value = 0;
-        self.complete_from_sequence = 0;
         for idx in 0..MAX_BLOCKS {
             let idx = idx as u32;
             if self
@@ -3136,7 +3151,7 @@ impl<
     /// FR37/FR38). `pub(crate)` and self-contained so the FR59 restart (Story 5.10)
     /// reuses the same primitive; ready state has no full-reconstruction path
     /// (DEC-159). Returns the FR21 value of the window the promotion will
-    /// establish and the completeness horizon `C` (Story 6.3 D2, DEC-167).
+    /// establish.
     ///
     /// **Derive-only** (Decision #2): it does not validate FR6 invariants, promote
     /// Stored→Active, or transition to Ready (Story 5.4), nor perform the FR5
@@ -3148,7 +3163,7 @@ impl<
     pub(crate) fn run_processing_pass(
         &mut self,
         candidate_tip_idx: u32,
-    ) -> Result<(u64, u32), ProcessingError> {
+    ) -> Result<u64, ProcessingError> {
         // AC5: clean working set on (re-)entry — no partial projection persists.
         self.node_info.reset();
         self.reset_vote_engine();
@@ -3349,7 +3364,16 @@ impl<
             complete: genesis_anchored,
             roster_bounded,
             saw_balance_block: false,
-            last_floor_seed: 0,
+            vote_seed_from: if genesis_anchored {
+                0
+            } else {
+                let a = self
+                    .blocks
+                    .get(marked[count - 1])
+                    .map_or(0, |e| e.sequence());
+                a.saturating_add(self.verification_horizon().unwrap_or(0))
+            },
+            first_segment_registration: u32::MAX,
         };
         let mut prev_hash: Option<[u8; 32]> = None;
         // Story 6.1 D5: the FR21 value of the window the promotion will
@@ -3362,6 +3386,14 @@ impl<
             self.blocks.get(marked[0]).map_or(0, |e| e.sequence()),
         );
         let mut window_value = 0u64;
+        // FR48 in the pass (Story 6.14 AC9, DEC-204): the block at `marked[i]`
+        // drops `marked[i + W]` — the block `W` sequences below it — whenever
+        // that block lies in the segment: every block at `s ≥ W` of a
+        // genesis-anchored segment, every block at `s ≥ a + W` of a
+        // window-anchored one. Earlier blocks of a window-anchored segment
+        // drop a block below it: pre-window trust. `W` is the candidate's own
+        // (the preload made it the held configuration).
+        let w = self.active_chain_length().map(|w| w as usize);
         let mut result = Ok(());
         for i in (0..count).rev() {
             let idx = marked[i];
@@ -3372,6 +3404,31 @@ impl<
                 result = Err(ProcessingError::StorageRead);
                 break;
             };
+            // Before the step: it clears the bits this block spends from the
+            // dropped block, and its commit moves seed pointers — the
+            // classification must see the pre-state a head extension sees.
+            if let Some(dropped) = w
+                .and_then(|w| i.checked_add(w))
+                .filter(|&d| d < count)
+                .and_then(|d| marked.get(d))
+            {
+                match classify_tail_drop(&self.blocks, &self.node_info, *dropped) {
+                    // An empty slot is the node's own inconsistency: local.
+                    Err(_) => {
+                        result = Err(ProcessingError::MissingBlock);
+                        break;
+                    }
+                    Ok(obligation) => {
+                        if tail_drop_binding(obligation, &view) == TailBinding::Invalid {
+                            result = Err(ProcessingError::Invalid {
+                                block_idx: idx,
+                                reason: ValidationReason::TailDropUnpreserved,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
             let this_hash = view.hash();
             if let Err(e) = self.validate_and_derive_block(&view, idx, prev_hash, &mut projection) {
                 result = Err(e);
@@ -3388,18 +3445,7 @@ impl<
                 self.blocks.clear_available_utxo(*slot);
             }
         }
-        // Story 6.3 D2 (DEC-167): the completeness horizon `C` — 0 on a
-        // genesis-anchored candidate, else the highest floor-seeding sequence,
-        // or the tip when the pass seeded nothing (conservative; FR50 coverage
-        // is Story 9.3's).
-        let complete_from = if genesis_anchored {
-            0
-        } else if projection.last_floor_seed != 0 {
-            projection.last_floor_seed
-        } else {
-            self.blocks.get(marked[0]).map_or(0, |e| e.sequence())
-        };
-        result.map(|()| (window_value, complete_from))
+        result.map(|()| window_value)
     }
 
     /// The FR6 per-block step (Story 6.0 AC1): validates one block against the
@@ -3436,6 +3482,22 @@ impl<
     /// non-complete FR3 projection (D3) the per-node state-dependent checks
     /// are gated on the actor being seeded: a window-anchored candidate trusts
     /// history it cannot re-derive.
+    /// Whether a non-complete FR3 pass may judge `node`'s accumulated vote
+    /// (DEC-177, Story 6.14 AC8): always in a complete projection; for a node
+    /// registered inside the segment (vote 0 is exact); otherwise once its
+    /// seed source lies at or after `a + H`. Before that, every check that
+    /// depends on the node's vote is auto-accepted, as in its pre-seed zone;
+    /// its balance and key are seeded as before. Pass-local, no stored state.
+    fn vote_seeded(&self, node: u32, projection: &Projection) -> bool {
+        projection.complete
+            || node >= projection.first_segment_registration
+            || self
+                .node_info
+                .seed_source_of(node)
+                .and_then(|slot| self.blocks.get(slot))
+                .is_some_and(|source| source.sequence() >= projection.vote_seed_from)
+    }
+
     fn derive_block(
         &mut self,
         view: &BlockView<'_>,
@@ -3523,8 +3585,11 @@ impl<
                     projection.saw_balance_block = true;
                 }
                 // D9: the payload repeats the pre-state; it seeds only what a
-                // non-complete projection does not know yet.
+                // non-complete projection does not know yet. DEC-177: a seeded
+                // node whose vote is not yet known has its vote seeded by its
+                // first entry at or after `a + H`, not compared.
                 let mut floor_seeded = false;
+                let mut vote_seeded_here = false;
                 for info in payload.iter() {
                     let owner = info.owner();
                     // Node ids are contiguous: an entry beyond the watermark
@@ -3534,8 +3599,14 @@ impl<
                         return Err(invalid(ValidationReason::NodeIdOutOfRange));
                     }
                     if self.node_info.is_seeded(owner) {
+                        let vote_known = self.vote_seeded(owner, projection);
+                        if !vote_known && seq >= projection.vote_seed_from {
+                            vote_seeded_here = true;
+                        }
                         let matches = self.node_info.balance_of(owner) == info.balance()
-                            && self.vote_engine.accumulated_vote_of(owner) == info.vote_count()
+                            && (!vote_known
+                                || self.vote_engine.accumulated_vote_of(owner)
+                                    == info.vote_count())
                             && self
                                 .node_info
                                 .public_key_of(owner)
@@ -3555,15 +3626,13 @@ impl<
                         floor_seeded = true;
                     }
                 }
-                // The vote half of the floor seeding. A seeded entry's
-                // `vote_count` was just shown equal, so re-seeding it is a no-op.
-                if floor_seeded && let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
+                // The vote half of the floor seeding, and the DEC-177 vote seed.
+                // A vote-seeded entry's `vote_count` was just shown equal, so
+                // re-seeding it is a no-op.
+                if (floor_seeded || vote_seeded_here)
+                    && let Ok(v) = BlockView::from_bytes(view.serialized_bytes())
+                {
                     self.vote_engine.seed_from_balance_block(v);
-                }
-                // Floor seeding has no inverse: a chain switch never walks
-                // back across it (Story 6.3 D2, DEC-167).
-                if floor_seeded {
-                    projection.last_floor_seed = projection.last_floor_seed.max(seq);
                 }
             }
             PAYLOAD_TYPE_TRANSACTION => {
@@ -3578,6 +3647,16 @@ impl<
                         return Err(e);
                     }
                     applied += 1;
+                }
+                // DEC-177: the first registration inside a non-complete segment
+                // marks every later node id as registered here.
+                if !projection.complete && projection.first_segment_registration == u32::MAX {
+                    for tx in txs.iter() {
+                        if let Some(reg) = tx.as_registration() {
+                            projection.first_segment_registration = reg.new_node_id();
+                            break;
+                        }
+                    }
                 }
                 // FR6 registration/complex mutual-exclusivity is intrinsic (decided
                 // from block bytes) and owned by the Tier-1 intake gate, which every
@@ -3624,10 +3703,19 @@ impl<
             self.invert_transactions(view, idx, applied);
             return Err(invalid(reason));
         }
+        // DEC-177: a node's vote is judged only once it is vote-seeded — by an
+        // earlier block, or by this balance block's own entry at or after
+        // `a + H` (its pointer moves only at the commit).
+        let seeds_here = |node: u32| {
+            seq >= projection.vote_seed_from
+                && view
+                    .balances()
+                    .is_some_and(|payload| payload.iter().any(|info| info.owner() == node))
+        };
         let header = self
             .vote_engine
             .check_header(view, projection.complete, |node| {
-                self.node_info.is_seeded(node)
+                self.vote_seeded(node, projection) || seeds_here(node)
             });
         if header != Ok(true) {
             self.invert_transactions(view, idx, applied);
@@ -4133,7 +4221,7 @@ impl<
     /// node seeded at or below `bound`, or whose seed source was released. Its
     /// registration then lies on the shared chain, and a key never changes
     /// after registration. Intake passes `S_tail` — every branch that can
-    /// connect contains the chain up to it (DEC-125) — and the chain-switch
+    /// connect forks at or above `S_head − H ≥ S_tail` (DEC-207, DEC-208) — and the chain-switch
     /// pre-pass passes the common ancestor. RAM only.
     fn key_is_branch_independent(&self, creator: u32, bound: u32) -> bool {
         if creator == 0 {
@@ -4288,10 +4376,12 @@ impl<
 
     /// FR9 Tier 2 of a side block in Ready (Story 6.1 D6): the UTXO-input
     /// structural completion of every complex transaction, along the block's
-    /// own ancestry from `parent_idx`. A reference within `W` resolves to its
-    /// block, whose bytes must hold the output with the declared amount; one
-    /// below `S_tail` is trusted pre-window history, as in the FR3 pass
-    /// (DEC-129, DEC-131). No available-UTXO bit is read: the bits follow the
+    /// own ancestry from `parent_idx`. A reference within `W` (`≥ s − W`) resolves to its
+    /// block — in the window or the verification horizon — whose bytes must
+    /// hold the output with the declared amount; one below the retained root
+    /// is trusted pre-window history, as in the FR3 pass (DEC-129, DEC-131),
+    /// which a side block inside FR58's bound never reaches once the horizon
+    /// is full (Story 6.14). No available-UTXO bit is read: the bits follow the
     /// active chain, so whether the output is unspent on this branch is Tier 3.
     ///
     /// The other FR9 Tier 2 items join here and in the shared head step
@@ -4456,6 +4546,11 @@ impl<
             self.active_branch_value = self.active_branch_value.saturating_sub(tail_value);
             self.chain_heads
                 .subtract_branch_value(&self.blocks, tail_value);
+        }
+        // FR58 reclamation (DEC-208): the active block at `S_head − H − 1` has
+        // just left the switch bound, and its forks with it.
+        if let (Some(entry), Some(h)) = (self.blocks.get(idx), self.verification_horizon()) {
+            self.reclaim_out_of_bound(entry.sequence().saturating_sub(h + 1));
         }
     }
 
@@ -4693,7 +4788,6 @@ impl<
         self.active_chain_head_idx = NONE_REF;
         self.snake_chain_tail_idx = NONE_REF;
         self.active_branch_value = 0;
-        self.complete_from_sequence = 0;
         for idx in 0..MAX_BLOCKS as u32 {
             if self
                 .blocks
@@ -4827,17 +4921,20 @@ impl<
         SwitchOutcome::Switched
     }
 
-    /// Whether the commit's deferred releases, from the physical tail up to
-    /// `virtual_tail`, will all succeed: the tail is the active chain's flagged
-    /// root and `virtual_tail` is a proper ancestor of `head`, so every block
-    /// released has a flagged child on the way to `head`. RAM only.
+    /// Whether the commit's deferred advances, from the physical tail up to
+    /// `virtual_tail`, will all succeed: the tail is flagged and
+    /// `virtual_tail` is a proper ancestor of `head`, so every block the
+    /// window advances over has a flagged child on the way to `head`. The
+    /// horizon releases they trigger take roots below the tail, which the walk
+    /// never touched (`A ≥ S_tail`, DEC-207), so they succeed whenever the
+    /// advances do. RAM only.
     fn releases_will_succeed(&self, head: u32, virtual_tail: u32) -> bool {
         let tail = self.snake_chain_tail_idx;
-        let tail_is_root = self
+        let tail_is_flagged = self
             .blocks
             .get(tail)
-            .is_some_and(|entry| entry.is_on_active_chain() && entry.parent_ref() == NONE_REF);
-        tail_is_root
+            .is_some_and(|entry| entry.is_on_active_chain());
+        tail_is_flagged
             && virtual_tail != head
             && self.blocks.get(virtual_tail).is_some_and(|entry| {
                 matches!(self.ancestor_at(head, entry.sequence()), Ok(Some(idx)) if idx == virtual_tail)
@@ -4861,28 +4958,24 @@ impl<
     /// Whether a switch with common ancestor `ancestor` may run in place
     /// (Story 6.3 AC1; [`crate::reconciliation::switch_admitted`]).
     fn in_place_switch_allowed(&self, ancestor: u32) -> bool {
-        let (Some(ancestor), Some(root), Some(top), Some(w)) = (
+        let (Some(ancestor), Some(tail), Some(root), Some(top), Some(w), Some(h)) = (
             self.blocks.get(ancestor),
             self.blocks.get(self.snake_chain_tail_idx),
+            self.blocks.get(self.horizon_root()),
             self.blocks.get(self.active_chain_head_idx),
             self.active_chain_length(),
+            self.verification_horizon(),
         ) else {
             return false;
         };
         crate::reconciliation::switch_admitted(
             ancestor.sequence(),
+            tail.sequence(),
             root.sequence(),
             top.sequence(),
             w,
-            self.verification_horizon(),
-            self.complete_from_sequence,
+            h,
         )
-    }
-
-    /// FR58's `H` (DEC-160, DEC-166): the registry default until Story 6.14
-    /// reads `verification_horizon` (ID 30) from the active configuration.
-    fn verification_horizon(&self) -> u32 {
-        50
     }
 
     /// The next block toward `target` above the active head: `target`'s
@@ -5105,9 +5198,10 @@ impl<
     /// (the release step's fragment reclamation reads current caches), the
     /// FR21 (iv) value hand-over before any release (a release may delete the
     /// old head), then the deferred tail advances and their FR21 (iii)
-    /// subtraction. No comparison follows (FR22 (d)). Story 9.7 adds the
-    /// switch-bound reclamation here, after the releases (DEC-159, DEC-161);
-    /// Story 7.4 the mempool window expiry (FR32 (3)).
+    /// subtraction, and last the FR58 reclamation of every block that left the
+    /// switch bound between the old head and the new one — the demoted branch
+    /// included once its common ancestor did (DEC-208). No comparison follows
+    /// (FR22 (d)). Story 7.4 adds the mempool window expiry (FR32 (3)).
     fn commit_switch(
         &mut self,
         head: u32,
@@ -5116,6 +5210,7 @@ impl<
         advances: usize,
         released_value: u64,
     ) {
+        let old_head_seq = self.blocks.get(old_head).map(|entry| entry.sequence());
         self.chain_heads.recompute_all_caches(&self.blocks);
         // The active value is never an entry (DEC-144); the old head, if an
         // entry still names it, carries the old active value.
@@ -5132,6 +5227,11 @@ impl<
         self.active_branch_value = self.active_branch_value.saturating_sub(released_value);
         self.chain_heads
             .subtract_branch_value(&self.blocks, released_value);
+        // The old head's bound was `S_head_old − H`: everything from there up to
+        // the new bound crossed it with this switch.
+        if let (Some(seq), Some(h)) = (old_head_seq, self.verification_horizon()) {
+            self.reclaim_out_of_bound(seq.saturating_sub(h));
+        }
     }
 
     /// AC6 — restores the original chain after a failed walk: undoes every
@@ -5162,7 +5262,8 @@ impl<
                 ChildStep::Applied { advance, value } => {
                     // Its effects are committed: promote it either way. The
                     // original chain fit the window, so an advance means an
-                    // inconsistent window — stop (the stop releases the excess).
+                    // inconsistent window — stop (the caller re-enters collecting,
+                    // DEC-205).
                     self.promote_replayed(next, value);
                     if advance.is_some() {
                         return self.stop_restore(offender);
@@ -5455,12 +5556,7 @@ impl<
     /// `active_chain_head_idx = tip` (overwriting any Story-5.2 bootstrap
     /// placeholder) and the FR48 window over it. A pure `parent_ref` walk (no
     /// storage reads), bounded by `MAX_BLOCKS`.
-    fn promote_candidate_active(
-        &mut self,
-        candidate_tip_idx: u32,
-        window_value: u64,
-        complete_from: u32,
-    ) {
+    fn promote_candidate_active(&mut self, candidate_tip_idx: u32, window_value: u64) {
         // Only the candidate is the active chain. A Collecting genesis anchor
         // that the candidate does not contain (FR2 adopted a window-anchored
         // segment, or a restart re-flagged it) would otherwise keep its flag
@@ -5487,7 +5583,6 @@ impl<
         self.establish_snake_chain_window();
         // The FR3 walk summed exactly the window just established (D5).
         self.active_branch_value = window_value;
-        self.complete_from_sequence = complete_from;
     }
 
     /// The sequence of the tail the window over a chain from `root_seq` to
@@ -5507,24 +5602,23 @@ impl<
     /// promotion).
     ///
     /// The tail starts at the active chain's root (a pure `parent_ref` walk, no
-    /// storage reads) and is then advanced by the ordinary release step until the
-    /// window is `W` long, which lands it on `max(anchor_seq, S_head − W + 1)`.
-    /// A chain shorter than `W` releases nothing — the bootstrap growth phase,
-    /// where a genesis-anchored tail stays at block #0 (AC2).
+    /// storage reads) and is then advanced by the ordinary window step until
+    /// the window is `W` long, which lands it on `max(anchor_seq, S_head − W +
+    /// 1)`. A chain shorter than `W` advances nothing — the bootstrap growth
+    /// phase, where a genesis-anchored tail stays at block #0 (Story 9.1 AC2).
     ///
-    /// A segment longer than `W` (FR2 accepts one, and a restart can hold more)
-    /// therefore enters Ready holding exactly `W` blocks (AC3). The excess blocks
-    /// are released even when they carry an FR49/FR50/FR51 obligation (Ratified
-    /// Decision 4, 2026-10-10): the segment passed FR3/FR6 as a whole and the
-    /// state they seed is in the derived projections; FR48's binding governs
-    /// head *extensions*, not adoption. Each is still classified first, so the
-    /// release record is uniform with a steady-state advance — the result feeds
-    /// only the AR16 log (Epic 11), so neither an obligation nor an unreadable
-    /// block stops the release here.
-    ///
-    /// That covers an *unreadable* block as well (Project Lead, 2026-10-13):
-    /// at adoption the obligation does not matter, so neither does whether it
-    /// could be read.
+    /// The blocks the tail passes enter the FR58 verification horizon, and only
+    /// those beyond `H` below the tail are released (Story 6.14 AC6): a
+    /// segment longer than `W + H` (a restart can hold more) enters Ready
+    /// holding `W + H` blocks. The released blocks go even when they carry an
+    /// FR49/FR50/FR51 obligation (Ratified Decision 4, 2026-10-10): the segment
+    /// passed FR3/FR6 as a whole, the state they seed is in the derived
+    /// projections, and the FR3 pass has already evaluated the FR48 binding of
+    /// every block whose dropped block lay in the segment (DEC-204). Each block
+    /// the window passes is still classified, so the record is uniform with a
+    /// steady-state advance — the result feeds only the AR16 log (Epic 11), so
+    /// neither an obligation nor an unreadable block stops the trim (Project
+    /// Lead, 2026-10-13).
     ///
     /// `W` is read now (FR56). A Ready node is durably locked, so it is always
     /// there; were it not, the window is the whole active chain and nothing is
@@ -5533,21 +5627,20 @@ impl<
     ///
     /// Before the trim every `chain_heads` entry is recomputed against the new
     /// marking (O-024 ruling): without it the adopted chain's own head stays
-    /// Stored and keeps requesting the anchor's parent, below `S_tail`. Stored
-    /// fragments that can never connect are then reclaimed at once (DEC-126,
-    /// DEC-127), including a genesis island the adopted chain does not contain.
+    /// Stored and keeps requesting the anchor's parent. Then the FR58
+    /// reclamation runs over the whole adopted chain (DEC-208): every branch
+    /// forked below `S_head − H` and every Stored fragment that can never
+    /// connect, including a genesis island the adopted chain does not contain
+    /// (DEC-127).
     ///
-    /// **Cost.** The tail is found by walking to the root and then releasing,
-    /// not by a `W − 1`-step walk, so the release is literally the steady-state
-    /// step. Each released block costs one storage read (transaction blocks
-    /// only) plus the release step's own cost (see
-    /// [`Self::advance_snake_chain_tail`]): dominated by one
-    /// `delete_subtree_with_followup` per fork and per reclaimed fragment, each
-    /// O(`MAX_BLOCKS`²) through `mark_subtree`. The number released is the
-    /// segment's excess over `W` — 0 on a live join that stops at `W`, larger
-    /// only on a restart that re-admits released blocks (R3). Bounded, but
-    /// O(excess × `MAX_BRANCH_COUNT` × `MAX_BLOCKS`²) in the worst case; the
-    /// common case releases nothing and deletes nothing.
+    /// **Cost.** The tail is found by walking to the root and then advancing,
+    /// not by a `W − 1`-step walk, so the trim is literally the steady-state
+    /// step. Each block the window passes costs one storage read (transaction
+    /// blocks only) and one O(`MAX_BLOCKS`) child scan; each release another
+    /// scan. The reclamation costs one `delete_subtree_with_followup` per fork
+    /// and per fragment, each O(`MAX_BLOCKS`²) through `mark_subtree`. The
+    /// common case — a live join of exactly `W + H` blocks — releases nothing
+    /// and deletes nothing.
     fn establish_snake_chain_window(&mut self) {
         let mut root = self.active_chain_head_idx;
         for _ in 0..MAX_BLOCKS {
@@ -5561,10 +5654,12 @@ impl<
         // chain without touching `chain_heads`. Current caches keep the adopted
         // chain's own head from looking like a Stored fragment, and make a
         // stale genesis island (now unflagged) look like one — it is reclaimed
-        // here, at once, rather than at the first advance (DEC-127).
+        // here, at once (DEC-127).
         self.chain_heads.recompute_all_caches(&self.blocks);
+        // FR58 reclamation over the whole adopted chain (DEC-208), before the
+        // trim: the releases below then meet only the active path.
         if let Some(root_seq) = self.blocks.get(root).map(|entry| entry.sequence()) {
-            self.reclaim_stale_fragments(root_seq);
+            self.reclaim_out_of_bound(root_seq);
         }
 
         let (Some(root_seq), Some(head_seq)) = (
@@ -5591,18 +5686,64 @@ impl<
         }
     }
 
-    /// FR58 stale-fragment reclamation (DEC-126): deletes, whole, every Stored
-    /// fragment whose lowest block `t` has `t − 1 ≤ s_tail`. Its missing parent
-    /// is below the window (FR60 refuses it) or at `S_tail` without being the
-    /// tail block (which would already have linked it), so the fragment's
-    /// divergence is below `S_tail` and it can never connect.
+    /// FR58 reclamation (DEC-159, DEC-208): deletes, whole, everything whose
+    /// divergence from the active chain lies at `D ≤ S_head − H` and so can
+    /// never become active:
+    /// - every branch forked at an active block at sequence `from ..= S_head −
+    ///   H − 1` — the blocks that left the bound since the previous sweep;
+    /// - every Stored fragment whose missing parent lies at `q ≤ S_head − H`
+    ///   (DEC-161 as tightened by DEC-208): the retained active block at `q`
+    ///   would have linked it at admission, so the missing parent is off the
+    ///   active chain and the fragment diverges at or below `q`; and, on a
+    ///   young chain where that bound is below #0, one whose missing parent
+    ///   is at or below the tail, which can never arrive.
     ///
-    /// Runs at Ready entry and at the end of every tail advance. It reads only
-    /// Stored entries, and a Stored head's tail-point is never on the active
-    /// chain — its walk would have stopped there and made it Connected — as
-    /// long as the caches are current: Ready entry recomputes them first, and
-    /// every later mutation maintains them.
-    fn reclaim_stale_fragments(&mut self, s_tail: u32) {
+    /// Runs at every Ready head extension (`from = S_head − H − 1`), at a chain
+    /// switch's commit (from the old head's bound) and at Ready entry (from the
+    /// root). It needs current `chain_heads` caches — a Stored head's
+    /// tail-point is then never an active block — and walks the active chain by
+    /// `parent_ref`, with no storage read. Without a configuration (never in
+    /// Ready) it does nothing. Cost: one O(`MAX_BLOCKS`) child scan per block
+    /// that crossed the bound, one O(`MAX_BRANCH_COUNT`) fragment pass, and one
+    /// `delete_subtree_with_followup` per deletion, one at a time.
+    fn reclaim_out_of_bound(&mut self, from: u32) {
+        let (Some(head), Some(h)) = (
+            self.blocks
+                .get(self.active_chain_head_idx)
+                .map(|entry| entry.sequence()),
+            self.verification_horizon(),
+        ) else {
+            return;
+        };
+        if let Some(top) = head.checked_sub(h + 1)
+            && from <= top
+            && let Ok(Some(mut cur)) = self.ancestor_at(self.active_chain_head_idx, top)
+        {
+            for _ in 0..MAX_BLOCKS {
+                let Some(entry) = self.blocks.get(cur) else {
+                    break;
+                };
+                if entry.sequence() < from {
+                    break;
+                }
+                let parent = entry.parent_ref();
+                self.delete_forks_at(cur);
+                cur = parent;
+            }
+        }
+        // A missing parent at or below the tail can never arrive either: FR60
+        // refuses it below the tail, and at the tail itself it would be the
+        // tail's sibling — out of the bound once the chain has matured, a
+        // second genesis before (the young chain's tail is #0). So a young
+        // chain still reclaims what Story 9.1 did.
+        let tail = self
+            .blocks
+            .get(self.snake_chain_tail_idx)
+            .map_or(0, |entry| entry.sequence());
+        let limit = head
+            .saturating_add(1)
+            .saturating_sub(h)
+            .max(tail.saturating_add(1));
         for slot in 0..MAX_BRANCH_COUNT {
             let Some(tail_point) = self.chain_heads.stored_head_tail(slot) else {
                 continue;
@@ -5610,107 +5751,130 @@ impl<
             if self
                 .blocks
                 .get(tail_point)
-                .is_some_and(|entry| entry.sequence() <= s_tail.saturating_add(1))
+                .is_some_and(|entry| entry.sequence() <= limit)
             {
                 self.delete_subtree_with_followup(tail_point);
             }
         }
     }
 
-    /// FR48 window-advance / tail-release step (AC5): moves the tail one block
-    /// up the active chain and releases the block it leaves. Returns `false`,
-    /// changing nothing, when there is nothing to advance over — no tail, or the
-    /// tail is the head.
-    ///
-    /// The caller decides *whether* to advance: the Ready-entry trim
-    /// ([`Self::establish_snake_chain_window`]), and Story 6.0's forward
-    /// extension, which advances once per head extension past length `W` after
-    /// [`crate::snake_chain::tail_drop_binding`] allows it.
-    ///
-    /// The release (Ratified Decision 2), in order:
-    /// 1. **FR58 stale side-branch reclamation** (pulled forward from Story 9.7,
-    ///    Project Lead 2026-10-17): every branch forked at the dropped block
-    ///    diverges below the new `S_tail`, so neither chain-switch zone can ever
-    ///    reach it. Each is deleted whole with
-    ///    [`Self::delete_subtree_with_followup`] — a child-closed delete-set, so
-    ///    the ordinary `chain_heads` event (iv) applies — while the dropped block
-    ///    is still in place, so no surviving walk ever meets the freed slot;
-    /// 2. the dropped block's `is_on_active_chain` is cleared and its slot freed
-    ///    with the ordinary lazy [`BlockTable::delete`] — the durable bytes stay
-    ///    until the slot is reused (Ratified Decision 3);
-    /// 3. its one remaining child, the new tail, is unlinked
-    ///    (`parent_ref = NONE_REF`) and becomes the active chain's root;
-    /// 4. **FR58 stale-fragment reclamation** (Project Lead 2026-10-17): every
-    ///    Stored fragment whose lowest block `t` has `t − 1 ≤ S_tail` (the new
-    ///    tail) is deleted whole. Its missing parent is either below the window
-    ///    (FR60 refuses it) or at `S_tail` — where it cannot be the tail block,
-    ///    which would already have linked it — so the fragment's divergence point
-    ///    is below `S_tail` and it can never connect. A fragment admitted after
-    ///    this step waits for the next advance.
-    ///
-    /// No `chain_heads` pass is needed for the dropped block itself: it is not a
-    /// tip (the new tail is its child), every head above it anchors on the
-    /// active chain at or above the new tail, and nothing else passed through it.
-    /// **Cost.** Two O(`MAX_BLOCKS`) scans find the children (the table has no
-    /// child index) and one O(`MAX_BRANCH_COUNT`) pass finds the fragments. Each
-    /// deleted fork or fragment then costs one `delete_subtree_with_followup`:
-    /// O(`MAX_BLOCKS`²) worst case through `mark_subtree`, plus its 2.4 KB
-    /// delete-set buffer (one call at a time, never nested). A step with nothing
-    /// to reclaim stays O(`MAX_BLOCKS`). With `R = 0`
-    /// ([`crate::snake_chain::BELOW_TAIL_RETENTION`]) the block is freed at once.
-    pub(crate) fn advance_snake_chain_tail(&mut self) -> bool {
-        let released = self.snake_chain_tail_idx;
-        if released == self.active_chain_head_idx {
-            return false;
-        }
-        // Runtime, not debug-only: Story 6.0 drives this, and releasing a block
-        // that is not the active chain's root would leave its parent with a
-        // stale `head_ref_count` and strand the chain below it.
-        if !self
-            .blocks
-            .get(released)
-            .is_some_and(|entry| entry.is_on_active_chain() && entry.parent_ref() == NONE_REF)
-        {
-            return false;
-        }
-        let Some((new_tail, s_tail)) = (0..MAX_BLOCKS as u32).find_map(|idx| {
-            self.blocks
-                .get(idx)
-                .filter(|child| child.parent_ref() == released && child.is_on_active_chain())
-                .map(|child| (idx, child.sequence()))
-        }) else {
-            return false;
-        };
-
+    /// Deletes, whole, every branch forked at the active block `block`: each
+    /// child that is not on the active path.
+    fn delete_forks_at(&mut self, block: u32) {
         for idx in 0..MAX_BLOCKS as u32 {
-            if idx != new_tail
-                && self
-                    .blocks
-                    .get(idx)
-                    .is_some_and(|child| child.parent_ref() == released)
+            if self
+                .blocks
+                .get(idx)
+                .is_some_and(|child| child.parent_ref() == block && !child.is_on_active_chain())
             {
                 self.delete_subtree_with_followup(idx);
             }
         }
-        self.blocks.set_on_active_chain(released, false);
-        self.blocks.delete(released);
-        // Index hygiene: no module state may name the freed slot. The head is a
-        // descendant of the new tail (checked above). Nodes seeded from the
-        // block stay seeded but stop naming the slot. The tentative provenance
-        // never fires in practice — a Ready node is durably locked — and costs
-        // one comparison.
-        self.node_info.release_seed_source(released);
-        if self.tentative_config_block_idx == released {
-            self.tentative_config_block_idx = NONE_REF;
-            self.chain_config.discard_tentative();
+    }
+
+    /// The lowest retained active-chain block, below the tail by at most `H`:
+    /// the root, whose `parent_ref` is `NONE_REF` (D1, DEC-206). Derived by a
+    /// RAM walk, so no index names it.
+    fn horizon_root(&self) -> u32 {
+        let mut root = self.snake_chain_tail_idx;
+        for _ in 0..MAX_BLOCKS {
+            match self.blocks.get(root) {
+                Some(entry) if entry.parent_ref() != NONE_REF => root = entry.parent_ref(),
+                _ => break,
+            }
         }
-        self.blocks.set_parent_ref(new_tail, NONE_REF);
+        root
+    }
+
+    /// FR48 window advance (Story 9.1 AC5; Story 6.14 AC3): moves the tail one
+    /// block up the active chain. Returns `false`, changing nothing, when there
+    /// is nothing to advance over — no tail, or the tail is the head.
+    ///
+    /// The block the tail leaves enters the FR58 verification horizon: it
+    /// keeps its entry, `parent_ref`, `Active` status, `is_on_active_chain`
+    /// flag, available-UTXO bits and every seed-source pointer that names it
+    /// (D1, DEC-206). Horizon blocks contribute nothing to the derived state
+    /// or the FR21 value — the window is the two indices — but a chain switch
+    /// resolves the dropped and referenced blocks below `S_tail` against them
+    /// (DEC-204). The block that leaves the horizon is then released
+    /// ([`Self::release_beyond_horizon`]).
+    ///
+    /// The caller decides *whether* to advance: the Ready-entry trim
+    /// ([`Self::establish_snake_chain_window`]), Story 6.0's forward
+    /// extension, which advances once per head extension past length `W` after
+    /// [`crate::snake_chain::tail_drop_binding`] allows it, and a chain
+    /// switch's commit. No fork is deleted here: under DEC-207 the dropped
+    /// block lies below `S_head − H − 1`, so its forks left FR58's bound
+    /// earlier and were reclaimed then ([`Self::reclaim_out_of_bound`],
+    /// DEC-208). The FR21 subtraction of event (iii) is the caller's.
+    ///
+    /// **Cost.** One O(`MAX_BLOCKS`) child scan, plus the release's.
+    pub(crate) fn advance_snake_chain_tail(&mut self) -> bool {
+        let dropped = self.snake_chain_tail_idx;
+        // Runtime, not debug-only: advancing over a block off the active path
+        // would move the window onto a branch.
+        if dropped == self.active_chain_head_idx
+            || !self
+                .blocks
+                .get(dropped)
+                .is_some_and(|entry| entry.is_on_active_chain())
+        {
+            return false;
+        }
+        let Some(new_tail) = self.tail_successor(dropped) else {
+            return false;
+        };
         self.snake_chain_tail_idx = new_tail;
-        self.reclaim_stale_fragments(s_tail);
-        // The FR21 subtraction of event (iii) is the head-extension caller's
-        // (`promote_head_extension`): this step also serves the Ready-entry
-        // trim, which runs before the window value is seeded.
+        self.release_beyond_horizon();
         true
+    }
+
+    /// The FR58 horizon release (D1, DEC-206): while more than `H` blocks lie
+    /// below the tail, the root — the block that leaves the horizon — is
+    /// released as Story 9.1 released the dropped tail:
+    /// 1. its `is_on_active_chain` is cleared and its slot freed with the lazy
+    ///    [`BlockTable::delete`] — the durable bytes stay until the slot is
+    ///    reused (Ratified Decision 3);
+    /// 2. index hygiene: nodes seeded from it stay seeded but stop naming the
+    ///    slot (`SEED_SOURCE_RELEASED`), and a tentative provenance naming it is
+    ///    dropped (never in practice: a Ready node is durably locked);
+    /// 3. its one flagged child is unlinked (`parent_ref = NONE_REF`) and
+    ///    becomes the new root.
+    ///
+    /// No fork is deleted: nothing but the active path lies at or below
+    /// `S_head − H` (DEC-208), so the root's only child is its successor.
+    /// Without a configuration `H` counts as 0. Cost: one root walk and one
+    /// O(`MAX_BLOCKS`) child scan per release.
+    fn release_beyond_horizon(&mut self) {
+        let Some(tail_seq) = self
+            .blocks
+            .get(self.snake_chain_tail_idx)
+            .map(|entry| entry.sequence())
+        else {
+            return;
+        };
+        let h = self.verification_horizon().unwrap_or(0);
+        let mut root = self.horizon_root();
+        for _ in 0..MAX_BLOCKS {
+            let Some(root_seq) = self.blocks.get(root).map(|entry| entry.sequence()) else {
+                return;
+            };
+            if tail_seq.saturating_sub(root_seq) <= h {
+                return;
+            }
+            let Some(successor) = self.tail_successor(root) else {
+                return;
+            };
+            self.blocks.set_on_active_chain(root, false);
+            self.blocks.delete(root);
+            self.node_info.release_seed_source(root);
+            if self.tentative_config_block_idx == root {
+                self.tentative_config_block_idx = NONE_REF;
+                self.chain_config.discard_tentative();
+            }
+            self.blocks.set_parent_ref(successor, NONE_REF);
+            root = successor;
+        }
     }
 
     /// FR19/FR46 tick: run the parent-recovery scheduler. First evaluates the
@@ -6077,7 +6241,6 @@ impl<
             self.active_chain_head_idx = NONE_REF;
             self.snake_chain_tail_idx = NONE_REF;
             self.active_branch_value = 0;
-            self.complete_from_sequence = 0;
         }
         if self.tentative_config_block_idx != NONE_REF
             && deleted.contains(&self.tentative_config_block_idx)
@@ -6416,6 +6579,16 @@ impl<
             .map(|config| u32::from(config.active_chain_length()))
     }
 
+    /// FR58's verification horizon `H` (DEC-160) the held configuration —
+    /// tentative or durable — declares, or `None` while the node holds none.
+    /// Read where it is needed and never cached (FR56); acceptance holds it
+    /// to `1 ≤ H < W` and `W + 2·H ≤ MAX_BLOCKS`.
+    pub(crate) fn verification_horizon(&self) -> Option<u32> {
+        self.chain_config
+            .active_configuration()
+            .map(|config| u32::from(config.verification_horizon()))
+    }
+
     /// The block UTXO-output cap `max_block_utxo_output` the held configuration
     /// — tentative or durable — declares, or the bitfield width while the node
     /// holds none (I-07).
@@ -6588,41 +6761,80 @@ mod tests {
     /// capacity keeps every other parameter at its code-baked default.
     const TEST_W: u16 = 16;
 
+    /// The verification horizon the `TEST_W` configurations declare beside the
+    /// window (configuration §6 check 15, `H < W`; see [`test_horizon`]).
+    /// The default 50 is not below any test window, so a content must declare
+    /// it. The test backend stores eight blocks, so a `TEST_W` chain never
+    /// holds a head above #7: at 7 the FR58 bound never binds there, and the
+    /// bound, the horizon and the reclamation are exercised on the W4 harness,
+    /// which declares `H = 3` or its own.
+    const TEST_H: u16 = 7;
+
+    /// The horizon a test configuration with window `w` declares: `TEST_H` on
+    /// the `TEST_W` harnesses, and the smallest legal horizon, 1, on every
+    /// smaller window — the W4 harness then joins on `W + H = 5` blocks and
+    /// keeps three of the backend's eight slots for forks.
+    const fn test_horizon(w: u16) -> u16 {
+        if w >= TEST_W { TEST_H } else { 1 }
+    }
+
+    /// The block table of the `TEST_W` harnesses: the window, the horizon and
+    /// one competing branch of depth `H` (configuration §6 check 16). The test
+    /// backend stores eight blocks, so the size only has to pass the check.
+    const TEST_MAX_BLOCKS: usize = TEST_W as usize + 2 * TEST_H as usize;
+
     /// The base override set as a **content region**: one literal entry
     /// declaring `active_chain_length = TEST_W`. Every other parameter resolves
     /// to its code-baked default, and those defaults are exactly the constants
     /// the retired `FixedChainConfig` returned — which is why the suite's
     /// expected values are unchanged.
-    const BASE_CONFIG_CONTENT: [u8; 6] = [
-        1,
+    const BASE_CONFIG_CONTENT: [u8; 10] = [
+        2,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
         TEST_W.to_le_bytes()[0],
         TEST_W.to_le_bytes()[1],
+        parameter::VERIFICATION_HORIZON,
+        2,
+        test_horizon(TEST_W).to_le_bytes()[0],
+        test_horizon(TEST_W).to_le_bytes()[1],
     ];
 
     /// A second content region, valid and **distinct in bytes** but resolving
     /// identically: the base entry plus a literal declaring `vote_interest`'s
     /// own default. Used where a test needs two different chain-config contents.
-    const OTHER_CONFIG_CONTENT: [u8; 9] = [
-        2,
+    const OTHER_CONFIG_CONTENT: [u8; 13] = [
+        3,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         2,
         TEST_W.to_le_bytes()[0],
         TEST_W.to_le_bytes()[1],
+        parameter::VERIFICATION_HORIZON,
+        2,
+        test_horizon(TEST_W).to_le_bytes()[0],
+        test_horizon(TEST_W).to_le_bytes()[1],
         parameter::VOTE_INTEREST,
         1,
         5,
     ];
 
-    /// An override set declaring only the window `w` — the base every fixture
-    /// builder starts from.
+    /// An override set declaring the window `w` and its test horizon — the
+    /// base every fixture builder starts from.
     fn window_config_builder(w: u16) -> ChainConfigPayloadBuilder {
+        window_horizon_config_builder(w, test_horizon(w))
+    }
+
+    /// An override set declaring the window `w` and the horizon `h`.
+    fn window_horizon_config_builder(w: u16, h: u16) -> ChainConfigPayloadBuilder {
         let mut builder = ChainConfigPayloadBuilder::new();
         builder
             .add_literal(parameter::ACTIVE_CHAIN_LENGTH, &w.to_le_bytes())
+            .ok()
+            .expect("a two-byte literal is well-formed");
+        builder
+            .add_literal(parameter::VERIFICATION_HORIZON, &h.to_le_bytes())
             .ok()
             .expect("a two-byte literal is well-formed");
         builder
@@ -6892,7 +7104,7 @@ mod tests {
         TestConfig,
         16,
         16,
-        16,
+        TEST_MAX_BLOCKS,
         4,
         16,
     > {
@@ -6929,8 +7141,8 @@ mod tests {
     fn init_sets_expected_defaults() {
         let (crypto, storage, chain_config) = construction_backends();
         let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut bc_slot,
             crypto,
             storage,
@@ -6958,7 +7170,6 @@ mod tests {
             tentative_config_block_idx,
             snake_chain_tail_idx,
             active_branch_value,
-            complete_from_sequence,
         } = &*bc;
 
         assert_eq!(*local_node_id, 7);
@@ -6982,7 +7193,6 @@ mod tests {
         assert_eq!(*tentative_config_block_idx, NONE_REF);
         assert_eq!(*snake_chain_tail_idx, NONE_REF);
         assert_eq!(*active_branch_value, 0);
-        assert_eq!(*complete_from_sequence, 0);
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -6997,8 +7207,9 @@ mod tests {
     #[test]
     fn init_is_equivalent_to_new() {
         let (crypto, storage, chain_config) = construction_backends();
-        let mut slot = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let built = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let built = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut slot,
             crypto,
             storage,
@@ -7008,7 +7219,7 @@ mod tests {
             0xDEAD_BEEF,
         );
         let (crypto, storage, chain_config) = construction_backends();
-        let spec = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::new(
+        let spec = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::new(
             crypto,
             storage,
             chain_config,
@@ -7035,7 +7246,6 @@ mod tests {
             tentative_config_block_idx,
             snake_chain_tail_idx,
             active_branch_value,
-            complete_from_sequence,
         } = &*built;
         let Blockchain {
             crypto: _,
@@ -7055,7 +7265,6 @@ mod tests {
             tentative_config_block_idx: spec_tentative_config_block_idx,
             snake_chain_tail_idx: spec_snake_chain_tail_idx,
             active_branch_value: spec_active_branch_value,
-            complete_from_sequence: spec_complete_from_sequence,
         } = &spec;
 
         assert_eq!(local_node_id, spec_local_node_id);
@@ -7075,7 +7284,6 @@ mod tests {
         assert_eq!(tentative_config_block_idx, spec_tentative_config_block_idx);
         assert_eq!(snake_chain_tail_idx, spec_snake_chain_tail_idx);
         assert_eq!(active_branch_value, spec_active_branch_value);
-        assert_eq!(complete_from_sequence, spec_complete_from_sequence);
     }
 
     /// AC2 — the neutrality proof: with the base override set (the window alone)
@@ -7441,8 +7649,8 @@ mod tests {
         let node_zero = *crypto.public_key().serialize();
 
         let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut bc_slot,
             crypto,
             BlockWriteFailsStorage,
@@ -7520,8 +7728,9 @@ mod tests {
         // (> HEADER_SIZE, <= MAX_BLOCK_SIZE), smaller than Block #0. The window
         // entry is the one every content on this harness carries.
         let w = TEST_W.to_le_bytes();
+        let h = test_horizon(TEST_W).to_le_bytes();
         let content = [
-            2u8,
+            3u8,
             0,
             parameter::BLOCK_SIZE_LIMIT,
             2,
@@ -7531,6 +7740,10 @@ mod tests {
             2,
             w[0],
             w[1],
+            parameter::VERIFICATION_HORIZON,
+            2,
+            h[0],
+            h[1],
         ];
 
         let outcome = bc.process_genesis(1_000_000_000, &content);
@@ -7574,7 +7787,7 @@ mod tests {
         TestConfig,
         16,
         16,
-        16,
+        TEST_MAX_BLOCKS,
         4,
         16,
     >;
@@ -8139,7 +8352,9 @@ mod tests {
 
         // The tail carries the configuration the node is locked on, as the FR8
         // final check requires.
-        let tail = w4_config_anchor_block(100, [0xAB; 32]);
+        let below = w4_horizon_block();
+        bc.receive_block(below.view(), 0);
+        let tail = w4_config_anchor_block(100, below.view().hash());
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
         for seq in 101..=102 {
@@ -8149,14 +8364,14 @@ mod tests {
         }
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "segment length 3 < W = 4"
+            "segment length 4 < W + H = 5"
         );
 
         let last = linked_transfer_block(103, prev);
         bc.receive_block(last.view(), 0);
         assert!(
             bc.is_ready(),
-            "segment length 4 = W qualifies, on a build that allocated 16"
+            "segment length 5 = W + H qualifies, on a build that allocated 16"
         );
     }
 
@@ -8338,9 +8553,19 @@ mod tests {
     >;
 
     fn new_w4_chain() -> W4Chain {
+        new_w4_chain_h(test_horizon(W4))
+    }
+
+    /// [`new_w4_chain`] locked on the horizon `h` (a few FR21 / FR22 tests
+    /// need a fork deeper than the head's parent to stay inside FR58's bound).
+    fn new_w4_chain_h(h: u16) -> W4Chain {
         let (crypto, storage, _) = test_backends();
         // This harness's own capacities, not `TestChain`'s: its window is 4.
-        let chain_config = locked_chain_config(&crypto, W4Chain::BUILD_LIMITS);
+        let mut chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
+        chain_config
+            .load_durable(window_horizon_config_builder(W4, h).build_signed(&crypto))
+            .ok()
+            .expect("the W4 configuration is accepted content");
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
         Blockchain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -8365,11 +8590,12 @@ mod tests {
     #[test]
     fn fr2_active_length_triggers_at_w() {
         let mut bc = new_w4_chain();
-        // Tail orphan at seq 100 (unresolved parent), then children up to len 3.
-        // The tail is the chain-config block the FR8 final check requires in
-        // scope (Story 5.9, AC3); as the segment anchor it is inert with respect
-        // to the derivation — see `chain_config_anchor_block`.
-        let tail = w4_config_anchor_block(100, [0xAB; 32]);
+        // The orphan #99 (unresolved parent), the chain-config block #100 the
+        // FR8 final check requires in scope (Story 5.9, AC3), then children up
+        // to length 4 — one below `W + H = 5` (DEC-177).
+        let below = w4_horizon_block();
+        bc.receive_block(below.view(), 0);
+        let tail = w4_config_anchor_block(100, below.view().hash());
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
         for seq in 101..=102 {
@@ -8377,13 +8603,13 @@ mod tests {
             prev = blk.view().hash();
             bc.receive_block(blk.view(), 0);
         }
-        assert_eq!(bc.block_tree_len(), 3);
+        assert_eq!(bc.block_tree_len(), 4);
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "segment length 3 < W = 4"
+            "segment length 4 = W, below W + H = 5"
         );
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
-        // The 4th block brings the continuous segment to length W = 4 → FR2
+        // The 5th block brings the continuous segment to length W + H = 5 → FR2
         // qualifies, and the window-anchored candidate (unseeded initializers, so
         // the per-node FR6 checks are pre-seed-skipped, and every block is
         // node-#0-signed against the trust anchor) validates → Ready (Story 5.4).
@@ -8391,7 +8617,7 @@ mod tests {
         bc.receive_block(last.view(), 0);
         assert!(
             bc.is_ready(),
-            "segment length 4 >= W → FR2 qualifies, FR6 validates → Ready"
+            "segment length 5 >= W + H → FR2 qualifies, FR6 validates → Ready"
         );
     }
 
@@ -8498,7 +8724,10 @@ mod tests {
             .expect("config admitted");
         // A separate non-genesis branch of length W = 4 (tail seq 100 → tip 103),
         // its tail naming the same configuration.
-        let tail = w4_config_anchor_block(100, [0xAB; 32]);
+        let below = w4_horizon_block();
+        bc.tier1_admit(&below.view(), &below.view().hash(), 0)
+            .expect("the block below the window admitted");
+        let tail = w4_config_anchor_block(100, below.view().hash());
         bc.tier1_admit(&tail.view(), &tail.view().hash(), 0)
             .expect("tail admitted");
         let mut prev = tail.view().hash();
@@ -8641,7 +8870,12 @@ mod tests {
     /// [`chain_config_anchor_block`] for the [`W4Chain`] harness, whose
     /// configuration declares its own window, [`W4`].
     fn w4_config_anchor_block(seq: u32, prev: [u8; 32]) -> Block {
-        chain_config_block_from(seq, prev, &mut window_config_builder(W4))
+        w4_config_anchor_block_h(seq, prev, test_horizon(W4))
+    }
+
+    /// [`w4_config_anchor_block`] for the [`new_w4_chain_h`] harness.
+    fn w4_config_anchor_block_h(seq: u32, prev: [u8; 32], h: u16) -> Block {
+        chain_config_block_from(seq, prev, &mut window_horizon_config_builder(W4, h))
     }
 
     /// A chain-config block at `seq`, chained to `prev`, carrying whatever
@@ -10291,17 +10525,13 @@ mod tests {
         let cfg = w4_config_anchor_block(104, b103.view().hash());
         bc.receive_block(cfg.view(), 0);
         assert!(bc.is_ready(), "the segment now names its configuration");
-        // Nothing was deleted for the waiting: the one block gone is #100, which
-        // the five-block segment's Ready entry released to keep the window at
-        // exactly W = 4 (FR48, Story 9.1).
-        assert_eq!(
-            bc.block_tree_len(),
-            4,
-            "every block survived the wait; only the window trim released one"
-        );
+        // Nothing was deleted for the waiting: the five-block segment is
+        // exactly `W + H`, so its Ready entry keeps #100 in the horizon (FR58,
+        // Story 6.14).
+        assert_eq!(bc.block_tree_len(), 5, "every block survived the wait");
         assert!(
-            !bc.block_tree_contains(100, &tail.view().hash()),
-            "#100 is the one released"
+            bc.block_tree_contains(100, &tail.view().hash()),
+            "#100 is the horizon"
         );
         for blk in [&b101, &b102, &b103, &cfg] {
             let view = blk.view();
@@ -10688,8 +10918,8 @@ mod tests {
                 bc.receive_block(block.view(), 0);
             }
             // The locked content as a fingerprint: its first two bytes are the
-            // `config_value_count`, which is 1 for the base override set config A
-            // carries and 2 for config B's.
+            // `config_value_count`, which is 2 for the base override set config A
+            // carries (window and horizon) and 3 for config B's.
             let locked = bc
                 .chain_config
                 .durable_content()
@@ -10706,7 +10936,7 @@ mod tests {
         );
         assert_eq!(
             a_first,
-            (true, 4, [1, 0]),
+            (true, 4, [2, 0]),
             "and they converge on config A — the candidate's own — with the side branch gone"
         );
     }
@@ -10739,9 +10969,12 @@ mod tests {
         // `max_node_id = 9` so the linked transfers' pre-window actors (nodes 7
         // and 9) are inside the derived node-id range; three entries so the block
         // comfortably exceeds the stray's declared limit.
+        let below = w4_horizon_block();
+        let (outcome, _) = bc.receive_block(below.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         let big = balance_block(
             100,
-            [0xAB; 32],
+            below.view().hash(),
             &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2), (3, 100, 0, 0xB3)],
             9,
         );
@@ -10770,7 +11003,7 @@ mod tests {
         );
 
         // (3) The candidate's own chain-config block completes the segment at
-        // W = 4 and triggers FR2.
+        // W + H = 5 and triggers FR2.
         let cfg = w4_config_anchor_block(103, b102.view().hash());
         let (outcome, _) = bc.receive_block(cfg.view(), 0);
 
@@ -10896,11 +11129,14 @@ mod tests {
     #[test]
     fn fr9_size_limit_is_reevaluated_at_the_durable_lock() {
         let mut bc = new_unconfigured_w4_chain();
-        // A four-block window-anchored candidate whose own chain-config declares a
-        // limit the balance block at its base exceeds.
+        // A five-block (`W + H`) window-anchored candidate whose own chain-config
+        // declares a limit the balance block near its base exceeds.
+        let below = w4_horizon_block();
+        let (outcome, _) = bc.receive_block(below.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         let big = balance_block(
             100,
-            [0xAB; 32],
+            below.view().hash(),
             &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2), (3, 100, 0, 0xB3)],
             9,
         );
@@ -11609,8 +11845,9 @@ mod tests {
             .expect("test private key");
         let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
-        let mut slot = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut slot,
             crypto,
             CorruptSlotsStorage,
@@ -11786,8 +12023,9 @@ mod tests {
             .ok()
             .expect("test private key");
         let node_zero = *crypto.public_key().serialize();
-        let mut slot = core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, 16, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, 16, 4, 16>::init(
+        let mut slot =
+            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
             &mut slot,
             crypto,
             CorruptSlotsStorage,
@@ -11852,18 +12090,38 @@ mod tests {
         bc
     }
 
-    /// A `W4Chain` that went Ready on the window-anchored segment `100..=last`,
+    /// The block below every W4 window-anchored segment: with `H = 1` a
+    /// window-anchored join needs `W + H = 5` blocks (DEC-177), so each segment
+    /// `100..` starts one block lower, at #99, which then lies in the FR58
+    /// horizon below the window `100..=103`. A plain transfer: it carries no
+    /// essential state, so dropping it binds nothing.
+    fn w4_horizon_block() -> Block {
+        linked_transfer_block(99, [0xAB; 32])
+    }
+
+    /// A `W4Chain` that went Ready on the window-anchored segment `99..=last`
+    /// (#99 from [`w4_horizon_block`]),
     /// its tail block #100 the chain-config block the FR8 final check requires.
     /// Returns the node and the hash of each block, indexed by `seq - 100`.
     fn w4_ready_on_segment(last: u32) -> (W4Chain, [[u8; 32]; 8]) {
         let mut bc = new_w4_chain();
         let mut hashes = [[0u8; 32]; 8];
-        let anchor = w4_config_anchor_block(100, [0xAB; 32]);
+        let below = w4_horizon_block();
+        bc.tier1_admit(&below.view(), &below.view().hash(), 0)
+            .expect("the block below the window admitted");
+        let anchor = w4_config_anchor_block(100, below.view().hash());
         hashes[0] = anchor.view().hash();
         bc.tier1_admit(&anchor.view(), &hashes[0], 0)
             .expect("anchor admitted");
         for seq in 101..=last {
-            let blk = linked_transfer_block(seq, hashes[(seq - 101) as usize]);
+            // #104 drops the chain-config block #100, so it is its replay
+            // (FR49): the FR3 pass binds it (Story 6.14 AC9).
+            let prev = hashes[(seq - 101) as usize];
+            let blk = if seq == 104 {
+                w4_config_anchor_block(seq, prev)
+            } else {
+                linked_transfer_block(seq, prev)
+            };
             hashes[(seq - 100) as usize] = blk.view().hash();
             bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
                 .expect("block admitted");
@@ -11911,29 +12169,26 @@ mod tests {
         assert_eq!(bc.block_tree_len(), 2);
     }
 
-    /// AC2 — `W = 1` (legal: acceptance only demands `W ≥ 1`): the tail is
-    /// block #1 and block #0 is released. Its chain-config replay would be
-    /// FR49's business (Story 9.2); the new root requests nothing.
+    /// AC2 — `W = 1` admits no verification horizon (`1 ≤ H < W` is empty,
+    /// DEC-207), so genesis refuses the content before anything is written.
     #[test]
-    fn snake_genesis_at_w_one_releases_block_zero() {
-        let bc = genesis_node_with_window(1);
-        assert_eq!(bc.active_snake_chain_window(), Ok((1, 1)));
-        assert_eq!(bc.block_tree_len(), 1);
-        assert!(bc.blocks.get(0).is_none(), "block #0's slot is free");
-        let tail = bc.blocks.get(1).expect("block #1 survives");
-        assert_eq!(tail.parent_ref(), NONE_REF, "unlinked from the freed slot");
-        assert!(tail.is_on_active_chain());
-        assert!(
-            !bc.chain_heads.has_stored_head(),
-            "the new root does not request the block it replaced"
-        );
+    fn snake_genesis_at_w_one_is_refused() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        let builder = window_config_builder(1);
+        assert!(matches!(
+            bc.process_genesis(1_000_000_000, builder.content()),
+            Err(GenesisRejectReason::InitialChainConfigRejected)
+        ));
+        assert_eq!(bc.block_tree_len(), 0, "nothing was written");
+        assert!(!bc.chain_config.is_durable_locked());
     }
 
-    /// AC10.2 / AC3 — Ready entry on a genesis-anchored segment of length
-    /// `W + 2` releases exactly two blocks, and the window is `W` long. The
-    /// extra blocks are chain-config replays, which FR6 accepts on a
-    /// genesis-anchored candidate; the released #1 is one, and goes anyway
-    /// (Ratified Decision 4).
+    /// AC10.2 / AC3; Story 6.14 AC6 — Ready entry on a genesis-anchored segment
+    /// of length `W + H + 1` keeps the window `W` long and `H` blocks below it,
+    /// and releases exactly the one block beyond them. The extra blocks are
+    /// chain-config replays, which FR6 accepts on a genesis-anchored candidate;
+    /// the retained #1 is one.
     #[test]
     fn snake_ready_entry_on_a_longer_genesis_segment_releases_the_excess() {
         let mut bc = new_w4_chain();
@@ -11950,49 +12205,69 @@ mod tests {
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready());
         assert_eq!(bc.active_snake_chain_window(), Ok((2, 5)));
-        assert_eq!(bc.block_tree_len(), 4, "exactly W blocks remain");
-        assert!(bc.blocks.get(0).is_none() && bc.blocks.get(1).is_none());
+        assert_eq!(bc.block_tree_len(), 5, "W blocks and H = 1 below them");
+        assert!(bc.blocks.get(0).is_none(), "#0 left the horizon: released");
+        let root = bc.blocks.get(1).expect("#1 in the horizon");
+        assert_eq!(root.sequence(), 1);
+        assert_eq!(root.parent_ref(), NONE_REF);
+        assert!(root.is_on_active_chain());
+        assert_eq!(bc.horizon_root(), 1);
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
-        assert_eq!(tail.parent_ref(), NONE_REF);
+        assert_eq!(tail.parent_ref(), 1, "the tail stays linked to the horizon");
         assert!(tail.is_on_active_chain());
         assert!(!bc.chain_heads.has_stored_head());
     }
 
-    /// AC10.3 — Ready entry on a window-anchored segment of exactly `W`
-    /// releases nothing.
+    /// AC10.3; Story 6.14 AC6 — Ready entry on a window-anchored segment of
+    /// exactly `W + H` releases nothing: the window is `100..=103` and #99 is
+    /// the horizon.
     #[test]
-    fn snake_ready_entry_on_exactly_w_releases_nothing() {
+    fn snake_ready_entry_on_exactly_w_plus_h_releases_nothing() {
         let (bc, _) = w4_ready_on_segment(103);
         assert_eq!(bc.active_snake_chain_window(), Ok((100, 103)));
-        assert_eq!(bc.block_tree_len(), 4);
+        assert_eq!(bc.block_tree_len(), 5);
+        let below = w4_horizon_block();
+        assert_eq!(
+            Some(bc.horizon_root()),
+            slot_of(&bc, 99, &below.view().hash()),
+            "#99 is the root"
+        );
         // O-024: the adopted chain's head is Connected, not a Stored head still
-        // asking for the anchor's parent below S_tail.
+        // asking for the anchor's parent.
         assert!(!bc.chain_heads.has_stored_head());
     }
 
-    /// Review patch — a released seed source stops naming its slot: the node
-    /// stays seeded, and the unrelated block that reuses the slot does not
-    /// classify as a seed source.
+    /// Review patch; Story 6.14 AC3 — a seed source that the window drops stays
+    /// named while it is in the horizon, and stops naming its slot only when it
+    /// leaves the horizon: the node stays seeded, and the unrelated block that
+    /// reuses the slot does not classify as a seed source.
     #[test]
     fn snake_released_seed_source_does_not_follow_the_slot() {
         let (mut bc, h) = w4_ready_on_segment(103);
+        let slot_99 = slot_of(&bc, 99, &w4_horizon_block().view().hash()).expect("#99");
         let slot_100 = slot_of(&bc, 100, &h[0]).expect("#100");
         let key = *bc.crypto.public_key().serialize();
         bc.node_info.seed_node(1, &key, 0, slot_100);
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
-        assert_eq!(
-            bc.active_snake_chain_window(),
-            Ok((101, 104)),
-            "#100 released"
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
+        assert!(
+            bc.node_info.is_seed_source(slot_100),
+            "#100 entered the horizon and keeps the pointer"
         );
+        let b105 = w4_config_anchor_block(105, b104.view().hash());
+        extend_active_head(&mut bc, &b105, 0);
+        assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
+        assert!(slot_of(&bc, 100, &h[0]).is_none(), "#100 left the horizon");
         assert!(bc.node_info.is_seeded(1), "the node stays seeded");
         assert!(bc.node_info.key_is_registered(&key));
-        // The next admission reuses the freed slot.
-        let orphan = node_transfer_block(106, 3, 105, 7);
+        assert!(!bc.node_info.is_seed_source(slot_100));
+        // #105 took #99's freed slot; the next admission reuses #100's.
+        assert_eq!(slot_of(&bc, 105, &b105.view().hash()), Some(slot_99));
+        let orphan = node_transfer_block(107, 3, 106, 7);
         let (outcome, _) = bc.receive_block(orphan.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(slot_of(&bc, 106, &orphan.view().hash()), Some(slot_100));
+        assert_eq!(slot_of(&bc, 107, &orphan.view().hash()), Some(slot_100));
         assert_eq!(
             classify_tail_drop(&bc.blocks, &bc.node_info, slot_100),
             Ok(TailObligation::None),
@@ -12000,24 +12275,45 @@ mod tests {
         );
     }
 
-    /// Review patch — the release step refuses a tail that is not the active
-    /// chain's root, at runtime.
+    /// Review patch; Story 6.14 AC3 — the window advance refuses, at runtime, a
+    /// tail that is off the active path or is the head.
     #[test]
-    fn snake_advance_refuses_a_tail_that_is_not_the_root() {
+    fn snake_advance_refuses_a_tail_off_the_active_path() {
         let (mut bc, h) = w4_ready_on_segment(103);
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
-        let slot_102 = slot_of(&bc, 102, &h[2]).expect("#102");
+        let fork = salted_linked_block(104, h[3], 9);
+        let fork_idx = admit_fork(&mut bc, &fork, 0);
+        let len = bc.block_tree_len();
         let real_tail = bc.snake_chain_tail_idx;
-        bc.snake_chain_tail_idx = slot_102; // has a parent: not the root
+        bc.snake_chain_tail_idx = fork_idx; // not on the active path
         assert!(!bc.advance_snake_chain_tail());
-        assert_eq!(bc.block_tree_len(), 4, "nothing released");
+        bc.snake_chain_tail_idx = bc.active_chain_head_idx; // the head
+        assert!(!bc.advance_snake_chain_tail());
+        assert_eq!(bc.block_tree_len(), len, "nothing released");
         bc.snake_chain_tail_idx = real_tail;
         assert!(bc.advance_snake_chain_tail());
     }
 
-    /// One drive step's record: the new `S_tail`, the released slot, and the
-    /// classification and binding decided before the release.
+    /// Admits a fork through Tier 1 and its Ready Tier 2, Connected, without
+    /// the FR22 comparison: these tests exercise the window, the horizon and
+    /// the reclamation, and a fork carrying a pre-window actor would lose the
+    /// FR23 replay it could otherwise win on a hash tie (Story 6.14 D6 lets a
+    /// window-anchored chain switch).
+    fn admit_fork(bc: &mut W4Chain, fork: &Block, now: u64) -> u32 {
+        let view = fork.view();
+        let idx = bc
+            .tier1_admit(&view, &view.hash(), now)
+            .expect("the fork is admitted");
+        assert_eq!(
+            bc.blocks.get(idx).map(|e| e.status()),
+            Some(BlockStatus::Connected)
+        );
+        idx
+    }
+
+    /// One drive step's record: the new `S_tail`, the dropped tail's slot, and
+    /// the classification and binding decided before the window advanced.
     type DriveRecord = (u32, u32, TailObligation, TailBinding);
 
     /// One step of the drive in [`drive_past_w`]: classify the tail, decide
@@ -12034,34 +12330,32 @@ mod tests {
         (s_tail, released, obligation, binding)
     }
 
-    /// The AC10.4 drive: from the `W`-long window `100..=103`, two head
-    /// extensions. Before the first, two forks hang off #100 (one of them two
-    /// blocks deep); before the second, one fork hangs off #101 and one off
-    /// #102. Returns the trace, the node, and the forks' hashes:
-    /// `[#100 fork, its child, second #100 fork, #101 fork, #102 fork]`.
+    /// The AC10.4 drive (Story 6.14): from the window `100..=103` with #99 in
+    /// the horizon (`W = 4`, `H = 1`), two head extensions. Only forks inside
+    /// FR58's bound can arrive (`S_new > S_head − H`): before the first, a fork
+    /// off #102, two blocks deep; before the second, a fork off #103; after
+    /// it, a fork off #104. Returns the trace, the node, and the hashes
+    /// `[#102 fork, its child, #103 fork, #104 fork, #104]`.
     fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [[u8; 32]; 5]) {
         let (mut bc, h) = w4_ready_on_segment(103);
-        let fork_a = salted_linked_block(101, h[0], 5);
-        let fork_a_child = salted_linked_block(102, fork_a.view().hash(), 5);
-        let fork_b = salted_linked_block(101, h[0], 6);
-        for blk in [&fork_a, &fork_a_child, &fork_b] {
-            let (outcome, _) = bc.receive_block(blk.view(), now);
-            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        let fork_a = salted_linked_block(103, h[2], 5);
+        let fork_a_child = salted_linked_block(104, fork_a.view().hash(), 5);
+        for blk in [&fork_a, &fork_a_child] {
+            admit_fork(&mut bc, blk, now);
         }
         // Dropping #100 (chain-config) needs a chain-config extension (FR49).
         let b104 = w4_config_anchor_block(104, h[3]);
         let first = drive_step(&mut bc, &b104, now);
-        let fork_c = salted_linked_block(102, h[1], 8);
-        let keep = salted_linked_block(103, h[2], 6);
-        for blk in [&fork_c, &keep] {
-            let (outcome, _) = bc.receive_block(blk.view(), now);
-            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        }
+        let fork_b = salted_linked_block(104, h[3], 8);
+        admit_fork(&mut bc, &fork_b, now);
         assert!(!bc.chain_heads.has_stored_head(), "every fork is Connected");
         // A Ready projection is complete (Story 6.0 D3): this segment seeds no
         // node but #0, so the extension must not name another actor.
         let b105 = w4_config_anchor_block(105, b104.view().hash());
         let second = drive_step(&mut bc, &b105, now);
+        // A fork inside the bound (`A = S_head − H`) is kept.
+        let keep = salted_linked_block(105, b104.view().hash(), 6);
+        admit_fork(&mut bc, &keep, now);
         (
             [first, second],
             bc,
@@ -12069,24 +12363,31 @@ mod tests {
                 fork_a.view().hash(),
                 fork_a_child.view().hash(),
                 fork_b.view().hash(),
-                fork_c.view().hash(),
                 keep.view().hash(),
+                b104.view().hash(),
             ],
         )
     }
 
-    /// AC10.4 / AC5 / AC6 — the window advance one block at a time: tail
-    /// positions, released slots, the new tail unlinked, and FR58 stale
-    /// reclamation (DEC-125): every branch forked at a dropped block is deleted
-    /// whole (two in one scan at #100), a branch forked above the new tail is
-    /// kept, and nothing is left asking for a parent below `S_tail`.
+    /// AC10.4 / AC5 / AC6; Story 6.14 AC3 / AC5 — the window advance one block
+    /// at a time: tail positions, the dropped block kept in the horizon, the
+    /// block leaving the horizon released and its successor unlinked, and the
+    /// FR58 reclamation (DEC-208): a branch whose fork point falls below
+    /// `S_head − H` is deleted whole at the extension that moves it out, a
+    /// branch inside the bound is kept, and nothing is left asking for a parent.
     #[test]
     fn snake_drive_past_w() {
-        let (h, slot_100, slot_101) = {
+        let (h, slot_99, slot_100, slot_101) = {
             let (bc, h) = w4_ready_on_segment(103);
-            (h, slot_of(&bc, 100, &h[0]), slot_of(&bc, 101, &h[1]))
+            let below = w4_horizon_block();
+            (
+                h,
+                slot_of(&bc, 99, &below.view().hash()),
+                slot_of(&bc, 100, &h[0]),
+                slot_of(&bc, 101, &h[1]),
+            )
         };
-        let (trace, mut bc, [fork_a, fork_a_child, fork_b, fork_c, keep]) = drive_past_w(1_000);
+        let (trace, mut bc, [fork_a, fork_a_child, fork_b, keep, b104]) = drive_past_w(1_000);
 
         assert_eq!(
             trace[0],
@@ -12107,39 +12408,50 @@ mod tests {
             )
         );
         assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
-        assert!(slot_of(&bc, 100, &h[0]).is_none() && slot_of(&bc, 101, &h[1]).is_none());
 
-        // The new tail is the active chain's root, unlinked from the freed slot.
+        // The horizon keeps #101, the block the window dropped last; #99 and
+        // #100 left the horizon and were released.
+        let below = w4_horizon_block();
+        assert!(slot_of(&bc, 99, &below.view().hash()).is_none());
+        assert!(slot_of(&bc, 100, &h[0]).is_none());
+        assert!(slot_99.is_some(), "precondition: #99 was retained at entry");
+        let root_idx = slot_of(&bc, 101, &h[1]).expect("#101 in the horizon");
+        assert_eq!(bc.horizon_root(), root_idx);
+        let root = bc.blocks.get(root_idx).expect("root");
+        assert_eq!(root.parent_ref(), NONE_REF, "unlinked from the freed slot");
+        assert!(root.is_on_active_chain(), "D1: the horizon keeps the flag");
+        assert_eq!(root.status(), BlockStatus::Active);
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
         assert_eq!(tail.sequence(), 102);
-        assert_eq!(tail.parent_ref(), NONE_REF);
-        assert!(tail.is_on_active_chain());
+        assert_eq!(tail.parent_ref(), root_idx, "the tail stays linked");
 
-        // FR58: every branch forked at a dropped block is gone, whole.
-        assert!(slot_of(&bc, 101, &fork_a).is_none(), "#100 fork deleted");
+        // FR58: the branch forked at #102 left the bound with #104's
+        // extension; the one forked at #103 with #105's.
+        assert!(slot_of(&bc, 103, &fork_a).is_none(), "#102 fork deleted");
         assert!(
-            slot_of(&bc, 102, &fork_a_child).is_none(),
+            slot_of(&bc, 104, &fork_a_child).is_none(),
             "with its descendant"
         );
-        assert!(
-            slot_of(&bc, 101, &fork_b).is_none(),
-            "second #100 fork, same scan"
-        );
-        assert!(slot_of(&bc, 102, &fork_c).is_none(), "#101 fork deleted");
-        let keep_idx = slot_of(&bc, 103, &keep).expect("in-range fork retained");
+        assert!(slot_of(&bc, 104, &fork_b).is_none(), "#103 fork deleted");
+        let keep_idx = slot_of(&bc, 105, &keep).expect("in-bound fork retained");
+        let b104_idx = slot_of(&bc, 104, &b104).expect("#104");
         assert_eq!(
             bc.blocks.get(keep_idx).map(|e| e.parent_ref()),
-            Some(bc.snake_chain_tail_idx),
-            "still attached to the new tail"
+            Some(b104_idx),
+            "still attached to #104"
         );
-        assert_eq!(bc.block_tree_len(), 5, "#102..#105 and the #102 fork");
+        assert_eq!(
+            bc.block_tree_len(),
+            6,
+            "#101 in the horizon, #102..#105, and the #104 fork"
+        );
 
-        // No head is left asking for a parent below S_tail.
+        // No head is left asking for a parent.
         assert!(!bc.chain_heads.has_stored_head());
         assert_eq!(
             bc.chain_heads.count(),
             2,
-            "the active head and the #102 fork"
+            "the active head and the #104 fork"
         );
         let (outcome, _) = bc.on_tick(u64::MAX / 2);
         assert!(!matches!(
@@ -12165,7 +12477,9 @@ mod tests {
             bc.blocks.get(gi).is_some_and(|e| e.is_on_active_chain()),
             "precondition: the Collecting bootstrap anchor"
         );
-        let anchor = w4_config_anchor_block(100, [0xAB; 32]);
+        let below = w4_horizon_block();
+        bc.receive_block(below.view(), 0);
+        let anchor = w4_config_anchor_block(100, below.view().hash());
         bc.receive_block(anchor.view(), 0);
         let mut prev = anchor.view().hash();
         for seq in 101..=103 {
@@ -12179,43 +12493,40 @@ mod tests {
             slot_of(&bc, 0, &genesis.view().hash()).is_none(),
             "island reclaimed"
         );
-        assert_eq!(bc.block_tree_len(), 4);
+        assert_eq!(bc.block_tree_len(), 5, "#99..#103");
         assert_eq!(bc.chain_heads.count(), 1, "only the active head");
         assert!(!bc.chain_heads.has_stored_head());
     }
 
-    /// FR58 stale-fragment reclamation (pulled forward 2026-10-17): at the tail
-    /// advance, a Stored fragment whose lowest block `t` has `t - 1 <= S_tail`
-    /// is deleted whole; one with `t - 1 > S_tail` may still connect and stays.
-    /// Both are admitted in Ready before the advance (FR60 accepts them).
+    /// FR58 fragment reclamation (DEC-161 as tightened by DEC-208): at a head
+    /// extension, a Stored fragment whose missing parent lies at `q ≤ S_head −
+    /// H` is deleted whole — the retained active block at `q` would have
+    /// linked it, so it diverges outside the bound — and one with `q > S_head −
+    /// H` may still connect and stays. Both are admitted in Ready before the
+    /// extension (`S_new > S_head − H` at admission).
     #[test]
-    fn snake_advance_reclaims_fragments_that_can_never_connect() {
+    fn snake_extension_reclaims_fragments_that_can_never_connect() {
         let (mut bc, h) = w4_ready_on_segment(103);
-        // Three orphans, two of them stale. After the advance S_tail = 101.
-        let stale = node_transfer_block(102, 3, 101, 7); // t - 1 = 101 = S_tail
-        let stale_two = node_transfer_block(101, 4, 100, 7); // t - 1 = 100 < S_tail
-        let alive = node_transfer_block(103, 3, 102, 7); // t - 1 = 102 > S_tail
-        for blk in [&stale, &stale_two, &alive] {
+        // After the extension, S_head − H = 103.
+        let stale = node_transfer_block(104, 3, 103, 7); // q = 103
+        let alive = node_transfer_block(105, 3, 104, 7); // q = 104
+        for blk in [&stale, &alive] {
             let (outcome, _) = bc.receive_block(blk.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
         let stored_before: [Option<u32>; 4] =
             core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
-        assert_eq!(stored_before.iter().flatten().count(), 3, "precondition");
+        assert_eq!(stored_before.iter().flatten().count(), 2, "precondition");
 
         let b104 = w4_config_anchor_block(104, h[3]);
         extend_active_head(&mut bc, &b104, 0);
         assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
 
         assert!(
-            slot_of(&bc, 102, &stale.view().hash()).is_none(),
+            slot_of(&bc, 104, &stale.view().hash()).is_none(),
             "stale fragment deleted"
         );
-        assert!(
-            slot_of(&bc, 101, &stale_two.view().hash()).is_none(),
-            "second fragment too"
-        );
-        let alive_idx = slot_of(&bc, 103, &alive.view().hash()).expect("may still connect");
+        let alive_idx = slot_of(&bc, 105, &alive.view().hash()).expect("may still connect");
         let stored_after: [Option<u32>; 4] =
             core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
         assert_eq!(
@@ -12224,13 +12535,9 @@ mod tests {
             "only the live fragment is Stored"
         );
         assert!(stored_after.contains(&Some(alive_idx)));
-        // The active chain is untouched by the reclamation.
-        for (i, seq) in (101..=104).enumerate() {
-            let hash = if seq == 104 {
-                b104.view().hash()
-            } else {
-                h[i + 1]
-            };
+        // The active chain and the horizon are untouched by the reclamation.
+        for (i, seq) in (100..=104).enumerate() {
+            let hash = if seq == 104 { b104.view().hash() } else { h[i] };
             assert!(slot_of(&bc, seq, &hash).is_some(), "active #{seq} kept");
         }
     }
@@ -12327,13 +12634,19 @@ mod tests {
         assert_eq!(bc.snake_chain_tail_idx, NONE_REF);
     }
 
-    /// AC3 + Ratified Decision 3 — a released block's durable bytes survive
-    /// (lazy release), so a restart re-admits it, and the Ready re-entry
-    /// releases it again: the restarted node holds the same `W`-long window.
+    /// AC3 + Ratified Decision 3; Story 6.14 AC6 — a released block's durable
+    /// bytes survive (lazy release), so a restart re-admits it, and the Ready
+    /// re-entry releases it again: the restarted node holds the same window
+    /// and the same horizon.
     #[test]
     fn snake_restart_rereleases_a_resurrected_tail_block() {
         let (bc, h) = w4_ready_on_segment(104);
-        assert_eq!(bc.block_tree_len(), 4);
+        assert_eq!(bc.block_tree_len(), 5);
+        let below = w4_horizon_block();
+        assert!(
+            slot_of(&bc, 99, &below.view().hash()).is_none(),
+            "#99 released"
+        );
         let storage = bc.storage;
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
         let chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
@@ -12345,8 +12658,10 @@ mod tests {
         restarted.initialize_from_storage(500);
         assert!(restarted.is_ready());
         assert_eq!(restarted.active_snake_chain_window(), Ok((101, 104)));
-        assert_eq!(restarted.block_tree_len(), 4);
-        assert!(slot_of(&restarted, 100, &h[0]).is_none());
+        assert_eq!(restarted.block_tree_len(), 5);
+        assert!(slot_of(&restarted, 99, &below.view().hash()).is_none());
+        let root = slot_of(&restarted, 100, &h[0]).expect("#100 in the horizon");
+        assert_eq!(restarted.horizon_root(), root);
     }
 
     // --- Story 6.8: ADR-016 sequence-indexed UTXO input -----------------------
@@ -12887,7 +13202,8 @@ mod tests {
         }
     }
 
-    type FailingReadChain = Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, 16, 4, 16>;
+    type FailingReadChain =
+        Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
 
     /// The UTXO harness on a [`FailingReadChain`] whose reads all succeed
     /// until a test arms `failing_slot`: chain-config anchor 99, balance block
@@ -13169,14 +13485,19 @@ mod tests {
     #[test]
     fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
         let mut bc = new_unconfigured_w4_chain();
-        let base = balance_block(100, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        // The block below the window (`W + H`, DEC-177) is a one-entry balance
+        // block, within the small limit; #100 repeats its snapshot.
+        let below = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let (outcome, _) = bc.receive_block(below.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        let base = balance_block(100, below.view().hash(), &[(3, 0, 0, 0xB3)], 3);
         let one = utxo_tx(101, &[], None, &[Ok(5)]);
         let b101 = complex_tx_block(101, base.view().hash(), 3, 0, &[&one]);
         let three = utxo_tx(102, &[], None, &[Ok(5), Ok(6), Ok(7)]);
         let b102 = complex_tx_block(102, b101.view().hash(), 3, 0, &[&three]);
         let cfg =
             chain_config_block_from(103, b102.view().hash(), &mut small_limit_config_builder(W4));
-        for small in [&base, &b101, &cfg] {
+        for small in [&below, &base, &b101, &cfg] {
             assert!(small.len() <= SMALL_BLOCK_SIZE_LIMIT as usize);
         }
         assert!(b102.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
@@ -13210,7 +13531,7 @@ mod tests {
 
     /// Every chain of this section shares `TestChain`'s capacities; only the
     /// storage differs (the fault-injecting one of AC6).
-    type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, 16, 4, 16>;
+    type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
 
     /// The FR54 currency of every genesis node in this section.
     const CURRENCY: u64 = 1_000_000_000;
@@ -13826,10 +14147,9 @@ mod tests {
             Ok((1, 4)),
             "the extension past W advanced the tail in the same step"
         );
-        assert!(
-            bc.blocks.find(0, &bc_genesis_hash()).is_none(),
-            "#0 released"
-        );
+        let genesis_idx = bc.blocks.find(0, &bc_genesis_hash());
+        assert!(genesis_idx.is_some(), "#0 entered the horizon (Story 6.14)");
+        assert_eq!(genesis_idx, Some(bc.horizon_root()));
         assert!(
             bc.blocks.find(5, &child.view().hash()).is_none(),
             "child deleted"
@@ -14442,6 +14762,17 @@ mod tests {
                     .ok()
                     .expect("transaction");
             }
+        } else if let Some(payload) = view.balances() {
+            use moonblokz_chain_types::NodeInfo;
+            for info in payload.iter() {
+                let key: [u8; PUBLIC_KEY_SIZE] = info.public_key().try_into().expect("public key");
+                let ni = NodeInfo::new(info.owner(), info.balance(), info.vote_count(), &key);
+                builder.add_node_info(&ni).ok().expect("add node info");
+            }
+            builder
+                .set_max_node_id(payload.max_node_id())
+                .ok()
+                .expect("set max node id");
         } else {
             builder
                 .set_chain_config_payload(view.payload())
@@ -14619,11 +14950,24 @@ mod tests {
     }
 
     /// The window-anchored W4 segment `100..=103` with the values 2 (the
-    /// chain-config anchor), 3, 5, 7, Ready through FR3. Returns the node and
-    /// the four blocks.
+    /// chain-config anchor), 3, 5, 7, Ready through FR3, above `H = 1` plain
+    /// blocks (the horizon). Returns the node and the four blocks.
     fn valued_w4() -> (W4Chain, [Block; 4]) {
-        let mut bc = new_w4_chain();
-        let anchor = revalue(&w4_config_anchor_block(100, [0xAB; 32]), 2);
+        valued_w4_h(test_horizon(W4))
+    }
+
+    /// [`valued_w4`] on the horizon `h`: the `h` plain blocks
+    /// `100 − h ..= 99` below the window.
+    fn valued_w4_h(h: u16) -> (W4Chain, [Block; 4]) {
+        let mut bc = new_w4_chain_h(h);
+        let mut prev = [0xAB; 32];
+        for seq in (100 - u32::from(h))..100 {
+            let below = linked_transfer_block(seq, prev);
+            prev = below.view().hash();
+            bc.tier1_admit(&below.view(), &prev, 0)
+                .expect("a block below the window admitted");
+        }
+        let anchor = revalue(&w4_config_anchor_block_h(100, prev, h), 2);
         let b101 = revalue(&linked_transfer_block(101, anchor.view().hash()), 3);
         let b102 = revalue(&linked_transfer_block(102, b101.view().hash()), 5);
         let b103 = revalue(&linked_transfer_block(103, b102.view().hash()), 7);
@@ -14681,15 +15025,17 @@ mod tests {
         );
     }
 
-    /// AC10.3 / AC5 / AC9 — a tail advance subtracts the block that becomes
-    /// `S_tail`, from the active value and from a side head forked at it; a
-    /// fresh node reaching Ready through FR3 over the same blocks holds the
-    /// same values.
+    /// AC10.3 / AC5 / AC9; Story 6.14 — a tail advance subtracts the block
+    /// that becomes `S_tail`, from the active value and from a side head forked
+    /// above it (with `H = 2` a fork at #102 stays inside FR58's bound after the
+    /// advance); a fresh node reaching Ready through FR3 over the same blocks
+    /// holds the same values. The horizon below the tail is never summed.
     #[test]
     fn tail_advance_subtracts_the_new_tail_everywhere() {
-        let (mut a, [anchor, b101, b102, b103]) = valued_w4();
-        // A fork at #101, judged before its write (D4) and valued by the walk.
-        let side = revalue(&salted_linked_block(102, b101.view().hash(), 6), 13);
+        let (mut a, [anchor, b101, b102, b103]) = valued_w4_h(2);
+        // A fork at #102, judged before its write (D4) and valued by the walk;
+        // worth less than the active branch, so no switch is attempted.
+        let side = revalue(&salted_linked_block(103, b102.view().hash(), 6), 1);
         assert_eq!(
             a.receive_block(side.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
@@ -14699,11 +15045,16 @@ mod tests {
             a.blocks.get(si).map(|e| e.status()),
             Some(BlockStatus::Connected)
         );
-        assert_eq!(a.chain_heads.branch_value_of(si), Some(3 + 13));
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(3 + 5 + 1));
         assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
 
         // Dropping the chain-config anchor needs a chain-config extension.
-        let b104 = real_on(&a, &w4_config_anchor_block(104, b103.view().hash()), 0, 1);
+        let b104 = real_on(
+            &a,
+            &w4_config_anchor_block_h(104, b103.view().hash(), 2),
+            0,
+            1,
+        );
         extend_active_head(&mut a, &b104, 0);
         assert_eq!(a.active_snake_chain_window(), Ok((101, 104)));
         assert_eq!(
@@ -14715,27 +15066,29 @@ mod tests {
             a.active_branch_value,
             brute_value(&a, a.active_chain_head_idx)
         );
-        assert_eq!(a.chain_heads.branch_value_of(si), Some(13));
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(5 + 1));
         assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
 
-        // A fresh node, orphans first, reaches the same values through FR3 —
-        // on `101..=104`, already `W` long, so the anchor is never needed.
-        let _ = anchor;
-        let mut b = new_w4_chain();
-        for blk in [&side, &b104, &b103, &b102, &b101] {
+        // A fresh node, orphans first, reaches the same values through FR3 on
+        // `99..=104` — `W + H` long, so #98 is not needed.
+        let b98 = linked_transfer_block(98, [0xAB; 32]);
+        let b99 = linked_transfer_block(99, b98.view().hash());
+        let mut b = new_w4_chain_h(2);
+        for blk in [&side, &b104, &b103, &b102, &b101, &anchor, &b99] {
             assert_eq!(
                 b.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
         assert!(b.is_ready());
+        assert_eq!(b.active_snake_chain_window(), Ok((101, 104)));
         assert_eq!(b.active_branch_value, a.active_branch_value);
         let bs = slot(&b, &side);
         assert_eq!(
             b.blocks.get(bs).map(|e| e.status()),
             Some(BlockStatus::Connected)
         );
-        assert_eq!(b.chain_heads.branch_value_of(bs), Some(13));
+        assert_eq!(b.chain_heads.branch_value_of(bs), Some(5 + 1));
     }
 
     /// A genesis node on a [`FaultyStorage`] whose faults are disarmed, on
@@ -15131,22 +15484,24 @@ mod tests {
             }
         }
 
-        // A reference more than `W` back, on the W4 window.
-        let (mut bc, [_, b101, _, _]) = valued_w4();
-        let p102 = revalue(&salted_linked_block(102, b101.view().hash(), 6), 13);
-        let tx = utxo_tx(103, &[(97, 0, 50)], None, &[Ok(50)]);
-        let far = complex_tx_block(103, p102.view().hash(), 0, 0, &[&tx]);
-        for blk in [&far, &p102] {
+        // A reference more than `W` back, on the W4 window. The side branch
+        // forks inside FR58's bound (`A = S_head − H`, DEC-208) and is worth
+        // less than the active branch, so no switch is attempted.
+        let (mut bc, [_, _, b102, _]) = valued_w4();
+        let p103 = revalue(&salted_linked_block(103, b102.view().hash(), 6), 1);
+        let tx = utxo_tx(104, &[(97, 0, 50)], None, &[Ok(50)]);
+        let far = complex_tx_block(104, p103.view().hash(), 0, 0, &[&tx]);
+        for blk in [&far, &p103] {
             assert_eq!(
                 bc.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
         assert!(
-            bc.blocks.find(103, &far.view().hash()).is_none(),
+            bc.blocks.find(104, &far.view().hash()).is_none(),
             "deleted by the driver"
         );
-        let pi = slot(&bc, &p102);
+        let pi = slot(&bc, &p103);
         assert_eq!(
             bc.blocks.get(pi).map(|e| e.status()),
             Some(BlockStatus::Connected)
@@ -15174,25 +15529,23 @@ mod tests {
         );
     }
 
-    /// AC10.8 / D6 — a UTXO reference below `S_tail` but within `W` is trusted
-    /// pre-window history (DEC-129); more than `W` back it is evidence.
+    /// AC10.8 / D6; Story 6.14 AC4 — a side block's UTXO reference into the
+    /// verification horizon resolves against the retained block: it is no
+    /// longer trusted pre-window history, so an output the horizon block does
+    /// not hold is evidence. More than `W` back it is evidence too.
     #[test]
-    fn side_reference_below_the_tail_within_w_is_trusted() {
-        let (mut bc, [_, b101, _, _]) = valued_w4();
-        let tx = utxo_tx(102, &[(99, 0, 50)], None, &[Ok(50)]);
-        let trusted = complex_tx_block(102, b101.view().hash(), 0, 0, &[&tx]);
+    fn side_reference_into_the_horizon_is_resolved() {
+        let (mut bc, [_, _, b102, _]) = valued_w4();
+        let tx = utxo_tx(103, &[(99, 0, 50)], None, &[Ok(50)]);
+        let missing = complex_tx_block(103, b102.view().hash(), 0, 0, &[&tx]);
         assert_eq!(
-            bc.receive_block(trusted.view(), 0).0,
-            ReceiveBlockOutcome::AcceptedSilently
-        );
-        let ti = slot(&bc, &trusted);
-        assert_eq!(
-            bc.blocks.get(ti).map(|e| e.status()),
-            Some(BlockStatus::Connected)
+            bc.receive_block(missing.view(), 0).0,
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            "#99 is retained and holds no output 0"
         );
 
-        let tx = utxo_tx(102, &[(97, 0, 50)], None, &[Ok(50)]);
-        let too_far = complex_tx_block(102, b101.view().hash(), 0, 0, &[&tx]);
+        let tx = utxo_tx(103, &[(98, 0, 50)], None, &[Ok(50)]);
+        let too_far = complex_tx_block(103, b102.view().hash(), 0, 0, &[&tx]);
         assert_eq!(
             bc.receive_block(too_far.view(), 0).0,
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
@@ -15543,16 +15896,17 @@ mod tests {
         }
     }
 
-    /// AC10.6 / AC3 / D3 — on the matured W4 window `[100, 103]` a heavier
-    /// side branch shorter than the window is not admissible; extended to
-    /// cover it, it is. The late case: once the head has moved on, a branch
-    /// at the old head sequence waits for its own extension. The window is
-    /// window-anchored with no balance block (`C = S_head`) and its tail is
-    /// the root, so the switch the comparison picks is not admitted (Story
-    /// 6.3 AC1, DEC-167, DEC-204): nothing changes.
+    /// AC10.6 / AC3 / D3; Story 6.14 D4 / D6 — on the matured W4 window
+    /// `[100, 103]` with `H = 2` below it, a heavier side branch shorter than
+    /// the window is not admissible: the horizon is not counted (DEC-209).
+    /// Extended to cover the window it is, and the switch now runs — there is
+    /// no completeness horizon (DEC-211) — so the replay refuses its forged
+    /// value and deletes the branch; the active chain stays. The late case:
+    /// once the head has moved on, a branch at the old head sequence waits for
+    /// its own extension.
     #[test]
     fn fr22_admissibility_follows_the_w4_window() {
-        let (mut bc, [_, b101, _, b103]) = valued_w4();
+        let (mut bc, [_, b101, _, b103]) = valued_w4_h(2);
         let s102 = valued(102, b101.view().hash(), 999, 6);
         assert_eq!(
             bc.receive_block(s102.view(), 0).0,
@@ -15563,30 +15917,33 @@ mod tests {
         assert_eq!(
             bc.switch_target([Some(si), None]),
             None,
-            "segment [100, 102] < W"
+            "segment [100, 102] < W; the horizon below it is not counted"
         );
         let s103 = valued(103, s102.view().hash(), 1, 7);
         assert_eq!(
             bc.receive_block(s103.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
         );
-        let s3 = slot(&bc, &s103);
-        assert_eq!(bc.switch_target([Some(s3), None]), Some(s3));
-        assert_eq!(bc.complete_from_sequence, 103);
+        assert!(
+            bc.blocks.find(102, &s102.view().hash()).is_none()
+                && bc.blocks.find(103, &s103.view().hash()).is_none(),
+            "attempted, refused by the replay (I-09) and deleted"
+        );
         assert_eq!(
             bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
             Some(b103.view().hash()),
-            "not admitted: nothing changed"
-        );
-        assert_eq!(
-            bc.blocks.get(s3).map(|e| e.status()),
-            Some(BlockStatus::Connected)
+            "the active chain stays"
         );
 
         // The late case (D3; AC10.10): the head moved on to #104, so a branch
         // at #103 is one short until it reaches #104.
-        let (mut bc, [_, _, b102, b103]) = valued_w4();
-        let b104 = real_on(&bc, &w4_config_anchor_block(104, b103.view().hash()), 0, 1);
+        let (mut bc, [_, _, b102, b103]) = valued_w4_h(2);
+        let b104 = real_on(
+            &bc,
+            &w4_config_anchor_block_h(104, b103.view().hash(), 2),
+            0,
+            1,
+        );
         extend_active_head(&mut bc, &b104, 0);
         assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
         let n103 = valued(103, b102.view().hash(), 500, 8);
@@ -15605,12 +15962,13 @@ mod tests {
             bc.receive_block(n104.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
         );
-        let n4 = slot(&bc, &n104);
-        assert_eq!(bc.switch_target([Some(n4), None]), Some(n4));
+        assert!(
+            bc.blocks.find(103, &n103.view().hash()).is_none(),
+            "admissible at #104: attempted and deleted"
+        );
         assert_eq!(
-            bc.blocks.get(n4).map(|e| e.status()),
-            Some(BlockStatus::Connected),
-            "not admitted"
+            bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
+            Some(b104.view().hash())
         );
     }
 
@@ -15983,30 +16341,38 @@ mod tests {
 
         // The tie: the all-zero state, node #0 on top; node #1 deviates. Both
         // are worth 0 and carry one transaction, so the hash decides: pinned
-        // for each order of the two hashes.
-        for n_lower in [true, false] {
-            let (mut bc, a2) = setup(0);
-            assert_eq!(bc.vote_engine.top_creator(), Some(0));
-            let d = headed(
+        // for each order of the two hashes. The pair comes from two small
+        // pools, so neither order hangs on where one block's hash happens to
+        // fall (every block is signed, and signing is slow in a debug build).
+        let prev = setup(0).1.view().hash();
+        let ds: [Block; 4] = core::array::from_fn(|i| {
+            headed(
                 3,
-                a2.view().hash(),
+                prev,
                 1,
                 NODE_ONE_KEY,
                 0,
                 0,
                 0,
-                votes_for(3, 1, 1, 70),
-            );
-            let n = (71..400)
-                .map(|salt| alt(3, a2.view().hash(), 0, 0, 0, salt, false))
-                .find(|n| {
+                votes_for(3, 1, 1, 60 + i as u64),
+            )
+        });
+        let ns: [Block; 8] = core::array::from_fn(|i| alt(3, prev, 0, 0, 0, 71 + i as u64, false));
+        for n_lower in [true, false] {
+            let (mut bc, a2) = setup(0);
+            assert_eq!(a2.view().hash(), prev);
+            assert_eq!(bc.vote_engine.top_creator(), Some(0));
+            let (d, n) = ds
+                .iter()
+                .flat_map(|d| ns.iter().map(move |n| (d, n)))
+                .find(|(d, n)| {
                     n.view().len() == d.view().len()
                         && (n.view().hash() < d.view().hash()) == n_lower
                 })
-                .expect("a same-size normal block");
-            assert_eq!(receive(&mut bc, &d), ReceiveBlockOutcome::AcceptedSilently);
-            assert_eq!(receive(&mut bc, &n), ReceiveBlockOutcome::AcceptedSilently);
-            let winner = if n_lower { &n } else { &d };
+                .expect("a same-size deviation and normal block in this order");
+            assert_eq!(receive(&mut bc, d), ReceiveBlockOutcome::AcceptedSilently);
+            assert_eq!(receive(&mut bc, n), ReceiveBlockOutcome::AcceptedSilently);
+            let winner = if n_lower { n } else { d };
             assert_eq!(
                 head_of(&bc),
                 (3, winner.view().hash()),
@@ -16127,7 +16493,7 @@ mod tests {
     ) {
         // `node_info` per node: seed sources are slots, so they are compared
         // as the blocks they name.
-        let source = |bc_blocks: &BlockTable<16>, src: Option<u32>| match src {
+        let source = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, src: Option<u32>| match src {
             Some(idx) if idx != SEED_SOURCE_RELEASED => {
                 bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
             }
@@ -16160,7 +16526,9 @@ mod tests {
             a.active_branch_value, b.active_branch_value,
             "{what}: value"
         );
-        let hash_of = |bc_blocks: &BlockTable<16>, idx: u32| bc_blocks.get(idx).map(|e| *e.hash());
+        let hash_of = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, idx: u32| {
+            bc_blocks.get(idx).map(|e| *e.hash())
+        };
         assert_eq!(
             hash_of(&a.blocks, a.active_chain_head_idx),
             hash_of(&b.blocks, b.active_chain_head_idx),
@@ -16171,10 +16539,6 @@ mod tests {
             hash_of(&b.blocks, b.snake_chain_tail_idx),
             "{what}: tail"
         );
-        assert_eq!(
-            a.complete_from_sequence, b.complete_from_sequence,
-            "{what}: completeness horizon"
-        );
         // `chain_heads`, by head block: every entry `b` holds is in `a` with
         // the same connection, the same anchor block and — for a Connected
         // side head — the same value (FR19 event (iii), no demotion, FR21
@@ -16182,7 +16546,7 @@ mod tests {
         // active head's own entry is skipped: it carries no value (DEC-144),
         // and it exists only while the head has no side child.
         type Entry = Option<((u32, [u8; 32]), bool, Option<[u8; 32]>, Option<u64>)>;
-        let entries = |bc_blocks: &BlockTable<16>, heads: &ChainHeadsTable<4>| {
+        let entries = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, heads: &ChainHeadsTable<4>| {
             let mut out: [Entry; 4] = [None; 4];
             for (slot, (head, anchor)) in heads.occupied_heads().enumerate() {
                 let entry = bc_blocks.get(head).expect("an entry names a block");
@@ -16975,12 +17339,13 @@ mod tests {
         }
     }
 
-    /// AC11.8 / DEC-204 — once the tail has advanced, a heavier admissible
-    /// fork inside `H` is not switched to: its replayed block would drop a
-    /// released block. Nothing changes (the gate is RAM-only and runs before
-    /// the pre-pass).
+    /// AC11.8 / DEC-204; Story 6.14 AC4 — once the tail has advanced, a heavier
+    /// admissible fork inside `H` is switched toward in place: its replayed
+    /// block at #4 is bound against the dropped block the horizon retained
+    /// (#0, node #0's seed source), and skipping that replay is exact
+    /// evidence. The fork is deleted and the original chain restored.
     #[test]
-    fn fr23_no_switch_once_the_tail_has_advanced() {
+    fn fr23_replay_binds_against_the_horizon() {
         let (mut bc, b3) = full_w4_genesis();
         let (mut twin, _) = full_w4_genesis();
         let r4 = snapshot_block(&bc, 4, b3.view().hash());
@@ -16988,12 +17353,16 @@ mod tests {
             assert_eq!(receive(node, &r4), ReceiveBlockOutcome::AcceptedSilently);
         }
         assert_eq!(bc.active_snake_chain_window(), Ok((1, 4)));
+        assert_eq!(
+            bc.blocks.get(bc.horizon_root()).map(|e| e.sequence()),
+            Some(0),
+            "#0 is retained below the tail"
+        );
         let s4 = tx_block(4, b3.view().hash(), 0, votes_for(4, 0, 3, 60));
         assert_eq!(receive(&mut bc, &s4), ReceiveBlockOutcome::AcceptedSilently);
-        let si = slot(&bc, &s4);
-        assert_eq!(bc.switch_target([Some(si), None]), Some(si), "it would win");
-        assert_eq!(bc.switch_toward(si), SwitchOutcome::NotAdmitted);
-        assert_same_projection(&bc, &twin, "not admitted");
+        assert_eq!(status_of(&bc, &s4), None, "the skipped replay deleted it");
+        assert_eq!(head_of(&bc), (4, r4.view().hash()));
+        assert_same_projection(&bc, &twin, "restored");
     }
 
     /// AC11.9 / D5 — the pre-pass: a bad signature by a creator registered at
@@ -17148,5 +17517,515 @@ mod tests {
         let _ = restarted.initialize_from_storage(0);
         assert!(restarted.is_ready());
         assert_eq!(head_of(&restarted), (3, s3.view().hash()));
+    }
+
+    // ===================================================================
+    // Story 6.14 — verification horizon, FR58 bound, W + H, FR3 binding
+    // ===================================================================
+
+    /// Admits `blocks` on a Collecting W4 node through Tier 1 only, without the
+    /// FR2 hook, so a test can run the pass on a tip of its choice.
+    fn admit_all(bc: &mut W4Chain, blocks: &[&Block]) {
+        for blk in blocks {
+            let view = blk.view();
+            bc.tier1_admit(&view, &view.hash(), 0).expect("admitted");
+        }
+    }
+
+    /// AC9 / AC12.8 — the FR3 pass evaluates the FR48 binding of every block
+    /// whose dropped block lies in the segment, and a skipped replay is exact
+    /// evidence (DEC-204). Genesis-anchored: #5 drops the chain-config block
+    /// #1. Window-anchored with `a = 99`: #104 drops #100 (`s ≥ a + W`); #103
+    /// drops #99, which carries nothing, and #101, #102 drop blocks below the
+    /// segment (pre-window trust).
+    #[test]
+    fn fr3_pass_evaluates_the_binding_inside_the_segment() {
+        let mut bc = new_w4_chain();
+        let g = node_transfer_block(0, 3, 0, 7);
+        let c1 = w4_config_anchor_block(1, g.view().hash());
+        let c2 = w4_config_anchor_block(2, c1.view().hash());
+        let c3 = w4_config_anchor_block(3, c2.view().hash());
+        let c4 = w4_config_anchor_block(4, c3.view().hash());
+        let skip = linked_transfer_block(5, c4.view().hash());
+        let replay = w4_config_anchor_block(5, c4.view().hash());
+        admit_all(&mut bc, &[&g, &c1, &c2, &c3, &c4, &skip, &replay]);
+        let si = bc.blocks.find(5, &skip.view().hash()).expect("stored");
+        assert!(matches!(
+            bc.run_processing_pass(si),
+            Err(ProcessingError::Invalid {
+                block_idx,
+                reason: ValidationReason::TailDropUnpreserved,
+            }) if block_idx == si
+        ));
+        let ri = bc.blocks.find(5, &replay.view().hash()).expect("stored");
+        assert!(
+            bc.run_processing_pass(ri).is_ok(),
+            "the chain-config replay preserves #1"
+        );
+        // Through the acquisition: FR5 deletes only the offender, and the node
+        // enters Ready on the prefix.
+        let mut bc = new_w4_chain();
+        admit_all(&mut bc, &[&g, &c1, &c2, &c3, &c4, &skip]);
+        bc.drive_dominant_chain_acquisition();
+        assert!(bc.is_ready());
+        assert!(
+            bc.blocks.find(5, &skip.view().hash()).is_none(),
+            "offender deleted"
+        );
+        assert_eq!(
+            bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
+            Some(c4.view().hash())
+        );
+        assert_eq!(
+            bc.block_tree_len(),
+            5,
+            "#0 in the horizon, #1..#4 the window"
+        );
+
+        let mut bc = new_w4_chain();
+        let below = w4_horizon_block();
+        let c100 = w4_config_anchor_block(100, below.view().hash());
+        let b101 = linked_transfer_block(101, c100.view().hash());
+        let b102 = linked_transfer_block(102, b101.view().hash());
+        let b103 = linked_transfer_block(103, b102.view().hash());
+        let skip = linked_transfer_block(104, b103.view().hash());
+        admit_all(&mut bc, &[&below, &c100, &b101, &b102, &b103, &skip]);
+        let si = bc.blocks.find(104, &skip.view().hash()).expect("stored");
+        assert!(matches!(
+            bc.run_processing_pass(si),
+            Err(ProcessingError::Invalid {
+                block_idx,
+                reason: ValidationReason::TailDropUnpreserved,
+            }) if block_idx == si
+        ));
+        let ti = bc.blocks.find(103, &b103.view().hash()).expect("stored");
+        assert!(bc.run_processing_pass(ti).is_ok());
+    }
+
+    /// AC8 / AC12.9 (DEC-177) — on a window-anchored candidate with `a = 99`
+    /// and `H = 1`, node #3's vote is seeded by its first entry at or after
+    /// #100: before it, its forged header at #101 is auto-accepted and the
+    /// D9 vote compare is skipped; after it, its forged header at #103 is
+    /// judged and refused.
+    #[test]
+    fn fr3_pass_seeds_a_window_anchored_vote_at_a_plus_h() {
+        let mut bc = new_w4_chain();
+        let floor = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let cfg = w4_config_anchor_block(100, floor.view().hash());
+        let early = headed(
+            101,
+            cfg.view().hash(),
+            3,
+            1,
+            777,
+            3,
+            0,
+            votes_for(101, 3, 1, 40),
+        );
+        // The vote seed: the entry repeats #3's balance (credited #101's fee)
+        // and states a vote the pass never derived.
+        let seed = balance_block(102, early.view().hash(), &[(3, 1, 1000, 0xB3)], 3);
+        let tip = tx_block(103, seed.view().hash(), 0, votes_for(103, 3, 1, 41));
+        let late = headed(
+            103,
+            seed.view().hash(),
+            3,
+            1,
+            777,
+            3,
+            0,
+            votes_for(103, 3, 1, 42),
+        );
+        admit_all(&mut bc, &[&floor, &cfg, &early, &seed, &tip, &late]);
+        let ti = bc.blocks.find(103, &tip.view().hash()).expect("stored");
+        assert!(
+            bc.run_processing_pass(ti).is_ok(),
+            "the forged header before the vote seed is auto-accepted"
+        );
+        let li = bc.blocks.find(103, &late.view().hash()).expect("stored");
+        assert!(matches!(
+            bc.run_processing_pass(li),
+            Err(ProcessingError::Invalid {
+                block_idx,
+                reason: ValidationReason::VoteHeaderMismatch,
+            }) if block_idx == li
+        ));
+    }
+
+    /// AC5 / AC12.5 (DEC-208) — Ready intake refuses a block at `S_new ≤ S_head
+    /// − H` as Out-of-Snake-Chain-Window and stores nothing: a late child of a
+    /// window block and a late child of the horizon block. A re-sent horizon
+    /// block is already known; a fork inside the bound is admitted.
+    #[test]
+    fn ready_intake_refuses_blocks_outside_the_switch_bound() {
+        let (mut bc, h) = w4_ready_on_segment(103);
+        let len = bc.block_tree_len();
+        let late = salted_linked_block(102, h[1], 9);
+        let below = w4_horizon_block();
+        let under = salted_linked_block(100, below.view().hash(), 9);
+        for blk in [&late, &under] {
+            assert_eq!(
+                bc.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)
+            );
+        }
+        assert_eq!(bc.block_tree_len(), len, "nothing stored");
+        assert_eq!(
+            bc.receive_block(below.view(), 0).0,
+            ReceiveBlockOutcome::DuplicateKnown
+        );
+        let fork = salted_linked_block(103, h[2], 9);
+        admit_fork(&mut bc, &fork, 0);
+        assert_eq!(bc.block_tree_len(), len + 1);
+    }
+
+    /// Every block below `S_tail` is a flagged, Active block of the active
+    /// path, `H` of them, and the root's only child is its successor (D1,
+    /// DEC-206) — after advances and reclamation, and after a restart.
+    fn assert_horizon_is_the_active_path(bc: &W4Chain, h: u32) {
+        let (s_tail, _) = bc.active_snake_chain_window().expect("Ready");
+        let mut below = 0;
+        for idx in 0..16u32 {
+            if let Some(entry) = bc.blocks.get(idx)
+                && entry.sequence() < s_tail
+            {
+                below += 1;
+                assert!(entry.is_on_active_chain());
+                assert_eq!(entry.status(), BlockStatus::Active);
+            }
+        }
+        assert_eq!(below, h);
+        let root = bc.horizon_root();
+        let children = (0..16u32)
+            .filter(|&idx| bc.blocks.get(idx).is_some_and(|e| e.parent_ref() == root))
+            .count();
+        assert_eq!(children, 1, "the root's only child is its successor");
+    }
+
+    /// AC12.3 — the D1 invariant: the horizon holds only the active path.
+    #[test]
+    fn the_horizon_holds_only_the_active_path() {
+        let (_, bc, _) = drive_past_w(1_000);
+        assert_horizon_is_the_active_path(&bc, 1);
+
+        let storage = bc.storage;
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+        let chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot = core::mem::MaybeUninit::uninit();
+        W4Chain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut restarted = unsafe { slot.assume_init() };
+        restarted.initialize_from_storage(500);
+        assert!(restarted.is_ready());
+        assert_eq!(restarted.active_snake_chain_window(), Ok((102, 105)));
+        assert_horizon_is_the_active_path(&restarted, 1);
+
+        // AC12.6 — the restarted node's projections equal a fresh node's fed
+        // the same retained blocks.
+        let mut fresh = new_w4_chain();
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        for idx in 0..16u32 {
+            // The exact stored length, as the node itself reads it back.
+            if let Some(view) = restarted.view_retained(idx, &mut buf) {
+                fresh.receive_block(view, 0);
+            }
+        }
+        assert!(fresh.is_ready());
+        assert_eq!(
+            fresh.active_snake_chain_window(),
+            restarted.active_snake_chain_window()
+        );
+        let hash_at = |bc: &W4Chain, idx: u32| bc.blocks.get(idx).map(|e| *e.hash());
+        assert_eq!(
+            hash_at(&fresh, fresh.active_chain_head_idx),
+            hash_at(&restarted, restarted.active_chain_head_idx)
+        );
+        assert_eq!(
+            hash_at(&fresh, fresh.horizon_root()),
+            hash_at(&restarted, restarted.horizon_root())
+        );
+        assert!(fresh.node_info == restarted.node_info);
+        assert!(fresh.vote_engine == restarted.vote_engine);
+        assert_eq!(fresh.active_branch_value, restarted.active_branch_value);
+    }
+
+    /// Compares two W4 nodes node by node (`0..=4`) and block by block: the
+    /// derived state a chain switch must leave exactly as a fresh pass does.
+    fn assert_same_nodes(a: &W4Chain, b: &W4Chain) {
+        let source = |bc: &W4Chain, node: u32| match bc.node_info.seed_source_of(node) {
+            Some(SEED_SOURCE_RELEASED) | None => None,
+            Some(slot) => bc.blocks.get(slot).map(|e| *e.hash()),
+        };
+        for node in 0..=4 {
+            assert_eq!(a.node_info.balance_of(node), b.node_info.balance_of(node));
+            assert_eq!(
+                a.vote_engine.accumulated_vote_of(node),
+                b.vote_engine.accumulated_vote_of(node)
+            );
+            assert_eq!(
+                a.node_info.public_key_of(node),
+                b.node_info.public_key_of(node)
+            );
+            assert_eq!(a.node_info.is_seeded(node), b.node_info.is_seeded(node));
+            assert_eq!(source(a, node), source(b, node), "node {node}: seed source");
+        }
+        assert_eq!(
+            a.node_info.max_known_node_id(),
+            b.node_info.max_known_node_id()
+        );
+        for idx in 0..16u32 {
+            if let Some(entry) = a.blocks.get(idx)
+                && let Some(other) = b.blocks.find(entry.sequence(), entry.hash())
+            {
+                assert_eq!(
+                    a.blocks.has_available_utxo(idx),
+                    b.blocks.has_available_utxo(other)
+                );
+            }
+        }
+        assert_eq!(a.active_branch_value, b.active_branch_value);
+        assert_eq!(a.active_snake_chain_window(), b.active_snake_chain_window());
+    }
+
+    /// AC4 / AC12.4 / AC5 (DEC-211, DEC-208) — a switch on a window-anchored
+    /// node may undo the balance block that seeded nodes in its FR3 pass: the
+    /// head #102 floor-seeds node #4 and vote-seeds node #3 (`a = 98`, `H = 1`,
+    /// #3 floor-seeded at #98). The undo is identity on the values, so the
+    /// switched node ends where a node that joined the new chain directly ends
+    /// — the ground truth, since a fresh pass on honest blocks is (Story 6.0's
+    /// FR3 equivalence). A forged twin of the winner is refused by the replay
+    /// and leaves the node exactly as it was; the winner arrives as a two-block
+    /// branch, and the commit's sweep deletes the demoted head.
+    #[test]
+    fn a_switch_undoes_seed_points_as_identity() {
+        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0xB3)], 4);
+        let cfg = w4_config_anchor_block(99, floor.view().hash());
+        let early = headed(
+            100,
+            cfg.view().hash(),
+            3,
+            1,
+            777,
+            3,
+            0,
+            votes_for(100, 3, 1, 40),
+        );
+        let b101 = tx_block(101, early.view().hash(), 0, votes_for(101, 3, 1, 41));
+        let entries = [(3, 1, 1000, 0xB3), (4, 70, 500, 0xB4)];
+        let seed = balance_block(102, b101.view().hash(), &entries, 4);
+        let joiner = || {
+            let mut bc = new_w4_chain();
+            for blk in [&floor, &cfg, &early, &b101, &seed] {
+                assert_eq!(
+                    bc.receive_block(blk.view(), 0).0,
+                    ReceiveBlockOutcome::AcceptedSilently
+                );
+            }
+            assert!(bc.is_ready());
+            assert_eq!(bc.active_snake_chain_window(), Ok((99, 102)));
+            bc
+        };
+        let (mut j, twin) = (joiner(), joiner());
+
+        // The winner: the same replay by #3, worth its real vote at #101.
+        let replay = balance_block(102, b101.view().hash(), &entries, 4);
+        let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
+        assert!(v(&f102) > v(&seed), "the replay by #3 outranks the head");
+
+        // A forged twin: attempted, refused by the replay (I-09), restored.
+        let forged = resign(&replay, 3, vote_snapshot(1000) + 1, 1);
+        assert_eq!(
+            j.receive_block(forged.view(), 0).0,
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert!(
+            j.blocks.find(102, &forged.view().hash()).is_none(),
+            "deleted"
+        );
+        assert!(j.node_info == twin.node_info);
+        assert!(j.vote_engine == twin.vote_engine);
+        assert_eq!(j.active_branch_value, twin.active_branch_value);
+
+        // The ground truth: a node that joins the new chain directly.
+        let mut direct = new_w4_chain();
+        for blk in [&floor, &cfg, &early, &b101, &f102] {
+            assert_eq!(
+                direct.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(direct.is_ready());
+        let f103 = real_on(
+            &direct,
+            &w4_config_anchor_block(103, f102.view().hash()),
+            0,
+            1,
+        );
+        extend_active_head(&mut direct, &f103, 0);
+
+        // The two-block branch, orphan first: the switch goes to #103 across
+        // both seed points.
+        for blk in [&f103, &f102] {
+            assert_eq!(
+                j.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(
+            j.blocks.get(j.active_chain_head_idx).map(|e| *e.hash()),
+            Some(f103.view().hash()),
+            "switched across the seed points"
+        );
+        assert!(
+            j.blocks.find(102, &seed.view().hash()).is_none(),
+            "the demoted head forks at #101 = S_head − H − 1: swept at the commit"
+        );
+        assert_same_nodes(&j, &direct);
+    }
+
+    /// AC12.3 — a block that enters the horizon keeps its available-UTXO bits;
+    /// they leave with its slot when it leaves the horizon.
+    #[test]
+    fn a_horizon_block_keeps_its_available_utxo_bits() {
+        let (mut bc, h) = w4_ready_on_segment(103);
+        let slot_100 = slot_of(&bc, 100, &h[0]).expect("#100");
+        assert!(bc.blocks.set_utxo_available(slot_100, 0, true));
+        let b104 = w4_config_anchor_block(104, h[3]);
+        extend_active_head(&mut bc, &b104, 0);
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
+        assert_eq!(
+            bc.blocks.utxo_available(slot_100, 0),
+            Some(true),
+            "kept in the horizon"
+        );
+        let b105 = w4_config_anchor_block(105, b104.view().hash());
+        extend_active_head(&mut bc, &b105, 0);
+        assert!(slot_of(&bc, 100, &h[0]).is_none(), "#100 left the horizon");
+        assert_ne!(bc.blocks.utxo_available(slot_100, 0), Some(true));
+    }
+
+    /// AC12.2 — the configured `H` reaches the bound: the same late block is
+    /// refused at `H = 1` and admitted at `H = 2`.
+    #[test]
+    fn the_configured_horizon_reaches_the_bound() {
+        for (h, expected) in [
+            (1, ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)),
+            (2, ReceiveBlockOutcome::AcceptedSilently),
+        ] {
+            let (mut bc, [_, b101, _, _]) = valued_w4_h(h);
+            let late = salted_linked_block(102, b101.view().hash(), 9);
+            assert_eq!(bc.receive_block(late.view(), 0).0, expected, "H = {h}");
+        }
+    }
+
+    /// AC12.3 / AC5 — Ready entry reclaims a branch forked below `S_head − H`
+    /// that was retained while collecting.
+    #[test]
+    fn ready_entry_reclaims_a_deep_fork() {
+        let mut bc = new_w4_chain();
+        let below = w4_horizon_block();
+        let anchor = w4_config_anchor_block(100, below.view().hash());
+        let b101 = linked_transfer_block(101, anchor.view().hash());
+        let b102 = linked_transfer_block(102, b101.view().hash());
+        let b103 = linked_transfer_block(103, b102.view().hash());
+        let deep = salted_linked_block(101, anchor.view().hash(), 5);
+        admit_all(&mut bc, &[&below, &anchor, &b101, &deep, &b102, &b103]);
+        bc.drive_dominant_chain_acquisition();
+        assert!(bc.is_ready());
+        assert_eq!(
+            bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
+            Some(b103.view().hash())
+        );
+        assert!(
+            bc.blocks.find(101, &deep.view().hash()).is_none(),
+            "forked at #100 ≤ S_head − H − 1"
+        );
+        assert_eq!(bc.block_tree_len(), 5);
+        assert_eq!(bc.chain_heads.count(), 1);
+    }
+
+    /// Review patch — a young genesis chain (`S_head + 1 < H`) still reclaims a
+    /// fragment whose missing parent is at or below its tail (#0): it can
+    /// never arrive, being a second genesis (Story 9.1's criterion).
+    #[test]
+    fn a_young_chain_reclaims_a_fragment_below_its_tail() {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let stray = node_transfer_block(1, 3, 0, 7);
+        assert_eq!(
+            receive(&mut bc, &stray),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert!(bc.chain_heads.has_stored_head(), "precondition: a fragment");
+        let b2 = transfer(2, b1.view().hash(), 0, 7);
+        assert_eq!(receive(&mut bc, &b2), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (2, b2.view().hash()));
+        assert!(
+            bc.blocks.find(1, &stray.view().hash()).is_none(),
+            "reclaimed at the extension"
+        );
+        assert!(!bc.chain_heads.has_stored_head());
+    }
+
+    /// The D6 scenario's admissions at wall clock `now`, then one extension
+    /// past the switch (a horizon release): the joiner's head, window, root,
+    /// tree size, values and the two nodes' derived state.
+    fn switch_across_a_vote_seed(now: u64) -> (W4Chain, [u8; 32]) {
+        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let cfg = w4_config_anchor_block(99, floor.view().hash());
+        let early = headed(
+            100,
+            cfg.view().hash(),
+            3,
+            1,
+            777,
+            3,
+            0,
+            votes_for(100, 3, 1, 40),
+        );
+        let b101 = tx_block(101, early.view().hash(), 0, votes_for(101, 3, 1, 41));
+        let seed = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0xB3)], 3);
+        let replay = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0xB3)], 3);
+        let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
+        let mut bc = new_w4_chain();
+        for blk in [&floor, &cfg, &early, &b101, &seed, &f102] {
+            assert_eq!(
+                bc.receive_block(blk.view(), now).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        let cfg103 = real_on(&bc, &w4_config_anchor_block(103, f102.view().hash()), 0, 1);
+        extend_active_head(&mut bc, &cfg103, now);
+        (bc, f102.view().hash())
+    }
+
+    /// AC11 — AR16 replay (FR63, NFR5): a `W + H` join, a switch within the
+    /// bound across a vote seed, and an extension that releases a horizon
+    /// block reproduce whatever the wall clock reads.
+    #[test]
+    fn horizon_switch_and_release_are_replay_deterministic() {
+        let (a, fa) = switch_across_a_vote_seed(1_000);
+        let (b, fb) = switch_across_a_vote_seed(9_999_999);
+        assert_eq!(fa, fb);
+        assert_eq!(a.active_snake_chain_window(), Ok((100, 103)));
+        assert_eq!(a.active_snake_chain_window(), b.active_snake_chain_window());
+        assert_eq!(a.active_chain_head_idx, b.active_chain_head_idx);
+        assert_eq!(a.snake_chain_tail_idx, b.snake_chain_tail_idx);
+        assert_eq!(a.horizon_root(), b.horizon_root());
+        assert_eq!(a.block_tree_len(), b.block_tree_len());
+        assert_eq!(a.active_branch_value, b.active_branch_value);
+        assert!(a.node_info == b.node_info);
+        assert!(a.vote_engine == b.vote_engine);
+        assert!(
+            a.blocks
+                .find(
+                    98,
+                    &balance_block(98, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3)
+                        .view()
+                        .hash()
+                )
+                .is_none(),
+            "#98 left the horizon"
+        );
     }
 }
