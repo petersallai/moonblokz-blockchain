@@ -16039,27 +16039,36 @@ mod tests {
 
         // The tie: the all-zero state, node #0 on top; node #1 deviates. Both
         // are worth 0 and carry one transaction, so the hash decides: pinned
-        // for each order of the two hashes.
-        for n_lower in [true, false] {
-            let (mut bc, a2) = setup(0);
-            assert_eq!(bc.vote_engine.top_creator(), Some(0));
-            let d = headed(
+        // for each order of the two hashes. The pair comes from two small
+        // pools, so neither order hangs on where one block's hash happens to
+        // fall (every block is signed, and signing is slow in a debug build).
+        let prev = setup(0).1.view().hash();
+        let ds: [Block; 4] = core::array::from_fn(|i| {
+            headed(
                 3,
-                a2.view().hash(),
+                prev,
                 1,
                 NODE_ONE_KEY,
                 0,
                 0,
                 0,
-                votes_for(3, 1, 1, 70),
-            );
-            let n = (71..400)
-                .map(|salt| alt(3, a2.view().hash(), 0, 0, 0, salt, false))
-                .find(|n| {
+                votes_for(3, 1, 1, 60 + i as u64),
+            )
+        });
+        let ns: [Block; 8] = core::array::from_fn(|i| alt(3, prev, 0, 0, 0, 71 + i as u64, false));
+        for n_lower in [true, false] {
+            let (mut bc, a2) = setup(0);
+            assert_eq!(a2.view().hash(), prev);
+            assert_eq!(bc.vote_engine.top_creator(), Some(0));
+            let (d, n) = ds
+                .iter()
+                .flat_map(|d| ns.iter().map(move |n| (d, n)))
+                .find(|(d, n)| {
                     n.view().len() == d.view().len()
                         && (n.view().hash() < d.view().hash()) == n_lower
                 })
-                .expect("a same-size normal block");
+                .expect("a same-size deviation and normal block in this order");
+            let (d, n) = (d.clone(), n.clone());
             assert_eq!(receive(&mut bc, &d), ReceiveBlockOutcome::AcceptedSilently);
             assert_eq!(receive(&mut bc, &n), ReceiveBlockOutcome::AcceptedSilently);
             let winner = if n_lower { &n } else { &d };
