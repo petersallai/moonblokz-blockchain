@@ -11003,8 +11003,8 @@ mod tests {
                 bc.receive_block(block.view(), 0);
             }
             // The locked content as a fingerprint: its first two bytes are the
-            // `config_value_count`, which is 2 for the base override set config A
-            // carries (window and horizon) and 3 for config B's.
+            // `config_value_count`, which is 3 for the base override set config A
+            // carries (window, horizon and node cap) and 4 for config B's.
             let locked = bc
                 .chain_config
                 .durable_content()
@@ -11021,7 +11021,7 @@ mod tests {
         );
         assert_eq!(
             a_first,
-            (true, 4, [2, 0]),
+            (true, 4, [3, 0]),
             "and they converge on config A — the candidate's own — with the side branch gone"
         );
     }
