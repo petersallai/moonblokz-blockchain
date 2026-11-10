@@ -39,7 +39,7 @@ pub(crate) fn block_value(view: &BlockView<'_>) -> u64 {
 /// lexicographically, which is the big-endian order.
 pub(crate) struct Rank {
     pub(crate) value: u64,
-    pub(crate) len: u16,
+    pub(crate) len: u32,
     pub(crate) hash: [u8; 32],
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn is_admissible(tail: u32, head: u32, tip: u32, w: u32) -> bool {
 mod tests {
     use super::*;
 
-    fn rank(value: u64, len: u16, hash_byte: u8) -> Rank {
+    fn rank(value: u64, len: u32, hash_byte: u8) -> Rank {
         Rank {
             value,
             len,

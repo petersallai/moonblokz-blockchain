@@ -112,7 +112,10 @@ pub(crate) enum Tier1Failure {
     /// this is where the deferred Story 1.1/1.4 payload-coherence watch-item
     /// is enforced.)
     MalformedPayload,
-    /// `block size > MAX_BLOCK_SIZE` per the durable-locked chain-config (AC8).
+    /// The block is larger than the **locked chain's** `block_size_limit` (AC8):
+    /// exact evidence. A block above this build's capacity never reaches
+    /// intake — `BlockView::from_bytes` refuses it — so it is a local refusal,
+    /// never this (DEC-225).
     BlockTooLarge,
     /// `sequence == u32::MAX` — FR53 (ii): the reserved ceiling sentinel is
     /// exact evidence of invalidity and is rejected at intake regardless of
@@ -247,7 +250,7 @@ pub(crate) fn verify_signature_bytes<C: CryptoTrait>(
 pub(crate) fn tier1_gate<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
-    block_size_limit: u16,
+    block_size_limit: u32,
     max_utxo_outputs: u16,
     crypto: &C,
 ) -> Result<(), Tier1Failure> {
@@ -562,7 +565,7 @@ mod tests {
 
     /// Block-size limit used by the "normal" Tier 1 tests (the chain-config
     /// stub's `block_size_limit()`).
-    const NORMAL_LIMIT: u16 = 2016;
+    const NORMAL_LIMIT: u32 = 2016;
     const UTXO_LIMIT: u16 = 256;
     const DUMMY_SIG: [u8; 64] = [0u8; 64];
 
