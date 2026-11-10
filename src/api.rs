@@ -536,6 +536,10 @@ pub(crate) enum ValidationReason {
     /// node that exists — exact evidence of invalidity even for a not-yet-seeded
     /// (pre-window) actor, whose *existence* is thereby still bounded-checkable.
     NodeIdOutOfRange,
+    /// A registration's `new_node_id`, or a balance block's `max_node_id`, is at
+    /// or above the chain's `max_node_count` (DEC-228). The cap is the chain's,
+    /// so every node judges it alike, whatever its `MAX_NODES`.
+    NodeCountExceeded,
     /// A complex tx UTXO input does not resolve (ADR-016): `block_sequence` is
     /// not a retained strict ancestor of the consuming block within `W`.
     UtxoUnresolvable,
@@ -3573,6 +3577,14 @@ impl<
                 let payload = view
                     .balances()
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
+                // FR6 node cap (DEC-228): no balance block names an id at or
+                // above the chain's `max_node_count`.
+                if self
+                    .max_node_count()
+                    .is_some_and(|cap| payload.max_node_id() >= cap)
+                {
+                    return Err(invalid(ValidationReason::NodeCountExceeded));
+                }
                 if projection.complete || projection.saw_balance_block {
                     // Every balance block carries `max_node_id` == the
                     // forward-tracked watermark at its sequence (FR50).
@@ -3878,6 +3890,12 @@ impl<
                 .registration_price()
                 .checked_add(reg.fee())
                 .ok_or(invalid(ValidationReason::ValueOverflow))?;
+            // FR6 node cap (DEC-228): every registered id is below the chain's
+            // `max_node_count`, judged from the transaction and the held
+            // configuration alone, so in every projection and on every build.
+            if !is_genesis_zero && self.max_node_count().is_some_and(|cap| node_id >= cap) {
+                return Err(invalid(ValidationReason::NodeCountExceeded));
+            }
             if !is_genesis_zero {
                 // FR6 registration monotonicity: `new_node_id == running
                 // watermark + 1`, authoritative once the watermark is
@@ -3921,8 +3939,9 @@ impl<
             if debits {
                 self.node_info.debit(init, debit);
             }
-            // Genesis #0 does not advance the watermark (FR54(h)).
-            if !is_genesis_zero && (node_id as usize) < MAX_NODES {
+            // Genesis #0 does not advance the watermark (FR54(h)). The id is
+            // below `max_node_count ≤ MAX_NODES` (DEC-228), so it has a slot.
+            if !is_genesis_zero {
                 let advanced = self.node_info.max_known_node_id().max(node_id);
                 self.node_info.set_max_known_node_id(advanced);
             }
@@ -4090,7 +4109,7 @@ impl<
                 // watermark one below the new id (D1 precondition 2).
                 let node_id = reg.new_node_id();
                 self.node_info.clear_node(node_id);
-                if !is_genesis_zero && (node_id as usize) < MAX_NODES {
+                if !is_genesis_zero {
                     self.node_info
                         .set_max_known_node_id(node_id.saturating_sub(1));
                 }
@@ -6592,6 +6611,18 @@ impl<
         self.chain_config
             .active_configuration()
             .map(|config| config.verification_horizon())
+    }
+
+    /// The chain's node cap `max_node_count` (DEC-228) the held configuration
+    /// declares, or `None` while the node holds none. Never cached (FR56).
+    ///
+    /// The per-block step runs only with a configuration held (the FR3 pass is
+    /// gated on one, Story 5.8; Ready holds the durable one), so `None` does not
+    /// arise where the rule is applied; the rule then has nothing to measure.
+    fn max_node_count(&self) -> Option<u32> {
+        self.chain_config
+            .active_configuration()
+            .map(|config| config.max_node_count())
     }
 
     /// The block UTXO-output cap `max_block_utxo_output` the held configuration
@@ -18081,5 +18112,112 @@ mod tests {
                 .is_none(),
             "#98 left the horizon"
         );
+    }
+
+    // ---- Story 6.15: the chain's node cap (DEC-228) ----
+
+    /// A configuration declaring the window `w`, its test horizon and the node
+    /// cap `cap` instead of [`TEST_MAX_NODES`].
+    fn capped_config_builder(w: u32, cap: u32) -> ChainConfigPayloadBuilder {
+        let mut builder = ChainConfigPayloadBuilder::new();
+        for (id, value) in [
+            (parameter::ACTIVE_CHAIN_LENGTH, w),
+            (parameter::VERIFICATION_HORIZON, test_horizon(w)),
+            (parameter::MAX_NODE_COUNT, cap),
+        ] {
+            builder
+                .add_literal(id, &value.to_le_bytes())
+                .ok()
+                .expect("a four-byte literal is well-formed");
+        }
+        builder
+    }
+
+    /// AC10: at a Ready head extension a registration at `max_node_count` is
+    /// exact evidence, and one below it is accepted and seeds its key. The cap
+    /// is the chain's 2, far below the build's `MAX_NODES` (16), so only the
+    /// chain rule can refuse it.
+    #[test]
+    fn fr6_registration_at_the_node_cap_is_evidence_in_ready() {
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        let genesis = bc
+            .process_genesis(CURRENCY, capped_config_builder(TEST_W, 2).content())
+            .ok()
+            .expect("genesis succeeds");
+        assert!(bc.is_ready());
+
+        let one = register(2, genesis.block_one.view().hash(), 1, 0xB1);
+        assert_eq!(
+            receive(&mut bc, &one),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&bc).1, one.view().hash());
+        assert!(bc.node_info.is_seeded(1), "an id below the cap registers");
+
+        let two = register(3, one.view().hash(), 2, 0xB2);
+        assert_eq!(
+            receive(&mut bc, &two),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(head_of(&bc).1, one.view().hash());
+        assert!(!bc.node_info.is_seeded(2));
+        assert_eq!(bc.node_info.max_known_node_id(), 1);
+    }
+
+    /// AC10: the FR3 pass applies the same rule to a registration (here the
+    /// fixture cap, `TEST_MAX_NODES` = 16, with the watermark at 15, so the id
+    /// is otherwise the expected next one).
+    #[test]
+    fn fr6_registration_at_the_node_cap_is_evidence_in_the_pass() {
+        let mut bc = new_test_chain();
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES - 1);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        let reg = registration_block(101, anchor.view().hash(), 1, TEST_MAX_NODES, 0xC3);
+        let ri = bc
+            .tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+        assert!(matches!(
+            bc.run_processing_pass(ri),
+            Err(ProcessingError::Invalid {
+                reason: ValidationReason::NodeCountExceeded,
+                ..
+            })
+        ));
+    }
+
+    /// AC10: a balance block naming an id at the cap is exact evidence; one just
+    /// below it is not refused by the rule.
+    #[test]
+    fn fr6_balance_block_at_the_node_cap_is_evidence() {
+        let mut bc = new_test_chain();
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let over = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES);
+        let oi = bc
+            .tier1_admit(&over.view(), &over.view().hash(), 0)
+            .expect("admitted");
+        assert!(matches!(
+            bc.run_processing_pass(oi),
+            Err(ProcessingError::Invalid {
+                reason: ValidationReason::NodeCountExceeded,
+                ..
+            })
+        ));
+
+        let mut bc = new_test_chain();
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let at_limit = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES - 1);
+        let ai = bc
+            .tier1_admit(&at_limit.view(), &at_limit.view().hash(), 0)
+            .expect("admitted");
+        assert!(!matches!(
+            bc.run_processing_pass(ai),
+            Err(ProcessingError::Invalid {
+                reason: ValidationReason::NodeCountExceeded,
+                ..
+            })
+        ));
     }
 }
