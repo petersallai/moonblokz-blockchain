@@ -4300,7 +4300,7 @@ impl<
         parent_idx: u32,
         consuming_seq: u32,
         block_sequence: u32,
-        output_index: u8,
+        output_index: u16,
         declared_amount: u64,
         trust_below_anchor: bool,
     ) -> Result<Option<[u8; 32]>, UtxoSpendError> {
@@ -4365,7 +4365,7 @@ impl<
     fn utxo_output_of(
         &self,
         ref_idx: u32,
-        output_index: u8,
+        output_index: u16,
     ) -> Result<Option<([u8; 32], u64)>, UtxoSpendError> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self
@@ -12705,7 +12705,7 @@ mod tests {
     /// balance output, in order.
     fn utxo_tx(
         seq: u32,
-        utxo_inputs: &[(u32, u8, u64)],
+        utxo_inputs: &[(u32, u16, u64)],
         balance_input: Option<(u32, u64)>,
         outputs: &[Result<u64, (u32, u64)>],
     ) -> moonblokz_chain_types::ComplexTransaction {
@@ -12716,7 +12716,7 @@ mod tests {
     fn utxo_tx_vote(
         vote: u32,
         seq: u32,
-        utxo_inputs: &[(u32, u8, u64)],
+        utxo_inputs: &[(u32, u16, u64)],
         balance_input: Option<(u32, u64)>,
         outputs: &[Result<u64, (u32, u64)>],
     ) -> moonblokz_chain_types::ComplexTransaction {
@@ -12827,7 +12827,7 @@ mod tests {
 
     /// Runs the pass over `mint ← spend(inputs)` and returns its verdict and
     /// the spending block's slot.
-    fn spend_verdict(inputs: &[(u32, u8, u64)]) -> (Result<(), ProcessingError>, u32) {
+    fn spend_verdict(inputs: &[(u32, u16, u64)]) -> (Result<(), ProcessingError>, u32) {
         let (mut bc, h100) = utxo_test_chain();
         let mint = utxo_mint_block(h100);
         admit(&mut bc, &mint);
@@ -13278,8 +13278,8 @@ mod tests {
     #[test]
     fn utxo_unavailable_output_is_rejected_without_a_read() {
         // (spending blocks' inputs, resolver reads expected on the mint)
-        let past_the_outputs: &[&[(u32, u8, u64)]] = &[&[(101, 2, 0)]];
-        let spent_earlier: &[&[(u32, u8, u64)]] = &[&[(101, 0, 60)], &[(101, 0, 60)]];
+        let past_the_outputs: &[&[(u32, u16, u64)]] = &[&[(101, 2, 0)]];
+        let spent_earlier: &[&[(u32, u16, u64)]] = &[&[(101, 0, 60)], &[(101, 0, 60)]];
         for (spends, resolver_reads) in [(past_the_outputs, 0), (spent_earlier, 1)] {
             let (mut bc, mint, mi) = failing_read_utxo_chain();
             let mut prev = mint.view().hash();
@@ -15362,7 +15362,7 @@ mod tests {
 
     /// A side block at `seq` on `prev` spending `(3, index)` with the declared
     /// `amount` into one UTXO output.
-    fn side_spend(seq: u32, prev: [u8; 32], index: u8, amount: u64) -> Block {
+    fn side_spend(seq: u32, prev: [u8; 32], index: u16, amount: u64) -> Block {
         let tx = utxo_tx(seq, &[(3, index, amount)], None, &[Ok(amount)]);
         complex_tx_block(seq, prev, 0, 0, &[&tx])
     }
