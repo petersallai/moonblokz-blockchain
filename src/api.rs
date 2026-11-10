@@ -8490,7 +8490,7 @@ mod tests {
         let cfg_idx = bc
             .tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
             .expect("block #1 is admitted");
-        assert_eq!(bc.active_chain_length(), Some(u32::from(W4)));
+        assert_eq!(bc.active_chain_length(), Some(W4));
         assert_eq!(
             bc.evaluate_stopping_condition(),
             Some(cfg_idx),
@@ -8531,7 +8531,7 @@ mod tests {
         let at = chain_config_anchor_block(100, [0xAB; 32]);
         let (outcome, _) = bc.receive_block(at.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(bc.active_chain_length(), Some(u32::from(TEST_W)));
+        assert_eq!(bc.active_chain_length(), Some(TEST_W));
     }
 
     /// AC2/AC5/AC6 + Story 5.4 — receiving the genesis (a length-1
@@ -15046,7 +15046,7 @@ mod tests {
     fn valued_w4_h(h: u32) -> (W4Chain, [Block; 4]) {
         let mut bc = new_w4_chain_h(h);
         let mut prev = [0xAB; 32];
-        for seq in (100 - u32::from(h))..100 {
+        for seq in (100 - h)..100 {
             let below = linked_transfer_block(seq, prev);
             prev = below.view().hash();
             bc.tier1_admit(&below.view(), &prev, 0)

@@ -443,7 +443,7 @@ mod tests {
     //
     // `S_head = 20`, `W = 16`, `HZ = 2`: in window and in bound is `19 ..= 35`.
 
-    const HZ: u32 = H as u32;
+    const HZ: u32 = H;
 
     #[test]
     fn window_verdict_in_window_interior() {
