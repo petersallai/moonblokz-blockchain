@@ -2477,6 +2477,14 @@ impl<
     /// [`Self::on_tick`] exactly when the FR19 parent-recovery scheduler can emit
     /// — else `NextCall::Idle`. The request itself is emitted from the tick
     /// (never inline here), gated by the FR46 global cooldown; see [`TickOutcome`].
+    ///
+    /// **A block above this build's capacity never arrives here** (DEC-225). The
+    /// caller frames it with `BlockView::from_bytes`, which refuses anything
+    /// larger than `MAX_BLOCK_SIZE` (`InputTooLarge`): a local refusal, never
+    /// evidence. And a build never locks a chain whose `block_size_limit`
+    /// exceeds that capacity (configuration §6 check 5), so a locked node only
+    /// ever judges sizes it can hold; `Tier1Failure::BlockTooLarge` measures the
+    /// chain's limit, the same on every build.
     pub fn receive_block(
         &mut self,
         block: BlockView<'_>,
