@@ -251,42 +251,66 @@ mod tests {
 
     /// The verification horizon the configurations declare beside `W`
     /// (configuration §6 check 15, `H < W`).
-    const H: u16 = 2;
+    const H: u32 = 2;
 
     /// `W + 2·H` (configuration §6 check 16); the test backend stores eight
     /// blocks, so the size only has to pass the check.
     const TEST_MAX_BLOCKS: usize = W as usize + 2 * H as usize;
 
+    /// The node cap the configurations declare: `TestChain`'s `MAX_NODES`
+    /// (DEC-228; the default 1000 would fail configuration §6 check 18).
+    const N: u32 = 16;
+
     /// The base override set as a **content region**: the window `W` declared
     /// at `TestChain`'s capacity, every other parameter at its code-baked
     /// default. Leaving the window out would resolve it to the default 500,
     /// which this harness cannot hold, so acceptance would refuse it (FR8).
-    const BASE_CONFIG_CONTENT: [u8; 10] = [
-        2,
+    const BASE_CONFIG_CONTENT: [u8; 20] = [
+        3,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
-        2,
+        4,
         W.to_le_bytes()[0],
         W.to_le_bytes()[1],
+        W.to_le_bytes()[2],
+        W.to_le_bytes()[3],
         parameter::VERIFICATION_HORIZON,
-        2,
+        4,
         H.to_le_bytes()[0],
         H.to_le_bytes()[1],
+        H.to_le_bytes()[2],
+        H.to_le_bytes()[3],
+        parameter::MAX_NODE_COUNT,
+        4,
+        N.to_le_bytes()[0],
+        N.to_le_bytes()[1],
+        N.to_le_bytes()[2],
+        N.to_le_bytes()[3],
     ];
 
     /// A second content region, equally valid and distinct in bytes: the base
     /// entry plus a literal declaring `vote_interest`'s own default value.
-    const OTHER_CONFIG_CONTENT: [u8; 13] = [
-        3,
+    const OTHER_CONFIG_CONTENT: [u8; 23] = [
+        4,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
-        2,
+        4,
         W.to_le_bytes()[0],
         W.to_le_bytes()[1],
+        W.to_le_bytes()[2],
+        W.to_le_bytes()[3],
         parameter::VERIFICATION_HORIZON,
-        2,
+        4,
         H.to_le_bytes()[0],
         H.to_le_bytes()[1],
+        H.to_le_bytes()[2],
+        H.to_le_bytes()[3],
+        parameter::MAX_NODE_COUNT,
+        4,
+        N.to_le_bytes()[0],
+        N.to_le_bytes()[1],
+        N.to_le_bytes()[2],
+        N.to_le_bytes()[3],
         parameter::VOTE_INTEREST,
         1,
         5,
@@ -388,7 +412,7 @@ mod tests {
     // would need the unstable `generic_const_exprs`). Callers parse `&buf[..len]`.
     /// A framed chain-config payload: a small content region plus the
     /// signature trailer.
-    const CFG_PAYLOAD_BUF: usize = 16 + SIGNATURE_SIZE;
+    const CFG_PAYLOAD_BUF: usize = 32 + SIGNATURE_SIZE;
     const CFG_BUF: usize = HEADER_SIZE + CFG_PAYLOAD_BUF;
     fn chain_config_block_bytes(seq: u32, payload: &[u8]) -> ([u8; CFG_BUF], usize) {
         // Header-only block (no payload added) → a canonical HEADER_SIZE-byte
@@ -419,7 +443,7 @@ mod tests {
     //
     // `S_head = 20`, `W = 16`, `HZ = 2`: in window and in bound is `19 ..= 35`.
 
-    const HZ: u32 = H as u32;
+    const HZ: u32 = H;
 
     #[test]
     fn window_verdict_in_window_interior() {
@@ -657,17 +681,27 @@ mod tests {
     /// out-of-window sequence.
     #[test]
     fn classify_window_width_is_the_configured_w() {
-        const W8_CONFIG_CONTENT: [u8; 10] = [
-            2,
+        const W8_CONFIG_CONTENT: [u8; 20] = [
+            3,
             0,
             parameter::ACTIVE_CHAIN_LENGTH,
-            2,
+            4,
             8,
             0,
+            0,
+            0,
             parameter::VERIFICATION_HORIZON,
-            2,
+            4,
             H.to_le_bytes()[0],
             H.to_le_bytes()[1],
+            H.to_le_bytes()[2],
+            H.to_le_bytes()[3],
+            parameter::MAX_NODE_COUNT,
+            4,
+            N.to_le_bytes()[0],
+            N.to_le_bytes()[1],
+            N.to_le_bytes()[2],
+            N.to_le_bytes()[3],
         ];
         let mut bc = locked_test_chain(&W8_CONFIG_CONTENT);
 

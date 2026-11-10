@@ -133,9 +133,9 @@ pub(crate) struct BlockEntry {
     /// byte-identical to the block that was signed; the FR6 byte-exact checks
     /// (block-creator signature, chain-config content-identity) trim the read-back
     /// bytes to this length first. `0` for entries constructed directly in tests
-    /// that never round-trip through storage. Fits the struct's existing 2-byte
-    /// tail padding — `size_of::<BlockEntry>()` stays 76 B.
-    len: u16,
+    /// that never round-trip through storage. A `u32` on every block-size tier
+    /// (DEC-224): `size_of::<BlockEntry>()` is 80 B.
+    len: u32,
 }
 
 // `new`/`is_on_active_chain`/`set_on_active_chain` are consumed starting
@@ -175,14 +175,14 @@ impl BlockEntry {
 
     /// The block's exact serialized length recorded at intake (Story 5.4), or 0
     /// if never stamped (test entries that do not round-trip through storage).
-    pub(crate) fn len(&self) -> u16 {
+    pub(crate) fn len(&self) -> u32 {
         self.len
     }
 
     /// Stamps the block's exact serialized length onto a `BlockEntry` value
     /// **before** it is inserted (Story 5.4 — the byte-exact FR6 checks trim a
     /// zero-padded read-back block to this length).
-    pub(crate) fn set_len(&mut self, len: u16) {
+    pub(crate) fn set_len(&mut self, len: u32) {
         self.len = len;
     }
 
@@ -897,14 +897,13 @@ mod tests {
     #[test]
     fn block_entry_size_is_within_budget() {
         // 32 hash + 4 parent_ref + 4 sequence + 32 available_utxo +
-        // 1 head_ref_count + 1 flags + 2 len = 76 B effective, 4-byte aligned
-        // (largest field is u32) -> 76 B, matching architecture §6.2. The
-        // Story-5.4 `len: u16` field consumed the 2 bytes of tail padding the
-        // 74-byte layout previously wasted, so the entry size is unchanged.
-        // Pinned exactly, not just bounded, so a future field addition must
-        // consciously update this (same discipline as chain-types'
-        // `block_view_size_is_pointer_plus_length`).
-        assert_eq!(core::mem::size_of::<BlockEntry>(), 76);
+        // 1 head_ref_count + 1 flags + 4 len = 78 B, 4-byte aligned (largest
+        // field is u32) -> 80 B, matching architecture §6.2. `len` is a `u32` on
+        // every block-size tier (DEC-224, Story 6.15); it was a `u16` in the
+        // tail padding before, at 76 B. Pinned exactly, not just bounded, so a
+        // future field addition must consciously update this (same discipline as
+        // chain-types' `block_view_size_is_pointer_plus_length`).
+        assert_eq!(core::mem::size_of::<BlockEntry>(), 80);
     }
 
     #[test]

@@ -38,7 +38,19 @@ moonblokz-storage = { path = "../moonblokz-storage", default-features = false, f
 # backend-generic, so any of the three backends is selectable end-to-end via
 # `--no-default-features --features <backend>` (storage's `backend-memory`
 # storage backend stays enabled directly — it is orthogonal to this choice).
-default = ["schnorr-crypto-bigint"]
+default = ["schnorr-crypto-bigint", "block-size-2016"]
+block-size-2016 = [
+    "moonblokz-vote/block-size-2016",
+    "moonblokz-configuration/block-size-2016",
+    "moonblokz-chain-types/block-size-2016",
+    "moonblokz-storage/block-size-2016",
+]
+block-size-65536 = [
+    "moonblokz-vote/block-size-65536",
+    "moonblokz-configuration/block-size-65536",
+    "moonblokz-chain-types/block-size-65536",
+    "moonblokz-storage/block-size-65536",
+]
 schnorr-crypto-bigint = [
     "moonblokz-vote/schnorr-crypto-bigint",
     "moonblokz-configuration/schnorr-crypto-bigint",

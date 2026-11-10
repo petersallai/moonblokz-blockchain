@@ -31,7 +31,7 @@ use moonblokz_chain_types::BlockView;
 /// Returns the `output_index`-th output of `view`'s UTXO-output stream as
 /// `(address, amount)`, or `None` when the block has fewer UTXO outputs (or
 /// is not a transaction block).
-pub(crate) fn utxo_output_at(view: &BlockView, output_index: u8) -> Option<([u8; 32], u64)> {
+pub(crate) fn utxo_output_at(view: &BlockView, output_index: u16) -> Option<([u8; 32], u64)> {
     view.transactions()?
         .iter()
         .filter_map(|tx| tx.as_complex())
