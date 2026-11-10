@@ -426,31 +426,6 @@ pub enum TickOutcome {
     SendParentRecoveryRequest(ParentRecoveryRequest),
 }
 
-/// Authoritative blockchain state for a MoonBlokz node.
-///
-/// Const generics define the compile-time-bounded memory model (AR9 /
-/// architecture §5). No runtime allocation occurs at any point — every
-/// internal buffer is sized from these parameters.
-///
-/// `Crypto`, `Storage`, and `Config` are the adjacent-component seams:
-/// - `Crypto: CryptoTrait` — the module calls `crypto.sign` / `crypto.verify`
-///   through the handle; it never holds raw signing-key bytes (FR68, AR13).
-/// - `Storage: StorageTrait` — the module persists and reads state through
-///   the trait; storage is a service it consumes (FR66 boundary).
-/// - `Config: ChainConfigTrait` — chain-configurable parameters arrive via
-///   `moonblokz_configuration`'s trait, read through the `ActiveConfig` handle
-///   at the moment each value is needed (FR56); this crate never names a
-///   concrete implementation.
-///
-/// Defaults (architecture §5): `MAX_NODES = 1000`,
-/// `SNAKE_CHAIN_LENGTH_MAX = 500`, `MAX_BLOCKS = 600`,
-/// `MAX_BRANCH_COUNT = 40`, `MAX_BLOCK_UTXO_OUTPUT = 256`.
-///
-/// `SNAKE_CHAIN_LENGTH_MAX` is this build's **capacity** for the active-chain
-/// window, not the window: the length in force, `W`, is chain configuration
-/// (FR56), identical on every node of a chain, and acceptance refuses a chain
-/// whose `W` exceeds the capacity (FR8). Every site that means "the window"
-/// reads `W` through the configuration handle.
 /// The available-UTXO bitfield width in bits: this build's capacity for a
 /// block's UTXO outputs, stated to the configuration module in `BUILD_LIMITS`
 /// and enforced at Tier 1 before the durable lock (DEC-132).
@@ -795,6 +770,31 @@ enum ConfigPreload {
     Unreadable,
 }
 
+/// Authoritative blockchain state for a MoonBlokz node.
+///
+/// Const generics define the compile-time-bounded memory model (AR9 /
+/// architecture §5). No runtime allocation occurs at any point — every
+/// internal buffer is sized from these parameters.
+///
+/// `Crypto`, `Storage`, and `Config` are the adjacent-component seams:
+/// - `Crypto: CryptoTrait` — the module calls `crypto.sign` / `crypto.verify`
+///   through the handle; it never holds raw signing-key bytes (FR68, AR13).
+/// - `Storage: StorageTrait` — the module persists and reads state through
+///   the trait; storage is a service it consumes (FR66 boundary).
+/// - `Config: ChainConfigTrait` — chain-configurable parameters arrive via
+///   `moonblokz_configuration`'s trait, read through the `ActiveConfig` handle
+///   at the moment each value is needed (FR56); this crate never names a
+///   concrete implementation.
+///
+/// Defaults (architecture §5): `MAX_NODES = 1000`,
+/// `SNAKE_CHAIN_LENGTH_MAX = 500`, `MAX_BLOCKS = 600`,
+/// `MAX_BRANCH_COUNT = 40`, `MAX_BLOCK_UTXO_OUTPUT = 256`.
+///
+/// `SNAKE_CHAIN_LENGTH_MAX` is this build's **capacity** for the active-chain
+/// window, not the window: the length in force, `W`, is chain configuration
+/// (FR56), identical on every node of a chain, and acceptance refuses a chain
+/// whose `W` exceeds the capacity (FR8). Every site that means "the window"
+/// reads `W` through the configuration handle.
 // Fields are consumed by the state-changing methods landing in Story 1.4+;
 // silencing dead_code here keeps the scaffold clean.
 #[allow(dead_code)]
@@ -896,8 +896,8 @@ pub struct Blockchain<
     // `W`, never over the capacity (`snake_chain.rs`). Below it lie the FR58
     // verification horizon's `H` blocks, still linked and flagged, down to the
     // active chain's root (`parent_ref == NONE_REF`), which is found by a walk
-    // (Story 6.14 D1, DEC-206). The capacity stays a `u32` const generic;
-    // `BUILD_LIMITS` asserts it fits the module's `u16`.
+    // (Story 6.14 D1, DEC-206). The capacity is a `u32` const generic, stated
+    // to the configuration module as a `u32` in `BUILD_LIMITS`.
     snake_chain_tail_idx: u32,
 
     // FR21 value of the active branch: the sum of the per-block values over
@@ -1579,7 +1579,8 @@ impl<
         // The length a window-anchored segment needs, once for the whole
         // evaluation: the window and the horizon below it (DEC-177). With no
         // configuration held the active-length condition is not evaluated.
-        // Acceptance keeps `W + 2·H` within a `u16` capacity, so the sum fits.
+        // Acceptance keeps `W + 2·H` within the `u32` block-storage capacity
+        // (check 16), so the sum fits a `u32`.
         let required = self
             .active_chain_length()
             .zip(self.verification_horizon())
@@ -3357,6 +3358,15 @@ impl<
             && let Some(view) = self.view_retained(floor_balance_idx, &mut buf)
             && let Some(payload) = view.balances()
         {
+            // DEC-228: an over-cap floor is exact evidence here, before it could
+            // seed a watermark the chain forbids — and before a block that
+            // precedes it is measured against one.
+            if payload.max_node_id() >= self.max_node_count() {
+                return Err(ProcessingError::Invalid {
+                    block_idx: floor_balance_idx,
+                    reason: ValidationReason::NodeCountExceeded,
+                });
+            }
             self.node_info.set_max_known_node_id(payload.max_node_id());
         }
 
@@ -3587,10 +3597,7 @@ impl<
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
                 // FR6 node cap (DEC-228): no balance block names an id at or
                 // above the chain's `max_node_count`.
-                if self
-                    .max_node_count()
-                    .is_some_and(|cap| payload.max_node_id() >= cap)
-                {
+                if payload.max_node_id() >= self.max_node_count() {
                     return Err(invalid(ValidationReason::NodeCountExceeded));
                 }
                 if projection.complete || projection.saw_balance_block {
@@ -3901,7 +3908,7 @@ impl<
             // FR6 node cap (DEC-228): every registered id is below the chain's
             // `max_node_count`, judged from the transaction and the held
             // configuration alone, so in every projection and on every build.
-            if !is_genesis_zero && self.max_node_count().is_some_and(|cap| node_id >= cap) {
+            if !is_genesis_zero && node_id >= self.max_node_count() {
                 return Err(invalid(ValidationReason::NodeCountExceeded));
             }
             if !is_genesis_zero {
@@ -6622,15 +6629,17 @@ impl<
     }
 
     /// The chain's node cap `max_node_count` (DEC-228) the held configuration
-    /// declares, or `None` while the node holds none. Never cached (FR56).
+    /// declares. Never cached (FR56).
     ///
     /// The per-block step runs only with a configuration held (the FR3 pass is
-    /// gated on one, Story 5.8; Ready holds the durable one), so `None` does not
-    /// arise where the rule is applied; the rule then has nothing to measure.
-    fn max_node_count(&self) -> Option<u32> {
+    /// gated on one, Story 5.8; Ready holds the durable one). Should it ever
+    /// run without one, the build's own `MAX_NODES` bounds the ids instead, so
+    /// the watermark can never name a node with no slot; acceptance keeps every
+    /// chain's cap at or below it.
+    fn max_node_count(&self) -> u32 {
         self.chain_config
             .active_configuration()
-            .map(|config| config.max_node_count())
+            .map_or(MAX_NODES as u32, |config| config.max_node_count())
     }
 
     /// The block UTXO-output cap `max_block_utxo_output` the held configuration
@@ -6666,9 +6675,11 @@ impl<
     /// this build's capacity (DEC-225, amending DEC-105): a larger block cannot be
     /// framed here at all, and `BlockView::from_bytes` refuses it before intake,
     /// so the fallback never judges a block as evidence. Two builds with
-    /// different capacities therefore never disagree on a verdict; they differ
-    /// only in what they can hold, and acceptance refuses a chain whose limit a
-    /// build cannot hold (§6 check 5).
+    /// different capacities never disagree on whether a block is acceptable:
+    /// a block above the smaller build's capacity is refused by both — as
+    /// evidence on a larger build locked to a chain whose limit it exceeds, as
+    /// a local refusal on the smaller one, which cannot frame it. Acceptance
+    /// refuses a chain whose limit a build cannot hold (§6 check 5).
     ///
     /// Read this where the configuration in force is known to be the one the work
     /// commits to — the FR54 genesis path, which is about to lock the very
@@ -9018,11 +9029,12 @@ mod tests {
     /// A deliberately small — but entirely legal — `block_size_limit`, used to
     /// build a tentative configuration that disagrees with a candidate's own.
     /// Above `HEADER_SIZE` (122), so the configuration module accepts it, and far
-    /// below the framing ceiling, so a realistic block can exceed it.
-    // Above the test configuration blocks (212 B with the four-byte `W`, `H`,
-    // block-size and node-cap entries, Story 6.15) and the one-entry balance
-    // block (178 B); below the three-entry balance block (274 B) and the
-    // three-output transaction block (254 B) the fixtures exceed it with.
+    /// below the build's block capacity, so a realistic block can exceed it.
+    ///
+    /// Above the test configuration blocks (212 B with the four-byte `W`, `H`,
+    /// block-size and node-cap entries, Story 6.15) and the one-entry balance
+    /// block (178 B); below the three-entry balance block (274 B) and the
+    /// three-output transaction block (254 B) the fixtures exceed it with.
     const SMALL_BLOCK_SIZE_LIMIT: u32 = 220;
 
     /// An override set declaring [`SMALL_BLOCK_SIZE_LIMIT`] and the window `w`.
@@ -13021,10 +13033,19 @@ mod tests {
 
     /// AC8 (5) / Story 6.11 AC3 — an `output_index` past the referenced
     /// block's UTXO outputs (or into a block with none) has no available bit:
-    /// exact evidence, decided from RAM.
+    /// exact evidence, decided from RAM. Story 6.15: the index is a `u16`, and
+    /// one past the 256-bit bitfield is unavailable too — 256 never aliases
+    /// output 0, as a truncation to `u8` would make it.
     #[test]
     fn utxo_out_of_bounds_index_is_unavailable() {
-        for (referenced, index) in [(101, 2), (101, 255), (100, 0), (99, 0)] {
+        for (referenced, index) in [
+            (101, 2),
+            (101, 255),
+            (101, 256),
+            (101, u16::MAX),
+            (100, 0),
+            (99, 0),
+        ] {
             let (verdict, si) = spend_verdict(&[(referenced, index, 0)]);
             assert_eq!(
                 verdict,
@@ -13429,7 +13450,7 @@ mod tests {
         builder
             .add_literal(parameter::MAX_BLOCK_UTXO_OUTPUT, &1u16.to_le_bytes())
             .ok()
-            .expect("a four-byte literal is well-formed");
+            .expect("a two-byte literal is well-formed");
         builder
     }
 
@@ -18171,6 +18192,26 @@ mod tests {
         assert_eq!(head_of(&bc).1, one.view().hash());
         assert!(!bc.node_info.is_seeded(2));
         assert_eq!(bc.node_info.max_known_node_id(), 1);
+
+        // The contrast: the same blocks on a chain whose cap is 3 are both
+        // accepted, so only the cap refused the registration above.
+        let (crypto, storage, chain_config) = test_backends();
+        let mut wide = new_chain(crypto, storage, chain_config, 0, 0);
+        let wide_genesis = wide
+            .process_genesis(CURRENCY, capped_config_builder(TEST_W, 3).content())
+            .ok()
+            .expect("genesis succeeds");
+        let one = register(2, wide_genesis.block_one.view().hash(), 1, 0xB1);
+        assert_eq!(
+            receive(&mut wide, &one),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let two = register(3, one.view().hash(), 2, 0xB2);
+        assert_eq!(
+            receive(&mut wide, &two),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert!(wide.node_info.is_seeded(2));
     }
 
     /// AC10: the FR3 pass applies the same rule to a registration (here the
@@ -18187,13 +18228,32 @@ mod tests {
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
-        assert!(matches!(
-            bc.run_processing_pass(ri),
+        assert_eq!(
+            bc.run_processing_pass(ri).map(|_| ()),
             Err(ProcessingError::Invalid {
+                block_idx: ri,
                 reason: ValidationReason::NodeCountExceeded,
-                ..
             })
-        ));
+        );
+    }
+
+    /// AC10: the equality the guard removal rests on — the cap equals the
+    /// build's `MAX_NODES` (16) — and the last id below it registers and gets
+    /// its slot.
+    #[test]
+    fn fr6_registration_just_below_the_node_cap_registers() {
+        let mut bc = new_test_chain();
+        let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES - 2);
+        bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
+            .expect("anchor admitted");
+        let reg = registration_block(101, anchor.view().hash(), 1, TEST_MAX_NODES - 1, 0xC3);
+        let ri = bc
+            .tier1_admit(&reg.view(), &reg.view().hash(), 0)
+            .expect("registration admitted");
+        assert!(bc.run_processing_pass(ri).is_ok());
+        assert!(bc.node_info.is_seeded(TEST_MAX_NODES - 1));
+        assert_eq!(bc.node_info.max_known_node_id(), TEST_MAX_NODES - 1);
     }
 
     /// AC10: a balance block naming an id at the cap is exact evidence; one just
@@ -18206,13 +18266,15 @@ mod tests {
         let oi = bc
             .tier1_admit(&over.view(), &over.view().hash(), 0)
             .expect("admitted");
-        assert!(matches!(
-            bc.run_processing_pass(oi),
+        // The over-cap block is the floor of this window-anchored candidate: it
+        // is condemned before it can seed the watermark.
+        assert_eq!(
+            bc.run_processing_pass(oi).map(|_| ()),
             Err(ProcessingError::Invalid {
+                block_idx: oi,
                 reason: ValidationReason::NodeCountExceeded,
-                ..
             })
-        ));
+        );
 
         let mut bc = new_test_chain();
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
@@ -18220,12 +18282,6 @@ mod tests {
         let ai = bc
             .tier1_admit(&at_limit.view(), &at_limit.view().hash(), 0)
             .expect("admitted");
-        assert!(!matches!(
-            bc.run_processing_pass(ai),
-            Err(ProcessingError::Invalid {
-                reason: ValidationReason::NodeCountExceeded,
-                ..
-            })
-        ));
+        assert!(bc.run_processing_pass(ai).is_ok());
     }
 }
