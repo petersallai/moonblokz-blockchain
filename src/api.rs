@@ -965,6 +965,9 @@ impl<
     /// - `block_size_max` — `MAX_BLOCK_SIZE`, the block buffer of this build's
     ///   size tier (DEC-220). The chain's `block_size_limit` must fit it (§6
     ///   check 5), so a block above it is a local refusal, never evidence.
+    /// - `node_count_max` — `MAX_NODES`, the node-indexed arrays. The chain's
+    ///   `max_node_count` must fit it (§6 check 18), so every registered node id
+    ///   has a slot (DEC-228).
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
         utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
@@ -993,6 +996,13 @@ impl<
         },
         // Lossless: chain-types asserts `MAX_BLOCK_SIZE <= u32::MAX`.
         block_size_max: MAX_BLOCK_SIZE as u32,
+        node_count_max: {
+            assert!(
+                MAX_NODES <= u32::MAX as usize,
+                "MAX_NODES must fit the configuration module's u32 capacity"
+            );
+            MAX_NODES as u32
+        },
     };
 
     /// Constructs the node in place, inside caller-provided storage, and
@@ -6776,6 +6786,11 @@ mod tests {
         if w >= TEST_W { TEST_H } else { 1 }
     }
 
+    /// The network node cap every test configuration declares (DEC-228): the
+    /// test chains' `MAX_NODES`. The default 1000 exceeds it, so acceptance
+    /// would refuse a content that left it out (configuration §6 check 18).
+    const TEST_MAX_NODES: u32 = 16;
+
     /// The block table of the `TEST_W` harnesses: the window, the horizon and
     /// one competing branch of depth `H` (configuration §6 check 16). The test
     /// backend stores eight blocks, so the size only has to pass the check.
@@ -6786,27 +6801,7 @@ mod tests {
     /// to its code-baked default, and those defaults are exactly the constants
     /// the retired `FixedChainConfig` returned — which is why the suite's
     /// expected values are unchanged.
-    const BASE_CONFIG_CONTENT: [u8; 14] = [
-        2,
-        0,
-        parameter::ACTIVE_CHAIN_LENGTH,
-        4,
-        TEST_W.to_le_bytes()[0],
-        TEST_W.to_le_bytes()[1],
-        TEST_W.to_le_bytes()[2],
-        TEST_W.to_le_bytes()[3],
-        parameter::VERIFICATION_HORIZON,
-        4,
-        test_horizon(TEST_W).to_le_bytes()[0],
-        test_horizon(TEST_W).to_le_bytes()[1],
-        test_horizon(TEST_W).to_le_bytes()[2],
-        test_horizon(TEST_W).to_le_bytes()[3],
-    ];
-
-    /// A second content region, valid and **distinct in bytes** but resolving
-    /// identically: the base entry plus a literal declaring `vote_interest`'s
-    /// own default. Used where a test needs two different chain-config contents.
-    const OTHER_CONFIG_CONTENT: [u8; 17] = [
+    const BASE_CONFIG_CONTENT: [u8; 20] = [
         3,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
@@ -6821,6 +6816,38 @@ mod tests {
         test_horizon(TEST_W).to_le_bytes()[1],
         test_horizon(TEST_W).to_le_bytes()[2],
         test_horizon(TEST_W).to_le_bytes()[3],
+        parameter::MAX_NODE_COUNT,
+        4,
+        TEST_MAX_NODES.to_le_bytes()[0],
+        TEST_MAX_NODES.to_le_bytes()[1],
+        TEST_MAX_NODES.to_le_bytes()[2],
+        TEST_MAX_NODES.to_le_bytes()[3],
+    ];
+
+    /// A second content region, valid and **distinct in bytes** but resolving
+    /// identically: the base entry plus a literal declaring `vote_interest`'s
+    /// own default. Used where a test needs two different chain-config contents.
+    const OTHER_CONFIG_CONTENT: [u8; 23] = [
+        4,
+        0,
+        parameter::ACTIVE_CHAIN_LENGTH,
+        4,
+        TEST_W.to_le_bytes()[0],
+        TEST_W.to_le_bytes()[1],
+        TEST_W.to_le_bytes()[2],
+        TEST_W.to_le_bytes()[3],
+        parameter::VERIFICATION_HORIZON,
+        4,
+        test_horizon(TEST_W).to_le_bytes()[0],
+        test_horizon(TEST_W).to_le_bytes()[1],
+        test_horizon(TEST_W).to_le_bytes()[2],
+        test_horizon(TEST_W).to_le_bytes()[3],
+        parameter::MAX_NODE_COUNT,
+        4,
+        TEST_MAX_NODES.to_le_bytes()[0],
+        TEST_MAX_NODES.to_le_bytes()[1],
+        TEST_MAX_NODES.to_le_bytes()[2],
+        TEST_MAX_NODES.to_le_bytes()[3],
         parameter::VOTE_INTEREST,
         1,
         5,
@@ -6841,6 +6868,10 @@ mod tests {
             .expect("a four-byte literal is well-formed");
         builder
             .add_literal(parameter::VERIFICATION_HORIZON, &h.to_le_bytes())
+            .ok()
+            .expect("a four-byte literal is well-formed");
+        builder
+            .add_literal(parameter::MAX_NODE_COUNT, &TEST_MAX_NODES.to_le_bytes())
             .ok()
             .expect("a four-byte literal is well-formed");
         builder
@@ -7735,8 +7766,9 @@ mod tests {
         // entry is the one every content on this harness carries.
         let w = TEST_W.to_le_bytes();
         let h = test_horizon(TEST_W).to_le_bytes();
+        let n = TEST_MAX_NODES.to_le_bytes();
         let content = [
-            3u8,
+            4u8,
             0,
             parameter::BLOCK_SIZE_LIMIT,
             4,
@@ -7756,6 +7788,12 @@ mod tests {
             h[1],
             h[2],
             h[3],
+            parameter::MAX_NODE_COUNT,
+            4,
+            n[0],
+            n[1],
+            n[2],
+            n[3],
         ];
 
         let outcome = bc.process_genesis(1_000_000_000, &content);
