@@ -33,6 +33,7 @@ use moonblokz_crypto::{
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
+use crate::approval::SupportMessage;
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
 use crate::branch_value::{Rank, block_value};
@@ -323,12 +324,12 @@ pub(crate) enum AdmitError {
 /// convention). Classification is deterministic in the block bytes + current
 /// authoritative state and is independent of transport origin.
 ///
-/// Epic 4 realizes the three terminal variants below. The `AcceptedAndSend*`
-/// addendum variants of architecture §3.2 are a forward-tagged extension, each
-/// added **with its payload type by its owning story**:
-/// `AcceptedAndSendBlock(BlockView<'_>)` by Epic 8 (FR26 relay) and
-/// `AcceptedAndSendSupport(SupportView<'_>)` by Epic 6 (FR12 deviance support);
-/// these borrowing variants introduce the `<'a>` lifetime when they land.
+/// Epic 4 realizes the three terminal variants; Story 6.4 adds
+/// [`Self::AcceptedAndSendSupport`], which carries an **owned**
+/// [`SupportMessage`] (D4), so the enum still has no lifetime. The remaining
+/// `AcceptedAndSend*` addendum variant of architecture §3.2,
+/// `AcceptedAndSendBlock(BlockView<'_>)`, is added with its payload type by
+/// Epic 8; that borrowing variant introduces the `<'a>` lifetime when it lands.
 ///
 /// **FR19 parent recovery is emitted from the tick, not here.** The architecture
 /// §3.2 sketch also lists `AcceptedAndSendParentRecoveryRequest`, and Story 4.3
@@ -352,6 +353,11 @@ pub enum ReceiveBlockOutcome {
     AcceptedSilently,
     /// FR16 / FR60 — the block was refused; see [`RejectReason`].
     Rejected(RejectReason),
+    /// FR12 — the block was admitted as [`Self::AcceptedSilently`] would be, and
+    /// it is a deviating block the local node endorses: the bridge sends the
+    /// support message to its proposer. Issuing support changes no chain
+    /// state.
+    AcceptedAndSendSupport(SupportMessage),
 }
 
 /// Why a block was refused at intake. Per the FR10 minimal-response convention
@@ -2519,10 +2525,12 @@ impl<
         // admission may complete a candidate segment. Evaluate the stopping
         // condition and, on success, transition Collecting→Processing. Runs only
         // after a real admission (not on duplicate/reject) and only while
-        // Collecting (Processing/Ready never re-trigger). `AcceptedSilently` is
-        // currently the sole accept outcome; when Epic 6/8 add `AcceptedAndSend*`
-        // accept variants they must be included in this gate (else a block admitted
-        // under them would miss the transition).
+        // Collecting (Processing/Ready never re-trigger). `classify_block`
+        // reports every admission as `AcceptedSilently`, and the gates below
+        // test exactly that. An `AcceptedAndSend*` variant replaces it only in
+        // the return value, after the last gate (Story 6.4: support is decided
+        // once, at the end), so no admission misses a gate; a later variant
+        // must keep that rule.
         //
         // The configuration is part of the gate (Story 5.8): the FR3 derivation
         // reads the FR37 vote parameters, so without a loaded configuration the
@@ -18283,5 +18291,21 @@ mod tests {
             .tier1_admit(&at_limit.view(), &at_limit.view().hash(), 0)
             .expect("admitted");
         assert!(bc.run_processing_pass(ai).is_ok());
+    }
+
+    // ---- Story 6.4: ADR-015 subgroup selection and FR12 support emission ----
+
+    /// AC2 — the size pin (deferred-work D8): the owned support message and the
+    /// outcome that carries it. Three `u32`s, the hash and the backend's
+    /// serialized multi-signature, with no padding; the outcome adds its tag,
+    /// rounded to the `u32` alignment. 108 B and 112 B on Schnorr (64-byte
+    /// signature), 92 B and 96 B on BLS (48 bytes).
+    #[test]
+    fn the_support_outcome_has_its_pinned_size() {
+        use moonblokz_chain_types::HASH_SIZE;
+        use moonblokz_crypto::MULTI_SIGNATURE_SIZE;
+        let message = core::mem::size_of::<SupportMessage>();
+        assert_eq!(message, 3 * 4 + HASH_SIZE + MULTI_SIGNATURE_SIZE);
+        assert_eq!(core::mem::size_of::<ReceiveBlockOutcome>(), message + 4);
     }
 }

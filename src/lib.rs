@@ -46,6 +46,7 @@ pub use api::{
     ReceiveBlockOutcome, ReceiveTransactionOutcome, RejectReason, TickOutcome, TransactionState,
     TxStateQueryError,
 };
+pub use approval::SupportMessage;
 
 #[cfg(test)]
 mod tests {
