@@ -148,15 +148,22 @@ const RING_SLOTS: usize = 16;
 const RING_ENTRY_SIZE: usize = 13;
 
 /// FR12 / DEC-198 / DEC-219 — the non-conflict record: the supports this node
-/// has given, so it never endorses two different blocks for one
+/// has given, so it does not endorse two different blocks for one
 /// `(proposer, p)`, and the monotone support floor `F`.
 ///
 /// `F` is both the "resolved" boundary and the restart floor (D8): it is
 /// raised to the active head at every ready entry and to `S_head − H` at every
 /// evaluation, never lowered, and no support is given at `p ≤ F`. An entry at
 /// `s ≤ F` is resolved — intake refuses every block there (FR58) — so its slot
-/// is free. Raising `F` before any reuse is what keeps a switch to a shorter
-/// branch, which lowers `S_head`, from reopening a sequence.
+/// is free. `S_head` itself can fall — a DEC-205 re-entry to collecting may
+/// come back on a lower head — so raising `F` before any reuse, and never
+/// lowering it, is what keeps a sequence from reopening.
+///
+/// Insert takes a free slot first. With all 16 live it reuses a live support
+/// entry at the same sequence for another proposer — a later grace round's
+/// candidate; the evicted proposer could only get a twin endorsed, FR70
+/// evidence against it (D8) — and otherwise abstains: an entry at another
+/// sequence, or for the same `(proposer, p)`, is never overwritten (DEC-198).
 ///
 /// Non-durable (FR59): a restart is a fresh `init`, with an empty ring and
 /// `F = 0` until the ready entry raises it. Never cleared otherwise, not even by
@@ -277,12 +284,9 @@ impl NonConflictRing {
 /// (`tail_creator == NONE_REF`) outside ready state, after a projection reset,
 /// or after an arithmetic inconsistency, and then the node gives no support.
 ///
-/// Counts are 15 bits of a `u16`: Story 6.4 counts creators only, at most one
-/// per window block, and the window is at most `SNAKE_CHAIN_LENGTH_MAX ≤
-/// COUNT_MAX` (asserted where the capacity is known). The top bit is a scratch
-/// mark the support evaluation sets on the creators of the blocks the window
-/// dropped above `p − 1` and always clears again, so the `p − 1` correction
-/// needs no list and no second counter. Story 6.6 re-checks the width when
+/// Counts are `u16`: Story 6.4 counts creators only, at most one per window
+/// block, and the window is at most `SNAKE_CHAIN_LENGTH_MAX ≤ u16::MAX`
+/// (asserted where the capacity is known). Story 6.6 re-checks the width when
 /// evidence signers count too (O-037).
 #[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct ActiveSetCounter<const MAX_NODES: usize> {
@@ -292,10 +296,6 @@ pub(crate) struct ActiveSetCounter<const MAX_NODES: usize> {
 
 /// The `tail_creator` of an invalid counter.
 const COUNTER_INVALID: u32 = u32::MAX;
-/// The scratch mark bit of a count.
-const COUNT_MARK: u16 = 0x8000;
-/// The largest count: a window is at most this many blocks.
-pub(crate) const COUNT_MAX: u16 = !COUNT_MARK;
 
 impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
     /// In-place construction: all counts zero, invalid. Never a
@@ -352,9 +352,7 @@ impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
     /// [`Self::in_set_at_parent`].
     #[cfg(test)]
     pub(crate) fn count(&self, node: u32) -> u16 {
-        self.counts
-            .get(node as usize)
-            .map_or(0, |count| count & COUNT_MAX)
+        self.counts.get(node as usize).copied().unwrap_or(0)
     }
 
     /// A block by `creator` entered the window. Overflow, or an id beyond the
@@ -364,7 +362,7 @@ impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
             return;
         }
         match self.counts.get_mut(creator as usize) {
-            Some(count) if *count & COUNT_MAX < COUNT_MAX => *count += 1,
+            Some(count) if *count < u16::MAX => *count += 1,
             _ => self.invalidate(),
         }
     }
@@ -376,50 +374,31 @@ impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
             return;
         }
         match self.counts.get_mut(creator as usize) {
-            Some(count) if *count & COUNT_MAX > 0 => *count -= 1,
+            Some(count) if *count > 0 => *count -= 1,
             _ => self.invalidate(),
-        }
-    }
-
-    /// Marks `node` as the creator of a block the window dropped above the
-    /// evaluation point (the `p − 1` correction). An id beyond the capacity has
-    /// no slot and is reported, so the caller can give up.
-    pub(crate) fn mark(&mut self, node: u32) -> bool {
-        match self.counts.get_mut(node as usize) {
-            Some(count) => {
-                *count |= COUNT_MARK;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Clears every mark.
-    pub(crate) fn clear_marks(&mut self) {
-        for count in self.counts.iter_mut() {
-            *count &= COUNT_MAX;
         }
     }
 
     /// Membership in `A` at `p − 1`, from the head's counts and the
     /// correction (D2): the `above` active blocks in `[p, S_head]`, all by
     /// `creator_d` (the shape check guarantees it), leave the window again,
-    /// and the blocks they dropped return — marked, or counted in
-    /// `returning_d` when by `creator_d`.
+    /// and the blocks they dropped return — `returned` when one of them is
+    /// `node`'s, or counted in `returning_d` when by `creator_d`.
     pub(crate) fn in_set_at_parent(
         &self,
         node: u32,
         creator_d: u32,
         above: u32,
         returning_d: u32,
+        returned: bool,
     ) -> bool {
-        let Some(&raw) = self.counts.get(node as usize) else {
+        let Some(&count) = self.counts.get(node as usize) else {
             return false;
         };
         if node == creator_d {
-            u32::from(raw & COUNT_MAX) + returning_d > above
+            u32::from(count) + returning_d > above
         } else {
-            raw & COUNT_MAX > 0 || raw & COUNT_MARK != 0
+            count > 0 || returned
         }
     }
 
@@ -519,6 +498,7 @@ mod tests {
         // (|A'|, required_support, m)
         let table = [
             (0, 1, None),
+            (0, 2, None),
             (0, 40, None),
             (1, 1, Some(1)),
             (1, 2, Some(1)),
@@ -610,8 +590,8 @@ mod tests {
     }
 
     /// AC9 / D8 — a resolved slot (`s ≤ F`) is free and reused first; with
-    /// every slot live, a same-`p` support for another proposer is reused, and
-    /// otherwise the node abstains.
+    /// every slot live, a same-`p` support for another proposer is reused (and
+    /// only that slot), and otherwise the node abstains.
     #[test]
     fn the_ring_reuses_resolved_then_same_sequence_slots_else_abstains() {
         let mut ring = NonConflictRing::new();
@@ -621,7 +601,7 @@ mod tests {
         // Full of live entries at distinct sequences: abstain.
         assert!(!ring.insert(RING_KIND_SUPPORT, 99, 200, KEY_A));
         // Same sequence as entry 3 (proposer 3 at 103), another proposer: a
-        // later grace round's candidate reuses that slot.
+        // later grace round's candidate reuses that slot, and only that one.
         assert!(ring.insert(RING_KIND_SUPPORT, 50, 103, KEY_B));
         assert_eq!(
             ring.check(RING_KIND_SUPPORT, 50, 103, KEY_B),
@@ -631,16 +611,29 @@ mod tests {
             ring.check(RING_KIND_SUPPORT, 3, 103, KEY_B),
             RingCheck::Free
         );
+        for i in (0..16).filter(|&i| i != 3) {
+            assert_eq!(
+                ring.check(RING_KIND_SUPPORT, i, 100 + i, KEY_A),
+                RingCheck::SameBlock,
+                "entry {i} untouched"
+            );
+        }
         // The same proposer at the same sequence is never a reuse target.
         assert!(!ring.insert(RING_KIND_SUPPORT, 50, 103, KEY_A));
         // Raising F resolves entries at or below it: their slots are free, and
-        // their sequences are closed (the evaluation refuses `p ≤ F`).
+        // their sequences are closed (the evaluation refuses `p ≤ F`). A
+        // resolved slot is taken before a same-`p` live one.
         ring.raise_floor(101);
         assert_eq!(
             ring.check(RING_KIND_SUPPORT, 0, 100, KEY_B),
             RingCheck::Free
         );
-        assert!(ring.insert(RING_KIND_SUPPORT, 99, 200, KEY_A));
+        assert!(ring.insert(RING_KIND_SUPPORT, 60, 103, KEY_A));
+        assert_eq!(
+            ring.check(RING_KIND_SUPPORT, 50, 103, KEY_B),
+            RingCheck::SameBlock,
+            "the same-p entry survives while a resolved slot is free"
+        );
         assert!(ring.insert(RING_KIND_SUPPORT, 98, 201, KEY_A));
         assert!(!ring.insert(RING_KIND_SUPPORT, 97, 202, KEY_A));
     }
@@ -683,23 +676,24 @@ mod tests {
         counter.add(4);
         assert!(!counter.is_valid(), "an id beyond the capacity");
         counter.start_build(0);
-        for _ in 0..COUNT_MAX {
+        for _ in 0..u16::MAX {
             counter.add(0);
         }
         assert!(counter.is_valid());
         counter.add(0);
-        assert!(!counter.is_valid(), "overflow into the mark bit");
+        assert!(!counter.is_valid(), "overflow");
     }
 
     /// AC9 — the `p − 1` correction equals a recomputed reference: the counts
     /// of a window `[p − W, p − 1]` from the counts of `[S_head − W + 1,
-    /// S_head]` with the blocks above `p − 1` (all by one creator) removed and
-    /// the dropped ones marked back.
+    /// S_head]` with the blocks above `p − 1` (all by one creator, `d`'s)
+    /// removed and the dropped ones returned — one of them `d`'s creator's.
     #[test]
     fn the_parent_correction_matches_a_recomputed_window() {
         const W: usize = 6;
-        // Creators by sequence 0..12; the head is at 11, `p` at 9.
-        let chain = [0u32, 1, 2, 3, 1, 4, 2, 0, 5, 6, 6, 6];
+        // Creators by sequence 0..12; the head is at 11, `p` at 9, and `d`'s
+        // creator 6 also made block 4, which returns.
+        let chain = [0u32, 1, 2, 3, 6, 4, 2, 0, 5, 6, 6, 6];
         let (head, p) = (11usize, 9usize);
         let creator_d = chain[p];
         let mut counter = ActiveSetCounter::<8>::new();
@@ -709,27 +703,28 @@ mod tests {
         }
         let above = (head - p + 1) as u32;
         let mut returning_d = 0;
+        let mut returned = [false; 8];
         for &c in &chain[p - W..=head - W] {
             if c == creator_d {
                 returning_d += 1;
             } else {
-                assert!(counter.mark(c));
+                returned[c as usize] = true;
             }
         }
+        assert_eq!(returning_d, 1, "the fixture returns one of d's blocks");
         let mut reference = [0u32; 8];
         for &c in &chain[p - W..p] {
             reference[c as usize] += 1;
         }
         for node in 0..8u32 {
-            assert_eq!(
-                counter.in_set_at_parent(node, creator_d, above, returning_d),
-                reference[node as usize] > 0,
-                "node {node}"
+            let member = counter.in_set_at_parent(
+                node,
+                creator_d,
+                above,
+                returning_d,
+                returned[node as usize],
             );
-        }
-        counter.clear_marks();
-        for node in 0..8u32 {
-            assert_eq!(counter.count(node) & COUNT_MARK, 0);
+            assert_eq!(member, reference[node as usize] > 0, "node {node}");
         }
     }
 }
