@@ -7390,7 +7390,7 @@ mod tests {
         assert_eq!(config.grace_period_window_ms(), 30_000);
         assert_eq!(config.block_size_limit(), 2016);
         assert_eq!(config.max_utxo_outputs(), 255);
-        assert_eq!(config.max_aggregated_signatures(), 50);
+        assert_eq!(config.required_support(), 40);
         assert_eq!(config.vote_scale().get(), 1000);
         assert_eq!(config.vote_interest(), 5);
         assert_eq!(config.parent_recovery_per_head_retry_interval_ms(), 120_000);
