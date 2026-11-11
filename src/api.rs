@@ -2222,16 +2222,38 @@ impl<
             return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
         }
 
+        // FR19 parent resolution (Story 4.4), a pure RAM lookup. Resolved here,
+        // ahead of the signature check that needs it (Story 6.4 D3).
+        // `previous_hash()` is a 32-byte slice; convert to the array key.
+        // Genesis (`sequence == 0`) has no parent.
+        let prev_hash: [u8; 32] = block.previous_hash().try_into().unwrap_or([0; 32]);
+        let parent = self.blocks.find_parent(&prev_hash, block.sequence());
+
         // FR9 Tier 1 case (2) (Story 6.2 D6, DEC-157): in Ready, the creator
         // signature is exact evidence, before anything is written, whenever the
         // creator's key is the same on every branch that can connect. A pass
         // marks the entry, so the per-block step never verifies it again.
+        //
+        // Story 6.4 D3: a block whose parent is a flagged active-chain block has
+        // the active chain up to its parent as its own ancestry, so a key seeded
+        // at or below the parent is this block's own branch key. The bound is
+        // then the parent's sequence instead of the tail's — never below it
+        // (`p − 1 ≥ S_head − H ≥ S_tail` for anything intake admits), so it
+        // only ever verifies more. FR12 needs it: a deviating sibling must be
+        // signature-verified to be endorsed, and a bad signature is exact
+        // evidence here, before the write.
         let signature_verified = self.lifecycle_phase == LifecyclePhase::Ready
             && self
                 .blocks
                 .get(self.snake_chain_tail_idx)
                 .is_some_and(|tail| {
-                    self.key_is_branch_independent(block.creator(), tail.sequence())
+                    let parent_on_chain = parent
+                        .and_then(|p| self.blocks.get(p))
+                        .filter(|entry| entry.is_on_active_chain())
+                        .map(|entry| entry.sequence());
+                    let bound =
+                        parent_on_chain.map_or(tail.sequence(), |seq| seq.max(tail.sequence()));
+                    self.key_is_branch_independent(block.creator(), bound)
                 })
             && match self.verify_block_creator_signature(block) {
                 Some(false) => {
@@ -2300,11 +2322,6 @@ impl<
             moonblokz_configuration::accept_content(block.payload(), Self::BUILD_LIMITS)
                 .map_err(|_| AdmitError::Rejected(Tier1Failure::ChainConfigContentRejected))?;
         }
-
-        // FR19 parent resolution (Story 4.4). `previous_hash()` is a 32-byte
-        // slice; convert to the array key. Genesis (`sequence == 0`) has no parent.
-        let prev_hash: [u8; 32] = block.previous_hash().try_into().unwrap_or([0; 32]);
-        let parent = self.blocks.find_parent(&prev_hash, block.sequence());
 
         // FR19 bootstrap (AC7): a genesis block (sequence 0, no parent) anchors
         // the active chain — mark it on-chain and record it as the active head so
@@ -4268,8 +4285,10 @@ impl<
     /// node seeded at or below `bound`, or whose seed source was released. Its
     /// registration then lies on the shared chain, and a key never changes
     /// after registration. Intake passes `S_tail` — every branch that can
-    /// connect forks at or above `S_head − H ≥ S_tail` (DEC-207, DEC-208) — and the chain-switch
-    /// pre-pass passes the common ancestor. RAM only.
+    /// connect forks at or above `S_head − H ≥ S_tail` (DEC-207, DEC-208) — or,
+    /// for a block whose parent is a flagged active-chain block, the parent's
+    /// sequence (Story 6.4 D3); the chain-switch pre-pass passes the common
+    /// ancestor. RAM only.
     fn key_is_branch_independent(&self, creator: u32, bound: u32) -> bool {
         if creator == 0 {
             return true;
@@ -17489,13 +17508,35 @@ mod tests {
 
     /// AC11.9 / D5 — the pre-pass: a bad signature by a creator registered at
     /// or below the common ancestor is deleted before anything is touched (no
-    /// read of the old head beyond its FORK valuation); one by a creator
+    /// read of the old head); one by a creator
     /// registered above it is refused by the replay instead, which restores
     /// and deletes it.
+    ///
+    /// Rebased by Story 6.4 (D3): a forged sibling whose parent is an active
+    /// block (`a2`) is now caught by Tier 1 at intake, measured against the key
+    /// at its parent, so the pre-pass case uses a forged block on a side block
+    /// (`s3`), whose parent is off the active chain and keeps the tail bound.
     #[test]
     fn fr23_signature_prepass() {
         let (mut bc, _, a2, a3) = failing_two_creator_chain();
-        let bad = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x77);
+        let forged_sibling = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x77);
+        assert_eq!(
+            receive(&mut bc, &forged_sibling),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            "Tier 1 judges it against the key at its active parent"
+        );
+        let s3 = (20..400)
+            .map(|salt| alt(3, a2.view().hash(), 1, 1, 0, salt, false))
+            .find(|g| g.view().len() == a3.view().len() && g.view().hash() > a3.view().hash())
+            .expect("a same-size sibling with a higher hash");
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, a3.view().hash()), "a tie lost by hash");
+        let bad = resign(
+            &alt(4, s3.view().hash(), 0, 1, 0, 41, false),
+            1,
+            vote_snapshot(1000),
+            0x77,
+        );
         bc.storage.failing_slot = slot(&bc, &a3);
         bc.storage.reads_left.set(1);
         assert_eq!(
@@ -17506,8 +17547,8 @@ mod tests {
         assert_eq!(head_of(&bc), (3, a3.view().hash()));
         assert_eq!(
             bc.storage.attempts.get(),
-            1,
-            "only the FORK valuation read a3"
+            0,
+            "the fork already exists at s3: nothing of the old branch is read"
         );
         bc.storage.failing_slot = NONE_REF;
 
@@ -18307,5 +18348,74 @@ mod tests {
         let message = core::mem::size_of::<SupportMessage>();
         assert_eq!(message, 3 * 4 + HASH_SIZE + MULTI_SIGNATURE_SIZE);
         assert_eq!(core::mem::size_of::<ReceiveBlockOutcome>(), message + 4);
+    }
+
+    /// Whether `block` is held with its creator signature marked verified.
+    fn verified<S: StorageTrait>(bc: &Chain16<S>, block: &Block) -> Option<bool> {
+        let view = block.view();
+        bc.blocks
+            .find(view.sequence(), &view.hash())
+            .and_then(|idx| bc.blocks.get(idx))
+            .map(|entry| entry.is_signature_verified())
+    }
+
+    /// AC9 test 4 (D3) — Tier 1 measures a block whose parent is a flagged
+    /// active-chain block against the key at its parent, not at the tail.
+    /// Node #1 is registered by `a2` (sequence 2) above the tail (#0), so the
+    /// old bound left its siblings unverified.
+    #[test]
+    fn tier1_verifies_a_sibling_against_the_key_at_its_active_parent() {
+        // Seeded inside `(tail, p − 1]`: a sibling of `a3` on `a2` is
+        // verified, and a bad signature is exact evidence, never stored.
+        let (mut bc, _, a2, _) = two_creator_chain();
+        let good = headed(
+            3,
+            a2.view().hash(),
+            1,
+            NODE_ONE_KEY,
+            0,
+            1,
+            0,
+            votes_for(3, 0, 1, 900),
+        );
+        assert_eq!(
+            receive(&mut bc, &good),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(verified(&bc, &good), Some(true));
+        let forged = headed(
+            3,
+            a2.view().hash(),
+            1,
+            0xC3,
+            0,
+            1,
+            0,
+            votes_for(3, 0, 1, 901),
+        );
+        assert_eq!(
+            receive(&mut bc, &forged),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(status_of(&bc, &forged), None, "not stored");
+
+        // Seeded above `p − 1`: a node #1 sibling of `a2` on `b1` is admitted
+        // unverified — its key is not its branch's key at `p − 1 = 1`.
+        let (mut bc, b1, _, _) = two_creator_chain();
+        let early = headed(
+            2,
+            b1.view().hash(),
+            1,
+            NODE_ONE_KEY,
+            0,
+            1,
+            0,
+            votes_for(2, 0, 1, 902),
+        );
+        assert_eq!(
+            receive(&mut bc, &early),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(verified(&bc, &early), Some(false));
     }
 }
