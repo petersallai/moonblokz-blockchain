@@ -20,19 +20,25 @@
 
 use moonblokz_chain_types::{
     Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HEADER_SIZE,
-    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_BALANCE,
-    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE, Registration,
-    TransactionView,
+    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL,
+    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE,
+    Registration, TransactionView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
 };
 use moonblokz_crypto::{
-    CryptoTrait, PUBLIC_KEY_SIZE, PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
+    CryptoTrait, MULTI_SIGNATURE_SIZE, MultiSignatureTrait, PUBLIC_KEY_SIZE, PublicKeyTrait,
+    SIGNATURE_SIZE, SignatureTrait,
 };
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
+use crate::approval::{
+    ActiveSetCounter, CIRCULATING_CURRENCY_STUB, NonConflictRing, RING_KIND_SUPPORT, RingCheck,
+    SUPPORT_MESSAGE_SIZE, SupportMessage, in_subgroup, subgroup_seed, subgroup_size,
+    support_message_bytes,
+};
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
 use crate::branch_value::{Rank, block_value};
@@ -41,7 +47,7 @@ use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
 use crate::node_info::{NodeInfoState, SEED_SOURCE_RELEASED};
 use crate::prng::Prng;
-use crate::snake_chain::{TailBinding, classify_tail_drop, tail_drop_binding};
+use crate::snake_chain::{TailBinding, TailObligation, classify_tail_drop, tail_drop_binding};
 use crate::staged_validation::{
     BlockStatus, Tier1Failure, tier1_chain_config_block, tier1_gate, verify_signature_bytes,
 };
@@ -323,12 +329,12 @@ pub(crate) enum AdmitError {
 /// convention). Classification is deterministic in the block bytes + current
 /// authoritative state and is independent of transport origin.
 ///
-/// Epic 4 realizes the three terminal variants below. The `AcceptedAndSend*`
-/// addendum variants of architecture §3.2 are a forward-tagged extension, each
-/// added **with its payload type by its owning story**:
-/// `AcceptedAndSendBlock(BlockView<'_>)` by Epic 8 (FR26 relay) and
-/// `AcceptedAndSendSupport(SupportView<'_>)` by Epic 6 (FR12 deviance support);
-/// these borrowing variants introduce the `<'a>` lifetime when they land.
+/// Epic 4 realizes the three terminal variants; Story 6.4 adds
+/// [`Self::AcceptedAndSendSupport`], which carries an **owned**
+/// [`SupportMessage`] (D4), so the enum still has no lifetime. The remaining
+/// `AcceptedAndSend*` addendum variant of architecture §3.2,
+/// `AcceptedAndSendBlock(BlockView<'_>)`, is added with its payload type by
+/// Epic 8; that borrowing variant introduces the `<'a>` lifetime when it lands.
 ///
 /// **FR19 parent recovery is emitted from the tick, not here.** The architecture
 /// §3.2 sketch also lists `AcceptedAndSendParentRecoveryRequest`, and Story 4.3
@@ -352,6 +358,11 @@ pub enum ReceiveBlockOutcome {
     AcceptedSilently,
     /// FR16 / FR60 — the block was refused; see [`RejectReason`].
     Rejected(RejectReason),
+    /// FR12 — the block was admitted as [`Self::AcceptedSilently`] would be, and
+    /// it is a deviating block the local node endorses: the bridge sends the
+    /// support message to its proposer. Issuing support changes no chain
+    /// state.
+    AcceptedAndSendSupport(SupportMessage),
 }
 
 /// Why a block was refused at intake. Per the FR10 minimal-response convention
@@ -608,14 +619,22 @@ impl Projection {
     };
 }
 
+/// What a tail advance needs from the block that becomes the new `S_tail`,
+/// read once, before any mutation: its FR21 value (Story 6.1 D1) and its
+/// creator, the active set's next decrement (Story 6.4 D2).
+#[derive(Clone, Copy)]
+struct TailStep {
+    value: u64,
+    creator: u32,
+}
+
 /// The verdict on a prospective extension of the active head (Story 6.0 D2).
 enum Extension {
     /// The window gate and the fallible half of the step passed. `advance`
-    /// is `Some(value)` when promoting it moves the tail: the FR21 value of
-    /// the block that becomes the new `S_tail`, read before any mutation
-    /// (Story 6.1 D1).
+    /// is `Some` when promoting it moves the tail, carrying the new `S_tail`
+    /// block's [`TailStep`].
     Valid {
-        advance: Option<u64>,
+        advance: Option<TailStep>,
         derivation: BlockDerivation,
     },
     /// Exact evidence of invalidity (Tier 2 / Tier 3, or the FR48 binding).
@@ -627,9 +646,14 @@ enum Extension {
 /// What the continuation does with a stored child of the head after the
 /// whole per-block step ran on it (Story 6.0 AC4).
 enum ChildStep {
-    /// Applied: promote it. `value` is its FR21 value; `advance` moves the
-    /// tail, carrying the new `S_tail` block's value.
-    Applied { advance: Option<u64>, value: u64 },
+    /// Applied: promote it. `value` is its FR21 value and `creator` its
+    /// creator; `advance` moves the tail, carrying the new `S_tail` block's
+    /// [`TailStep`].
+    Applied {
+        advance: Option<TailStep>,
+        value: u64,
+        creator: u32,
+    },
     /// Exact evidence: delete it with its descendants.
     Invalid,
     /// A local failure: leave it Stored for a later retry.
@@ -909,6 +933,15 @@ pub struct Blockchain<
     // value — grown on every head extension, reduced by the new `S_tail`
     // block's value on every tail advance (D1), 0 without a window.
     active_branch_value: u64,
+    // FR12 active set `A` (Story 6.4 D2, DEC-213): per node, its blocks in the
+    // active window, with the tail's creator kept for the next decrement.
+    // Maintained at the ready-state window events from reads they already do;
+    // built at every ready entry; invalid otherwise. `2·MAX_NODES` B + 4 B.
+    active_set: ActiveSetCounter<MAX_NODES>,
+    // FR12 non-conflict record and support floor `F` (Story 6.4 D8, DEC-219):
+    // 208 B + 4 B. Initialized only here and never cleared, not even by a
+    // re-entry to collecting; non-durable, so a restart starts empty.
+    non_conflict: NonConflictRing,
     // No completeness horizon (Story 6.14 D6, DEC-211, withdrawing DEC-167):
     // a balance entry is a snapshot of its node at its position, so the undo
     // of a seed is identity on the values, and every state below it follows
@@ -980,6 +1013,12 @@ impl<
             assert!(
                 SNAKE_CHAIN_LENGTH_MAX >= 1,
                 "SNAKE_CHAIN_LENGTH_MAX must hold a window of at least one block"
+            );
+            // Story 6.4 D2: the active-set counter holds at most one count per
+            // window block in a `u16`.
+            assert!(
+                SNAKE_CHAIN_LENGTH_MAX <= u16::MAX as u32,
+                "SNAKE_CHAIN_LENGTH_MAX must fit the active-set counter"
             );
             // Acceptance admits any `W` up to this capacity, and FR2 needs a
             // `W`-long segment in the block table to leave Collecting. A
@@ -1119,6 +1158,8 @@ impl<
             (&raw mut (*p).tentative_config_block_idx).write(NONE_REF);
             (&raw mut (*p).snake_chain_tail_idx).write(NONE_REF);
             (&raw mut (*p).active_branch_value).write(0);
+            ActiveSetCounter::init(field_slot(&raw mut (*p).active_set));
+            (&raw mut (*p).non_conflict).write(NonConflictRing::new());
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -1160,6 +1201,8 @@ impl<
             tentative_config_block_idx: NONE_REF,
             snake_chain_tail_idx: NONE_REF,
             active_branch_value: 0,
+            active_set: ActiveSetCounter::new(),
+            non_conflict: NonConflictRing::new(),
         }
     }
 
@@ -2216,16 +2259,38 @@ impl<
             return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
         }
 
+        // FR19 parent resolution (Story 4.4), a pure RAM lookup. Resolved here,
+        // ahead of the signature check that needs it (Story 6.4 D3).
+        // `previous_hash()` is a 32-byte slice; convert to the array key.
+        // Genesis (`sequence == 0`) has no parent.
+        let prev_hash: [u8; 32] = block.previous_hash().try_into().unwrap_or([0; 32]);
+        let parent = self.blocks.find_parent(&prev_hash, block.sequence());
+
         // FR9 Tier 1 case (2) (Story 6.2 D6, DEC-157): in Ready, the creator
         // signature is exact evidence, before anything is written, whenever the
         // creator's key is the same on every branch that can connect. A pass
         // marks the entry, so the per-block step never verifies it again.
+        //
+        // Story 6.4 D3: a block whose parent is a flagged active-chain block has
+        // the active chain up to its parent as its own ancestry, so a key seeded
+        // at or below the parent is this block's own branch key. The bound is
+        // then the parent's sequence instead of the tail's — never below it
+        // (`p − 1 ≥ S_head − H ≥ S_tail` for anything intake admits), so it
+        // only ever verifies more. FR12 needs it: a deviating sibling must be
+        // signature-verified to be endorsed, and a bad signature is exact
+        // evidence here, before the write.
         let signature_verified = self.lifecycle_phase == LifecyclePhase::Ready
             && self
                 .blocks
                 .get(self.snake_chain_tail_idx)
                 .is_some_and(|tail| {
-                    self.key_is_branch_independent(block.creator(), tail.sequence())
+                    let parent_on_chain = parent
+                        .and_then(|p| self.blocks.get(p))
+                        .filter(|entry| entry.is_on_active_chain())
+                        .map(|entry| entry.sequence());
+                    let bound =
+                        parent_on_chain.map_or(tail.sequence(), |seq| seq.max(tail.sequence()));
+                    self.key_is_branch_independent(block.creator(), bound)
                 })
             && match self.verify_block_creator_signature(block) {
                 Some(false) => {
@@ -2294,11 +2359,6 @@ impl<
             moonblokz_configuration::accept_content(block.payload(), Self::BUILD_LIMITS)
                 .map_err(|_| AdmitError::Rejected(Tier1Failure::ChainConfigContentRejected))?;
         }
-
-        // FR19 parent resolution (Story 4.4). `previous_hash()` is a 32-byte
-        // slice; convert to the array key. Genesis (`sequence == 0`) has no parent.
-        let prev_hash: [u8; 32] = block.previous_hash().try_into().unwrap_or([0; 32]);
-        let parent = self.blocks.find_parent(&prev_hash, block.sequence());
 
         // FR19 bootstrap (AC7): a genesis block (sequence 0, no parent) anchors
         // the active chain — mark it on-chain and record it as the active head so
@@ -2447,7 +2507,7 @@ impl<
         );
 
         if let Some(advance) = promote {
-            self.promote_head_extension(idx, block_value(block), advance);
+            self.promote_head_extension(idx, block_value(block), block.creator(), advance);
         }
         if side_judged && let Some(p) = parent {
             self.connect_judged_side_block(idx, p, block_value(block), parent_value);
@@ -2514,15 +2574,22 @@ impl<
         // Read before the Collecting branch below, which can reach Ready
         // inside this same call (AC4).
         let was_ready = self.lifecycle_phase == LifecyclePhase::Ready;
-        let (outcome, admitted) = classify_block(self, &block, window, now);
+        let (mut outcome, admitted) = classify_block(self, &block, window, now);
+        // Story 6.4 AC3: the admitted block's key, so the support evaluation at
+        // the end re-finds it — the drive or a switch may have deleted it.
+        let admitted_key = admitted
+            .and_then(|idx| self.blocks.get(idx))
+            .map(|entry| (entry.sequence(), *entry.hash()));
         // FR2 dominant-chain acquisition (Story 5.2): a successful collecting-phase
         // admission may complete a candidate segment. Evaluate the stopping
         // condition and, on success, transition Collecting→Processing. Runs only
         // after a real admission (not on duplicate/reject) and only while
-        // Collecting (Processing/Ready never re-trigger). `AcceptedSilently` is
-        // currently the sole accept outcome; when Epic 6/8 add `AcceptedAndSend*`
-        // accept variants they must be included in this gate (else a block admitted
-        // under them would miss the transition).
+        // Collecting (Processing/Ready never re-trigger). `classify_block`
+        // reports every admission as `AcceptedSilently`, and the gates below
+        // test exactly that. An `AcceptedAndSend*` variant replaces it only in
+        // the return value, after the last gate (Story 6.4: support is decided
+        // once, at the end), so no admission misses a gate; a later variant
+        // must keep that rule.
         //
         // The configuration is part of the gate (Story 5.8): the FR3 derivation
         // reads the FR37 vote parameters, so without a loaded configuration the
@@ -2560,7 +2627,288 @@ impl<
         if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
             self.compare_and_switch([admitted, driver_best], now);
         }
+        // Story 6.4 (FR12, D3): support is decided once, here, on the state
+        // the node now holds, and replaces `AcceptedSilently` only in the
+        // return value.
+        if outcome == ReceiveBlockOutcome::AcceptedSilently
+            && self.is_ready()
+            && let Some((sequence, hash)) = admitted_key
+            && let Some(x_idx) = self.blocks.find(sequence, &hash)
+            && let Some(message) =
+                self.evaluate_support(x_idx, block.creator(), block.first_voted_node())
+        {
+            outcome = ReceiveBlockOutcome::AcceptedAndSendSupport(message);
+        }
         (outcome, self.next_parent_recovery_call())
+    }
+
+    /// FR12 / ADR-015 (Story 6.4) — whether the local node endorses the
+    /// admitted block `x` at `x_idx` (creator `x_creator`, header
+    /// `first_voted_node` `x_first_voted`, from the view in hand), and the
+    /// signed support message when it does. Every condition is a runtime check
+    /// (AC5), RAM-only ones first; any failure is `None`, with no reason
+    /// (minimal response). Issuing support changes no chain state beyond the
+    /// non-conflict record and the support floor.
+    ///
+    /// In order: (1) `p > F`, `F` first raised to `S_head − H` (D8); (2) the
+    /// grace seam, false until Story 8.5; (3) no conflicting live support in
+    /// the ring; `x` signature-verified (D3) on a flagged parent at `p − 1`;
+    /// (4) no obligation due at the head; (5) the shape (DEC-200): `d`, the
+    /// active block at `p`, is `x` or another proposer's approval-less
+    /// deviation, every active block above `p` is by `d`'s creator, and `x`
+    /// deviates from `u`; (6) no retained block at `p` on `p − 1` by `u`
+    /// (DEC-183; the evidence half is Story 6.6's); (7) the local node is in
+    /// `A'` and in the subgroup.
+    ///
+    /// **`u` comes from a validated header** (D3): `x`'s own `first_voted_node`
+    /// when `x` is active, else `d`'s. Sound only because `p > F` and `F` is
+    /// at least the ready-entry head: blocks up to it were validated with an
+    /// incomplete projection, where the vote check does not pin the top;
+    /// everything above it, with a complete one, which does. A non-top
+    /// creator's block in normal form (`first_voted_node == creator`) passes
+    /// that check — grace admission is local and unbuilt (I-10) — and is
+    /// classed as no deviation here, the safe direction.
+    ///
+    /// Story 8.5 calls the same function when a grace expiry admits a held
+    /// candidate (DEC-203). It takes `x`'s creator and `first_voted_node` as
+    /// arguments, not only `x_idx` as AC3 sketched, so the intake path reads
+    /// nothing for them; 8.5 reads them from the held candidate's header.
+    fn evaluate_support(
+        &mut self,
+        x_idx: u32,
+        x_creator: u32,
+        x_first_voted: u32,
+    ) -> Option<SupportMessage> {
+        // (1) Live sequence (D8), raised first, whatever follows: `F = max(F,
+        // S_head − H)`. `p > F` implies `p + H > S_head`, so the window of
+        // `p − 1` is retained, and catches a head the drive or a switch moved
+        // past intake's FR58 check in this same call.
+        let head = self.active_chain_head_idx;
+        let s_head = self.blocks.get(head)?.sequence();
+        let h = self.verification_horizon()?;
+        self.non_conflict.raise_floor(s_head.saturating_sub(h));
+        if !self.is_ready() || !self.active_set.is_valid() {
+            return None;
+        }
+        let w = self.active_chain_length()?;
+        let required_support = self.chain_config.active_configuration()?.required_support();
+        let x = self.blocks.get(x_idx)?;
+        let (p, x_hash, x_parent, x_verified) = (
+            x.sequence(),
+            *x.hash(),
+            x.parent_ref(),
+            x.is_signature_verified(),
+        );
+        if p <= self.non_conflict.floor() {
+            return None;
+        }
+        // (2) Grace eligibility (D3).
+        if !self.grace_admits(x_creator) {
+            return None;
+        }
+        // (3) Non-conflict (D8); `x` verified against the key at `p − 1` (D3)
+        // on the active block at `p − 1`.
+        let key = NonConflictRing::key_of(&x_hash);
+        let ring = self
+            .non_conflict
+            .check(RING_KIND_SUPPORT, x_creator, p, key);
+        if ring == RingCheck::Conflict || !x_verified {
+            return None;
+        }
+        let parent = self.blocks.get(x_parent)?;
+        if !parent.is_on_active_chain() || parent.sequence() + 1 != p {
+            return None;
+        }
+        // (4) Replay completion: no obligation due at the head (FR12).
+        if let Some(dropped) = self
+            .dropped_by_extension(head, self.snake_chain_tail_idx, w)
+            .ok()?
+            && classify_tail_drop(&self.blocks, &self.node_info, dropped)
+                != Ok(TailObligation::None)
+        {
+            return None;
+        }
+        // (5) Shape (DEC-200), deviation and `u`. The first storage reads.
+        let d_idx = self.ancestor_at(head, p).ok()??;
+        let (creator_d, u) = if d_idx == x_idx {
+            (x_creator, x_first_voted)
+        } else {
+            let (d_creator, d_first_voted) = self.header_at(d_idx)?;
+            // Another proposer's (not a twin) deviation, and `x` claims the
+            // same top: a normal-form `x` (I-10) or one naming another top is
+            // no deviation to endorse, the safe direction as in shape (a).
+            if d_creator == x_creator
+                || d_creator == d_first_voted
+                || x_first_voted != d_first_voted
+            {
+                return None;
+            }
+            (d_creator, d_first_voted)
+        };
+        if x_creator == u {
+            return None;
+        }
+        // Above `p`: only `d`'s creator, no approval evidence (FR27). At most
+        // `H − 1` blocks, since `p + H > S_head`.
+        let above = s_head - p + 1;
+        let mut cur = head;
+        for _ in 1..above {
+            let entry = self.blocks.get(cur)?;
+            if entry.payload_type() == PAYLOAD_TYPE_APPROVAL || self.header_at(cur)?.0 != creator_d
+            {
+                return None;
+            }
+            cur = entry.parent_ref();
+        }
+        if cur != d_idx {
+            return None;
+        }
+        // (6) Resolution stop (DEC-183): `u`'s own block at `p` is held.
+        for idx in 0..MAX_BLOCKS as u32 {
+            if idx == x_idx || idx == d_idx {
+                continue;
+            }
+            if self
+                .blocks
+                .get(idx)
+                .is_some_and(|entry| entry.parent_ref() == x_parent && entry.sequence() == p)
+                && self.header_at(idx)?.0 == u
+            {
+                return None;
+            }
+        }
+        // (7) `A'` at `p − 1` and the subgroup (D2, ADR-015).
+        if !self.local_in_subgroup(
+            p,
+            x_parent,
+            x_creator,
+            u,
+            creator_d,
+            above,
+            w,
+            required_support,
+        ) {
+            return None;
+        }
+
+        // Emission (AC7): record, then sign in its own frame.
+        if ring == RingCheck::Free
+            && !self
+                .non_conflict
+                .insert(RING_KIND_SUPPORT, x_creator, p, key)
+        {
+            return None;
+        }
+        let bytes = support_message_bytes(x_creator, p, &x_hash);
+        Some(SupportMessage {
+            supporter_node_id: self.local_node_id,
+            proposer_node_id: x_creator,
+            deviation_sequence: p,
+            deviation_block_hash: x_hash,
+            support_signature: self.sign_support(&bytes),
+        })
+    }
+
+    /// AC5 check 7: the local node is in `A' = A \\ {proposer, u}` at `p − 1`
+    /// and among its `m` smallest node values. `A` at `p − 1` is the active
+    /// set corrected on the fly (D2): the `above` active blocks in `[p,
+    /// S_head]`, all by `creator_d`, leave it, and the blocks they dropped
+    /// (`[p − W, S_head − W]`, in the horizon, one read each) return. Their
+    /// creators are noted in a transient `[bool; MAX_NODES]` in this frame
+    /// (about 1 KB at the reference build), never in the counter. The
+    /// physical window is always `[max(0, S_head − W + 1), S_head]`: no
+    /// switch shortens a matured window (DEC-209), and a ready entry rebuilds
+    /// it.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn local_in_subgroup(
+        &self,
+        p: u32,
+        parent: u32,
+        proposer: u32,
+        u: u32,
+        creator_d: u32,
+        above: u32,
+        w: u32,
+        required_support: u8,
+    ) -> bool {
+        let head = self.active_chain_head_idx;
+        let s_head = p + above - 1;
+        let mut returning_d = 0u32;
+        let mut returned = [false; MAX_NODES];
+        if let Some(last) = s_head.checked_sub(w) {
+            for sequence in p.saturating_sub(w)..=last {
+                let creator = self
+                    .ancestor_at(head, sequence)
+                    .ok()
+                    .flatten()
+                    .and_then(|idx| self.header_at(idx))
+                    .map(|(creator, _)| creator);
+                match creator {
+                    Some(c) if c == creator_d => returning_d += 1,
+                    Some(c) if (c as usize) < MAX_NODES => returned[c as usize] = true,
+                    // A failed read, or a creator id beyond this build's
+                    // capacity: a local failure, no support.
+                    _ => return false,
+                }
+            }
+        }
+        let set = &self.active_set;
+        let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
+        let member = |n: &u32| {
+            *n != proposer
+                && *n != u
+                && set.in_set_at_parent(*n, creator_d, above, returning_d, returned[*n as usize])
+        };
+        let local = self.local_node_id;
+        let eligible = (0..=last_node).filter(member).count() as u32;
+        member(&local)
+            && subgroup_size(required_support, eligible).is_some_and(|m| {
+                let seed = subgroup_seed(p, self.circulating_currency_at(parent), proposer);
+                in_subgroup(&seed, local, (0..=last_node).filter(member), m)
+            })
+    }
+
+    /// Story 6.4 D3 — whether the local grace expansion admits `creator` at
+    /// the evaluation point. Story 8.5 implements it over the creator order at
+    /// `p − 1` (Algorithm 5, the order its timers walk); until then it is
+    /// `false`, so production emits no support and a ready block costs no
+    /// storage read for it (AC5). Amends DEC-200's `expansion_rank()` seam.
+    fn grace_admits(&self, _creator: u32) -> bool {
+        #[cfg(test)]
+        {
+            crate::approval::test_seams::grace_admits()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Story 6.4 D1 — `circulating_currency` after the block at `idx`, the
+    /// subgroup seed's input (DEC-192): the fixed [`CIRCULATING_CURRENCY_STUB`]
+    /// until Story 7.6 replaces this body with the per-position projection.
+    /// The seed is grindable until then (AR-013), and the same on every node;
+    /// Story 7.6 must land before Story 8.5 enables production emission.
+    fn circulating_currency_at(&self, _idx: u32) -> u64 {
+        CIRCULATING_CURRENCY_STUB
+    }
+
+    /// The `(creator, first_voted_node)` of a retained block's header; `None`
+    /// on a failed read. Its own read buffer (DEC-136).
+    #[inline(never)]
+    fn header_at(&self, idx: u32) -> Option<(u32, u32)> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        self.view_retained(idx, &mut buf)
+            .map(|view| (view.creator(), view.first_voted_node()))
+    }
+
+    /// AC7 — signs the support content with the local node's multi-signature
+    /// key, in its own frame: the backend's signature value and the signer's
+    /// working set never overlap a read buffer.
+    #[inline(never)]
+    fn sign_support(&self, bytes: &[u8; SUPPORT_MESSAGE_SIZE]) -> [u8; MULTI_SIGNATURE_SIZE] {
+        *self.crypto.multi_sign(bytes).serialize()
     }
 
     /// The FR2→FR3→FR6→FR4 acquisition spine: while a candidate segment
@@ -2863,6 +3211,9 @@ impl<
     /// construction into uninitialized memory, exactly once, while this runs
     /// repeatedly on a live engine.
     fn reset_vote_engine(&mut self) {
+        // The active set is part of the projection (Story 6.4 D2): invalid
+        // until the next ready entry builds it.
+        self.active_set.invalidate();
         match self.chain_config.active_configuration() {
             // FR37 parameters from the chain, and an empty working set.
             Some(config) => self
@@ -4260,8 +4611,10 @@ impl<
     /// node seeded at or below `bound`, or whose seed source was released. Its
     /// registration then lies on the shared chain, and a key never changes
     /// after registration. Intake passes `S_tail` — every branch that can
-    /// connect forks at or above `S_head − H ≥ S_tail` (DEC-207, DEC-208) — and the chain-switch
-    /// pre-pass passes the common ancestor. RAM only.
+    /// connect forks at or above `S_head − H ≥ S_tail` (DEC-207, DEC-208) — or,
+    /// for a block whose parent is a flagged active-chain block, the parent's
+    /// sequence (Story 6.4 D3); the chain-switch pre-pass passes the common
+    /// ancestor. RAM only.
     fn key_is_branch_independent(&self, creator: u32, bound: u32) -> bool {
         if creator == 0 {
             return true;
@@ -4491,40 +4844,32 @@ impl<
             else {
                 return Extension::Local;
             };
-            let sequence = head_entry.sequence() + 1;
             // New length `S_head + 1 − S_tail + 1` exceeds `W`.
-            let full = sequence.saturating_sub(tail_entry.sequence()) >= w;
-            // DEC-204: a block at `sequence ≥ W` drops block `sequence − W`
-            // wherever the walk stands, and its binding is evaluated against
-            // that retained block — the tail when the window is full, a block
-            // below a window a chain-switch backward walk shortened otherwise
-            // (Story 6.14's horizon). A dropped block that is not retained
-            // cannot be evaluated: a local failure, never trust.
-            if sequence >= w {
-                let dropped = if full {
-                    tail
-                } else {
-                    match self.ancestor_at(head, sequence - w) {
-                        Ok(Some(dropped)) => dropped,
-                        _ => return Extension::Local,
+            let full = (head_entry.sequence() + 1).saturating_sub(tail_entry.sequence()) >= w;
+            // DEC-204: the block the extension drops, if any, is evaluated
+            // against its binding. A dropped block that is not retained cannot
+            // be evaluated: a local failure, never trust.
+            match self.dropped_by_extension(head, tail, w) {
+                Ok(Some(dropped)) => {
+                    let Ok(obligation) = classify_tail_drop(&self.blocks, &self.node_info, dropped)
+                    else {
+                        return Extension::Local;
+                    };
+                    if tail_drop_binding(obligation, view) == TailBinding::Invalid {
+                        return Extension::Invalid;
                     }
-                };
-                let Ok(obligation) = classify_tail_drop(&self.blocks, &self.node_info, dropped)
-                else {
-                    return Extension::Local;
-                };
-                if tail_drop_binding(obligation, view) == TailBinding::Invalid {
-                    return Extension::Invalid;
                 }
+                Ok(None) => {}
+                Err(()) => return Extension::Local,
             }
             if full {
                 // FR21 (iii): the block that becomes `S_tail` leaves every
                 // sum; its value is read now, before anything is mutated, so
                 // a failed read is a local failure (Story 6.1 D1).
-                let Some(tail_value) = self.new_tail_value(tail) else {
+                let Some(step) = self.new_tail_step(tail) else {
                     return Extension::Local;
                 };
-                advance = Some(tail_value);
+                advance = Some(step);
             }
         }
         let mut projection = Projection::COMPLETE;
@@ -4538,12 +4883,37 @@ impl<
         }
     }
 
-    /// The FR21 value of the block that becomes `S_tail` when the window
+    /// DEC-204 — the block an extension of `head` at `S_head + 1` drops: block
+    /// `S_head + 1 − W`, wherever the walk stands — the tail when the window is
+    /// full, a block below a window a chain-switch backward walk shortened
+    /// otherwise (Story 6.14's horizon). `Ok(None)` while `S_head + 1 < W` (the
+    /// growth phase drops nothing); `Err` when either end or the dropped block
+    /// is not retained, a local failure. RAM only. Shared by the extension's
+    /// FR48 gate and the FR12 replay-completion check (Story 6.4 AC5.4).
+    fn dropped_by_extension(&self, head: u32, tail: u32, w: u32) -> Result<Option<u32>, ()> {
+        let (Some(tail_entry), Some(head_entry)) = (self.blocks.get(tail), self.blocks.get(head))
+        else {
+            return Err(());
+        };
+        let sequence = head_entry.sequence() + 1;
+        if sequence < w {
+            return Ok(None);
+        }
+        if sequence.saturating_sub(tail_entry.sequence()) >= w {
+            return Ok(Some(tail));
+        }
+        match self.ancestor_at(head, sequence - w) {
+            Ok(Some(dropped)) => Ok(Some(dropped)),
+            _ => Err(()),
+        }
+    }
+
+    /// The [`TailStep`] of the block that becomes `S_tail` when the window
     /// advances past `tail`: its active-chain child. `None` on a failed read —
     /// a local failure. The tail is never the head here: that needs `W = 1`,
     /// where FR60 refuses every extension (`s_new ≥ s_head + W`).
-    fn new_tail_value(&self, tail: u32) -> Option<u64> {
-        self.block_value_at(self.tail_successor(tail)?)
+    fn new_tail_step(&self, tail: u32) -> Option<TailStep> {
+        self.tail_step_at(self.tail_successor(tail)?)
     }
 
     /// The active-chain child of `tail`: the block that becomes `S_tail`
@@ -4556,13 +4926,15 @@ impl<
         })
     }
 
-    /// Reads a retained block and returns its FR21 value; `None` on a failed
-    /// read. The read copy lives only in this frame (DEC-136).
+    /// Reads a retained block and returns its FR21 value and creator; `None`
+    /// on a failed read. The read copy lives only in this frame (DEC-136).
     #[inline(never)]
-    fn block_value_at(&self, idx: u32) -> Option<u64> {
+    fn tail_step_at(&self, idx: u32) -> Option<TailStep> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
-        self.view_retained(idx, &mut buf)
-            .map(|view| block_value(&view))
+        self.view_retained(idx, &mut buf).map(|view| TailStep {
+            value: block_value(&view),
+            creator: view.creator(),
+        })
     }
 
     /// Promotes a block that passed the whole per-block step to the active
@@ -4570,21 +4942,30 @@ impl<
     /// `chain_heads` entry (AC7), adds its FR21 `value` to the active value
     /// (event (i)) and, when the window gate said so, advances the tail (9.1)
     /// and subtracts the new `S_tail` block's value from every value (event
-    /// (iii), Story 6.1 D1).
-    fn promote_head_extension(&mut self, idx: u32, value: u64, advance: Option<u64>) {
+    /// (iii), Story 6.1 D1). The active set follows both window events
+    /// (Story 6.4 D2): `creator` enters, the old tail's creator leaves.
+    fn promote_head_extension(
+        &mut self,
+        idx: u32,
+        value: u64,
+        creator: u32,
+        advance: Option<TailStep>,
+    ) {
         self.blocks.set_status(idx, BlockStatus::Active);
         self.blocks.set_on_active_chain(idx, true);
         self.active_chain_head_idx = idx;
         self.chain_heads.refresh_head(&self.blocks, idx);
         self.active_branch_value += value;
+        self.active_set.add(creator);
         // FR64 (Epic 11 `LogSink`): emit the head-extension event carrying the
         // promoted block's hash and sequence. Deferred — see deferred-work.md.
-        if let Some(tail_value) = advance
+        if let Some(step) = advance
             && self.advance_snake_chain_tail()
         {
-            self.active_branch_value = self.active_branch_value.saturating_sub(tail_value);
+            self.active_branch_value = self.active_branch_value.saturating_sub(step.value);
             self.chain_heads
-                .subtract_branch_value(&self.blocks, tail_value);
+                .subtract_branch_value(&self.blocks, step.value);
+            self.active_set.advance_tail(step.creator);
         }
         // FR58 reclamation (DEC-208): the active block at `S_head − H − 1` has
         // just left the switch bound, and its forks with it.
@@ -4614,8 +4995,12 @@ impl<
             // deletion or tail advance, whose delete-set buffer (2.4 KB) must
             // not share the stack with it (D4, DEC-136).
             match self.apply_stored_child(child, self.snake_chain_tail_idx) {
-                ChildStep::Applied { advance, value } => {
-                    self.promote_head_extension(child, value, advance);
+                ChildStep::Applied {
+                    advance,
+                    value,
+                    creator,
+                } => {
+                    self.promote_head_extension(child, value, creator, advance);
                 }
                 // A local failure: the child stays Stored for a later retry.
                 ChildStep::Local => return,
@@ -4908,45 +5293,60 @@ impl<
         // tail and released only at the commit (D3, DEC-168). Story 7.4:
         // remove each applied block's transactions from the mempool here
         // (FR32 (2)).
+        //
+        // Story 6.4 D2: the active set follows the virtual window — each
+        // replayed block enters it, and each virtual advance removes the block
+        // that leaves it, whose creator the previous advance read (the
+        // physical tail's is kept). A failure unwinds those removals before the
+        // restore ([`Self::abort_switch`]).
         let mut virtual_tail = self.snake_chain_tail_idx;
+        let mut virtual_tail_creator = self.active_set.tail_creator();
         let mut advances = 0usize;
         let mut released_value = 0u64;
         while self.active_chain_head_idx != head {
             let Some(next) = self.next_toward(head) else {
-                return self.restore_original(ancestor, old_head, old_value, None);
+                return self.abort_switch(ancestor, old_head, old_value, None, advances);
             };
             match self.apply_stored_child(next, virtual_tail) {
-                ChildStep::Applied { advance, value } => {
-                    self.promote_replayed(next, value);
-                    if let Some(tail_value) = advance {
+                ChildStep::Applied {
+                    advance,
+                    value,
+                    creator,
+                } => {
+                    self.promote_replayed(next, value, creator);
+                    if let Some(step) = advance {
                         let Some(successor) = self.tail_successor(virtual_tail) else {
-                            return self.restore_original(ancestor, old_head, old_value, None);
+                            return self
+                                .abort_switch(ancestor, old_head, old_value, None, advances);
                         };
                         virtual_tail = successor;
                         advances += 1;
-                        released_value = released_value.saturating_add(tail_value);
+                        released_value = released_value.saturating_add(step.value);
+                        self.active_set.remove(virtual_tail_creator);
+                        virtual_tail_creator = step.creator;
                     }
                 }
                 ChildStep::Invalid => {
                     // `next`'s parent is the current head: its value is the
                     // active value now, before anything is undone.
                     let parent_value = self.active_branch_value;
-                    return self.restore_original(
+                    return self.abort_switch(
                         ancestor,
                         old_head,
                         old_value,
                         Some((next, parent_value)),
+                        advances,
                     );
                 }
                 ChildStep::Local => {
-                    return self.restore_original(ancestor, old_head, old_value, None);
+                    return self.abort_switch(ancestor, old_head, old_value, None, advances);
                 }
             }
         }
         // The walk must land on the value the comparison ranked (FR21): a
         // mismatch means an inconsistent table — a local failure.
         if self.chain_heads.branch_value_of(head) != Some(self.active_branch_value) {
-            return self.restore_original(ancestor, old_head, old_value, None);
+            return self.abort_switch(ancestor, old_head, old_value, None, advances);
         }
         // Every deferred release must succeed, so the commit's summed FR21
         // (iii) subtraction is exact (AC5): the physical tail is the flagged
@@ -4954,10 +5354,51 @@ impl<
         // `advance_snake_chain_tail` walks. A breach is a local failure,
         // before anything is committed.
         if advances > 0 && !self.releases_will_succeed(head, virtual_tail) {
-            return self.restore_original(ancestor, old_head, old_value, None);
+            return self.abort_switch(ancestor, old_head, old_value, None, advances);
         }
         self.commit_switch(head, old_head, old_value, advances, released_value);
+        if advances > 0 {
+            self.active_set.set_tail_creator(virtual_tail_creator);
+        }
         SwitchOutcome::Switched
+    }
+
+    /// A failed replay: unwinds the active set's virtual-advance removals,
+    /// then restores the original chain (Story 6.4 D2).
+    fn abort_switch(
+        &mut self,
+        ancestor: u32,
+        old_head: u32,
+        old_value: u64,
+        offender: Option<(u32, u64)>,
+        advances: usize,
+    ) -> SwitchOutcome {
+        self.unwind_virtual_advances(advances);
+        self.restore_original(ancestor, old_head, old_value, offender)
+    }
+
+    /// Puts back the creators the replay's `advances` virtual advances removed
+    /// from the active set: the physical tail's, then its successors' along
+    /// the flagged chain, read again — the failure path's only reads for the
+    /// active set. A failed read invalidates it (no support until the next
+    /// ready entry).
+    fn unwind_virtual_advances(&mut self, advances: usize) {
+        if advances == 0 || !self.active_set.is_valid() {
+            return;
+        }
+        let mut released = self.snake_chain_tail_idx;
+        self.active_set.add(self.active_set.tail_creator());
+        for _ in 1..advances {
+            let Some((next, creator)) = self
+                .tail_successor(released)
+                .and_then(|next| Some((next, self.header_at(next)?.0)))
+            else {
+                self.active_set.invalidate();
+                return;
+            };
+            self.active_set.add(creator);
+            released = next;
+        }
     }
 
     /// Whether the commit's deferred advances, from the physical tail up to
@@ -5096,7 +5537,8 @@ impl<
             }
             self.previous_seed_sources(parent, &owners[..count], &mut sources[..count])?;
         }
-        self.undo_committed_block(idx, &owners[..count], &sources[..count])?;
+        let creator = self.undo_committed_block(idx, &owners[..count], &sources[..count])?;
+        self.active_set.remove(creator);
         self.blocks.set_status(idx, BlockStatus::Connected);
         self.blocks.set_on_active_chain(idx, false);
         self.active_chain_head_idx = parent;
@@ -5181,14 +5623,15 @@ impl<
     /// seed-source restore (`owners` → `sources`), the FR36 creator credit,
     /// and [`Self::invert_transactions`]; its FR21 value leaves the active
     /// value. A balance block seeds nothing in Ready (D9), so its seeding
-    /// inverse is the identity (O-009, DEC-025). Its own read buffer.
+    /// inverse is the identity (O-009, DEC-025). Its own read buffer. Returns
+    /// the block's creator, which leaves the active set (Story 6.4 D2).
     #[inline(never)]
     fn undo_committed_block(
         &mut self,
         idx: u32,
         owners: &[u32],
         sources: &[u32],
-    ) -> Result<(), ()> {
+    ) -> Result<u32, ()> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf).ok_or(())?;
         let value = block_value(&view);
@@ -5220,17 +5663,19 @@ impl<
         }
         self.invert_transactions(&view, idx, usize::MAX);
         self.active_branch_value = remaining_value;
-        Ok(())
+        Ok(view.creator())
     }
 
     /// Promotes a block the replay (or the restore) just applied: Connected →
     /// Active (FR9), on the active chain, the new head; its FR21 value joins
-    /// the active value. The tail is left to the commit (D3).
-    fn promote_replayed(&mut self, idx: u32, value: u64) {
+    /// the active value and its `creator` the active set (Story 6.4 D2). The
+    /// tail is left to the commit (D3).
+    fn promote_replayed(&mut self, idx: u32, value: u64, creator: u32) {
         self.blocks.set_status(idx, BlockStatus::Active);
         self.blocks.set_on_active_chain(idx, true);
         self.active_chain_head_idx = idx;
         self.active_branch_value += value;
+        self.active_set.add(creator);
     }
 
     /// AC5 — the commit, after which nothing fails: FR19 event (iii) first
@@ -5259,7 +5704,9 @@ impl<
             if !self.advance_snake_chain_tail() {
                 // Unreachable by construction — the replay advanced the
                 // virtual tail along the same flagged chain. FR64: log the
-                // invariant breach. Deferred — see deferred-work.md.
+                // invariant breach. Deferred — see deferred-work.md. The
+                // active set no longer matches the window (Story 6.4 D2).
+                self.active_set.invalidate();
                 return;
             }
         }
@@ -5298,12 +5745,16 @@ impl<
                 return self.stop_restore(offender);
             };
             match self.apply_stored_child(next, tail) {
-                ChildStep::Applied { advance, value } => {
+                ChildStep::Applied {
+                    advance,
+                    value,
+                    creator,
+                } => {
                     // Its effects are committed: promote it either way. The
                     // original chain fit the window, so an advance means an
                     // inconsistent window — stop (the caller re-enters collecting,
                     // DEC-205).
-                    self.promote_replayed(next, value);
+                    self.promote_replayed(next, value, creator);
                     if advance.is_some() {
                         return self.stop_restore(offender);
                     }
@@ -5559,6 +6010,7 @@ impl<
                 Ok(()) => ChildStep::Applied {
                     advance,
                     value: block_value(&view),
+                    creator: view.creator(),
                 },
                 Err(err) if is_evidence(&err) => ChildStep::Invalid,
                 Err(_) => ChildStep::Local,
@@ -5707,6 +6159,7 @@ impl<
                 .get(self.active_chain_head_idx)
                 .map(|entry| entry.sequence()),
         ) else {
+            self.active_set.invalidate();
             return;
         };
         let target = self.window_tail_sequence(root_seq, head_seq);
@@ -5723,6 +6176,39 @@ impl<
                 break;
             }
         }
+        // Story 6.4: the FR12 state of a ready entry — the support floor
+        // reaches the head (D8: DEC-198's restart floor, also for the DEC-205
+        // re-entry, whose ring survives), and the active set is built over the
+        // window just established (D2).
+        self.non_conflict.raise_floor(head_seq);
+        self.build_active_set();
+    }
+
+    /// Story 6.4 D2: builds the active set by one walk over the window, head
+    /// to tail (at most `W` reads, one buffer in this frame, DEC-136). A failed
+    /// read leaves it invalid: no support until the next ready entry.
+    #[inline(never)]
+    fn build_active_set(&mut self) {
+        let tail = self.snake_chain_tail_idx;
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        self.active_set.start_build(0);
+        let mut cur = self.active_chain_head_idx;
+        for _ in 0..MAX_BLOCKS {
+            let Some(view) = self.view_retained(cur, &mut buf) else {
+                break;
+            };
+            let creator = view.creator();
+            self.active_set.add(creator);
+            if cur == tail {
+                self.active_set.set_tail_creator(creator);
+                return;
+            }
+            match self.blocks.get(cur) {
+                Some(entry) if entry.parent_ref() != NONE_REF => cur = entry.parent_ref(),
+                _ => break,
+            }
+        }
+        self.active_set.invalidate();
     }
 
     /// FR58 reclamation (DEC-159, DEC-208): deletes, whole, everything whose
@@ -6280,6 +6766,8 @@ impl<
             self.active_chain_head_idx = NONE_REF;
             self.snake_chain_tail_idx = NONE_REF;
             self.active_branch_value = 0;
+            // No window, so no active set (Story 6.4 D2).
+            self.active_set.invalidate();
         }
         if self.tentative_config_block_idx != NONE_REF
             && deleted.contains(&self.tentative_config_block_idx)
@@ -7257,6 +7745,8 @@ mod tests {
             tentative_config_block_idx,
             snake_chain_tail_idx,
             active_branch_value,
+            active_set,
+            non_conflict,
         } = &*bc;
 
         assert_eq!(*local_node_id, 7);
@@ -7280,6 +7770,11 @@ mod tests {
         assert_eq!(*tentative_config_block_idx, NONE_REF);
         assert_eq!(*snake_chain_tail_idx, NONE_REF);
         assert_eq!(*active_branch_value, 0);
+        // Story 6.4: no window yet, so no active set; an empty ring, `F = 0`.
+        assert!(!active_set.is_valid());
+        assert!((0..16).all(|node| active_set.count(node) == 0));
+        assert!(*non_conflict == NonConflictRing::new());
+        assert_eq!(non_conflict.floor(), 0);
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -7333,6 +7828,8 @@ mod tests {
             tentative_config_block_idx,
             snake_chain_tail_idx,
             active_branch_value,
+            active_set,
+            non_conflict,
         } = &*built;
         let Blockchain {
             crypto: _,
@@ -7352,6 +7849,8 @@ mod tests {
             tentative_config_block_idx: spec_tentative_config_block_idx,
             snake_chain_tail_idx: spec_snake_chain_tail_idx,
             active_branch_value: spec_active_branch_value,
+            active_set: spec_active_set,
+            non_conflict: spec_non_conflict,
         } = &spec;
 
         assert_eq!(local_node_id, spec_local_node_id);
@@ -7371,6 +7870,8 @@ mod tests {
         assert_eq!(tentative_config_block_idx, spec_tentative_config_block_idx);
         assert_eq!(snake_chain_tail_idx, spec_snake_chain_tail_idx);
         assert_eq!(active_branch_value, spec_active_branch_value);
+        assert!(active_set == spec_active_set);
+        assert!(non_conflict == spec_non_conflict);
     }
 
     /// AC2 — the neutrality proof: with the base override set (the window alone)
@@ -7390,7 +7891,7 @@ mod tests {
         assert_eq!(config.grace_period_window_ms(), 30_000);
         assert_eq!(config.block_size_limit(), 2016);
         assert_eq!(config.max_utxo_outputs(), 255);
-        assert_eq!(config.max_aggregated_signatures(), 50);
+        assert_eq!(config.required_support(), 40);
         assert_eq!(config.vote_scale().get(), 1000);
         assert_eq!(config.vote_interest(), 5);
         assert_eq!(config.parent_recovery_per_head_retry_interval_ms(), 120_000);
@@ -13266,6 +13767,8 @@ mod tests {
         reads_left: core::cell::Cell<u32>,
         failures_left: core::cell::Cell<u32>,
         attempts: core::cell::Cell<u32>,
+        /// Every read, of any slot (Story 6.4 AC9 3d).
+        reads: core::cell::Cell<u32>,
     }
 
     impl StorageTrait for FailingReadStorage {
@@ -13287,6 +13790,7 @@ mod tests {
             idx: u32,
             out: &mut [u8; MAX_BLOCK_SIZE],
         ) -> Result<(), StorageError> {
+            self.reads.set(self.reads.get() + 1);
             if idx == self.failing_slot {
                 self.attempts.set(self.attempts.get() + 1);
                 let left = self.reads_left.get();
@@ -13333,6 +13837,7 @@ mod tests {
             reads_left: core::cell::Cell::new(0),
             failures_left: core::cell::Cell::new(u32::MAX),
             attempts: core::cell::Cell::new(0),
+            reads: core::cell::Cell::new(0),
         };
         let mut slot = core::mem::MaybeUninit::<FailingReadChain>::uninit();
         FailingReadChain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -14273,6 +14778,8 @@ mod tests {
             bc.node_info.is_seed_source(replay_idx),
             "D9: the seed source moved"
         );
+        // Story 6.4 AC9 3c: a head extension that advanced the tail.
+        assert_active_set_matches(&bc, "after the tail advance");
     }
 
     /// Block #0 of every genesis node in this section (it is deterministic).
@@ -15203,6 +15710,8 @@ mod tests {
             Some(BlockStatus::Connected)
         );
         assert_eq!(b.chain_heads.branch_value_of(bs), Some(5 + 1));
+        // Story 6.4 AC9 3c: built at a window-anchored ready entry.
+        assert_active_set_matches(&b, "window-anchored entry");
     }
 
     /// A genesis node on a [`FaultyStorage`] whose faults are disarmed, on
@@ -16789,6 +17298,7 @@ mod tests {
             reads_left: core::cell::Cell::new(0),
             failures_left: core::cell::Cell::new(u32::MAX),
             attempts: core::cell::Cell::new(0),
+            reads: core::cell::Cell::new(0),
         };
         let mut slot = core::mem::MaybeUninit::<Chain16<FailingReadStorage>>::uninit();
         Chain16::<FailingReadStorage>::init(
@@ -16974,7 +17484,8 @@ mod tests {
             ChildStep::Applied {
                 advance: None,
                 value,
-            } => bc.promote_replayed(idx, value),
+                creator,
+            } => bc.promote_replayed(idx, value, creator),
             _ => panic!("genesis #1 re-applies"),
         }
         assert_same_projection(&bc, &twin, "genesis #1");
@@ -17442,6 +17953,8 @@ mod tests {
                     );
                 }
                 assert_same_projection(&bc, &fresh, "committed");
+                // Story 6.4 AC9 3c: the deferred advances' decrements.
+                assert_active_set_matches(&bc, "committed with advances");
             } else {
                 assert_eq!(head_of(&bc), (3, b3.view().hash()), "restored");
                 assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
@@ -17449,6 +17962,8 @@ mod tests {
                 assert_eq!(status_of(&bc, &blocks[3]), None, "with its descendant");
                 assert_eq!(status_of(&bc, &blocks[1]), Some(BlockStatus::Connected));
                 assert_same_projection(&bc, &twin, "restored after the advances");
+                // Story 6.4 AC9 3c: the unwound virtual advances.
+                assert_active_set_matches(&bc, "restored after the advances");
             }
         }
     }
@@ -17481,13 +17996,35 @@ mod tests {
 
     /// AC11.9 / D5 — the pre-pass: a bad signature by a creator registered at
     /// or below the common ancestor is deleted before anything is touched (no
-    /// read of the old head beyond its FORK valuation); one by a creator
+    /// read of the old head); one by a creator
     /// registered above it is refused by the replay instead, which restores
     /// and deletes it.
+    ///
+    /// Rebased by Story 6.4 (D3): a forged sibling whose parent is an active
+    /// block (`a2`) is now caught by Tier 1 at intake, measured against the key
+    /// at its parent, so the pre-pass case uses a forged block on a side block
+    /// (`s3`), whose parent is off the active chain and keeps the tail bound.
     #[test]
     fn fr23_signature_prepass() {
         let (mut bc, _, a2, a3) = failing_two_creator_chain();
-        let bad = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x77);
+        let forged_sibling = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x77);
+        assert_eq!(
+            receive(&mut bc, &forged_sibling),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            "Tier 1 judges it against the key at its active parent"
+        );
+        let s3 = (20..400)
+            .map(|salt| alt(3, a2.view().hash(), 1, 1, 0, salt, false))
+            .find(|g| g.view().len() == a3.view().len() && g.view().hash() > a3.view().hash())
+            .expect("a same-size sibling with a higher hash");
+        assert_eq!(receive(&mut bc, &s3), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (3, a3.view().hash()), "a tie lost by hash");
+        let bad = resign(
+            &alt(4, s3.view().hash(), 0, 1, 0, 41, false),
+            1,
+            vote_snapshot(1000),
+            0x77,
+        );
         bc.storage.failing_slot = slot(&bc, &a3);
         bc.storage.reads_left.set(1);
         assert_eq!(
@@ -17498,8 +18035,8 @@ mod tests {
         assert_eq!(head_of(&bc), (3, a3.view().hash()));
         assert_eq!(
             bc.storage.attempts.get(),
-            1,
-            "only the FORK valuation read a3"
+            0,
+            "the fork already exists at s3: nothing of the old branch is read"
         );
         bc.storage.failing_slot = NONE_REF;
 
@@ -18283,5 +18820,962 @@ mod tests {
             .tier1_admit(&at_limit.view(), &at_limit.view().hash(), 0)
             .expect("admitted");
         assert!(bc.run_processing_pass(ai).is_ok());
+    }
+
+    // ---- Story 6.4: ADR-015 subgroup selection and FR12 support emission ----
+
+    /// AC2 — the size pin (deferred-work D8): the owned support message and the
+    /// outcome that carries it. Three `u32`s, the hash and the backend's
+    /// serialized multi-signature, with no padding; the outcome adds its tag,
+    /// rounded to the `u32` alignment. 108 B and 112 B on Schnorr (64-byte
+    /// signature), 92 B and 96 B on BLS (48 bytes).
+    #[test]
+    fn the_support_outcome_has_its_pinned_size() {
+        use moonblokz_chain_types::HASH_SIZE;
+        use moonblokz_crypto::MULTI_SIGNATURE_SIZE;
+        let message = core::mem::size_of::<SupportMessage>();
+        assert_eq!(message, 3 * 4 + HASH_SIZE + MULTI_SIGNATURE_SIZE);
+        assert_eq!(core::mem::size_of::<ReceiveBlockOutcome>(), message + 4);
+    }
+
+    /// AC3 — a forged direct extension of the head is exact evidence, never
+    /// stored: the deferred-work "FR16 Ready-state direct-extension signature
+    /// check → 6.4", already built by Story 6.0, pinned here.
+    #[test]
+    fn a_forged_direct_extension_is_refused() {
+        let (mut bc, _, _, a3) = two_creator_chain();
+        let direct = headed(
+            4,
+            a3.view().hash(),
+            1,
+            0xC3,
+            0,
+            1,
+            0,
+            votes_for(4, 0, 1, 903),
+        );
+        assert_eq!(
+            receive(&mut bc, &direct),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(status_of(&bc, &direct), None, "not stored");
+    }
+
+    /// Whether `block` is held with its creator signature marked verified.
+    fn verified<S: StorageTrait>(bc: &Chain16<S>, block: &Block) -> Option<bool> {
+        let view = block.view();
+        bc.blocks
+            .find(view.sequence(), &view.hash())
+            .and_then(|idx| bc.blocks.get(idx))
+            .map(|entry| entry.is_signature_verified())
+    }
+
+    /// AC9 test 4 (D3) — Tier 1 measures a block whose parent is a flagged
+    /// active-chain block against the key at its parent, not at the tail.
+    /// Node #1 is registered by `a2` (sequence 2) above the tail (#0), so the
+    /// old bound left its siblings unverified.
+    #[test]
+    fn tier1_verifies_a_sibling_against_the_key_at_its_active_parent() {
+        // Seeded inside `(tail, p − 1]`: a sibling of `a3` on `a2` is
+        // verified, and a bad signature is exact evidence, never stored.
+        let (mut bc, _, a2, _) = two_creator_chain();
+        let good = headed(
+            3,
+            a2.view().hash(),
+            1,
+            NODE_ONE_KEY,
+            0,
+            1,
+            0,
+            votes_for(3, 0, 1, 900),
+        );
+        assert_eq!(
+            receive(&mut bc, &good),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(verified(&bc, &good), Some(true));
+        let forged = headed(
+            3,
+            a2.view().hash(),
+            1,
+            0xC3,
+            0,
+            1,
+            0,
+            votes_for(3, 0, 1, 901),
+        );
+        assert_eq!(
+            receive(&mut bc, &forged),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(status_of(&bc, &forged), None, "not stored");
+
+        // Seeded above `p − 1`: a node #1 sibling of `a2` on `b1` is admitted
+        // unverified — its key is not its branch's key at `p − 1 = 1`.
+        let (mut bc, b1, _, _) = two_creator_chain();
+        let early = headed(
+            2,
+            b1.view().hash(),
+            1,
+            NODE_ONE_KEY,
+            0,
+            1,
+            0,
+            votes_for(2, 0, 1, 902),
+        );
+        assert_eq!(
+            receive(&mut bc, &early),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(verified(&bc, &early), Some(false));
+    }
+
+    // -- Story 6.4 fixtures: a separate local node on a multi-creator chain --
+
+    use crate::approval::node_value;
+    use crate::approval::test_seams::set_grace_admits;
+
+    /// `block`'s transaction or balance payload under a new header:
+    /// `creator`, signed with `[key; 32]`, with the given vote fields (the
+    /// deviation form of [`resign`]).
+    fn reheader(
+        block: &Block,
+        creator: u32,
+        consumed: u32,
+        first_voted: u32,
+        recorded: u32,
+        key: u8,
+    ) -> Block {
+        use moonblokz_chain_types::NodeInfo;
+        let view = block.view();
+        let signer = Crypto::new([key; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let header = BlockHeader {
+            version: view.version(),
+            sequence: view.sequence(),
+            creator,
+            mined_amount: view.mined_amount(),
+            payload_type: view.payload_type(),
+            consumed_votes: consumed,
+            first_voted_node: first_voted,
+            consumed_votes_from_first_voted_node: recorded,
+            previous_hash: view.previous_hash().try_into().expect("32 bytes"),
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        if let Some(txs) = view.transactions() {
+            for tx in txs.iter() {
+                builder
+                    .add_transaction_bytes(tx.as_bytes())
+                    .ok()
+                    .expect("transaction");
+            }
+        } else if let Some(payload) = view.balances() {
+            for info in payload.iter() {
+                let key: [u8; PUBLIC_KEY_SIZE] = info.public_key().try_into().expect("public key");
+                let ni = NodeInfo::new(info.owner(), info.balance(), info.vote_count(), &key);
+                builder.add_node_info(&ni).ok().expect("add node info");
+            }
+            builder
+                .set_max_node_id(payload.max_node_id())
+                .ok()
+                .expect("set max node id");
+        }
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// A balance block on `prev` repeating `nodes`' state on `state` (the
+    /// active head is the block's parent) with their own keys, its header to be
+    /// set by [`real_on`] or [`reheader`].
+    fn balance_snapshot<S: StorageTrait>(
+        state: &Chain16<S>,
+        seq: u32,
+        prev: [u8; 32],
+        nodes: &[u32],
+    ) -> Block {
+        use moonblokz_chain_types::NodeInfo;
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let header = BlockHeader {
+            version: 1,
+            sequence: seq,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_BALANCE,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: prev,
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        for &n in nodes {
+            let key = *Crypto::new([key_of(n); PRIVATE_KEY_SIZE])
+                .ok()
+                .expect("node key")
+                .public_key()
+                .serialize();
+            let ni = NodeInfo::new(
+                n,
+                state.node_info.balance_of(n),
+                state.vote_engine.accumulated_vote_of(n),
+                &key,
+            );
+            builder.add_node_info(&ni).ok().expect("add node info");
+        }
+        builder
+            .set_max_node_id(state.node_info.max_known_node_id())
+            .ok()
+            .expect("set max node id");
+        builder.build_signed(&signer).ok().expect("build signed")
+    }
+
+    /// `template` as a deviation by `creator` on `state`, whose active head is
+    /// the block's parent: real snapshots, `first_voted_node` the top of the
+    /// order at `p − 1` (I-09, FR37).
+    fn deviation_on<S: StorageTrait>(state: &Chain16<S>, template: &Block, creator: u32) -> Block {
+        let top = state.vote_engine.top_creator().expect("a top creator");
+        let snapshot = |n| vote_snapshot(state.vote_engine.accumulated_vote_of(n));
+        reheader(
+            template,
+            creator,
+            snapshot(creator),
+            top,
+            snapshot(top),
+            key_of(creator),
+        )
+    }
+
+    /// The key byte of node `n` in these fixtures (node #0's is `1`).
+    fn key_of(n: u32) -> u8 {
+        if n == 0 { 1 } else { 0xB0 + n as u8 }
+    }
+
+    /// A node with its own key and id over `storage`, trusting node #0's key
+    /// as the FR69 anchor, not yet configured.
+    fn local_node<S: StorageTrait>(local: u32, storage: S) -> Chain16<S> {
+        let crypto = Crypto::new([key_of(local); PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("local key");
+        let node_zero = *Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("node #0 key")
+            .public_key()
+            .serialize();
+        let mut slot = core::mem::MaybeUninit::uninit();
+        Blockchain::init(
+            &mut slot,
+            crypto,
+            storage,
+            empty_chain_config(TestChain::BUILD_LIMITS),
+            local,
+            node_zero,
+            0,
+        );
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        unsafe { slot.assume_init() }
+    }
+
+    /// Room for the longer chains of these tests (16 slots).
+    type SupportStorage = MemoryBackend<{ 16 * MAX_BLOCK_SIZE + 8000 }>;
+
+    fn local_storage(local: u32) -> SupportStorage {
+        let mut storage = SupportStorage::new();
+        storage
+            .init(
+                [key_of(local); PRIVATE_KEY_SIZE],
+                0,
+                [0u8; INIT_PARAMS_SIZE],
+            )
+            .ok()
+            .expect("the test backend initializes");
+        storage
+    }
+
+    type SupportChain = Chain16<SupportStorage>;
+
+    /// The Story 6.4 chain on `W = w` (configuration `extra` added): genesis
+    /// by node #0, then `a2` (node #0, registering nodes 1..=5), `a3` (node 1,
+    /// one credit for node 4), `a4` (node 4, three for node 1) and `a5` (node
+    /// 3, one for node 5). At #5 node 1 tops the order (`u = 1`), node 5 holds
+    /// 1000 and nodes 0, 2, 3 and 4 hold 0; `A = {0, 1, 3, 4}`; node 2 is
+    /// registered but never creates. Returns the builder `g` (node #0, local
+    /// id 0), the `local` node fed the same blocks over `storage`, Ready, and
+    /// the blocks `b0..=a5`.
+    fn support_chain_on<S: StorageTrait>(
+        local: u32,
+        storage: S,
+        w: u32,
+        extra: impl FnOnce(&mut ChainConfigPayloadBuilder),
+    ) -> (SupportChain, Chain16<S>, [Block; 6]) {
+        let mut g = local_node(0, local_storage(0));
+        let mut config = window_config_builder(w);
+        extra(&mut config);
+        let genesis = g
+            .process_genesis(CURRENCY, config.content())
+            .ok()
+            .expect("genesis");
+        let (b0, b1) = (genesis.block_zero, genesis.block_one);
+        let mut l = local_node(local, storage);
+        for block in [&b1, &b0] {
+            assert_eq!(
+                receive(&mut l, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert!(l.is_ready(), "precondition: the local node is Ready");
+
+        let regs = tx_block(2, b1.view().hash(), 0, |b| {
+            for n in 1..=5 {
+                b.add_registration(&registration_tx(0, n, key_of(n)))
+                    .ok()
+                    .expect("add registration");
+            }
+        });
+        let a2 = real_on(&g, &regs, 0, 1);
+        let next =
+            |g: &mut SupportChain, l: &mut Chain16<S>, prev: &Block, plan: (u32, u32, u32)| {
+                assert_eq!(receive(g, prev), ReceiveBlockOutcome::AcceptedSilently);
+                assert_eq!(receive(l, prev), ReceiveBlockOutcome::AcceptedSilently);
+                let (creator, target, n) = plan;
+                let seq = prev.view().sequence() + 1;
+                let template = tx_block(
+                    seq,
+                    prev.view().hash(),
+                    0,
+                    votes_for(seq, target, n, 100 * u64::from(seq)),
+                );
+                real_on(g, &template, creator, key_of(creator))
+            };
+        let a3 = next(&mut g, &mut l, &a2, (1, 4, 1));
+        let a4 = next(&mut g, &mut l, &a3, (4, 1, 3));
+        let a5 = next(&mut g, &mut l, &a4, (3, 5, 1));
+        assert_eq!(receive(&mut g, &a5), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut l, &a5), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l).0, 5);
+        assert_eq!(g.vote_engine.top_creator(), Some(1), "precondition: u = 1");
+        assert!(g.vote_engine.accumulated_vote_of(5) > 0);
+        assert_eq!(g.vote_engine.accumulated_vote_of(2), 0);
+        (g, l, [b0, b1, a2, a3, a4, a5])
+    }
+
+    fn support_chain(local: u32) -> (SupportChain, SupportChain, [Block; 6]) {
+        support_chain_on(local, local_storage(local), 16, |_| {})
+    }
+
+    /// A deviation by `creator` on `prev` (the active head of `g`), its
+    /// transaction from `salt`.
+    fn deviation_after(g: &SupportChain, prev: &Block, creator: u32, salt: u64) -> Block {
+        let seq = prev.view().sequence() + 1;
+        let template = tx_block(seq, prev.view().hash(), 0, votes_for(seq, 0, 1, salt));
+        deviation_on(g, &template, creator)
+    }
+
+    /// A normal-form block by `creator` on `prev` (the active head of `g`).
+    fn normal_after(g: &SupportChain, prev: &Block, creator: u32, salt: u64) -> Block {
+        let seq = prev.view().sequence() + 1;
+        let template = tx_block(seq, prev.view().hash(), 0, votes_for(seq, 0, 1, salt));
+        real_on(g, &template, creator, key_of(creator))
+    }
+
+    /// The support `node` sends for `block`, if any.
+    fn support_for<S: StorageTrait>(
+        node: &mut Chain16<S>,
+        block: &Block,
+    ) -> Option<SupportMessage> {
+        match receive(node, block) {
+            ReceiveBlockOutcome::AcceptedAndSendSupport(message) => Some(message),
+            ReceiveBlockOutcome::AcceptedSilently => None,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// AC9 3c — the active set equals a window walk recomputed from storage.
+    fn assert_active_set_matches<
+        C: CryptoTrait,
+        S: StorageTrait,
+        G: ChainConfigTrait,
+        const N: usize,
+        const L: u32,
+        const B: usize,
+        const H: usize,
+        const U: usize,
+    >(
+        bc: &Blockchain<C, S, G, N, L, B, H, U>,
+        what: &str,
+    ) {
+        assert!(bc.active_set.is_valid(), "{what}: the active set is built");
+        let mut reference = [0u16; N];
+        let tail = bc.snake_chain_tail_idx;
+        let mut cur = bc.active_chain_head_idx;
+        loop {
+            let mut buf = [0u8; MAX_BLOCK_SIZE];
+            let creator = bc.view_retained(cur, &mut buf).expect("readable").creator();
+            reference[creator as usize] += 1;
+            if cur == tail {
+                assert_eq!(
+                    bc.active_set.tail_creator(),
+                    creator,
+                    "{what}: tail creator"
+                );
+                break;
+            }
+            cur = bc.blocks.get(cur).expect("on the path").parent_ref();
+        }
+        for (node, count) in reference.iter().enumerate() {
+            assert_eq!(
+                bc.active_set.count(node as u32),
+                *count,
+                "{what}: node {node}"
+            );
+        }
+    }
+
+    /// AC9 test 1 (shape (a), AC7) — a direct-extension deviation by node 4:
+    /// node 3, in `A' = {0, 3}` and so in the subgroup, endorses it, and the
+    /// signature verifies over the 45-byte content. Also AC9 test 3b (M8): the
+    /// chain is in its growth phase (`S_head + 1 < W`) and its tail #0 is a
+    /// seed source, so nothing is due.
+    #[test]
+    fn a_direct_deviation_is_endorsed() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        assert_active_set_matches(&l, "after the extensions");
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let message = support_for(&mut l, &x).expect("support");
+        assert_eq!(head_of(&l), (6, x.view().hash()), "x is active (shape (a))");
+        assert_eq!(message.supporter_node_id, 3);
+        assert_eq!(message.proposer_node_id, 4);
+        assert_eq!(message.deviation_sequence, 6);
+        assert_eq!(message.deviation_block_hash, x.view().hash());
+        let signature = MultiSignature::new(&message.support_signature)
+            .ok()
+            .expect("well-formed");
+        let bytes = support_message_bytes(4, 6, &x.view().hash());
+        assert!(
+            l.crypto
+                .verify_multi_signature(&bytes, &signature, l.crypto.public_key())
+        );
+        // A re-send for the same block is allowed (AC6).
+        assert_eq!(
+            l.non_conflict.check(
+                RING_KIND_SUPPORT,
+                4,
+                6,
+                NonConflictRing::key_of(&x.view().hash())
+            ),
+            RingCheck::SameBlock
+        );
+        assert_active_set_matches(&l, "after the deviation");
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 2 (shape (b)) — `d`, node 5's approval-less deviation, is
+    /// active at 6; node 2's lighter sibling `x` stays a side block, verified
+    /// at Tier 1 against the key at #5, and node 3 endorses both. Then the
+    /// switch case: the heavier sibling becomes active through FR22 and is
+    /// endorsed in shape (a).
+    #[test]
+    fn a_sibling_of_an_approval_less_deviation_is_endorsed() {
+        set_grace_admits(true);
+        {
+            let (g, mut l, blocks) = support_chain(3);
+            let d = deviation_after(&g, &blocks[5], 5, 1);
+            assert!(support_for(&mut l, &d).is_some(), "d itself, in shape (a)");
+            let x = deviation_after(&g, &blocks[5], 2, 2);
+            let message = support_for(&mut l, &x).expect("support for the sibling");
+            assert_eq!(
+                (message.proposer_node_id, message.deviation_sequence),
+                (2, 6)
+            );
+            assert_eq!(head_of(&l), (6, d.view().hash()), "x stays a side block");
+            assert_eq!(status_of(&l, &x), Some(BlockStatus::Connected));
+            assert_eq!(verified(&l, &x), Some(true));
+        }
+
+        // The switch: the lighter `d` (node 2) first, then the heavier `x`
+        // (node 5), which FR22 makes active.
+        let (g, mut l, blocks) = support_chain(3);
+        let d = deviation_after(&g, &blocks[5], 2, 3);
+        assert!(support_for(&mut l, &d).is_some());
+        let x = deviation_after(&g, &blocks[5], 5, 4);
+        let message = support_for(&mut l, &x).expect("support after the switch");
+        assert_eq!(head_of(&l), (6, x.view().hash()), "switched to x");
+        assert_eq!(message.proposer_node_id, 5);
+        assert_active_set_matches(&l, "after the switch");
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — no support: each test starts from the eligible fixture of
+    /// test 1 (or test 2 for the shape-(b) cases) with one condition flipped.
+    #[test]
+    fn no_support_while_collecting() {
+        set_grace_admits(true);
+        let (g, _, blocks) = support_chain(3);
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let mut collecting = local_node(3, local_storage(3));
+        assert_eq!(support_for(&mut collecting, &x), None);
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — `x` by `u` is no deviation (normal form).
+    #[test]
+    fn no_support_for_a_block_by_u() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        assert_eq!(
+            support_for(&mut l, &normal_after(&g, &blocks[5], 1, 1)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — the local node is the proposer.
+    #[test]
+    fn no_support_when_local_is_the_proposer() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(4);
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 4, 1)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 / M1 — the local node is `u`, although `u` is in `A`.
+    #[test]
+    fn no_support_when_local_is_u() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(1);
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 4, 1)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — the local node created nothing in the window.
+    #[test]
+    fn no_support_when_local_is_outside_the_window() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(2);
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 4, 1)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — the grace seam at its production value.
+    #[test]
+    fn no_support_while_grace_refuses() {
+        set_grace_admits(false);
+        let (g, mut l, blocks) = support_chain(3);
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 4, 1)),
+            None
+        );
+    }
+
+    /// AC9 test 3 / M4 — a conflicting second candidate at the same
+    /// `(proposer, p)`: node 2's two siblings of node 5's `d` both pass the
+    /// shape, so only the non-conflict record refuses the second.
+    #[test]
+    fn no_support_for_a_conflicting_candidate() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        assert!(support_for(&mut l, &deviation_after(&g, &blocks[5], 5, 1)).is_some());
+        assert!(support_for(&mut l, &deviation_after(&g, &blocks[5], 2, 2)).is_some());
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 2, 3)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — `u`'s own block at `p` is held (DEC-183): a forged-value
+    /// block by node 1 on #5, a light side block beside test 2's `d`.
+    #[test]
+    fn no_support_once_us_block_is_held() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        assert!(support_for(&mut l, &deviation_after(&g, &blocks[5], 5, 1)).is_some());
+        let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 0, 1, 77));
+        let u_block = reheader(&template, 1, 0, 1, 0, key_of(1));
+        assert_eq!(
+            receive(&mut l, &u_block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 2, 2)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — a block above `p` by another creator (shape (b) fails).
+    #[test]
+    fn no_support_with_another_creator_above_p() {
+        set_grace_admits(true);
+        let (mut g, mut l, blocks) = support_chain(3);
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        // `x` is built at #5, so its header names the top at `p − 1`.
+        let x = deviation_after(&g, &blocks[5], 2, 3);
+        let _ = receive(&mut g, &d);
+        assert!(support_for(&mut l, &d).is_some());
+        let above = normal_after(&g, &d, 3, 2);
+        assert_eq!(
+            receive(&mut l, &above),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(support_for(&mut l, &x), None);
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — a ring full of live entries at other sequences: abstain.
+    #[test]
+    fn no_support_with_a_full_ring() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        for i in 0..16 {
+            assert!(l.non_conflict.insert(RING_KIND_SUPPORT, 9, 7 + i, i));
+        }
+        assert_eq!(
+            support_for(&mut l, &deviation_after(&g, &blocks[5], 4, 1)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 / M7 — `A` is taken at `p − 1`: node 5's deviation `d` and its own
+    /// block above put node 5 into the window at the head, but not at #5, so
+    /// node 5 does not endorse a sibling of `d`.
+    #[test]
+    fn the_active_set_is_taken_at_the_parent() {
+        set_grace_admits(true);
+        let (mut g, mut l, blocks) = support_chain(5);
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        // `x` is built at #5, so its header names the top at `p − 1`.
+        let x = deviation_after(&g, &blocks[5], 2, 3);
+        let _ = receive(&mut g, &d);
+        assert_eq!(support_for(&mut l, &d), None, "local = proposer");
+        let d7 = normal_after(&g, &d, 5, 2);
+        assert_eq!(receive(&mut l, &d7), ReceiveBlockOutcome::AcceptedSilently);
+        assert!(l.active_set.count(5) > 0, "node 5 is in A at the head");
+        assert_eq!(support_for(&mut l, &x), None);
+        set_grace_admits(false);
+    }
+
+    /// AC9 / M5 — an obligation due at the head: on `W = 7` the chain `0..=6`
+    /// is full once `x` lands, and the next extension would drop #0, node #0's
+    /// seed source. The same deviation is endorsed on `W = 16` (test 1).
+    #[test]
+    fn no_support_while_an_obligation_is_due_at_the_head() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain_on(3, local_storage(3), 7, |_| {});
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(support_for(&mut l, &x), None);
+        assert_eq!(head_of(&l), (6, x.view().hash()), "x is active");
+        set_grace_admits(false);
+    }
+
+    /// AC9 — `p + H ≤ S_head` after the head advanced in the same call: `x`
+    /// arrives after its seven descendants (`H = 7` on these `W = 16`
+    /// chains), which the drive promotes behind it, so `x` is out of the
+    /// switch bound by the time it is evaluated.
+    #[test]
+    fn no_support_after_the_head_advanced_past_the_horizon() {
+        set_grace_admits(true);
+        let (mut g, mut l, blocks) = support_chain(3);
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let _ = receive(&mut g, &x);
+        let mut descendants = core::array::from_fn::<Option<Block>, 7, _>(|_| None);
+        let mut prev_hash = x.view().hash();
+        for (i, slot) in descendants.iter_mut().enumerate() {
+            let seq = 7 + i as u32;
+            let template = tx_block(seq, prev_hash, 0, votes_for(seq, 0, 1, 500 + seq as u64));
+            let block = real_on(&g, &template, 4, key_of(4));
+            assert_eq!(
+                receive(&mut g, &block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            prev_hash = block.view().hash();
+            *slot = Some(block);
+        }
+        for block in descendants.iter().rev().flatten() {
+            assert_eq!(
+                receive(&mut l, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(support_for(&mut l, &x), None);
+        assert_eq!(head_of(&l).0, 13, "the drive promoted the descendants");
+        set_grace_admits(false);
+    }
+
+    /// AC9 — `p ≤ F` after a restart: the restarted node's floor is its
+    /// ready-entry head (DEC-198), so the sibling it would have endorsed
+    /// (test 2) is refused.
+    #[test]
+    fn no_support_at_or_below_the_restart_floor() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        assert!(support_for(&mut l, &d).is_some());
+        let mut restarted = local_node(3, l.storage);
+        let _ = restarted.initialize_from_storage(0);
+        assert!(restarted.is_ready());
+        assert_eq!(restarted.non_conflict.floor(), 6);
+        assert_active_set_matches(&restarted, "after the restart");
+        assert_eq!(
+            support_for(&mut restarted, &deviation_after(&g, &blocks[5], 2, 2)),
+            None
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC6 — the ring survives a DEC-205 re-entry to collecting that lands
+    /// on a lower head: `x` (node 4 at 6) was endorsed, then lost, and the
+    /// node re-entered on #5, so `F = 5` no longer covers 6 — only the record
+    /// refuses a conflicting candidate there. The same candidate is endorsed
+    /// on a node that never endorsed `x`.
+    #[test]
+    fn the_ring_survives_a_re_entry() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        assert!(support_for(&mut l, &x).is_some());
+        let lost = slot(&l, &x);
+        l.delete_subtree_with_followup(lost);
+        let _ = l.reenter_collecting(0);
+        assert!(l.is_ready(), "the re-entry reached Ready again");
+        assert_eq!(head_of(&l).0, 5, "on a lower head");
+        assert_eq!(l.non_conflict.floor(), 5);
+        assert_active_set_matches(&l, "after the re-entry");
+        let other = deviation_after(&g, &blocks[5], 4, 2);
+        assert_eq!(support_for(&mut l, &other), None, "the record survives");
+        let (_, mut fresh, _) = support_chain(3);
+        assert!(support_for(&mut fresh, &other).is_some());
+        set_grace_admits(false);
+    }
+
+    /// AC9 / M2 — with `required_support = 1` the subgroup is the one member
+    /// of `A' = {0, 3}` with the smaller node value: exactly that node — node
+    /// #0 (the builder) or node 3 — endorses.
+    #[test]
+    fn only_the_m_smallest_node_values_endorse() {
+        set_grace_admits(true);
+        let (mut g, mut l, blocks) = support_chain_on(3, local_storage(3), 16, |c| {
+            c.add_literal(parameter::REQUIRED_SUPPORT, &[1])
+                .ok()
+                .expect("a one-byte literal");
+        });
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let by_three = support_for(&mut l, &x).is_some();
+        let by_zero = support_for(&mut g, &x).is_some();
+        let seed = subgroup_seed(6, CIRCULATING_CURRENCY_STUB, 4);
+        let zero_is_smaller = node_value(&seed, 0) < node_value(&seed, 3);
+        assert_eq!((by_zero, by_three), (zero_is_smaller, !zero_is_smaller));
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3d — with the seams at their production values an evaluation
+    /// reads nothing at all: the shape-(b) sibling's evaluation, which reads
+    /// `d`'s header once the grace seam admits, reads no block in production.
+    /// Measured on the evaluation itself: the rest of `receive_block` (the FR22
+    /// comparison) may read regardless.
+    #[test]
+    fn an_evaluation_in_production_reads_nothing() {
+        set_grace_admits(false);
+        let storage = FailingReadStorage {
+            inner: initialized_storage([key_of(3); PRIVATE_KEY_SIZE]),
+            failing_slot: NONE_REF,
+            reads_left: core::cell::Cell::new(u32::MAX),
+            failures_left: core::cell::Cell::new(0),
+            attempts: core::cell::Cell::new(0),
+            reads: core::cell::Cell::new(0),
+        };
+        let (g, mut l, blocks) = support_chain_on(3, storage, 16, |_| {});
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        assert_eq!(support_for(&mut l, &d), None);
+        let x = deviation_after(&g, &blocks[5], 2, 2);
+        assert_eq!(support_for(&mut l, &x), None);
+        let x_idx = slot(&l, &x);
+        let first_voted = x.view().first_voted_node();
+        let before = l.storage.reads.get();
+        assert_eq!(l.evaluate_support(x_idx, 2, first_voted), None);
+        assert_eq!(l.storage.reads.get(), before, "no read in production");
+        set_grace_admits(true);
+        assert!(l.evaluate_support(x_idx, 2, first_voted).is_some());
+        assert!(
+            l.storage.reads.get() > before,
+            "the admitted evaluation reads"
+        );
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 4, second half, and AC3's known safe case — node 5's `d` is a
+    /// balance block that lists node 2, so node 2's seed source moves above
+    /// `p − 1`: node 2's sibling `x` is admitted unverified and gets no
+    /// support. Test 2 is the same with a transaction `d`, where `x` is
+    /// verified and endorsed.
+    #[test]
+    fn an_unverified_sibling_gets_no_support() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        let top = g.vote_engine.top_creator().expect("a top");
+        let snapshot = |n| vote_snapshot(g.vote_engine.accumulated_vote_of(n));
+        let template = balance_snapshot(&g, 6, blocks[5].view().hash(), &[2]);
+        let d = reheader(&template, 5, snapshot(5), top, snapshot(top), key_of(5));
+        let _ = support_for(&mut l, &d);
+        assert_eq!(head_of(&l), (6, d.view().hash()), "d is active");
+        let x = deviation_after(&g, &blocks[5], 2, 2);
+        assert_eq!(support_for(&mut l, &x), None);
+        assert_eq!(verified(&l, &x), Some(false));
+        set_grace_admits(false);
+    }
+
+    /// AC8 — two nodes fed the same blocks in the same order decide alike
+    /// and emit byte-identical messages; here `d` then its sibling `x`.
+    #[test]
+    fn support_is_replay_deterministic() {
+        set_grace_admits(true);
+        let (g, mut first, blocks) = support_chain(3);
+        let (_, mut second, _) = support_chain(3);
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        let x = deviation_after(&g, &blocks[5], 2, 2);
+        let one = (support_for(&mut first, &d), support_for(&mut first, &x));
+        let two = (support_for(&mut second, &d), support_for(&mut second, &x));
+        assert!(one.0.is_some() && one.1.is_some());
+        assert_eq!(one, two);
+        set_grace_admits(false);
+    }
+
+    /// AC8 — the other arrival order: `x` (lighter) arrives first and is
+    /// endorsed as a direct extension; the heavier `d` then wins FR22 and is
+    /// endorsed after the switch. Again two nodes agree byte for byte.
+    #[test]
+    fn support_is_replay_deterministic_in_the_other_order() {
+        set_grace_admits(true);
+        let (g, mut first, blocks) = support_chain(3);
+        let (_, mut second, _) = support_chain(3);
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        let x = deviation_after(&g, &blocks[5], 2, 2);
+        let one = (support_for(&mut first, &x), support_for(&mut first, &d));
+        let two = (support_for(&mut second, &x), support_for(&mut second, &d));
+        assert!(one.0.is_some() && one.1.is_some());
+        assert_eq!(head_of(&first), (6, d.view().hash()));
+        assert_eq!(one, two);
+        set_grace_admits(false);
+    }
+
+    /// The Story 6.4 chain on `W = 8` (`H = 1`) carried past genesis, so its
+    /// tail has advanced: [`support_chain_on`]'s `b0..=a5`, then `a6` (node 2,
+    /// one credit for node 3), `a7` (node 5, one for node 2), `r8` (node #0's
+    /// balance replay of node #0, dropping #0), `r9` (node 3's chain-config
+    /// replay, dropping #1), `r10` (node #0's balance replay of nodes 1..=5,
+    /// dropping #2) and `a11` (node 3, one credit for node 1). The window at
+    /// #11 is `[4, 11]`, and node 4's only block in it is `a4`: an extension at
+    /// 12 drops `a4`, which then lies in the horizon. `u` stays node 1.
+    fn long_support_chain(local: u32) -> (SupportChain, SupportChain, [Block; 6]) {
+        let (mut g, mut l, base) = support_chain_on(local, local_storage(local), 8, |_| {});
+        let both = |g: &mut SupportChain, l: &mut SupportChain, block: &Block| {
+            assert_eq!(receive(g, block), ReceiveBlockOutcome::AcceptedSilently);
+            assert_eq!(receive(l, block), ReceiveBlockOutcome::AcceptedSilently);
+        };
+        let a6 = normal_votes(&g, &base[5], 2, 3);
+        both(&mut g, &mut l, &a6);
+        let a7 = normal_votes(&g, &a6, 5, 2);
+        both(&mut g, &mut l, &a7);
+        let r8 = real_on(
+            &g,
+            &balance_snapshot(&g, 8, a7.view().hash(), &[0]),
+            0,
+            key_of(0),
+        );
+        both(&mut g, &mut l, &r8);
+        let template = chain_config_block_from(9, r8.view().hash(), &mut window_config_builder(8));
+        let r9 = real_on(&g, &template, 3, key_of(3));
+        both(&mut g, &mut l, &r9);
+        let r10 = real_on(
+            &g,
+            &balance_snapshot(&g, 10, r9.view().hash(), &[1, 2, 3, 4, 5]),
+            0,
+            key_of(0),
+        );
+        both(&mut g, &mut l, &r10);
+        let a11 = normal_votes(&g, &r10, 3, 1);
+        both(&mut g, &mut l, &a11);
+        assert_eq!(head_of(&l).0, 11);
+        assert_eq!(l.active_snake_chain_window(), Ok((4, 11)));
+        assert_eq!(g.vote_engine.top_creator(), Some(1), "precondition: u = 1");
+        assert_active_set_matches(&l, "past genesis");
+        let [_, _, _, _, a4, _] = base;
+        (g, l, [a4, a6, a7, r8, r10, a11])
+    }
+
+    /// A normal-form block by `creator` on `prev` (the active head of `g`),
+    /// one credit for `target`.
+    fn normal_votes(g: &SupportChain, prev: &Block, creator: u32, target: u32) -> Block {
+        let seq = prev.view().sequence() + 1;
+        let template = tx_block(
+            seq,
+            prev.view().hash(),
+            0,
+            votes_for(seq, target, 1, 100 * u64::from(seq)),
+        );
+        real_on(g, &template, creator, key_of(creator))
+    }
+
+    /// AC9 (the `p − 1` correction on a chain, M7's returning half) — node 2's
+    /// deviation at 12 drops `a4`, node 4's only block in the window of #11:
+    /// node 4 is in `A` at `p − 1` only through the returning block, read back
+    /// from the horizon, and endorses.
+    #[test]
+    fn a_dropped_block_returns_its_creator_to_the_parent_window() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = long_support_chain(4);
+        let x = deviation_after(&g, &blocks[5], 2, 1);
+        let message = support_for(&mut l, &x).expect("node 4 is in A at #11");
+        assert_eq!(message.supporter_node_id, 4);
+        assert_eq!(head_of(&l), (12, x.view().hash()));
+        assert_eq!(l.active_snake_chain_window(), Ok((5, 12)));
+        assert_eq!(
+            l.active_set.count(4),
+            0,
+            "node 4 left the window at the head"
+        );
+        assert_active_set_matches(&l, "after the tail advance");
+        set_grace_admits(false);
+    }
+
+    /// AC9 (the `returning_d` branch) — node 4's own deviation `d` at 12
+    /// drops `a4`, node 4's block: at #11 node 4 counts once (`a4`), at the
+    /// head once (`d`); the correction removes `d` and returns `a4`, so node 4
+    /// — `d`'s creator, not the proposer of the sibling `x` — endorses `x`.
+    #[test]
+    fn a_returning_block_of_ds_creator_keeps_it_in_the_parent_window() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = long_support_chain(4);
+        let d = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(support_for(&mut l, &d), None, "local = proposer");
+        assert_eq!(head_of(&l), (12, d.view().hash()));
+        let x = deviation_after(&g, &blocks[5], 2, 2);
+        let message = support_for(&mut l, &x).expect("node 4 is in A at #11");
+        assert_eq!(message.proposer_node_id, 2);
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 3 — shape (b) with a sibling in normal form: node 2's block
+    /// beside node 5's `d` names itself as `first_voted_node`, a
+    /// non-deviation under I-10, so it gets no support (test 2's deviating
+    /// sibling does).
+    #[test]
+    fn no_support_for_a_normal_form_sibling() {
+        set_grace_admits(true);
+        let (g, mut l, blocks) = support_chain(3);
+        assert!(support_for(&mut l, &deviation_after(&g, &blocks[5], 5, 1)).is_some());
+        let sibling = normal_after(&g, &blocks[5], 2, 2);
+        assert_eq!(support_for(&mut l, &sibling), None);
+        assert_eq!(verified(&l, &sibling), Some(true));
+        set_grace_admits(false);
     }
 }

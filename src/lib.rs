@@ -19,6 +19,11 @@
 //! identically) — the seam every later replay/simulator story (Epic 11)
 //! builds on.
 
+// The AC9 test seams use `std::thread_local!` (Story 6.4); production stays
+// `no_std`.
+#[cfg(test)]
+extern crate std;
+
 pub mod api;
 
 // Internal modules — crate-private; never `pub mod` (FR66 boundary).
@@ -46,6 +51,7 @@ pub use api::{
     ReceiveBlockOutcome, ReceiveTransactionOutcome, RejectReason, TickOutcome, TransactionState,
     TxStateQueryError,
 };
+pub use approval::SupportMessage;
 
 #[cfg(test)]
 mod tests {
