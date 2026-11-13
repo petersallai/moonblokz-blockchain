@@ -35,9 +35,9 @@ use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
 use crate::approval::{
-    ActiveSetCounter, CIRCULATING_CURRENCY_STUB, NonConflictRing, RING_KIND_SUPPORT, RingCheck,
-    SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView, in_subgroup, subgroup_seed,
-    subgroup_size, support_body_tail, support_dedupe_key, support_message_bytes,
+    ActiveSetCounter, CIRCULATING_CURRENCY_STUB, DEDUPE_SALT_LABEL, NonConflictRing,
+    RING_KIND_SUPPORT, RingCheck, SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView,
+    in_subgroup, subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
 };
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
@@ -1197,7 +1197,9 @@ impl<
             (&raw mut (*p).active_branch_value).write(0);
             ActiveSetCounter::init(field_slot(&raw mut (*p).active_set));
             (&raw mut (*p).non_conflict).write(NonConflictRing::new());
-            (&raw mut (*p).support_dedupe).write(SupportDedupe::new());
+            (&raw mut (*p).support_dedupe).write(SupportDedupe::new(
+                Prng::new(prng_seed).derive_subseed(DEDUPE_SALT_LABEL),
+            ));
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -1241,7 +1243,9 @@ impl<
             active_branch_value: 0,
             active_set: ActiveSetCounter::new(),
             non_conflict: NonConflictRing::new(),
-            support_dedupe: SupportDedupe::new(),
+            support_dedupe: SupportDedupe::new(
+                Prng::new(prng_seed).derive_subseed(DEDUPE_SALT_LABEL),
+            ),
         }
     }
 
@@ -2693,9 +2697,10 @@ impl<
     /// The checks, cheapest first (AC2): (v) the relay-dedupe cache, a hit is
     /// `Rejected`; then, when the deviation is **on the active chain** (ready,
     /// held there, `S_tail ≤ p ≤ S_head` by sequence; D4), the supporter id at
-    /// most `max_known_node_id`, (iii) the proposer is the deviation's creator
-    /// and the deviation is in deviation form, (iv-a) no approval block above
-    /// it, (iv-c) no validated block of the originally-top node `u` beside it,
+    /// most `max_known_node_id`, (iv-a) no approval block above it (RAM),
+    /// (iii) the proposer is the deviation's creator and the deviation is in
+    /// deviation form, (iv-c) no validated block of the originally-top node `u`
+    /// beside it,
     /// and (iv-b) the supporter in the ADR-015 subgroup at `p − 1` within `p +
     /// H > S_head`; off the active chain, in ready state, only (iv-c); and
     /// last (ii), the signature, whenever the supporter's key is derivable.
@@ -2724,7 +2729,7 @@ impl<
         }
         let (sequence, key, supporter) = (
             support.deviation_sequence(),
-            support.dedupe_key(),
+            self.support_dedupe.key(support.tail()),
             support.supporter(),
         );
         let outcome = if !self.support_dedupe.contains(sequence, key, supporter)
@@ -2768,7 +2773,8 @@ impl<
     }
 
     /// FR26 for a deviation `d` (at `d_idx`, sequence `p`) on the active chain:
-    /// the supporter watermark, (iii), (iv-a), (iv-c) and (iv-b) (D4, D5).
+    /// the supporter watermark, (iv-a), (iii), (iv-c) and (iv-b), cheapest
+    /// first (D4, D5).
     fn on_chain_support_holds(&self, d_idx: u32, p: u32, supporter: u32, proposer: u32) -> bool {
         // Ids are contiguous: a supporter in `A` at `p − 1` is at most the
         // head's watermark. Not `public_key_of`: a pre-seed node has no key.
@@ -2783,16 +2789,17 @@ impl<
             return true;
         };
         let above = s_head - p + 1;
+        // (iv-a), RAM only and so first: an approval block above `d` is its
+        // evidence (FR27).
+        if self.active_above(d_idx, above, None) == AboveP::Evidence {
+            return false;
+        }
         // (iii): the signed proposer is `d`'s creator, and `d` deviates. A
-        // failed read defers (iii) and (iv-b); (iv-a) still runs.
+        // failed read defers (iii) and (iv-b).
         let header = self.header_at(d_idx);
         if let Some((creator_d, first_voted_d)) = header
             && (proposer != creator_d || creator_d == first_voted_d)
         {
-            return false;
-        }
-        // (iv-a): an approval block above `d` is its evidence (FR27), RAM only.
-        if self.active_above(d_idx, above, None) == AboveP::Evidence {
             return false;
         }
         let (Some((creator_d, u)), Some(parent)) =
@@ -2815,7 +2822,7 @@ impl<
             return true;
         };
         if !self.active_set.is_valid()
-            || p + h <= s_head
+            || s_head - p >= h
             || self.active_above(d_idx, above, Some(creator_d)) != AboveP::Clean
         {
             return true;
@@ -3066,7 +3073,7 @@ impl<
         // Story 6.5 (AC3): cache the node's own support as relayed, so a
         // neighbour's echo of it is not relayed back.
         let local = self.local_node_id;
-        let dedupe_key = support_dedupe_key(&support_body_tail(
+        let dedupe_key = self.support_dedupe.key(&support_body_tail(
             local,
             x_creator,
             &x_hash,
@@ -3138,6 +3145,10 @@ impl<
         skip: [u32; 2],
         validated_only: bool,
     ) -> Option<bool> {
+        // An unlinked block has no resolved parent: every root would match.
+        if parent == NONE_REF {
+            return None;
+        }
         let mut failed = false;
         for idx in 0..MAX_BLOCKS as u32 {
             if skip.contains(&idx) {
@@ -8140,7 +8151,10 @@ mod tests {
         assert!(*non_conflict == NonConflictRing::new());
         assert_eq!(non_conflict.floor(), 0);
         // Story 6.5: an empty relay-dedupe cache.
-        assert!(*support_dedupe == SupportDedupe::new());
+        assert!(
+            *support_dedupe
+                == SupportDedupe::new(Prng::new(0xDEAD_BEEF).derive_subseed(DEDUPE_SALT_LABEL))
+        );
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -20453,6 +20467,11 @@ mod tests {
             intake(&mut r, &support_by(2, 2, 6, h)),
             ReceiveSupportOutcome::Accepted
         );
+        // (iii) is deferred too: a wrong proposer is not checked here.
+        assert_eq!(
+            intake(&mut r, &support_by(3, 9, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
     }
 
     /// AC7 test 3 / N5 — `a3` at 3 is flagged on the active chain but lies
@@ -20494,10 +20513,13 @@ mod tests {
             intake(&mut r, &support_by(1, 4, 12, h)),
             ReceiveSupportOutcome::Accepted
         );
-        assert_eq!(
-            intake(&mut r, &support_by(9, 4, 12, h)),
-            ReceiveSupportOutcome::Rejected
-        );
+        for unknown in [9, 20] {
+            assert_eq!(
+                intake(&mut r, &support_by(unknown, 4, 12, h)),
+                ReceiveSupportOutcome::Rejected,
+                "node {unknown}"
+            );
+        }
         let y_idx = slot(&r, &y);
         r.blocks.stamp_payload_type(y_idx, PAYLOAD_TYPE_APPROVAL);
         assert_eq!(
@@ -20678,6 +20700,11 @@ mod tests {
             intake(&mut r, &support_by(3, 2, 6, [9u8; 32])),
             ReceiveSupportOutcome::Accepted
         );
+        // No active block at all at 7 (above the head): not evaluable either.
+        assert_eq!(
+            intake(&mut r, &support_by(3, 2, 7, [9u8; 32])),
+            ReceiveSupportOutcome::Accepted
+        );
     }
 
     /// AC7 test 3b — a failed read of a candidate sibling never rejects: the
@@ -20697,12 +20724,18 @@ mod tests {
         assert_eq!(receive(&mut r, &x), ReceiveBlockOutcome::AcceptedSilently);
         let u = u_block(&blocks, 77);
         assert_eq!(receive(&mut r, &u), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            verified(&r, &u),
+            Some(true),
+            "the validated filter admits u"
+        );
         r.storage.failing_slot = slot(&r, &u);
         r.storage.failures_left.set(u32::MAX);
         assert_eq!(
             intake(&mut r, &support_by(3, 4, 6, x.view().hash())),
             ReceiveSupportOutcome::Accepted
         );
+        assert!(r.storage.attempts.get() > 0, "u's header read was tried");
     }
 
     /// AC7 test 4 / N6 — a rejected support is not cached, an accepted one is;
@@ -20715,7 +20748,10 @@ mod tests {
         assert_eq!(intake(&mut r, &rejected), ReceiveSupportOutcome::Rejected);
         let body = body_of(&rejected);
         let view = SupportView::from_bytes(&body).expect("one body");
-        assert!(!r.support_dedupe.contains(6, view.dedupe_key(), 2));
+        assert!(
+            !r.support_dedupe
+                .contains(6, r.support_dedupe.key(view.tail()), 2)
+        );
         let accepted = support_by(3, 4, 6, h);
         assert_eq!(intake(&mut r, &accepted), ReceiveSupportOutcome::Accepted);
         let x_idx = slot(&r, &x);
@@ -20805,6 +20841,70 @@ mod tests {
         assert_eq!(head_of(&r), (6, x.view().hash()));
     }
 
+    /// Review patch (edge case) — an unresolved parent is not a parent: the
+    /// sibling scan defers on `NONE_REF` instead of matching every root.
+    #[test]
+    fn the_sibling_scan_defers_on_an_unresolved_parent() {
+        let (_, r, blocks, _) = on_chain_receiver();
+        assert_eq!(r.creator_block_at(NONE_REF, 6, 1, [0, 0], true), None);
+        let parent = slot(&r, &blocks[5]);
+        assert_eq!(r.creator_block_at(parent, 6, 1, [0, 0], true), Some(false));
+    }
+
+    /// Review patch (N8 as specified) — a non-zero supporter whose seed source
+    /// is the tail is derivable off the active chain, so its bad signature is
+    /// rejected and its good one accepted. The seed source is moved there by
+    /// hand: no block fixture reaches it (D4's narrow reach).
+    #[test]
+    fn a_key_seeded_at_the_tail_is_checked_off_the_active_chain() {
+        let (_, mut r, _) = support_chain(2);
+        let tail = r.snake_chain_tail_idx;
+        r.node_info.move_seed_source(3, tail);
+        let h = [7u8; 32];
+        assert_eq!(
+            intake(&mut r, &forged(support_by(3, 4, 6, h))),
+            ReceiveSupportOutcome::Rejected
+        );
+        assert_eq!(
+            intake(&mut r, &support_by(3, 4, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
+    }
+
+    /// Review patch (AC7 3b, case (b)) — `u`'s own block is the active block
+    /// at 6 and node 4's deviation is held beside it: the active `u`-block
+    /// stops the relay (the `is_on_active_chain` arm of the validated filter).
+    #[test]
+    fn an_active_u_block_stops_the_relay_for_a_held_deviation() {
+        let (g, mut r, blocks) = support_chain(2);
+        let n = normal_after(&g, &blocks[5], 1, 1);
+        assert_eq!(receive(&mut r, &n), ReceiveBlockOutcome::AcceptedSilently);
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(receive(&mut r, &x), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&r), (6, n.view().hash()), "u's block stays active");
+        assert_eq!(
+            intake(&mut r, &support_by(3, 4, 6, x.view().hash())),
+            ReceiveSupportOutcome::Rejected
+        );
+    }
+
+    /// Review patch (AC7 test 4, D2) — a copy with only the proposer changed
+    /// is another dedupe entry: it does not take the real support's slot.
+    #[test]
+    fn a_proposer_forgery_does_not_take_the_real_supports_slot() {
+        let mut c = local_node(2, local_storage(2));
+        let real = support_by(3, 4, 6, [7u8; 32]);
+        let mut forgery = support_by(3, 4, 6, [7u8; 32]);
+        forgery.proposer_node_id = 5;
+        assert_eq!(
+            intake(&mut c, &forgery),
+            ReceiveSupportOutcome::Accepted,
+            "relayed unverified (AR-023)"
+        );
+        assert_eq!(intake(&mut c, &real), ReceiveSupportOutcome::Accepted);
+        assert_eq!(intake(&mut c, &real), ReceiveSupportOutcome::Rejected);
+    }
+
     /// AC7 test 7 (AR16) — two nodes fed the same blocks and the same support
     /// stream classify it identically.
     #[test]
@@ -20821,10 +20921,25 @@ mod tests {
                 forged(support_by(3, 4, 7, [5u8; 32])),
                 support_by(9, 4, 6, h),
             ];
-            stream.map(|m| intake(&mut r, &m))
+            let outcomes = stream.map(|m| intake(&mut r, &m));
+            // 128 deferred junk supports evict the stream's entries.
+            for i in 0..128 {
+                let junk = SupportMessage {
+                    supporter_node_id: 1000 + i,
+                    proposer_node_id: 4,
+                    deviation_sequence: 7,
+                    deviation_block_hash: [3u8; 32],
+                    support_signature: [0u8; MULTI_SIGNATURE_SIZE],
+                };
+                assert_eq!(intake(&mut r, &junk), ReceiveSupportOutcome::Accepted);
+            }
+            (outcomes, intake(&mut r, &support_by(3, 4, 6, h)))
         };
-        let first = run();
-        assert_eq!(first, run());
+        let (first, after_eviction) = run();
+        let (second, second_after_eviction) = run();
+        assert_eq!(first, second);
+        assert_eq!(after_eviction, second_after_eviction);
+        assert_eq!(after_eviction, ReceiveSupportOutcome::Accepted, "evicted");
         assert_eq!(
             first,
             [

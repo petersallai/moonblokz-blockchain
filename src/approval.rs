@@ -347,9 +347,10 @@ impl<'a> SupportView<'a> {
         &self.body[SUPPORT_SIGNATURE_AT..]
     }
 
-    /// The relay-dedupe key of this message (DEC-230).
-    pub(crate) fn dedupe_key(&self) -> u32 {
-        support_dedupe_key(&self.body[4..])
+    /// The body after `deviation_sequence`: the bytes the relay-dedupe key
+    /// covers (DEC-230).
+    pub(crate) fn tail(&self) -> &[u8] {
+        &self.body[4..]
     }
 }
 
@@ -370,13 +371,11 @@ pub(crate) fn support_body_tail(
     tail
 }
 
-/// FR26 (v) / DEC-230 — the relay-dedupe key: the first four bytes of the
-/// SHA-256 of a support body after its sequence. It covers the proposer, so a
-/// copy with only the proposer changed is another entry; and a digest, unlike
-/// an affine CRC, cannot be steered to a seen message's key.
-pub(crate) fn support_dedupe_key(tail: &[u8]) -> u32 {
-    NonConflictRing::key_of(&calculate_hash(tail))
-}
+/// The label of the relay-dedupe salt's sub-seed (DEC-230, AR11).
+pub(crate) const DEDUPE_SALT_LABEL: &[u8] = b"support-dedupe";
+
+/// Length of the dedupe key's preimage: the salt, then the body tail.
+const DEDUPE_PREIMAGE_SIZE: usize = 8 + SUPPORT_BODY_SIZE - 4;
 
 /// Relay-dedupe capacity (DEC-199).
 const DEDUPE_SLOTS: usize = 128;
@@ -395,6 +394,17 @@ const DEDUPE_ENTRY_SIZE: usize = 12;
 /// at most one duplicate relay, which FR26 accepts. Entries are key-agnostic:
 /// Story 6.13's twin vote uses the same form, `(s, key, voter)`.
 ///
+/// **The key** (DEC-230, code review 2026-11-13) is the first four bytes of
+/// `SHA-256(salt ‖ tail)`: `tail` is the body after the sequence (supporter,
+/// proposer, hash, signature), so a copy with only the proposer changed is
+/// another entry, and `salt` is this node's secret, derived from its
+/// construction seed. Without the salt a 4-byte key could be ground — about
+/// `2³²` hashes find junk with a seen support's key — and the junk would make
+/// a node that accepts it unverified drop the real copy. With it nobody can
+/// compute this node's keys, and a collision found for one node does not
+/// carry to another. The production seed must be unpredictable (the bridge,
+/// AR12).
+///
 /// A never-used slot is all `0xFF` bytes. Only the junk triple `(u32::MAX,
 /// 0xFFFF_FFFF, u32::MAX)` can match it, and treating that as a duplicate is
 /// harmless.
@@ -406,15 +416,25 @@ const DEDUPE_ENTRY_SIZE: usize = 12;
 pub(crate) struct SupportDedupe {
     entries: [[u8; DEDUPE_ENTRY_SIZE]; DEDUPE_SLOTS],
     next: u8,
+    salt: [u8; 8],
 }
 
 impl SupportDedupe {
-    /// An empty cache.
-    pub(crate) const fn new() -> Self {
+    /// An empty cache keyed with `salt`.
+    pub(crate) const fn new(salt: u64) -> Self {
         Self {
             entries: [[0xFF; DEDUPE_ENTRY_SIZE]; DEDUPE_SLOTS],
             next: 0,
+            salt: salt.to_le_bytes(),
         }
+    }
+
+    /// The key of a support body's `tail` (after its sequence) on this node.
+    pub(crate) fn key(&self, tail: &[u8]) -> u32 {
+        let mut preimage = [0u8; DEDUPE_PREIMAGE_SIZE];
+        preimage[..8].copy_from_slice(&self.salt);
+        preimage[8..].copy_from_slice(tail);
+        NonConflictRing::key_of(&calculate_hash(&preimage))
     }
 
     fn entry(sequence: u32, key: u32, node: u32) -> [u8; DEDUPE_ENTRY_SIZE] {
@@ -935,16 +955,19 @@ mod tests {
     }
 
     /// D2 / N1 — the key covers every byte after the sequence, the proposer
-    /// included, and an emitted message is keyed exactly as a received copy.
+    /// included, and an emitted message is keyed exactly as a received copy;
+    /// it depends on the node's salt (code review 2026-11-13).
     #[test]
     fn the_dedupe_key_covers_the_proposer_and_matches_an_emitted_copy() {
+        let cache = SupportDedupe::new(0x1234_5678_9ABC_DEF0);
+        let key_of = |b: &[u8; SUPPORT_BODY_SIZE]| {
+            cache.key(SupportView::from_bytes(b).expect("one body").tail())
+        };
         let bytes = body(6, 3, 4, 1, 2);
-        let key = SupportView::from_bytes(&bytes)
-            .expect("one body")
-            .dedupe_key();
+        let key = key_of(&bytes);
         assert_eq!(
             key,
-            support_dedupe_key(&support_body_tail(
+            cache.key(&support_body_tail(
                 3,
                 4,
                 &[1; HASH_SIZE],
@@ -957,27 +980,20 @@ mod tests {
             body(6, 3, 4, 1, 7),
             body(6, 8, 4, 1, 2),
         ] {
-            assert_ne!(
-                SupportView::from_bytes(&other)
-                    .expect("one body")
-                    .dedupe_key(),
-                key
-            );
+            assert_ne!(key_of(&other), key);
         }
         // The sequence lives in the entry, not the key.
-        assert_eq!(
-            SupportView::from_bytes(&body(7, 3, 4, 1, 2))
-                .expect("one body")
-                .dedupe_key(),
-            key
-        );
+        assert_eq!(key_of(&body(7, 3, 4, 1, 2)), key);
+        // Another node's salt keys the same body differently.
+        let other_node = SupportDedupe::new(0x1234_5678_9ABC_DEF1);
+        assert_ne!(other_node.key(&bytes[4..]), key);
     }
 
     /// D3 — FIFO: the 129th insert drops the first, a hit refreshes nothing,
     /// and a never-used slot matches only the all-ones junk triple.
     #[test]
     fn the_dedupe_cache_is_a_fifo() {
-        let mut cache = SupportDedupe::new();
+        let mut cache = SupportDedupe::new(7);
         assert!(!cache.contains(0, 0, 0));
         assert!(
             cache.contains(u32::MAX, u32::MAX, u32::MAX),
@@ -993,6 +1009,6 @@ mod tests {
         assert!(!cache.contains(0, 0, 0), "the oldest went first");
         assert!(cache.contains(1, 1, 1));
         assert!(cache.contains(1000, 1000, 1000));
-        assert_eq!(core::mem::size_of::<SupportDedupe>(), 128 * 12 + 1);
+        assert_eq!(core::mem::size_of::<SupportDedupe>(), 128 * 12 + 1 + 8);
     }
 }
