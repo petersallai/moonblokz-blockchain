@@ -2,8 +2,10 @@
 //!
 //! Story 6.4 builds what a node needs to decide, deterministically and from
 //! chain state alone, whether it endorses a deviating block, and the message it
-//! sends when it does: the outbound [`SupportMessage`]. The proposer-side
-//! accumulation and the evidence block are Story 6.6's.
+//! sends when it does: the outbound [`SupportMessage`]. Story 6.5 adds the
+//! inbound side, the FR26 intake: the [`SupportView`] a received support is
+//! parsed into and the relay-dedupe cache. The proposer-side accumulation and
+//! the evidence block are Story 6.6's.
 
 use moonblokz_chain_types::{HASH_SIZE, calculate_hash};
 use moonblokz_crypto::MULTI_SIGNATURE_SIZE;
@@ -12,9 +14,10 @@ use moonblokz_crypto::MULTI_SIGNATURE_SIZE;
 /// [`crate::ReceiveBlockOutcome::AcceptedAndSendSupport`], when it endorses a
 /// deviating block (D4, owned).
 ///
-/// The bridge frames it into the radio `Support` message (DEC-187): the radio
-/// header's sequence and supporter fields carry `deviation_sequence` and
-/// `supporter_node_id`. The signature is over the 45-byte content of
+/// The bridge frames it into the radio `Support` message (DEC-187), whose
+/// body after the type byte and the relay sender is the [`SupportView`]
+/// layout: `deviation_sequence ‖ supporter_node_id ‖ proposer_node_id ‖
+/// deviation_block_hash ‖ support_signature`. The signature is over the 45-byte content of
 /// [`support_message_bytes`], made with the local node's multi-signature key.
 ///
 /// `support_signature` holds the backend's serialized multi-signature bytes,
@@ -269,6 +272,169 @@ impl NonConflictRing {
         entry[5..9].copy_from_slice(&sequence.to_le_bytes());
         entry[9..13].copy_from_slice(&key.to_le_bytes());
         true
+    }
+}
+
+/// Length of a support body (DEC-229): `deviation_sequence` u32 ‖
+/// `supporter_node_id` u32 ‖ `proposer_node_id` u32 ‖ the deviation block hash ‖
+/// the serialized multi-signature: 108 bytes with Schnorr, 92 with BLS.
+const SUPPORT_BODY_SIZE: usize = 4 + 4 + 4 + HASH_SIZE + MULTI_SIGNATURE_SIZE;
+
+/// Offset of the deviation block hash in a support body.
+const SUPPORT_HASH_AT: usize = 12;
+
+/// Offset of the signature in a support body.
+const SUPPORT_SIGNATURE_AT: usize = SUPPORT_HASH_AT + HASH_SIZE;
+
+/// FR26 — a received support message, borrowed (DEC-229).
+///
+/// It views the radio `Support` message's hop-invariant body, bytes `[5..len)`:
+/// `deviation_sequence u32 ‖ supporter_node_id u32 ‖ proposer_node_id u32 ‖
+/// deviation_block_hash ‖ support_signature`, integers little-endian (DEC-218).
+/// The type byte and the relay sender lie outside it, so the classification
+/// cannot depend on the transport origin.
+///
+/// [`SupportView::from_bytes`] is FR26 (i), the format check, as
+/// `BlockView::from_bytes` is for blocks: the bridge treats its `None` exactly
+/// like [`crate::ReceiveSupportOutcome::Rejected`] — the message is dropped and
+/// not relayed — and calls [`crate::Blockchain::receive_support`] only with a
+/// parsed view. The field reads are crate-private (system constraints §0).
+pub struct SupportView<'a> {
+    body: &'a [u8],
+}
+
+impl<'a> SupportView<'a> {
+    /// The view over `body`, iff it is exactly one support body long (FR26
+    /// (i)). Nothing else is checked here: the fields are classified by
+    /// [`crate::Blockchain::receive_support`].
+    pub fn from_bytes(body: &'a [u8]) -> Option<Self> {
+        (body.len() == SUPPORT_BODY_SIZE).then_some(Self { body })
+    }
+
+    fn word(&self, at: usize) -> u32 {
+        u32::from_le_bytes([
+            self.body[at],
+            self.body[at + 1],
+            self.body[at + 2],
+            self.body[at + 3],
+        ])
+    }
+
+    /// The deviating block's sequence `p`.
+    pub(crate) fn deviation_sequence(&self) -> u32 {
+        self.word(0)
+    }
+
+    /// The node that signed.
+    pub(crate) fn supporter(&self) -> u32 {
+        self.word(4)
+    }
+
+    /// The deviating block's creator the support is addressed to.
+    pub(crate) fn proposer(&self) -> u32 {
+        self.word(8)
+    }
+
+    /// The deviating block's hash.
+    pub(crate) fn hash(&self) -> [u8; HASH_SIZE] {
+        let mut hash = [0u8; HASH_SIZE];
+        hash.copy_from_slice(&self.body[SUPPORT_HASH_AT..SUPPORT_SIGNATURE_AT]);
+        hash
+    }
+
+    /// The serialized multi-signature.
+    pub(crate) fn signature(&self) -> &[u8] {
+        &self.body[SUPPORT_SIGNATURE_AT..]
+    }
+
+    /// The relay-dedupe key of this message (DEC-230).
+    pub(crate) fn dedupe_key(&self) -> u32 {
+        support_dedupe_key(&self.body[4..])
+    }
+}
+
+/// The body after `deviation_sequence` — supporter ‖ proposer ‖ hash ‖
+/// signature, the bytes the dedupe key covers — of a support this node emits,
+/// so that its own message is keyed exactly like a received copy (AC3).
+pub(crate) fn support_body_tail(
+    supporter: u32,
+    proposer: u32,
+    hash: &[u8; HASH_SIZE],
+    signature: &[u8; MULTI_SIGNATURE_SIZE],
+) -> [u8; SUPPORT_BODY_SIZE - 4] {
+    let mut tail = [0u8; SUPPORT_BODY_SIZE - 4];
+    tail[..4].copy_from_slice(&supporter.to_le_bytes());
+    tail[4..8].copy_from_slice(&proposer.to_le_bytes());
+    tail[8..SUPPORT_SIGNATURE_AT - 4].copy_from_slice(hash);
+    tail[SUPPORT_SIGNATURE_AT - 4..].copy_from_slice(signature);
+    tail
+}
+
+/// FR26 (v) / DEC-230 — the relay-dedupe key: the first four bytes of the
+/// SHA-256 of a support body after its sequence. It covers the proposer, so a
+/// copy with only the proposer changed is another entry; and a digest, unlike
+/// an affine CRC, cannot be steered to a seen message's key.
+pub(crate) fn support_dedupe_key(tail: &[u8]) -> u32 {
+    NonConflictRing::key_of(&calculate_hash(tail))
+}
+
+/// Relay-dedupe capacity (DEC-199).
+const DEDUPE_SLOTS: usize = 128;
+
+/// One entry: `sequence u32 ‖ key u32 ‖ node u32`, little-endian, packed so the
+/// cache is 128 × 12 = 1 536 bytes.
+const DEDUPE_ENTRY_SIZE: usize = 12;
+
+/// FR26 (v) / DEC-199 / DEC-231 — the relay-dedupe cache: the supports this
+/// node has accepted, hence relayed, so a copy is not relayed again.
+///
+/// A FIFO ring of `(sequence, key, node)` entries: an insert overwrites the
+/// oldest one, and a hit does not refresh it. Only an accepted message is
+/// inserted — the cache means "already relayed" — and the node's own emitted
+/// supports too, so a neighbour's echo is not relayed back. An eviction costs
+/// at most one duplicate relay, which FR26 accepts. Entries are key-agnostic:
+/// Story 6.13's twin vote uses the same form, `(s, key, voter)`.
+///
+/// A never-used slot is all `0xFF` bytes. Only the junk triple `(u32::MAX,
+/// 0xFFFF_FFFF, u32::MAX)` can match it, and treating that as a duplicate is
+/// harmless.
+///
+/// Non-durable (FR59): a restart is a fresh `init`. Never cleared otherwise,
+/// not even by a re-entry to collecting, which would only re-relay what the
+/// neighbours already have.
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct SupportDedupe {
+    entries: [[u8; DEDUPE_ENTRY_SIZE]; DEDUPE_SLOTS],
+    next: u8,
+}
+
+impl SupportDedupe {
+    /// An empty cache.
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [[0xFF; DEDUPE_ENTRY_SIZE]; DEDUPE_SLOTS],
+            next: 0,
+        }
+    }
+
+    fn entry(sequence: u32, key: u32, node: u32) -> [u8; DEDUPE_ENTRY_SIZE] {
+        let mut entry = [0u8; DEDUPE_ENTRY_SIZE];
+        entry[..4].copy_from_slice(&sequence.to_le_bytes());
+        entry[4..8].copy_from_slice(&key.to_le_bytes());
+        entry[8..].copy_from_slice(&node.to_le_bytes());
+        entry
+    }
+
+    /// Whether `(sequence, key, node)` is cached.
+    pub(crate) fn contains(&self, sequence: u32, key: u32, node: u32) -> bool {
+        let wanted = Self::entry(sequence, key, node);
+        self.entries.contains(&wanted)
+    }
+
+    /// Caches `(sequence, key, node)` over the oldest entry.
+    pub(crate) fn insert(&mut self, sequence: u32, key: u32, node: u32) {
+        self.entries[self.next as usize] = Self::entry(sequence, key, node);
+        self.next = ((self.next as usize + 1) % DEDUPE_SLOTS) as u8;
     }
 }
 
@@ -726,5 +892,107 @@ mod tests {
             );
             assert_eq!(member, reference[node as usize] > 0, "node {node}");
         }
+    }
+
+    // ---- Story 6.5: the support view and the relay-dedupe cache ----
+
+    fn body(
+        sequence: u32,
+        supporter: u32,
+        proposer: u32,
+        hash: u8,
+        sig: u8,
+    ) -> [u8; SUPPORT_BODY_SIZE] {
+        let mut body = [0u8; SUPPORT_BODY_SIZE];
+        body[..4].copy_from_slice(&sequence.to_le_bytes());
+        body[4..].copy_from_slice(&support_body_tail(
+            supporter,
+            proposer,
+            &[hash; HASH_SIZE],
+            &[sig; MULTI_SIGNATURE_SIZE],
+        ));
+        body
+    }
+
+    /// AC2 (i) / D1 — `from_bytes` accepts exactly one support body, and the
+    /// fields sit at the DEC-229 offsets, little-endian.
+    #[test]
+    fn a_support_view_takes_exactly_one_body() {
+        let bytes = body(0x0102_0304, 7, 9, 0xAA, 0x55);
+        assert_eq!(bytes.len(), 44 + MULTI_SIGNATURE_SIZE);
+        assert_eq!(&bytes[..4], &[0x04, 0x03, 0x02, 0x01]);
+        let view = SupportView::from_bytes(&bytes).expect("one body");
+        assert_eq!(view.deviation_sequence(), 0x0102_0304);
+        assert_eq!(view.supporter(), 7);
+        assert_eq!(view.proposer(), 9);
+        assert_eq!(view.hash(), [0xAA; HASH_SIZE]);
+        assert_eq!(view.signature(), &[0x55; MULTI_SIGNATURE_SIZE][..]);
+        assert!(SupportView::from_bytes(&bytes[..SUPPORT_BODY_SIZE - 1]).is_none());
+        let mut long = [0u8; SUPPORT_BODY_SIZE + 1];
+        long[..SUPPORT_BODY_SIZE].copy_from_slice(&bytes);
+        assert!(SupportView::from_bytes(&long).is_none());
+        assert!(SupportView::from_bytes(&[]).is_none());
+    }
+
+    /// D2 / N1 — the key covers every byte after the sequence, the proposer
+    /// included, and an emitted message is keyed exactly as a received copy.
+    #[test]
+    fn the_dedupe_key_covers_the_proposer_and_matches_an_emitted_copy() {
+        let bytes = body(6, 3, 4, 1, 2);
+        let key = SupportView::from_bytes(&bytes)
+            .expect("one body")
+            .dedupe_key();
+        assert_eq!(
+            key,
+            support_dedupe_key(&support_body_tail(
+                3,
+                4,
+                &[1; HASH_SIZE],
+                &[2; MULTI_SIGNATURE_SIZE]
+            ))
+        );
+        for other in [
+            body(6, 3, 5, 1, 2),
+            body(6, 3, 4, 9, 2),
+            body(6, 3, 4, 1, 7),
+            body(6, 8, 4, 1, 2),
+        ] {
+            assert_ne!(
+                SupportView::from_bytes(&other)
+                    .expect("one body")
+                    .dedupe_key(),
+                key
+            );
+        }
+        // The sequence lives in the entry, not the key.
+        assert_eq!(
+            SupportView::from_bytes(&body(7, 3, 4, 1, 2))
+                .expect("one body")
+                .dedupe_key(),
+            key
+        );
+    }
+
+    /// D3 — FIFO: the 129th insert drops the first, a hit refreshes nothing,
+    /// and a never-used slot matches only the all-ones junk triple.
+    #[test]
+    fn the_dedupe_cache_is_a_fifo() {
+        let mut cache = SupportDedupe::new();
+        assert!(!cache.contains(0, 0, 0));
+        assert!(
+            cache.contains(u32::MAX, u32::MAX, u32::MAX),
+            "the junk triple"
+        );
+        for i in 0..DEDUPE_SLOTS as u32 {
+            cache.insert(i, i, i);
+        }
+        assert!((0..DEDUPE_SLOTS as u32).all(|i| cache.contains(i, i, i)));
+        // A hit on the oldest does not save it from the next insert.
+        assert!(cache.contains(0, 0, 0));
+        cache.insert(1000, 1000, 1000);
+        assert!(!cache.contains(0, 0, 0), "the oldest went first");
+        assert!(cache.contains(1, 1, 1));
+        assert!(cache.contains(1000, 1000, 1000));
+        assert_eq!(core::mem::size_of::<SupportDedupe>(), 128 * 12 + 1);
     }
 }

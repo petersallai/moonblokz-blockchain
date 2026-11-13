@@ -476,6 +476,19 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         *slot = entry;
     }
 
+    /// Test-only: overwrites the cached payload type of the entry at `idx`
+    /// (Story 6.5: an approval block on the active chain, which no admission
+    /// path can produce before Stories 6.6 and 6.7).
+    #[cfg(test)]
+    pub(crate) fn stamp_payload_type(&mut self, idx: u32, payload_type: u8) {
+        let entry = &mut self.blocks[idx as usize];
+        assert!(
+            !entry.is_empty_slot(),
+            "stamp_payload_type: an occupied slot"
+        );
+        entry.set_payload_type(payload_type);
+    }
+
     /// Returns the entry at `idx`, or `None` if `idx` is out of bounds or
     /// names an empty slot.
     pub(crate) fn get(&self, idx: u32) -> Option<&BlockEntry> {
