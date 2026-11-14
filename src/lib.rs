@@ -48,10 +48,10 @@ pub(crate) mod uninit;
 pub use api::{
     BalanceQueryError, BlockQueryError, Blockchain, CallResult, GenesisBlocks, GenesisRejectReason,
     InitOutcome, LifecyclePhase, LocalTransactionOutcome, NextCall, ParentRecoveryRequest,
-    ReceiveBlockOutcome, ReceiveTransactionOutcome, RejectReason, TickOutcome, TransactionState,
-    TxStateQueryError,
+    ReceiveBlockOutcome, ReceiveSupportOutcome, ReceiveTransactionOutcome, RejectReason,
+    TickOutcome, TransactionState, TxStateQueryError,
 };
-pub use approval::SupportMessage;
+pub use approval::{SupportMessage, SupportView};
 
 #[cfg(test)]
 mod tests {
