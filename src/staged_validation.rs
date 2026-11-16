@@ -235,6 +235,23 @@ pub(crate) fn verify_signature_bytes<C: CryptoTrait>(
     }
 }
 
+/// Verifies a proof of possession for a public key given as raw bytes.
+/// Malformed key or proof bytes fail closed (`false`), like
+/// [`verify_signature_bytes`].
+fn verify_possession_bytes<C: CryptoTrait>(
+    crypto: &C,
+    public_key_bytes: &[u8],
+    proof_bytes: &[u8],
+) -> bool {
+    match (
+        PublicKey::new(public_key_bytes),
+        Signature::new(proof_bytes),
+    ) {
+        (Ok(pk), Ok(proof)) => crypto.verify_possession(&pk, &proof),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tier 1 gating (FR9 Tier 1 / FR16, AC2/AC3/AC8)
 // ---------------------------------------------------------------------------
@@ -347,14 +364,10 @@ fn tier1_transaction_block<C: CryptoTrait>(
             {
                 return Err(Tier1Failure::NodeZeroRegistrationKeyMismatch);
             }
-            // new_key_signature proves possession: the new key signs its own
-            // public-key bytes.
-            if !verify_signature_bytes(
-                crypto,
-                reg.new_public_key(),
-                reg.new_key_signature(),
-                reg.new_public_key(),
-            ) {
+            // new_key_signature is the new key's proof of possession (DEC-248):
+            // a signature over its own public key in the proof domain, which no
+            // ordinary signature satisfies.
+            if !verify_possession_bytes(crypto, reg.new_public_key(), reg.new_key_signature()) {
                 return Err(Tier1Failure::InvalidNewKeySignature);
             }
         } else if let Some(cx) = tx.as_complex() {
@@ -1000,6 +1013,32 @@ mod tests {
                 UTXO_LIMIT,
                 &a
             ),
+            Err(Tier1Failure::InvalidNewKeySignature)
+        );
+    }
+
+    #[test]
+    fn tier1_rejects_ordinary_signature_as_proof_of_possession() {
+        // The new key's own ordinary signature over its key bytes is not a proof
+        // of possession: the proof lives in its own domain (DEC-248), so a key
+        // signature obtained by any other means cannot register the key.
+        let a = crypto(1);
+        let pk_a = pubkey_bytes(&a);
+        let mut ordinary = [0u8; 64];
+        ordinary.copy_from_slice(&a.sign(&pk_a).serialize()[..64]);
+        let zero = [0u8; 64];
+        let unsigned = Registration::new(3, 5, 9, 0, 0, &pk_a, &ordinary, &zero);
+        let mut tx_sig = [0u8; 64];
+        tx_sig.copy_from_slice(&a.sign(unsigned.as_bytes()).serialize()[..64]);
+        let reg = Registration::new(3, 5, 9, 0, 0, &pk_a, &ordinary, &tx_sig);
+        let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
+        builder
+            .add_registration(&reg)
+            .ok()
+            .expect("add registration");
+        let block = builder.build_signed(&a).ok().expect("build signed");
+        assert_eq!(
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
             Err(Tier1Failure::InvalidNewKeySignature)
         );
     }

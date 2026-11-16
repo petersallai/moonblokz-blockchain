@@ -7979,6 +7979,7 @@ mod tests {
         fn aggregate_signatures(
             &self,
             _signatures: &[&MultiSignature],
+            _public_keys: &[&[u8; PUBLIC_KEY_SIZE]],
             _message: &[u8],
         ) -> Result<AggregatedSignature, CryptoError> {
             unimplemented!("construction never aggregates")
@@ -7990,6 +7991,14 @@ mod tests {
             _aggregated_signature: &AggregatedSignature,
             _public_keys: &[&PublicKey],
         ) -> bool {
+            unimplemented!("construction never verifies")
+        }
+
+        fn prove_possession(&self) -> Signature {
+            unimplemented!("construction never proves possession")
+        }
+
+        fn verify_possession(&self, _public_key: &PublicKey, _proof: &Signature) -> bool {
             unimplemented!("construction never verifies")
         }
     }
@@ -9779,7 +9788,7 @@ mod tests {
             .expect("new key");
         let new_pk = *new_signer.public_key().serialize();
         let mut new_key_sig = [0u8; 64];
-        new_key_sig.copy_from_slice(&new_signer.sign(&new_pk).serialize()[..64]);
+        new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..64]);
         // The transaction signature signs the tx bytes with its signature field
         // zeroed and the new-key signature already present (the `new_signed`
         // convention), produced here by the initializer's key.
@@ -14571,7 +14580,7 @@ mod tests {
             .expect("new key");
         let new_pk = *new_signer.public_key().serialize();
         let mut new_key_sig = [0u8; 64];
-        new_key_sig.copy_from_slice(&new_signer.sign(&new_pk).serialize()[..64]);
+        new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..64]);
         let zero = [0u8; 64];
         let unsigned = Registration::new(
             0,
