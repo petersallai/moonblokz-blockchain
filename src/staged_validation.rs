@@ -365,8 +365,9 @@ fn tier1_transaction_block<C: CryptoTrait>(
                 return Err(Tier1Failure::NodeZeroRegistrationKeyMismatch);
             }
             // new_key_signature is the new key's proof of possession (DEC-248):
-            // a signature over its own public key in the proof domain, which no
-            // ordinary signature satisfies.
+            // a signature over its own public key in the proof domain. An ordinary
+            // signature over the key bytes does not pass (the Schnorr domain is
+            // the message prefix `MoonBlokz/pop`, BLS has its own DST).
             if !verify_possession_bytes(crypto, reg.new_public_key(), reg.new_key_signature()) {
                 return Err(Tier1Failure::InvalidNewKeySignature);
             }
@@ -1020,8 +1021,7 @@ mod tests {
     #[test]
     fn tier1_rejects_ordinary_signature_as_proof_of_possession() {
         // The new key's own ordinary signature over its key bytes is not a proof
-        // of possession: the proof lives in its own domain (DEC-248), so a key
-        // signature obtained by any other means cannot register the key.
+        // of possession: the proof lives in its own domain (DEC-248).
         let a = crypto(1);
         let pk_a = pubkey_bytes(&a);
         let mut ordinary = [0u8; 64];
