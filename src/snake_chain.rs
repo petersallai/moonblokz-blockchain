@@ -123,7 +123,9 @@ mod tests {
         Block, BlockBuilder, BlockHeader, ChainConfigPayloadBuilder, ComplexTransaction, NodeInfo,
         NodeTransfer, PAYLOAD_TYPE_TRANSACTION,
     };
-    use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{
+        Crypto, CryptoTrait, PRIVATE_KEY_SIZE, PUBLIC_KEY_SIZE, SIGNATURE_SIZE,
+    };
 
     fn signer() -> Crypto {
         Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
@@ -154,7 +156,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         }
     }
 
@@ -172,12 +174,16 @@ mod tests {
         let signer = signer();
         let mut cx = ComplexTransaction::new(3);
         for i in 0..inputs {
-            cx.add_utxo_input(u32::from(i), 0, 0, &[0u8; 64])
+            cx.add_utxo_input(u32::from(i), 0, 0, &[0u8; SIGNATURE_SIZE])
                 .ok()
                 .expect("add input");
         }
-        cx.add_utxo_output(&[1u8; 32], 10).ok().expect("add output");
-        cx.add_utxo_output(&[2u8; 32], 20).ok().expect("add output");
+        cx.add_utxo_output(&[1u8; PUBLIC_KEY_SIZE], 10)
+            .ok()
+            .expect("add output");
+        cx.add_utxo_output(&[2u8; PUBLIC_KEY_SIZE], 20)
+            .ok()
+            .expect("add output");
         let mut builder = BlockBuilder::new().header(header(PAYLOAD_TYPE_TRANSACTION));
         builder
             .add_complex_transaction(&cx)
@@ -189,7 +195,7 @@ mod tests {
     fn balance_block() -> Block {
         let signer = signer();
         let mut builder = BlockBuilder::new().header(header(PAYLOAD_TYPE_BALANCE));
-        let ni = NodeInfo::new(1, 50, 0, &[5u8; 32]);
+        let ni = NodeInfo::new(1, 50, 0, &[5u8; PUBLIC_KEY_SIZE]);
         builder.add_node_info(&ni).ok().expect("add node info");
         builder.set_max_node_id(1).ok().expect("set max node id");
         builder.build_signed(&signer).ok().expect("build signed")

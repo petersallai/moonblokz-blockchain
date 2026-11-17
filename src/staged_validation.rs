@@ -581,7 +581,7 @@ mod tests {
     /// stub's `block_size_limit()`).
     const NORMAL_LIMIT: u32 = 2016;
     const UTXO_LIMIT: u16 = 256;
-    const DUMMY_SIG: [u8; 64] = [0u8; 64];
+    const DUMMY_SIG: [u8; SIGNATURE_SIZE] = [0u8; SIGNATURE_SIZE];
 
     fn crypto(seed: u8) -> Crypto {
         Crypto::new([seed; PRIVATE_KEY_SIZE])
@@ -604,7 +604,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         }
     }
 
@@ -929,7 +929,7 @@ mod tests {
             6,
             0,
             0,
-            &[0xC1; 32],
+            &[0xC1; PUBLIC_KEY_SIZE],
             &c,
         );
         let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
@@ -950,7 +950,12 @@ mod tests {
         );
     }
 
-    fn registration_block(seq: u32, new_node_id: u32, new_pk: &[u8; 32], signer: &Crypto) -> Block {
+    fn registration_block(
+        seq: u32,
+        new_node_id: u32,
+        new_pk: &[u8; PUBLIC_KEY_SIZE],
+        signer: &Crypto,
+    ) -> Block {
         let reg = Registration::new_signed(
             3, /*vote*/
             5, /*initializer*/
@@ -1024,12 +1029,12 @@ mod tests {
         // of possession: the proof lives in its own domain (DEC-248).
         let a = crypto(1);
         let pk_a = pubkey_bytes(&a);
-        let mut ordinary = [0u8; 64];
-        ordinary.copy_from_slice(&a.sign(&pk_a).serialize()[..64]);
-        let zero = [0u8; 64];
+        let mut ordinary = [0u8; SIGNATURE_SIZE];
+        ordinary.copy_from_slice(&a.sign(&pk_a).serialize()[..SIGNATURE_SIZE]);
+        let zero = [0u8; SIGNATURE_SIZE];
         let unsigned = Registration::new(3, 5, 9, 0, 0, &pk_a, &ordinary, &zero);
-        let mut tx_sig = [0u8; 64];
-        tx_sig.copy_from_slice(&a.sign(unsigned.as_bytes()).serialize()[..64]);
+        let mut tx_sig = [0u8; SIGNATURE_SIZE];
+        tx_sig.copy_from_slice(&a.sign(unsigned.as_bytes()).serialize()[..SIGNATURE_SIZE]);
         let reg = Registration::new(3, 5, 9, 0, 0, &pk_a, &ordinary, &tx_sig);
         let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
         builder
@@ -1089,8 +1094,12 @@ mod tests {
     fn tier1_caps_utxo_outputs_across_the_whole_block() {
         let c = crypto(1);
         let mut cx = ComplexTransaction::new(3);
-        cx.add_utxo_output(&[1u8; 32], 10).ok().unwrap();
-        cx.add_utxo_output(&[2u8; 32], 20).ok().unwrap();
+        cx.add_utxo_output(&[1u8; PUBLIC_KEY_SIZE], 10)
+            .ok()
+            .unwrap();
+        cx.add_utxo_output(&[2u8; PUBLIC_KEY_SIZE], 20)
+            .ok()
+            .unwrap();
         let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
         builder.add_complex_transaction(&cx).ok().unwrap();
         builder.add_complex_transaction(&cx).ok().unwrap();
@@ -1228,7 +1237,12 @@ mod tests {
 
     // --- AC3: balance-block trust-anchor check (FR69 ii) --------------------
 
-    fn balance_block(seq: u32, owner: u32, pubkey: &[u8; 32], signer: &Crypto) -> Block {
+    fn balance_block(
+        seq: u32,
+        owner: u32,
+        pubkey: &[u8; PUBLIC_KEY_SIZE],
+        signer: &Crypto,
+    ) -> Block {
         let info = NodeInfo::new(owner, 100, 0, pubkey);
         let mut builder = BlockBuilder::new().header(header(seq, PAYLOAD_TYPE_BALANCE));
         builder.add_node_info(&info).ok().expect("add node info");
