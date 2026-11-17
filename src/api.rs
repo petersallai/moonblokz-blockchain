@@ -19,25 +19,29 @@
 //! therefore yield identical state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE,
-    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL,
-    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE,
-    Registration, TransactionView,
+    APPROVAL_DEVIATION_SEQUENCE_OFFSET, APPROVAL_LATE_COUNT_SIZE, APPROVAL_LATE_ENTRY_SIZE,
+    APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, ApprovalView, Block, BlockBuilder, BlockHeader,
+    BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
+    NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
+    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE, Registration,
+    TransactionView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
 };
 use moonblokz_crypto::{
-    CryptoTrait, MULTI_SIGNATURE_SIZE, MultiSignature, MultiSignatureTrait, PUBLIC_KEY_SIZE,
-    PublicKey, PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
+    AggregatedSignatureTrait, CryptoTrait, MAX_AGGREGATED_SIGNATURES, MULTI_SIGNATURE_SIZE,
+    MultiSignature, MultiSignatureTrait, PUBLIC_KEY_SIZE, PublicKey, PublicKeyTrait,
+    SIGNATURE_SIZE, SignatureTrait,
 };
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
 use crate::approval::{
-    ActiveSetCounter, CIRCULATING_CURRENCY_STUB, DEDUPE_SALT_LABEL, NonConflictRing,
-    RING_KIND_SUPPORT, RingCheck, SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView,
-    in_subgroup, subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
+    ActiveSetCounter, ApprovalAccumulator, ApprovalStep, CIRCULATING_CURRENCY_STUB,
+    DEDUPE_SALT_LABEL, MAX_SUBGROUP, NonConflictRing, RING_KIND_SUPPORT, RingCheck,
+    SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView, in_subgroup, node_value,
+    subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
 };
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
@@ -47,9 +51,12 @@ use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
 use crate::node_info::{NodeInfoState, SEED_SOURCE_RELEASED};
 use crate::prng::Prng;
-use crate::snake_chain::{TailBinding, TailObligation, classify_tail_drop, tail_drop_binding};
+use crate::snake_chain::{
+    TailBinding, TailObligation, TailUnreadable, classify_tail_drop, tail_drop_binding,
+};
 use crate::staged_validation::{
-    BlockStatus, Tier1Failure, tier1_chain_config_block, tier1_gate, verify_signature_bytes,
+    BlockStatus, SUPPORTED_VERSION, Tier1Failure, tier1_chain_config_block, tier1_gate,
+    verify_signature_bytes,
 };
 use crate::uninit::field_slot;
 
@@ -396,6 +403,33 @@ enum AboveP {
     Foreign,
     /// A failed read, or a walk that does not reach `d`: local, not evaluable.
     Unreadable,
+}
+
+/// `A' = A \ {proposer, u}` at `p − 1` (ADR-015): the head's active-set
+/// counts with the `p − 1` correction of
+/// [`Blockchain::parent_set_correction`]. The one membership predicate of
+/// 6.4's emission, 6.5's intake and 6.6's accumulator.
+struct APrime<'a, const MAX_NODES: usize> {
+    proposer: u32,
+    u: u32,
+    creator_d: u32,
+    above: u32,
+    returning_d: u32,
+    returned: &'a [bool; MAX_NODES],
+}
+
+impl<const MAX_NODES: usize> APrime<'_, MAX_NODES> {
+    fn contains(&self, set: &ActiveSetCounter<MAX_NODES>, n: u32) -> bool {
+        n != self.proposer
+            && n != self.u
+            && set.in_set_at_parent(
+                n,
+                self.creator_d,
+                self.above,
+                self.returning_d,
+                self.returned.get(n as usize).copied().unwrap_or(false),
+            )
+    }
 }
 
 /// Why a block was refused at intake. Per the FR10 minimal-response convention
@@ -979,6 +1013,10 @@ pub struct Blockchain<
     // 128 × 12 B + a 1 B cursor. Initialized only here and never cleared, not
     // even by a re-entry to collecting; non-durable, so a restart starts empty.
     support_dedupe: SupportDedupe,
+    // FR27 proposer-side accumulator (Story 6.6 D2, DEC-236): the subgroup's
+    // supports for the local node's own deviation, one at a time. Non-durable;
+    // cleared by a re-entry to collecting and the FR5 recovery.
+    approval: ApprovalAccumulator,
     // No completeness horizon (Story 6.14 D6, DEC-211, withdrawing DEC-167):
     // a balance entry is a snapshot of its node at its position, so the undo
     // of a seed is identity on the values, and every state below it follows
@@ -1206,6 +1244,7 @@ impl<
             (&raw mut (*p).support_dedupe).write(SupportDedupe::new(
                 Prng::new(prng_seed).derive_subseed(DEDUPE_SALT_LABEL),
             ));
+            ApprovalAccumulator::init(field_slot(&raw mut (*p).approval));
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -1252,6 +1291,7 @@ impl<
             support_dedupe: SupportDedupe::new(
                 Prng::new(prng_seed).derive_subseed(DEDUPE_SALT_LABEL),
             ),
+            approval: ApprovalAccumulator::new(),
         }
     }
 
@@ -2715,16 +2755,23 @@ impl<
     /// not on the active chain and whose key is not derivable are relayed
     /// unverified (AR-023).
     ///
-    /// When the local node is the proposer it classifies the same way; Story
-    /// 6.6 accumulates an `Accepted` support here. Where the proposer's own
-    /// deviation is a sibling of another proposer's approval-less deviation
-    /// (DEC-200), its deviation is not on its active chain, so (iv-b) defers
-    /// and FR27's accumulator-time check is the authoritative one; the epics
-    /// AC's "gate (iv) always runs for the proposer" is superseded.
+    /// **The proposer's exception** (Story 6.6 D3, DEC-237): for the tuple of
+    /// the local node's open accumulator, `(p, hash(d), local_node_id)`, (iv-b)
+    /// is not run; FR27's authoritative subgroup check, the rank lookup in the
+    /// accumulator, replaces it, after every other check has passed. A
+    /// non-member is `Rejected`, and so is a bad signature where (ii) was
+    /// deferred and is now checked against the supporter's registered key (the
+    /// key at `p − 1`: keys never change); a verified support is not verified
+    /// again. The first support of each rank is stored until `r_eff` are held;
+    /// a valid support for a held rank, or past `r_eff`, stays `Accepted`, not
+    /// stored. The accumulator's liveness is checked first after the FR26
+    /// checks (RAM; before a deferred verification also its reads): a dead
+    /// accumulator is cleared, and the support is classified as a plain relay,
+    /// (iv-b) included.
     ///
-    /// The only state it changes is the dedupe cache (an `Accepted` message is
-    /// cached as relayed). A node that refused its restart rejects everything,
-    /// as `receive_block` does.
+    /// The state it changes is the dedupe cache (an `Accepted` message is
+    /// cached as relayed) and the accumulator. A node that refused its restart
+    /// rejects everything, as `receive_block` does.
     pub fn receive_support(
         &mut self,
         support: SupportView<'_>,
@@ -2739,7 +2786,8 @@ impl<
             support.supporter(),
         );
         let outcome = if !self.support_dedupe.contains(sequence, key, supporter)
-            && self.support_is_acceptable(&support)
+            && let Some(verified) = self.support_is_acceptable(&support)
+            && self.accumulate_support(&support, verified)
         {
             self.support_dedupe.insert(sequence, key, supporter);
             ReceiveSupportOutcome::Accepted
@@ -2749,9 +2797,10 @@ impl<
         (outcome, self.next_parent_recovery_call())
     }
 
-    /// FR26 checks (ii)–(iv) for a support not in the dedupe cache; `true`
-    /// when every applicable one holds. See [`Self::receive_support`].
-    fn support_is_acceptable(&self, support: &SupportView<'_>) -> bool {
+    /// FR26 checks (ii)–(iv) for a support not in the dedupe cache: `None`
+    /// when one fails, else whether (ii) verified the signature (`false`:
+    /// deferred). See [`Self::receive_support`].
+    fn support_is_acceptable(&self, support: &SupportView<'_>) -> Option<bool> {
         let (p, supporter, proposer, hash) = (
             support.deviation_sequence(),
             support.supporter(),
@@ -2769,19 +2818,195 @@ impl<
                     .is_ok_and(|(tail, head)| tail <= p && p <= head)
         });
         if let Some(d_idx) = on_chain {
-            if !self.on_chain_support_holds(d_idx, p, supporter, proposer) {
-                return false;
+            // The accumulator's rank lookup replaces (iv-b) only while it is
+            // live: a dead one is cleared at the hook and the support is a
+            // plain relay, which (iv-b) still classifies.
+            let own = self.is_own_tuple(p, &hash, proposer) && self.approval_live_ram().is_some();
+            if !self.on_chain_support_holds(d_idx, p, supporter, proposer, own) {
+                return None;
             }
         } else if self.is_ready() && self.off_chain_u_block_stops(p, &hash) {
-            return false;
+            return None;
         }
-        self.support_signature_holds(support, on_chain.is_some())
+        match self.support_signature_holds(support, on_chain.is_some()) {
+            Some(false) => None,
+            verdict => Some(verdict.is_some()),
+        }
+    }
+
+    /// Whether `(p, hash, proposer)` is the tuple of the local node's open
+    /// accumulator (Story 6.6 D3).
+    fn is_own_tuple(&self, p: u32, hash: &[u8; HASH_SIZE], proposer: u32) -> bool {
+        proposer == self.local_node_id && self.approval.deviation() == Some((p, hash))
+    }
+
+    /// Story 6.6 AC5 (D3) — the accumulation step for a support every FR26
+    /// check passed (`verified`: whether (ii) checked its signature). Another
+    /// tuple is untouched (`true`). For the proposer's own tuple, `false`
+    /// (`Rejected`) for a non-member or a bad signature. See
+    /// [`Self::receive_support`].
+    fn accumulate_support(&mut self, support: &SupportView<'_>, verified: bool) -> bool {
+        if !self.is_own_tuple(
+            support.deviation_sequence(),
+            &support.hash(),
+            support.proposer(),
+        ) {
+            return true;
+        }
+        let Some(d_idx) = self.approval_live_ram() else {
+            self.approval.clear();
+            return true;
+        };
+        let Some(j) = self.approval.rank_of(support.supporter()) else {
+            return false;
+        };
+        if self.approval.is_complete() || self.approval.holds_rank(j) {
+            return true;
+        }
+        if !verified {
+            if !self.approval_live_reads(d_idx) {
+                self.approval.clear();
+                return true;
+            }
+            // A member is in `A` at `p − 1`, so it created a block and is
+            // registered; a missing key is the node's own inconsistency: not
+            // stored, never evidence.
+            let Some(key) = self.registered_key(support.supporter()) else {
+                return true;
+            };
+            if !self.support_verifies(support, key) {
+                return false;
+            }
+        }
+        self.approval.store(j, support.signature());
+        true
+    }
+
+    /// The registered key of `node` (node 0's is a construction input).
+    fn registered_key(&self, node: u32) -> Option<&[u8; PUBLIC_KEY_SIZE]> {
+        if node == 0 {
+            Some(&self.node_zero_public_key)
+        } else {
+            self.node_info.public_key_of(node)
+        }
+    }
+
+    /// Story 6.6 AC6 (D5, DEC-239) — whether the open accumulator is live: the
+    /// single pure predicate for its discard and its release; it never mutates.
+    /// The RAM half ([`Self::approval_live_ram`]) and then the reads
+    /// ([`Self::approval_live_reads`]). Only `&mut` sites clear on `false`.
+    fn approval_live(&self) -> bool {
+        self.approval_live_ram()
+            .is_some_and(|d_idx| self.approval_live_reads(d_idx))
+    }
+
+    /// AC6's RAM half: an accumulator is open, `d` is held (its index is the
+    /// result), its parent is the active block at `p − 1` inside the window,
+    /// and, only while incomplete, `p > F` and `p + H > S_head` (D6: a
+    /// complete package may be carried past the bound by its own replays).
+    ///
+    /// `p > F` is checked with the bound, not always: `F` is raised to `S_head
+    /// − H` at every evaluation, so an unconditional `p > F` would void D6's
+    /// lift. Its DEC-214 part, the ready-entry floor, was checked at open and
+    /// cannot rise past `p` while the accumulator lives: only a new ready
+    /// entry raises it that way, and the re-entry before it clears this.
+    fn approval_live_ram(&self) -> Option<u32> {
+        let (p, hash) = self.approval.deviation()?;
+        let d_idx = self.blocks.find(p, hash)?;
+        let parent = self.blocks.get(d_idx)?.parent_ref();
+        if !self.approval_parent_holds(p, parent) {
+            return None;
+        }
+        if !self.approval.is_complete() {
+            if p <= self.non_conflict.floor() {
+                return None;
+            }
+            let s_head = self.blocks.get(self.active_chain_head_idx)?.sequence();
+            if p.checked_add(self.verification_horizon()?)? <= s_head {
+                return None;
+            }
+        }
+        Some(d_idx)
+    }
+
+    /// AC6's read half for the deviation at `d_idx`: no validated evidence
+    /// block for any deviation at `p`, and no validated block of `u =
+    /// first_voted(d)` at `p` on `p − 1` (DEC-200, DEC-183). Only validated
+    /// blocks stop (D5: a planted unverified block must not silence a
+    /// deviation), and a failed read never discards (local I/O is not
+    /// evidence). The proposer's own evidence, once admitted, makes it false:
+    /// the FR27 release.
+    fn approval_live_reads(&self, d_idx: u32) -> bool {
+        self.approval_live_reads_with(d_idx, self.header_at(d_idx).map(|(_, u)| u))
+    }
+
+    /// [`Self::approval_live_reads`] with `u = first_voted(d)` already read
+    /// (`None`: the read failed, so only the evidence half is evaluable).
+    fn approval_live_reads_with(&self, d_idx: u32, u: Option<u32>) -> bool {
+        let Some(entry) = self.blocks.get(d_idx) else {
+            return false;
+        };
+        let (p, parent) = (entry.sequence(), entry.parent_ref());
+        self.holds_evidence_at(p) != Some(true)
+            && u.is_none_or(|u| {
+                self.creator_block_at(parent, p, u, [d_idx, d_idx], true) != Some(true)
+            })
+    }
+
+    /// Story 6.6 AC6 — whether a validated evidence block (`payload_type` 4,
+    /// on the active chain or signature-verified) names a deviation at `p`:
+    /// a RAM scan of the block table, then one read per candidate. `None` when
+    /// none does but a read failed: the discard counts it as not held, the
+    /// emission as held.
+    fn holds_evidence_at(&self, p: u32) -> Option<bool> {
+        let mut failed = false;
+        for idx in 0..MAX_BLOCKS as u32 {
+            let Some(entry) = self.blocks.get(idx) else {
+                continue;
+            };
+            // The evidence extends the deviation's branch, so it lies above `p`.
+            if entry.payload_type() != PAYLOAD_TYPE_APPROVAL
+                || entry.sequence() <= p
+                || (!entry.is_on_active_chain() && !entry.is_signature_verified())
+            {
+                continue;
+            }
+            match self.evidence_deviation(idx) {
+                Some(Some(sequence)) if sequence == p => return Some(true),
+                Some(_) => {}
+                None => failed = true,
+            }
+        }
+        (!failed).then_some(false)
+    }
+
+    /// The deviation sequence the evidence block at `idx` names; `Some(None)`
+    /// when its read header is not type 4 or its payload does not frame;
+    /// `None` on a failed read. Its own read buffer.
+    #[inline(never)]
+    fn evidence_deviation(&self, idx: u32) -> Option<Option<u32>> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        Some(
+            (view.payload_type() == PAYLOAD_TYPE_APPROVAL)
+                .then(|| ApprovalView::from_payload(view.payload()))
+                .flatten()
+                .map(|approval| approval.deviation_sequence()),
+        )
     }
 
     /// FR26 for a deviation `d` (at `d_idx`, sequence `p`) on the active chain:
     /// the supporter watermark, (iv-a), (iii), (iv-c) and (iv-b), cheapest
-    /// first (D4, D5).
-    fn on_chain_support_holds(&self, d_idx: u32, p: u32, supporter: u32, proposer: u32) -> bool {
+    /// first (D4, D5). For the proposer's `own` tuple (iv-b) is not run: the
+    /// accumulator's rank lookup answers it (Story 6.6 D3).
+    fn on_chain_support_holds(
+        &self,
+        d_idx: u32,
+        p: u32,
+        supporter: u32,
+        proposer: u32,
+        own: bool,
+    ) -> bool {
         // Ids are contiguous: a supporter in `A` at `p − 1` is at most the
         // head's watermark. Not `public_key_of`: a pre-seed node has no key.
         if supporter > self.node_info.max_known_node_id() {
@@ -2820,6 +3045,9 @@ impl<
         // (iv-b): within `p + H > S_head` (the `p − 1` correction's dropped
         // blocks are still in the horizon), only `d`'s creator above it, a
         // valid counter and a configuration; deferred otherwise.
+        if own {
+            return true;
+        }
         let (Some(w), Some(h), Some(configuration)) = (
             self.active_chain_length(),
             self.verification_horizon(),
@@ -2896,10 +3124,9 @@ impl<
     /// FR26 (ii): the supporter's signature over the 45 B content, when its
     /// key is derivable (D4): node 0's always; in ready state, any registered
     /// key when the deviation is on the active chain, else a key that is
-    /// branch-independent at the tail (DEC-157's rule). Not derivable: `true`,
-    /// deferred. Its own frame: the backend values never overlap a read buffer.
-    #[inline(never)]
-    fn support_signature_holds(&self, support: &SupportView<'_>, on_chain: bool) -> bool {
+    /// branch-independent at the tail (DEC-157's rule). `Some(verdict)` when
+    /// verified, `None` when not derivable: deferred.
+    fn support_signature_holds(&self, support: &SupportView<'_>, on_chain: bool) -> Option<bool> {
         let supporter = support.supporter();
         let key = if supporter == 0 {
             Some(&self.node_zero_public_key)
@@ -2914,9 +3141,16 @@ impl<
                 .then(|| self.node_info.public_key_of(supporter))
                 .flatten()
         };
-        let Some(key) = key else {
-            return true;
-        };
+        Some(self.support_verifies(support, key?))
+    }
+
+    /// FR26 (ii) / FR27 — the support's signature over its 45 B content
+    /// against `key`. Its own frame: the backend values never overlap a read
+    /// buffer.
+    #[inline(never)]
+    fn support_verifies(&self, support: &SupportView<'_>, key: &[u8; PUBLIC_KEY_SIZE]) -> bool {
+        #[cfg(test)]
+        crate::approval::test_seams::count(&crate::approval::test_seams::VERIFICATIONS);
         let bytes = support_message_bytes(
             support.proposer(),
             support.deviation_sequence(),
@@ -2944,12 +3178,15 @@ impl<
     /// In order: (1) `p > F`, `F` first raised to `S_head − H` (D8); (2) the
     /// grace seam, false until Story 8.5; (3) no conflicting live support in
     /// the ring; `x` signature-verified (D3) on a flagged parent at `p − 1`;
-    /// (4) no obligation due at the head; (5) the shape (DEC-200): `d`, the
-    /// active block at `p`, is `x` or another proposer's approval-less
-    /// deviation, every active block above `p` is by `d`'s creator, and `x`
-    /// deviates from `u`; (6) no retained block at `p` on `p − 1` by `u`
-    /// (DEC-183; the evidence half is Story 6.6's); (7) the local node is in
-    /// `A'` and in the subgroup.
+    /// (4) replay completion at `p` (Story 6.6 D6, DEC-240): the block `x`
+    /// itself drops, at `p − W`, is preserved by `x`; (5) the shape (DEC-200):
+    /// `d`, the active block at `p`, is `x` or another proposer's
+    /// approval-less deviation, every active block above `p` is by `d`'s
+    /// creator, and `x` deviates from `u`; (6) the resolution stop (DEC-183):
+    /// no validated evidence block for any deviation at `p` (a failed read
+    /// counts as held) and no validated block at `p` on `p − 1` by `u` (Story
+    /// 6.6 D5, amending DEC-233: an unverified one no longer stops); (7) the
+    /// local node is in `A'` and in the subgroup.
     ///
     /// **`u` comes from a validated header** (D3): `x`'s own `first_voted_node`
     /// when `x` is active, else `d`'s. Sound only because `p > F` and `F` is
@@ -3010,14 +3247,15 @@ impl<
         if !parent.is_on_active_chain() || parent.sequence() + 1 != p {
             return None;
         }
-        // (4) Replay completion: no obligation due at the head (FR12).
-        if let Some(dropped) = self
-            .dropped_by_extension(head, self.snake_chain_tail_idx, w)
-            .ok()?
-            && classify_tail_drop(&self.blocks, &self.node_info, dropped)
-                != Ok(TailObligation::None)
-        {
-            return None;
+        // (4) Replay completion at `p` (D6): `x`'s own drop, the block at
+        // `p − W` (none while `p < W`), is preserved by `x`. Obligations that
+        // come due above `p − 1` do not stop support. An unreadable or
+        // released block gives none: local I/O never endorses.
+        if let Some(dropped_sequence) = p.checked_sub(w) {
+            let dropped = self.ancestor_at(x_parent, dropped_sequence).ok()??;
+            if !self.extension_preserves(x_idx, dropped) {
+                return None;
+            }
         }
         // (5) Shape (DEC-200), deviation and `u`. The first storage reads.
         let d_idx = self.ancestor_at(head, p).ok()??;
@@ -3045,9 +3283,13 @@ impl<
         if self.active_above(d_idx, above, Some(creator_d)) != AboveP::Clean {
             return None;
         }
-        // (6) Resolution stop (DEC-183): `u`'s own block at `p` is held. Any
-        // held one counts, verified or not: the signer's conservative side.
-        if self.creator_block_at(x_parent, p, u, [x_idx, d_idx], false) != Some(false) {
+        // (6) Resolution stop (DEC-183): a validated evidence block for any
+        // deviation at `p` (a failed read counts as held, the conservative
+        // side), or a validated block of `u` at `p` (D5: an unverified one
+        // must not silence the deviation).
+        if self.holds_evidence_at(p) != Some(false)
+            || self.creator_block_at(x_parent, p, u, [x_idx, d_idx], true) != Some(false)
+        {
             return None;
         }
         // (7) `A'` at `p − 1` and the subgroup (D2, ADR-015).
@@ -3097,6 +3339,23 @@ impl<
         })
     }
 
+    /// FR48 / FR12 (Story 6.6 D6) — whether the block at `x_idx` preserves the
+    /// obligation of `dropped`, the block it drops: no obligation (RAM), or
+    /// `x` is the matching replay kind (one read, its own buffer). An
+    /// unclassifiable or unreadable block: `false`.
+    #[inline(never)]
+    fn extension_preserves(&self, x_idx: u32, dropped: u32) -> bool {
+        match classify_tail_drop(&self.blocks, &self.node_info, dropped) {
+            Ok(TailObligation::None) => true,
+            Ok(obligation) => {
+                let mut buf = [0u8; MAX_BLOCK_SIZE];
+                self.view_retained(x_idx, &mut buf)
+                    .is_some_and(|x| tail_drop_binding(obligation, &x) == TailBinding::Advance)
+            }
+            Err(_) => false,
+        }
+    }
+
     /// The active blocks above `d_idx`, the active block at `p`, walked down from
     /// the head: `above − 1` of them, with `above = S_head − p + 1`. The approval
     /// check reads the payload-type flags only (RAM) and covers all of them
@@ -3139,10 +3398,10 @@ impl<
     /// entries, was created by `creator` (DEC-183's originally-top block):
     /// `Some(true)` if one was; `None` if none was but a read failed; else
     /// `Some(false)`. With `validated_only`, only a block on the active chain or
-    /// signature-verified counts (FR26 (iv-c), DEC-233: stopping relay is the
-    /// liveness side, so a planted unverified block must not do it); FR12
-    /// emission counts every held one. The `parent_ref` and flag filters are
-    /// RAM, so only a candidate costs a read.
+    /// signature-verified counts (FR26 (iv-c), FR12 emission and the FR27
+    /// accumulator alike: DEC-233 as amended by Story 6.6 D5, a planted
+    /// unverified block must not silence a deviation). The `parent_ref` and
+    /// flag filters are RAM, so only a candidate costs a read.
     fn creator_block_at(
         &self,
         parent: u32,
@@ -3205,15 +3464,57 @@ impl<
         w: u32,
         required_support: u8,
     ) -> Option<bool> {
+        #[cfg(test)]
+        crate::approval::test_seams::count(&crate::approval::test_seams::SUBGROUP_EVALS);
         let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
         // Before any index by `node`: a wire id can be anything.
         if node > last_node {
             return Some(false);
         }
+        let mut returned = [false; MAX_NODES];
+        let Some(returning_d) =
+            self.parent_set_correction(p, above, w, creator_d, &mut returned)?
+        else {
+            return Some(false);
+        };
+        let a_prime = APrime {
+            proposer,
+            u,
+            creator_d,
+            above,
+            returning_d,
+            returned: &returned,
+        };
+        let member = |n: &u32| a_prime.contains(&self.active_set, *n);
+        let eligible = (0..=last_node).filter(member).count() as u32;
+        Some(
+            member(&node)
+                && subgroup_size(required_support, eligible).is_some_and(|m| {
+                    let seed = subgroup_seed(p, self.circulating_currency_at(parent), proposer);
+                    in_subgroup(&seed, node, (0..=last_node).filter(member), m)
+                }),
+        )
+    }
+
+    /// The `A`-at-`p − 1` correction (6.4 D2), shared by every `A'` computation
+    /// (6.4 emission, 6.5 intake, 6.6 open): the `above` active blocks in `[p,
+    /// S_head]`, all by `creator_d`, leave the window again, and the blocks they
+    /// dropped (`[p − W, S_head − W]`, in the horizon, one read each) return.
+    /// Their creators are marked in `returned`; the count of `creator_d`'s
+    /// returning blocks is the result. `Some(None)`: a returning creator id
+    /// beyond this build's capacity, chain data, so no member; `None`: a failed
+    /// read, local, not evaluable.
+    fn parent_set_correction(
+        &self,
+        p: u32,
+        above: u32,
+        w: u32,
+        creator_d: u32,
+        returned: &mut [bool; MAX_NODES],
+    ) -> Option<Option<u32>> {
         let head = self.active_chain_head_idx;
         let s_head = p + above - 1;
         let mut returning_d = 0u32;
-        let mut returned = [false; MAX_NODES];
         if let Some(last) = s_head.checked_sub(w) {
             for sequence in p.saturating_sub(w)..=last {
                 let creator = self
@@ -3225,28 +3526,571 @@ impl<
                 match creator {
                     Some(c) if c == creator_d => returning_d += 1,
                     Some(c) if (c as usize) < MAX_NODES => returned[c as usize] = true,
-                    // A creator id beyond this build's capacity is chain data,
-                    // not a local failure: no member.
-                    Some(_) => return Some(false),
-                    // A failed read is local: not evaluable.
+                    Some(_) => return Some(None),
                     None => return None,
                 }
             }
         }
-        let set = &self.active_set;
-        let member = |n: &u32| {
-            *n != proposer
-                && *n != u
-                && set.in_set_at_parent(*n, creator_d, above, returning_d, returned[*n as usize])
+        Some(Some(returning_d))
+    }
+
+    /// Story 6.6 AC4 (D2) — opens the FR27 accumulator for the local node's
+    /// own deviation `d` at `d_idx`: computes its subgroup once, at the event,
+    /// and replaces any previous accumulator. `false`, with nothing changed,
+    /// unless the node is Ready with a valid active set and a configuration,
+    /// `d` is the local node's block in deviation form, its parent is the
+    /// active block at `p − 1` inside the window, `p + H > S_head`, `p > F`
+    /// (DEC-214's soundness bound: below it the `cv` / `cvf` the evidence
+    /// projection rewinds were never verified), the active chain above `p − 1`
+    /// is `d` and its creator's blocks or, DEC-200's sibling case, another
+    /// proposer's approval-less deviation `y@p` claiming the same `u` and its
+    /// creator's blocks, and `A'` is not empty.
+    ///
+    /// Stories 8.3 / 8.5 call it when the local node creates a deviation
+    /// block; nothing does before Epic 8.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn open_approval(&mut self, d_idx: u32) -> bool {
+        let mut members = [0u32; MAX_SUBGROUP];
+        let Some((p, hash, m)) = self.ranked_subgroup(d_idx, &mut members) else {
+            return false;
         };
+        self.approval.open(p, &hash, &members[..m])
+    }
+
+    /// AC4: the subgroup of the local deviation at `d_idx` in rank order
+    /// (ascending `node_value`) into `out`; `(p, hash(d), m)`. One pass over
+    /// `A'` keeps the `m` smallest values by bounded insertion into a
+    /// transient `[u64; MAX_SUBGROUP]`, beside the correction's `[bool;
+    /// MAX_NODES]` (its own frame).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline(never)]
+    fn ranked_subgroup(
+        &self,
+        d_idx: u32,
+        out: &mut [u32; MAX_SUBGROUP],
+    ) -> Option<(u32, [u8; HASH_SIZE], usize)> {
+        if !self.is_ready() || !self.active_set.is_valid() {
+            return None;
+        }
+        let configuration = self.chain_config.active_configuration()?;
+        let (w, h) = (
+            configuration.active_chain_length(),
+            configuration.verification_horizon(),
+        );
+        let d = self.blocks.get(d_idx)?;
+        let (p, hash, parent) = (d.sequence(), *d.hash(), d.parent_ref());
+        if !self.approval_parent_holds(p, parent) {
+            return None;
+        }
+        let s_head = self.blocks.get(self.active_chain_head_idx)?.sequence();
+        if p.checked_add(h)? <= s_head || p <= self.non_conflict.floor() {
+            return None;
+        }
+        let (creator_d, u) = self.header_at(d_idx)?;
+        if creator_d != self.local_node_id || creator_d == u {
+            return None;
+        }
+        // Who extends `p − 1` on the active chain: nobody (the head is `p −
+        // 1`), `d`'s creator from `d` up, or the DEC-200 sibling's creator.
+        let above = s_head + 1 - p;
+        let creator_above = if above == 0 {
+            creator_d
+        } else {
+            let a_idx = self.ancestor_at(self.active_chain_head_idx, p).ok()??;
+            let creator_above = if a_idx == d_idx {
+                creator_d
+            } else {
+                let (c_y, u_y) = self.header_at(a_idx)?;
+                if c_y == creator_d || c_y == u_y || u_y != u {
+                    return None;
+                }
+                c_y
+            };
+            if self.active_above(a_idx, above, Some(creator_above)) != AboveP::Clean {
+                return None;
+            }
+            creator_above
+        };
+        let mut returned = [false; MAX_NODES];
+        let returning = self.parent_set_correction(p, above, w, creator_above, &mut returned)??;
+        let a_prime = APrime {
+            proposer: creator_d,
+            u,
+            creator_d: creator_above,
+            above,
+            returning_d: returning,
+            returned: &returned,
+        };
+        let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
+        let member = |n: &u32| a_prime.contains(&self.active_set, *n);
         let eligible = (0..=last_node).filter(member).count() as u32;
-        Some(
-            member(&node)
-                && subgroup_size(required_support, eligible).is_some_and(|m| {
-                    let seed = subgroup_seed(p, self.circulating_currency_at(parent), proposer);
-                    in_subgroup(&seed, node, (0..=last_node).filter(member), m)
-                }),
-        )
+        let m = subgroup_size(configuration.required_support(), eligible)? as usize;
+        if m > MAX_SUBGROUP {
+            return None;
+        }
+        let seed = subgroup_seed(p, self.circulating_currency_at(parent), creator_d);
+        let mut values = [u64::MAX; MAX_SUBGROUP];
+        let mut len = 0usize;
+        for n in (0..=last_node).filter(member) {
+            let value = node_value(&seed, n);
+            if len == m && value >= values[m - 1] {
+                continue;
+            }
+            let mut at = len.min(m - 1);
+            while at > 0 && values[at - 1] > value {
+                values[at] = values[at - 1];
+                at -= 1;
+            }
+            values[at] = value;
+            len = (len + 1).min(m);
+        }
+        for (slot, value) in out.iter_mut().zip(&values[..m]) {
+            // The low word of a node value is its id (ADR-015).
+            *slot = *value as u32;
+        }
+        Some((p, hash, m))
+    }
+
+    /// Whether `parent` is the active block at `p − 1` inside the window: the
+    /// flag and the sequence, with the window bound by sequence (the flag also
+    /// covers the horizon).
+    fn approval_parent_holds(&self, p: u32, parent: u32) -> bool {
+        self.blocks
+            .get(parent)
+            .is_some_and(|e| e.is_on_active_chain() && e.sequence().checked_add(1) == Some(p))
+            && self
+                .active_snake_chain_window()
+                .is_ok_and(|(tail, head)| tail < p && p <= head + 1)
+    }
+
+    /// Story 6.6 AC7 (FR27, DEC-216, DEC-184, DEC-194, DEC-195) — builds the
+    /// signed approval evidence block for the open accumulator on top of
+    /// `tip_idx`, the current tip of the deviation-bearing branch (`d` or the
+    /// proposer's last replay above it). `None` unless the accumulator is live
+    /// and holds `r_eff` supports, the tip is `d` or above it on `d`'s branch,
+    /// and every block from `d` to the tip is the local node's.
+    ///
+    /// It emits, admits and releases nothing: Epic 8 emits the block, which then
+    /// goes through the shared acceptance path, and that admission releases the
+    /// accumulator (AC6). Its only lasting effect is the vote projection's
+    /// re-entry to collecting when a restore fails (D4).
+    ///
+    /// **Callable only from a root whose stack allows it**: `on_tick` (Epic 8's
+    /// creation pull), never `receive_block`. Its `BlockBuilder`, the
+    /// projection's read buffer and the aggregation (about 5 KB Schnorr, 12 KB
+    /// `bls-min-sig`, 28 KB `bls-min-pk`) do not fit above `receive_block`
+    /// within DEC-137's margin. Consumers: Stories 8.3 / 8.4.
+    ///
+    /// The aggregation's preconditions (crypto crate): every contribution was
+    /// verified against its key (FR26 (ii) or the accumulator's deferred check,
+    /// D3) and the signers are distinct (one support per rank, D2).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn build_evidence_block(&mut self, tip_idx: u32, now: u64) -> Option<Block> {
+        let d_idx = self.approval_live_ram()?;
+        let (cv_d, u) = self.deviation_votes(d_idx)?;
+        if !self.approval.is_complete() || !self.approval_live_reads_with(d_idx, Some(u)) {
+            return None;
+        }
+        let p = self.blocks.get(d_idx)?.sequence();
+        let tip = self.blocks.get(tip_idx)?;
+        let (tip_seq, tip_hash) = (tip.sequence(), *tip.hash());
+        if self.ancestor_at(tip_idx, p).ok()? != Some(d_idx) {
+            return None;
+        }
+        let configuration = self.chain_config.active_configuration()?;
+        let vote_scale = u64::from(configuration.vote_scale().get());
+        let (m, r_eff, _) = self.approval.counts();
+        let (m, r_eff) = (usize::from(m), usize::from(r_eff));
+
+        let room = (self.block_size_limit() as usize)
+            .checked_sub(HEADER_SIZE)?
+            .min(MAX_PAYLOAD_SIZE);
+        #[cfg(test)]
+        let room = crate::approval::test_seams::payload_room(room);
+        let fixed = moonblokz_chain_types::approval_fixed_size(m, r_eff);
+        let late_room =
+            (room.checked_sub(fixed)? / APPROVAL_LATE_ENTRY_SIZE).min(u16::MAX as usize);
+        let mut builder =
+            BlockBuilder::new().header(self.post_deviation_header(tip_seq, tip_hash)?);
+        let payload = builder.approval_payload_mut(room).ok()?;
+
+        // DEC-195, little-endian: `supporter_vote_sum u64 ‖ deviation_sequence
+        // u32 ‖ m u8 ‖ bitmap ‖ aggregate ‖ late_count u16 ‖ late entries`.
+        payload[APPROVAL_DEVIATION_SEQUENCE_OFFSET..APPROVAL_M_OFFSET]
+            .copy_from_slice(&p.to_le_bytes());
+        payload[APPROVAL_M_OFFSET] = m as u8;
+        let bitmap_end = APPROVAL_PREFIX_SIZE + m.div_ceil(8);
+        payload[APPROVAL_PREFIX_SIZE..bitmap_end].fill(0);
+        for (rank, _) in self.approval.held_in_rank_order() {
+            // D7: rank `j` is bit `j % 8` of byte `j / 8`, LSB-first.
+            payload[APPROVAL_PREFIX_SIZE + usize::from(rank) / 8] |= 1 << (rank % 8);
+        }
+        let late_count_at = fixed - APPROVAL_LATE_COUNT_SIZE;
+        let aggregate_len = self.aggregate_supports(p, &mut payload[bitmap_end..late_count_at])?;
+        if bitmap_end + aggregate_len != late_count_at {
+            return None;
+        }
+
+        // The projection (D4): the creator order and votes at `p − 1`, then
+        // the late values at the tip.
+        let late_at = fixed;
+        let mut late_count = 0usize;
+        let projected = self.vote_projection(d_idx, tip_idx, now, |bc, at_tip| {
+            let engine = &bc.vote_engine;
+            let slot = |i: usize| late_at + APPROVAL_LATE_ENTRY_SIZE * i;
+            let id_at = |payload: &[u8], i: usize| {
+                let at = slot(i);
+                u32::from_le_bytes([
+                    payload[at],
+                    payload[at + 1],
+                    payload[at + 2],
+                    payload[at + 3],
+                ])
+            };
+            if at_tip {
+                // DEC-184: each late vote after the evidence block's interest step.
+                for i in 0..late_count {
+                    let Ok(vote) = engine.grown(engine.accumulated_vote_of(id_at(payload, i)))
+                    else {
+                        return false;
+                    };
+                    payload[slot(i) + 4..slot(i) + 8].copy_from_slice(&vote.to_le_bytes());
+                }
+                return true;
+            }
+            // At `p − 1`: `u` heads the order; the proposer's rank `k`;
+            // DEC-216's `B_k = h · Σ_{j=0..k} (grown(av(n_j)) + vote_scale)`,
+            // `h = r_eff`; the late nodes are the ranks above the proposer but
+            // `u`, kept in creator order by bounded insertion.
+            let local = bc.local_node_id;
+            if engine.top_creator() != Some(u) {
+                return false;
+            }
+            let mut sum = 0u64;
+            let mut k = 0u32;
+            for n in 0..MAX_NODES as u32 {
+                let above = engine.ranks_above(n, local);
+                if n != local && !above {
+                    continue;
+                }
+                let Ok(grown) = engine.grown(engine.accumulated_vote_of(n)) else {
+                    return false;
+                };
+                let Some(next) = sum.checked_add(u64::from(grown) + vote_scale) else {
+                    return false;
+                };
+                sum = next;
+                if !above || n == u {
+                    k += u32::from(above);
+                    continue;
+                }
+                k += 1;
+                if late_count == late_room
+                    && (late_room == 0 || !engine.ranks_above(n, id_at(payload, late_room - 1)))
+                {
+                    continue;
+                }
+                let mut at = late_count.min(late_room - 1);
+                while at > 0 && engine.ranks_above(n, id_at(payload, at - 1)) {
+                    payload.copy_within(slot(at - 1)..slot(at - 1) + 4, slot(at));
+                    at -= 1;
+                }
+                payload[slot(at)..slot(at) + 4].copy_from_slice(&n.to_le_bytes());
+                late_count = (late_count + 1).min(late_room);
+            }
+            let supporter_vote_sum = (k > 0)
+                .then(|| sum.checked_mul(r_eff as u64))
+                .flatten()
+                .and_then(|b_k| b_k.checked_sub(u64::from(cv_d)));
+            let Some(supporter_vote_sum) = supporter_vote_sum else {
+                return false;
+            };
+            payload[..APPROVAL_DEVIATION_SEQUENCE_OFFSET]
+                .copy_from_slice(&supporter_vote_sum.to_le_bytes());
+            true
+        });
+        if !projected {
+            return None;
+        }
+        payload[late_count_at..fixed].copy_from_slice(&(late_count as u16).to_le_bytes());
+        builder
+            .approval_payload_mut(fixed + APPROVAL_LATE_ENTRY_SIZE * late_count)
+            .ok()?;
+        builder.build_signed(&self.crypto).ok()
+    }
+
+    /// AC7 — the `consumed_votes` and `first_voted_node` (`u`) of the
+    /// deviation at `idx`; `None` on a failed read. Its own read buffer.
+    #[inline(never)]
+    fn deviation_votes(&self, idx: u32) -> Option<(u32, u32)> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        self.view_retained(idx, &mut buf)
+            .map(|view| (view.consumed_votes(), view.first_voted_node()))
+    }
+
+    /// AC7 (D1, D2, DEC-194) — aggregates the held supports, in ascending
+    /// rank order with their registered keys, over the support content, and
+    /// serializes the aggregate into `out`; its length. Its own frame: the
+    /// parsed signatures and the crypto call never overlap a read buffer.
+    #[inline(never)]
+    fn aggregate_supports(&self, p: u32, out: &mut [u8]) -> Option<usize> {
+        let (hash, members) = (self.approval.deviation()?.1, self.approval.members());
+        let mut parsed: [Option<MultiSignature>; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|_| None);
+        let mut keys = [&self.node_zero_public_key; MAX_AGGREGATED_SIGNATURES];
+        let mut n = 0;
+        for (rank, signature) in self.approval.held_in_rank_order() {
+            parsed[n] = Some(MultiSignature::new(signature).ok()?);
+            keys[n] = self.registered_key(*members.get(usize::from(rank))?)?;
+            n += 1;
+        }
+        let first = parsed[0].as_ref()?;
+        let signatures: [&MultiSignature; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| parsed[i].as_ref().unwrap_or(first));
+        let message = support_message_bytes(self.local_node_id, p, hash);
+        self.crypto
+            .aggregate_signatures(&signatures[..n], &keys[..n], &message)
+            .ok()?
+            .serialize(out)
+            .ok()
+    }
+
+    /// FR27 / I-11 — the header of the block the local node puts on top of its
+    /// own deviation branch at `tip_seq` (`tip_hash`): the evidence block now,
+    /// Epic 9's replay blocks later. The FR27 overrides (`consumed_votes = 0`,
+    /// `first_voted_node = creator = local`, `consumed_votes_from_first_voted_node
+    /// = 0`); the rest per FR45. `mined_amount` is FR45's `mining_reward` (ID 5)
+    /// at the block's sequence, the code-baked default 0 until Story 7.2 adds
+    /// its accessor here. `payload_type` is the payload setter's. `None` at
+    /// `u32::MAX`.
+    fn post_deviation_header(
+        &self,
+        tip_seq: u32,
+        tip_hash: [u8; HASH_SIZE],
+    ) -> Option<BlockHeader> {
+        Some(BlockHeader {
+            version: SUPPORTED_VERSION,
+            sequence: tip_seq.checked_add(1)?,
+            creator: self.local_node_id,
+            mined_amount: 0,
+            payload_type: 0,
+            consumed_votes: 0,
+            first_voted_node: self.local_node_id,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: tip_hash,
+            signature: [0u8; SIGNATURE_SIZE],
+        })
+    }
+
+    /// Story 6.6 AC7 (D4, DEC-238) — the scoped in-place rewind of the live
+    /// vote engine for the deviation `d` at `d_idx` and its branch tip
+    /// `tip_idx`: `step(self, false)` reads the engine at `p − 1`, then
+    /// `step(self, true)` at the tip, and the engine is restored before this
+    /// returns. No copy of the engine is made, and no caller can leave it
+    /// rewound. Story 6.7 (an incoming evidence's Tier 3) and Story 8.5 (the
+    /// sibling's `cv` / `cvf`) reuse it.
+    ///
+    /// 1. A RAM pre-check: every active block above `p − 1` and, in the
+    ///    DEC-200 sibling case, every block of `d`'s branch up to the tip is
+    ///    held; in the direct case the tip is the head.
+    /// 2. The rewind: `undo_block` over the active blocks above `p − 1`, head
+    ///    down, one read each; in the direct case they are `d`'s branch and
+    ///    must be the local node's.
+    /// 3. `step` at `p − 1`.
+    /// 4. To the tip: the direct case re-applies the undone blocks; the sibling
+    ///    case applies `d ..= tip` (the local node's), runs `step`, undoes them
+    ///    again and re-applies the active blocks.
+    ///
+    /// Any failure before the restore (a read, a refused vote step, `step`
+    /// answering `false`) restores what this call did and returns `false`: the
+    /// engine is byte-identical to its state before. A failure while
+    /// restoring (re-applying an undone active block, or undoing the applied
+    /// branch) is 6.3's `RestoreFailed`: the node re-enters collecting
+    /// (DEC-205). Expected only on a transient read fault, since the call
+    /// writes no storage. Power loss is harmless: the engine is RAM-only.
+    fn vote_projection(
+        &mut self,
+        d_idx: u32,
+        tip_idx: u32,
+        now: u64,
+        mut step: impl FnMut(&Self, bool) -> bool,
+    ) -> bool {
+        let head = self.active_chain_head_idx;
+        let (Some(d), Some(head_entry), Some(tip)) = (
+            self.blocks.get(d_idx),
+            self.blocks.get(head),
+            self.blocks.get(tip_idx),
+        ) else {
+            return false;
+        };
+        let (p, parent, direct) = (d.sequence(), d.parent_ref(), d.is_on_active_chain());
+        let (s_head, tip_seq) = (head_entry.sequence(), tip.sequence());
+        // 1. Pre-check, RAM only (`ancestor_at` walks held entries).
+        let Some(parent_seq) = p.checked_sub(1) else {
+            return false;
+        };
+        if self.ancestor_at(head, parent_seq).ok() != Some(Some(parent))
+            || self.ancestor_at(tip_idx, p).ok() != Some(Some(d_idx))
+            || (direct && tip_idx != head)
+            || (!direct
+                && (p..=tip_seq).any(|s| {
+                    self.ancestor_at(tip_idx, s)
+                        .ok()
+                        .flatten()
+                        .is_none_or(|idx| {
+                            self.blocks
+                                .get(idx)
+                                .is_none_or(BlockEntry::is_on_active_chain)
+                        })
+                }))
+        {
+            return false;
+        }
+        let local = self.local_node_id;
+        let above = s_head - parent_seq;
+        let at = |bc: &Self, from: u32, s: u32| bc.ancestor_at(from, s).ok().flatten();
+        // 2. Rewind.
+        let mut undone = 0u32;
+        while undone < above {
+            let creator = direct.then_some(local);
+            let Some(idx) = at(self, head, s_head - undone) else {
+                break;
+            };
+            if !self.vote_step(idx, true, creator, false) {
+                break;
+            }
+            undone += 1;
+        }
+        // 3. At `p − 1`.
+        let mut ok = undone == above && step(self, false);
+        // 4. To the tip, and the restore.
+        if ok && !direct {
+            let mut applied = 0u32;
+            while p + applied <= tip_seq {
+                let Some(idx) = at(self, tip_idx, p + applied) else {
+                    break;
+                };
+                if !self.vote_step(idx, false, Some(local), true) {
+                    break;
+                }
+                applied += 1;
+            }
+            ok = p + applied > tip_seq && step(self, true);
+            while applied > 0 {
+                let restored = at(self, tip_idx, p + applied - 1)
+                    .is_some_and(|idx| self.vote_step(idx, true, None, false));
+                if !restored {
+                    self.reenter_after_failed_restore(now);
+                    return false;
+                }
+                applied -= 1;
+            }
+        }
+        while undone > 0 {
+            let restored = at(self, head, s_head - undone + 1)
+                .is_some_and(|idx| self.vote_step(idx, false, None, false));
+            if !restored {
+                self.reenter_after_failed_restore(now);
+                return false;
+            }
+            undone -= 1;
+        }
+        ok && (!direct || step(self, true))
+    }
+
+    /// D4's failed restore, 6.3's `RestoreFailed`: re-enter collecting
+    /// (DEC-205) and, when the re-entry reaches Ready again, run the restart's
+    /// FR22 comparison, as [`Self::compare_and_switch`] does.
+    fn reenter_after_failed_restore(&mut self, now: u64) {
+        if let Some(driver_best) = self.reenter_collecting(now) {
+            self.compare_and_switch([None, driver_best], now);
+        }
+    }
+
+    /// One vote step of the projection (D4) on the block at `idx`: `undo_block`
+    /// or `apply_block`, after an optional creator check. `false` on a failed
+    /// read, a foreign creator or a refused step (atomic: nothing changed). Its
+    /// own read buffer.
+    #[inline(never)]
+    fn vote_step(&mut self, idx: u32, undo: bool, creator: Option<u32>, check: bool) -> bool {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let Some(view) = self.view_retained(idx, &mut buf) else {
+            return false;
+        };
+        if creator.is_some_and(|c| c != view.creator()) {
+            return false;
+        }
+        // A block the engine has never applied (the DEC-200 sibling branch):
+        // its vote header must match the engine's state (I-09; a Ready
+        // projection is complete), or `undo_block`, which restores the creator
+        // from that header, would not be its exact inverse.
+        if check && self.vote_engine.check_header(&view, true, |_| true) != Ok(true) {
+            return false;
+        }
+        if undo {
+            self.vote_engine.undo_block(view).is_ok()
+        } else {
+            self.vote_engine.apply_block(view).is_ok()
+        }
+    }
+
+    /// Story 6.6 AC8 (FR29, FR27, FR58; D6, D9) — what the proposer's
+    /// deviation-bearing branch, whose tip is at `tip_seq`, does next.
+    /// `obligation` is `classify_tail_drop` of the block the branch's next
+    /// extension would drop, computed by the caller; `last_emit_ms` is when the
+    /// deviation block or the branch's last replay was emitted (the caller's
+    /// state: FR46's fifth tracked deadline, Story 8.4). In order:
+    ///
+    /// 1. no live accumulator: `Hold`;
+    /// 2. an unreadable tail: `Hold` (never taken as no obligation);
+    /// 3. no obligation due: `Evidence` once `r_eff` supports are held, else
+    ///    `Hold` — the evidence is never paced;
+    /// 4. a replay due while incomplete that would close `p` (`p ≤ tip_seq + 1
+    ///    − H`, the support floor and FR58): `Hold` (D6), so supports keep
+    ///    arriving and nothing drops;
+    /// 5. otherwise the replay, once FR29's `deviation_replay_insertion_delay_ms`
+    ///    (read at the active head's post-state, DEC-197) has passed since
+    ///    `last_emit_ms`: `Replay`, or `WaitUntil` that instant.
+    ///
+    /// Precedence is not re-implemented here: an evidence block can only extend
+    /// where the drop is clean (Story 9.1's binding), so rule 2 / 3 only read it.
+    /// Consumers: Story 8.4 (the deadline and the emission), Stories 9.2–9.5
+    /// (the replay content).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn approval_step(
+        &self,
+        tip_seq: u32,
+        obligation: Result<TailObligation, TailUnreadable>,
+        last_emit_ms: u64,
+        now: u64,
+    ) -> ApprovalStep {
+        let (Some((p, _)), true) = (self.approval.deviation(), self.approval_live()) else {
+            return ApprovalStep::Hold;
+        };
+        let complete = self.approval.is_complete();
+        match obligation {
+            Err(TailUnreadable) => return ApprovalStep::Hold,
+            Ok(TailObligation::None) if complete => return ApprovalStep::Evidence,
+            Ok(TailObligation::None) => return ApprovalStep::Hold,
+            Ok(_) => {}
+        }
+        let (Some(h), Some(configuration)) = (
+            self.verification_horizon(),
+            self.chain_config.active_configuration(),
+        ) else {
+            return ApprovalStep::Hold;
+        };
+        if !complete && u64::from(p) + u64::from(h) <= u64::from(tip_seq) + 1 {
+            return ApprovalStep::Hold;
+        }
+        let due = last_emit_ms.saturating_add(u64::from(
+            configuration.deviation_replay_insertion_delay_ms(),
+        ));
+        if now >= due {
+            ApprovalStep::Replay
+        } else {
+            ApprovalStep::WaitUntil(due)
+        }
     }
 
     /// Story 6.4 D3 — whether the local grace expansion admits `creator` at
@@ -3742,6 +4586,7 @@ impl<
 
         // Step 1 — unconditional working-set rollback (before any deletion
         // decision, and regardless of which deletion path is taken).
+        self.approval.clear();
         self.node_info.reset();
         self.reset_vote_engine();
 
@@ -5581,6 +6426,8 @@ impl<
     /// rebuilt from the tree. The FR8 lock is irrevocable and stays. Returns
     /// the side-branch driver's best when the spine reached `Ready`.
     fn reenter_collecting(&mut self, now: u64) -> Option<Option<u32>> {
+        // Story 6.6 AC4: the accumulator is Ready-state work.
+        self.approval.clear();
         self.node_info.reset();
         self.reset_vote_engine();
         for idx in 0..MAX_BLOCKS as u32 {
@@ -8158,6 +9005,7 @@ mod tests {
             active_set,
             non_conflict,
             support_dedupe,
+            approval,
         } = &*bc;
 
         assert_eq!(*local_node_id, 7);
@@ -8191,6 +9039,9 @@ mod tests {
             *support_dedupe
                 == SupportDedupe::new(Prng::new(0xDEAD_BEEF).derive_subseed(DEDUPE_SALT_LABEL))
         );
+        // Story 6.6: no accumulator.
+        assert!(approval.deviation().is_none());
+        assert!(*approval == ApprovalAccumulator::new());
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -8247,6 +9098,7 @@ mod tests {
             active_set,
             non_conflict,
             support_dedupe,
+            approval,
         } = &*built;
         let Blockchain {
             crypto: _,
@@ -8269,6 +9121,7 @@ mod tests {
             active_set: spec_active_set,
             non_conflict: spec_non_conflict,
             support_dedupe: spec_support_dedupe,
+            approval: spec_approval,
         } = &spec;
 
         assert_eq!(local_node_id, spec_local_node_id);
@@ -8291,6 +9144,7 @@ mod tests {
         assert!(active_set == spec_active_set);
         assert!(non_conflict == spec_non_conflict);
         assert!(support_dedupe == spec_support_dedupe);
+        assert!(approval == spec_approval);
     }
 
     /// AC2 — the neutrality proof: with the base override set (the window alone)
@@ -12606,23 +13460,48 @@ mod tests {
         );
     }
 
+    /// Writes an approval payload's `late_count` (the field before the late
+    /// entries, at `fixed − 2` of the payload).
+    fn payload_late_count(raw: &mut [u8], fixed: usize, late_count: u16) {
+        raw[HEADER_SIZE + fixed - 2..HEADER_SIZE + fixed]
+            .copy_from_slice(&late_count.to_le_bytes());
+    }
+
     /// AC3/AC11 — a slot whose payload does not frame coherently is skipped, not
-    /// fatal: one bad slot must not cost the node its chain. An approval block
-    /// with a populated payload is the reachable case today, because Epic 6 has
-    /// not defined that format and `content_length` refuses to guess at it.
+    /// fatal: one bad slot must not cost the node its chain. The fixture is an
+    /// approval block (Story 6.6 AC2) whose `late_count` frames it far beyond
+    /// the slot, so `content_length` refuses rather than guesses.
     #[test]
     fn fr59_restart_skips_a_slot_whose_length_cannot_be_recovered() {
         let (_, mut storage, _) = test_backends();
         let genesis = node_transfer_block(0, 0, 0, 0);
         storage.save_block(0, &genesis).ok().expect("save");
 
-        let mut raw = [0u8; HEADER_SIZE + 4];
+        const FIXED: usize = moonblokz_chain_types::approval_fixed_size(1, 1);
+        let fixed = FIXED;
+        let mut raw = [0u8; HEADER_SIZE + FIXED];
         raw[0] = 1; // version
         raw[13] = moonblokz_chain_types::PAYLOAD_TYPE_APPROVAL;
-        raw[HEADER_SIZE] = 0xFF; // a payload with no defined framing
+        let payload = &mut raw[HEADER_SIZE..];
+        payload[12] = 1; // m
+        payload[13] = 0b1; // one signer
+        #[cfg(feature = "schnorr")]
+        payload[14..16].copy_from_slice(&1u16.to_be_bytes()); // Schnorr's signer count
+        let framed = Block::from_bytes(&raw).ok().expect("parses");
+        assert_eq!(
+            framed.content_length(),
+            Some(framed.len()),
+            "premise: with no late entry the fixture frames"
+        );
+        payload_late_count(&mut raw, fixed, u16::MAX);
         let undecodable = Block::from_bytes(&raw)
             .ok()
             .expect("structurally parseable, just not measurable");
+        assert_eq!(
+            undecodable.content_length(),
+            None,
+            "the late count overruns it"
+        );
         storage.save_block(1, &undecodable).ok().expect("save");
 
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
@@ -19962,15 +20841,16 @@ mod tests {
         set_grace_admits(false);
     }
 
-    /// AC9 / M5 — an obligation due at the head: on `W = 7` the chain `0..=6`
-    /// is full once `x` lands, and the next extension would drop #0, node #0's
-    /// seed source. The same deviation is endorsed on `W = 16` (test 1).
+    /// Story 6.6 AC6 / D6 pin (flipped from 6.4's M5) — FR12's replay
+    /// completion is anchored at `p`: on `W = 7` the chain `0..=6` is full once
+    /// `x` lands and the next extension would drop #0, node #0's seed source,
+    /// but `x` at #6 itself drops nothing, so it is endorsed.
     #[test]
-    fn no_support_while_an_obligation_is_due_at_the_head() {
+    fn support_ignores_an_obligation_due_above_the_deviation() {
         set_grace_admits(true);
         let (g, mut l, blocks) = support_chain_on(3, local_storage(3), 7, |_| {});
         let x = deviation_after(&g, &blocks[5], 4, 1);
-        assert_eq!(support_for(&mut l, &x), None);
+        assert!(support_for(&mut l, &x).is_some());
         assert_eq!(head_of(&l), (6, x.view().hash()), "x is active");
         set_grace_admits(false);
     }
@@ -20735,11 +21615,12 @@ mod tests {
         );
     }
 
-    /// AC7 test 3b / N13 / N15 — an unverified `u`-block (node 5's balance
-    /// deviation `d` lists node 1, moving its seed source above `p − 1`) does
-    /// not stop the relay, yet still stops 6.4's emission for a sibling.
+    /// AC7 test 3b / N13 / N15, flipped by Story 6.6 D5 — an unverified
+    /// `u`-block (node 5's balance deviation `d` lists node 1, moving its seed
+    /// source above `p − 1`) stops neither the relay nor, now, 6.4's emission
+    /// for a sibling: only a validated block silences a deviation.
     #[test]
-    fn an_unverified_u_block_stops_emission_but_not_relay() {
+    fn an_unverified_u_block_stops_neither_emission_nor_relay() {
         set_grace_admits(true);
         let (g, mut l, blocks) = support_chain(3);
         let top = g.vote_engine.top_creator().expect("a top");
@@ -20757,10 +21638,9 @@ mod tests {
             "relay: an unverified u-block does not count"
         );
         let x = deviation_after(&g, &blocks[5], 2, 2);
-        assert_eq!(
-            support_for(&mut l, &x),
-            None,
-            "emission: any held u-block counts"
+        assert!(
+            support_for(&mut l, &x).is_some(),
+            "emission: only a validated u-block counts (D5)"
         );
         assert_eq!(verified(&l, &x), Some(true));
         set_grace_admits(false);
@@ -21074,5 +21954,1496 @@ mod tests {
                 ReceiveSupportOutcome::Rejected,
             ]
         );
+    }
+
+    // ---- Story 6.6: proposer-side accumulation and the evidence block ----
+
+    use crate::approval::test_seams::{SUBGROUP_EVALS, VERIFICATIONS, counted};
+    use moonblokz_crypto::{
+        AGGREGATED_SIGNATURE_CONSTANT_SIZE, AGGREGATED_SIGNATURE_VARIABLE_SIZE,
+    };
+
+    /// The proposer `local` on Story 6.4's chain with its own deviation `d` at
+    /// 6 received (it becomes the active head: the direct case). Returns the
+    /// builder `g` (still at #5), the proposer, the blocks, `d` and its slot.
+    fn proposer_chain(local: u32) -> (SupportChain, SupportChain, [Block; 6], Block, u32) {
+        let (g, mut l, blocks) = support_chain(local);
+        let d = deviation_after(&g, &blocks[5], local, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l), (6, d.view().hash()), "d is active");
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d held");
+        (g, l, blocks, d, d_idx)
+    }
+
+    /// ADR-015 recomputed by hand: `a_prime` sorted by node value under the
+    /// seed of `proposer`'s deviation at 6, the first `m` of them.
+    fn expected_members(proposer: u32, a_prime: &[u32]) -> std::vec::Vec<u32> {
+        expected_members_at(6, proposer, a_prime)
+    }
+
+    fn expected_members_at(p: u32, proposer: u32, a_prime: &[u32]) -> std::vec::Vec<u32> {
+        let seed = subgroup_seed(p, CIRCULATING_CURRENCY_STUB, proposer);
+        let mut ids: std::vec::Vec<u32> = a_prime.to_vec();
+        ids.sort_by_key(|&n| node_value(&seed, n));
+        let r = a_prime.len() / 2 + 1;
+        ids.truncate((2 * r - 1).min(a_prime.len()));
+        ids
+    }
+
+    /// Every node's accumulated vote: the engine's whole observable state.
+    fn engine_votes<S: StorageTrait>(bc: &Chain16<S>) -> [u32; 16] {
+        core::array::from_fn(|n| bc.vote_engine.accumulated_vote_of(n as u32))
+    }
+
+    fn held<S: StorageTrait>(bc: &Chain16<S>) -> u8 {
+        bc.approval.counts().2
+    }
+
+    /// The evidence payload fields a test checks: `(supporter_vote_sum,
+    /// deviation_sequence, m, bitmap, aggregate bytes, late entries)`.
+    struct Evidence {
+        supporter_vote_sum: u64,
+        deviation_sequence: u32,
+        m: usize,
+        bitmap: std::vec::Vec<u8>,
+        aggregate: std::vec::Vec<u8>,
+        late: std::vec::Vec<(u32, u32)>,
+    }
+
+    fn evidence_of(block: &Block, signers: usize) -> Evidence {
+        let payload = block.view().payload();
+        let m = usize::from(payload[12]);
+        let bitmap_end = 13 + m.div_ceil(8);
+        let aggregate_len =
+            AGGREGATED_SIGNATURE_CONSTANT_SIZE + AGGREGATED_SIGNATURE_VARIABLE_SIZE * signers;
+        let fixed = moonblokz_chain_types::approval_fixed_size(m, signers);
+        assert_eq!(bitmap_end + aggregate_len + 2, fixed);
+        let late_count = usize::from(u16::from_le_bytes([payload[fixed - 2], payload[fixed - 1]]));
+        let word = |at: usize| u32::from_le_bytes(payload[at..at + 4].try_into().expect("4"));
+        Evidence {
+            supporter_vote_sum: u64::from_le_bytes(payload[..8].try_into().expect("8")),
+            deviation_sequence: word(8),
+            m,
+            bitmap: payload[13..bitmap_end].to_vec(),
+            aggregate: payload[bitmap_end..bitmap_end + aggregate_len].to_vec(),
+            late: (0..late_count)
+                .map(|i| (word(fixed + 8 * i), word(fixed + 8 * i + 4)))
+                .collect(),
+        }
+    }
+
+    /// Whether `aggregate` verifies over `proposer`'s support content at 6 for
+    /// `hash` against `signers`' fixture keys in this order.
+    fn aggregate_verifies_at(
+        aggregate: &[u8],
+        p: u32,
+        proposer: u32,
+        hash: &[u8; 32],
+        signers: &[u32],
+    ) -> bool {
+        use moonblokz_crypto::AggregatedSignature;
+        let Ok(aggregate) = AggregatedSignature::new(aggregate) else {
+            return false;
+        };
+        let keys: std::vec::Vec<PublicKey> = signers
+            .iter()
+            .map(|&n| {
+                let bytes = *Crypto::new([key_of(n); PRIVATE_KEY_SIZE])
+                    .ok()
+                    .expect("key")
+                    .public_key()
+                    .serialize();
+                PublicKey::new(&bytes).ok().expect("a key")
+            })
+            .collect();
+        let refs: std::vec::Vec<&PublicKey> = keys.iter().collect();
+        test_crypto().verify_aggregated_signature(
+            &support_message_bytes(proposer, p, hash),
+            &aggregate,
+            &refs,
+        )
+    }
+
+    fn test_crypto() -> Crypto {
+        Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key")
+    }
+
+    /// Proposer 2's deviation `d` held off the active chain: node 5's heavier
+    /// approval-less deviation `y@6` is the active head (DEC-200's sibling
+    /// case). Returns `g`, the proposer, the blocks, `d`, its slot and `y`.
+    fn sibling_proposer() -> (SupportChain, SupportChain, [Block; 6], Block, u32, Block) {
+        let (g, mut l, blocks) = support_chain(2);
+        let d = deviation_after(&g, &blocks[5], 2, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let y = deviation_after(&g, &blocks[5], 5, 4);
+        assert_eq!(receive(&mut l, &y), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l), (6, y.view().hash()), "the heavier sibling");
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d held");
+        assert!(!l.blocks.get(d_idx).expect("d").is_on_active_chain());
+        (g, l, blocks, d, d_idx, y)
+    }
+
+    /// Opens the accumulator and feeds the first `n` members' supports.
+    fn accumulate<S: StorageTrait>(bc: &mut Chain16<S>, d: &Block, d_idx: u32, n: usize) {
+        assert!(bc.open_approval(d_idx), "open");
+        let (p, proposer, h) = (d.view().sequence(), d.view().creator(), d.view().hash());
+        let members: std::vec::Vec<u32> = bc.approval.members().to_vec();
+        for &member in &members[..n] {
+            assert_eq!(
+                intake(bc, &support_by(member, proposer, p, h)),
+                ReceiveSupportOutcome::Accepted
+            );
+        }
+        assert_eq!(usize::from(held(bc)), n);
+    }
+
+    /// Puts `block` into `bc`'s table and storage as a retained entry with no
+    /// parent: a planted block (verified or not) for the evidence scans.
+    /// `stored == false` leaves its slot unwritten, so its read fails.
+    fn plant<S: StorageTrait>(bc: &mut Chain16<S>, block: &Block, verified: bool, stored: bool) {
+        let view = block.view();
+        let mut entry = BlockEntry::new(view.hash(), NONE_REF, view.sequence());
+        entry.set_payload_type(view.payload_type());
+        entry.set_len(block.len() as u32);
+        if verified {
+            entry.set_signature_verified();
+        }
+        let idx = bc.blocks.insert(entry).expect("a free slot");
+        if stored {
+            bc.storage.save_block(idx, block).ok().expect("save");
+        }
+    }
+
+    /// Node 4's complete evidence for its deviation at 6 (`A' = {0, 3}`): the
+    /// block other nodes see.
+    fn node_four_evidence() -> Block {
+        let (_, mut l, _, d, d_idx) = proposer_chain(4);
+        accumulate(&mut l, &d, d_idx, 2);
+        l.build_evidence_block(d_idx, 0).expect("evidence")
+    }
+
+    /// AC9 test 1 — the subgroup at open equals the hand recomputation, in
+    /// the direct case (head = `d`) and in the sibling case. (A held `d` under
+    /// a head at `p − 1` cannot be built here: a Ready node promotes every
+    /// direct extension it admits.)
+    #[test]
+    fn open_ranks_the_subgroup_in_every_case() {
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        assert_eq!(l.approval.members(), &expected_members(5, &[0, 3, 4])[..]);
+        assert_eq!(l.approval.counts(), (3, 2, 0));
+
+        let (_, mut l, _, _, d_idx, _) = sibling_proposer();
+        assert!(l.open_approval(d_idx));
+        assert_eq!(l.approval.members(), &expected_members(2, &[0, 3, 4])[..]);
+        let (_, mut direct, _, _, direct_idx) = proposer_chain(2);
+        assert!(direct.open_approval(direct_idx));
+        assert_eq!(l.approval.members(), direct.approval.members());
+    }
+
+    /// AC9 test 1 — a refusal of AC4 returns `false` and changes nothing.
+    fn assert_refused<S: StorageTrait>(bc: &mut Chain16<S>, idx: u32, what: &str) {
+        assert!(!bc.open_approval(idx), "{what}");
+        assert!(bc.approval.deviation().is_none(), "{what}: nothing changed");
+    }
+
+    #[test]
+    fn open_refuses_while_not_ready_or_for_a_foreign_block() {
+        // Not ready, all else as for a passing open.
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        l.lifecycle_phase = LifecyclePhase::Collecting;
+        assert_refused(&mut l, d_idx, "not ready");
+        let (g, mut l, blocks) = support_chain(5);
+        let foreign = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(
+            receive(&mut l, &foreign),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let idx = l.blocks.find(6, &foreign.view().hash()).expect("held");
+        assert_refused(&mut l, idx, "another node's deviation");
+    }
+
+    #[test]
+    fn open_refuses_a_normal_form_block() {
+        let (g, mut l, blocks) = support_chain(5);
+        let normal = normal_after(&g, &blocks[5], 5, 1);
+        assert_eq!(
+            receive(&mut l, &normal),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let idx = l.blocks.find(6, &normal.view().hash()).expect("held");
+        assert_refused(&mut l, idx, "normal form");
+    }
+
+    #[test]
+    fn open_refuses_at_or_below_the_floor_or_without_an_active_set() {
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        l.non_conflict.raise_floor(5);
+        assert!(l.open_approval(d_idx), "p = F + 1 opens");
+        l.approval.clear();
+        l.non_conflict.raise_floor(6);
+        assert_refused(&mut l, d_idx, "p ≤ F");
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        l.active_set.invalidate();
+        assert_refused(&mut l, d_idx, "no valid active set");
+    }
+
+    #[test]
+    fn open_refuses_another_creator_above_the_parent() {
+        let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let foreign_above = normal_after(&g, &d, 3, 2);
+        assert_eq!(
+            receive(&mut l, &foreign_above),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_refused(&mut l, d_idx, "another creator above p − 1");
+    }
+
+    #[test]
+    fn open_refuses_past_the_horizon() {
+        let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let mut prev = d;
+        for salt in 0..7 {
+            if salt == 6 {
+                // Head 12: `p + H = 13 > 12`, the last head that opens.
+                assert_eq!(head_of(&l).0, 12);
+                assert!(l.open_approval(d_idx), "the boundary control");
+                l.approval.clear();
+            }
+            let next = normal_after(&g, &prev, 5, 10 + salt);
+            assert_eq!(
+                receive(&mut g, &next),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(
+                receive(&mut l, &next),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            prev = next;
+        }
+        assert_eq!(head_of(&l).0, 13);
+        // `F` followed `S_head − H` to 6: reset it, so only the bound refuses.
+        l.non_conflict = NonConflictRing::new();
+        assert_refused(&mut l, d_idx, "p + H ≤ S_head");
+    }
+
+    /// AC9 test 1 — a second open (the proposer's next deviation, at 7 on
+    /// its own `d`) replaces the first; a refused one keeps it.
+    #[test]
+    fn a_second_open_replaces_the_first() {
+        let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
+        accumulate(&mut l, &d, d_idx, 1);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let second = deviation_after(&g, &d, 5, 2);
+        assert_eq!(
+            receive(&mut l, &second),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let second_idx = l.blocks.find(7, &second.view().hash()).expect("held");
+        assert!(l.open_approval(second_idx));
+        assert_eq!(l.approval.deviation(), Some((7, &second.view().hash())));
+        assert_eq!(
+            l.approval.counts().2,
+            0,
+            "the first one's supports do not carry over"
+        );
+        l.non_conflict.raise_floor(6);
+        assert!(!l.open_approval(d_idx));
+        assert_eq!(
+            l.approval.deviation(),
+            Some((7, &second.view().hash())),
+            "kept"
+        );
+    }
+
+    /// AC9 test 2 (direct case) — a non-member is rejected and not stored; the
+    /// first support of a rank is stored, a duplicate rank and a support past
+    /// `r_eff` are accepted and not stored; another tuple is untouched. Each
+    /// support is verified once (by FR26 (ii)), and (iv-b) never runs for the
+    /// own tuple.
+    #[test]
+    fn accumulation_keeps_the_first_support_of_each_rank() {
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        let h = d.view().hash();
+        let members: std::vec::Vec<u32> = l.approval.members().to_vec();
+        let (verifications, subgroup_evals) = (counted(&VERIFICATIONS), counted(&SUBGROUP_EVALS));
+        for non_member in [1, 2] {
+            assert_eq!(
+                intake(&mut l, &support_by(non_member, 5, 6, h)),
+                ReceiveSupportOutcome::Rejected
+            );
+        }
+        assert_eq!(held(&l), 0);
+        assert_eq!(
+            intake(&mut l, &support_by(members[0], 5, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert_eq!(held(&l), 1);
+        assert_eq!(counted(&VERIFICATIONS) - verifications, 3, "once each");
+        assert_eq!(counted(&SUBGROUP_EVALS), subgroup_evals, "(iv-b) skipped");
+        // A copy past the dedupe cache: the rank is held.
+        l.support_dedupe = SupportDedupe::new(7);
+        assert_eq!(
+            intake(&mut l, &support_by(members[0], 5, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert_eq!(held(&l), 1);
+        assert_eq!(
+            intake(&mut l, &support_by(members[1], 5, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert_eq!(held(&l), 2);
+        assert_eq!(
+            intake(&mut l, &support_by(members[2], 5, 6, h)),
+            ReceiveSupportOutcome::Accepted,
+            "past r_eff"
+        );
+        assert_eq!(held(&l), 2);
+        assert_eq!(
+            intake(&mut l, &support_by(3, 4, 6, [0x5A; 32])),
+            ReceiveSupportOutcome::Accepted,
+            "another tuple: a plain relay"
+        );
+        assert_eq!(held(&l), 2);
+        assert_eq!(l.approval.deviation(), Some((6, &h)));
+    }
+
+    /// AC9 test 2 (sibling case) — FR26 defers the signature, so the
+    /// accumulator verifies it, once: a bad one is rejected and not stored.
+    #[test]
+    fn sibling_supports_are_verified_by_the_accumulator() {
+        let (_, mut l, _, d, d_idx, _) = sibling_proposer();
+        assert!(l.open_approval(d_idx));
+        let h = d.view().hash();
+        // A member other than node #0, whose key is always derivable: its key
+        // was registered at #2, above `S_tail`, so FR26 defers (ii).
+        let first = *l
+            .approval
+            .members()
+            .iter()
+            .find(|&&n| n != 0)
+            .expect("a member");
+        let tail = l
+            .blocks
+            .get(l.snake_chain_tail_idx)
+            .expect("tail")
+            .sequence();
+        assert!(
+            !l.key_is_branch_independent(first, tail),
+            "deferred by FR26"
+        );
+        assert_eq!(
+            intake(&mut l, &forged(support_by(first, 2, 6, h))),
+            ReceiveSupportOutcome::Rejected
+        );
+        assert_eq!(held(&l), 0);
+        assert_eq!(
+            intake(&mut l, &support_by(1, 2, 6, h)),
+            ReceiveSupportOutcome::Rejected
+        );
+        let verifications = counted(&VERIFICATIONS);
+        assert_eq!(
+            intake(&mut l, &support_by(first, 2, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert_eq!(held(&l), 1);
+        assert_eq!(
+            counted(&VERIFICATIONS) - verifications,
+            1,
+            "deferred, then once"
+        );
+    }
+
+    /// AC9 test 3 — the RAM discard triggers clear the accumulator at the next
+    /// own-tuple intake (or at once: re-entry to collecting).
+    #[test]
+    fn a_dead_accumulator_is_cleared() {
+        let at_intake = |l: &mut SupportChain, d: &Block| {
+            assert!(l.approval.deviation().is_some(), "open until the intake");
+            let member = l.approval.members()[0];
+            assert_eq!(
+                intake(l, &support_by(member, 5, 6, d.view().hash())),
+                ReceiveSupportOutcome::Accepted,
+                "a plain relay"
+            );
+            l.approval.deviation().is_none()
+        };
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        l.non_conflict.raise_floor(6);
+        assert!(at_intake(&mut l, &d), "p ≤ F while incomplete");
+
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        let parent = l.blocks.get(d_idx).expect("d").parent_ref();
+        l.blocks.set_on_active_chain(parent, false);
+        assert!(!l.approval_live());
+        assert!(at_intake(&mut l, &d), "p − 1 left the active chain");
+
+        let (_, mut l, _, d, d_idx, _) = sibling_proposer();
+        assert!(l.open_approval(d_idx));
+        l.blocks.delete(d_idx);
+        assert!(l.approval.deviation().is_some());
+        let member = l.approval.members()[0];
+        assert_eq!(
+            intake(&mut l, &support_by(member, 2, 6, d.view().hash())),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert!(l.approval.deviation().is_none(), "d deleted");
+
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        l.reenter_collecting(0);
+        assert!(l.approval.deviation().is_none(), "re-entry to collecting");
+    }
+
+    /// AC9 test 3 — validated blocks stop the proposer, unverified ones do
+    /// not: a validated `u`-block at `p`; a planted evidence for a deviation at
+    /// `p`, unverified and then verified; the sibling's heavier active head
+    /// keeps it (DEC-200).
+    #[test]
+    fn only_validated_blocks_stop_the_accumulator() {
+        let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        assert!(l.approval_live());
+        let u = u_block(&blocks, &[&d]);
+        assert_eq!(receive(&mut l, &u), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(verified(&l, &u), Some(true));
+        assert!(!l.approval_live(), "a validated u-block");
+
+        let evidence = node_four_evidence();
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        plant(&mut l, &evidence, false, true);
+        assert!(l.approval_live(), "an unverified evidence does not stop");
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        plant(&mut l, &evidence, true, true);
+        assert!(!l.approval_live(), "a validated evidence at p");
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        plant(&mut l, &evidence, true, false);
+        assert!(l.approval_live(), "a failed read never discards");
+
+        let (_, mut l, _, _, d_idx, _) = sibling_proposer();
+        assert!(l.open_approval(d_idx));
+        assert!(l.approval_live(), "the heavier sibling keeps it");
+    }
+
+    /// AC9 test 3 — an unverified `u`-block (the 6.5 fixture: node 5's
+    /// balance deviation lists node 1, moving its key above `p − 1`) does not
+    /// stop the accumulator.
+    #[test]
+    fn an_unverified_u_block_does_not_stop_the_accumulator() {
+        let (g, mut l, blocks) = support_chain(5);
+        let top = g.vote_engine.top_creator().expect("a top");
+        let snapshot = |n| vote_snapshot(g.vote_engine.accumulated_vote_of(n));
+        let template = balance_snapshot(&g, 6, blocks[5].view().hash(), &[1]);
+        let d = reheader(&template, 5, snapshot(5), top, snapshot(top), key_of(5));
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("held");
+        assert!(l.open_approval(d_idx));
+        let u = u_block(&blocks, &[&d]);
+        assert_eq!(receive(&mut l, &u), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(verified(&l, &u), Some(false));
+        assert!(l.approval_live());
+    }
+
+    /// AC9 test 3 — the proposer's own evidence, admitted, releases it.
+    #[test]
+    fn the_own_evidence_releases_the_accumulator() {
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        accumulate(&mut l, &d, d_idx, 2);
+        let e = l.build_evidence_block(d_idx, 0).expect("evidence");
+        assert!(l.approval_live(), "building releases nothing");
+        assert_eq!(receive(&mut l, &e), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l), (7, e.view().hash()));
+        assert!(!l.approval_live(), "released");
+        assert_eq!(
+            l.approval_step(7, Ok(TailObligation::None), 0, 0),
+            ApprovalStep::Hold
+        );
+    }
+
+    /// AC9 test 4 — 6.4's emission gains the evidence half: a validated
+    /// evidence at `p` stops it, an unverified one does not, a failed evidence
+    /// read stops it (the conservative side).
+    #[test]
+    fn the_evidence_half_stops_emission() {
+        set_grace_admits(true);
+        let evidence = node_four_evidence();
+        for (verified, stored, endorsed) in [
+            (true, true, false),
+            (false, true, true),
+            (true, false, false),
+        ] {
+            let (g, mut l, blocks) = support_chain(3);
+            plant(&mut l, &evidence, verified, stored);
+            let x = deviation_after(&g, &blocks[5], 4, 1);
+            assert_eq!(
+                support_for(&mut l, &x).is_some(),
+                endorsed,
+                "verified {verified}, stored {stored}"
+            );
+        }
+        set_grace_admits(false);
+    }
+
+    /// AC9 test 4 / D6 converse — a candidate whose own drop is obligated
+    /// gets no support unless it is the matching replay: block #0 is node
+    /// #0's seed source; a transaction block does not preserve it, a balance
+    /// block does.
+    #[test]
+    fn an_obligated_own_drop_needs_its_replay() {
+        let (g, mut l, blocks) = support_chain(5);
+        let zero = l.blocks.find(0, &blocks[0].view().hash()).expect("#0");
+        assert_eq!(
+            classify_tail_drop(&l.blocks, &l.node_info, zero),
+            Ok(TailObligation::SeedSource)
+        );
+        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let top = g.vote_engine.top_creator().expect("a top");
+        let snapshot = |n| vote_snapshot(g.vote_engine.accumulated_vote_of(n));
+        let template = balance_snapshot(&g, 6, blocks[5].view().hash(), &[1]);
+        let balance = reheader(&template, 5, snapshot(5), top, snapshot(top), key_of(5));
+        assert_eq!(receive(&mut l, &x), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            receive(&mut l, &balance),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let x_idx = l.blocks.find(6, &x.view().hash()).expect("x held");
+        let b_idx = l
+            .blocks
+            .find(6, &balance.view().hash())
+            .expect("balance held");
+        assert!(
+            !l.extension_preserves(x_idx, zero),
+            "a transaction block drops it"
+        );
+        assert!(
+            l.extension_preserves(b_idx, zero),
+            "a balance block replays it"
+        );
+        let clean = l.blocks.find(5, &blocks[5].view().hash()).expect("#5");
+        assert_eq!(
+            classify_tail_drop(&l.blocks, &l.node_info, clean),
+            Ok(TailObligation::None)
+        );
+        assert!(l.extension_preserves(x_idx, clean), "nothing to preserve");
+        let free = l.blocks.next_free_index().expect("a free slot");
+        assert!(
+            !l.extension_preserves(x_idx, free),
+            "an unclassifiable drop never endorses"
+        );
+    }
+
+    /// AC9 test 5 — the builder at the threshold: proposer 2, credited at #6
+    /// by node 3 so that its deviation `d@7` consumes votes and it ranks `k ≥
+    /// 2` at `p − 1`; its supports arrive out of rank order. The block frames
+    /// exactly, a second node admits it on `d`, its header carries the FR27
+    /// overrides, its bitmap has exactly the held ranks LSB-first, its
+    /// aggregate verifies in rank order, and its value and late list equal the
+    /// hand computation (DEC-216, DEC-184).
+    #[test]
+    fn the_evidence_block_carries_the_approval() {
+        let (mut g, mut l, blocks) = support_chain(2);
+        let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 2, 1, 600));
+        let a6 = real_on(&g, &template, 3, key_of(3));
+        assert_eq!(receive(&mut g, &a6), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut l, &a6), ReceiveBlockOutcome::AcceptedSilently);
+        let d = deviation_after(&g, &a6, 2, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(7, &d.view().hash()).expect("d");
+        assert!(l.open_approval(d_idx));
+        let h = d.view().hash();
+        let members: std::vec::Vec<u32> = l.approval.members().to_vec();
+        assert_eq!(members, expected_members_at(7, 2, &[0, 3, 4]));
+        for &n in &[members[2], members[0]] {
+            assert_eq!(
+                intake(&mut l, &support_by(n, 2, 7, h)),
+                ReceiveSupportOutcome::Accepted
+            );
+        }
+        let before = engine_votes(&l);
+        let e = l.build_evidence_block(d_idx, 0).expect("evidence");
+        assert_eq!(engine_votes(&l), before, "the engine is byte-identical");
+
+        // (a) framing, (c) the header.
+        let view = e.view();
+        assert_eq!(e.content_length(), Some(e.len()));
+        assert_eq!(
+            (
+                view.version(),
+                view.sequence(),
+                view.creator(),
+                view.payload_type()
+            ),
+            (1, 8, 2, PAYLOAD_TYPE_APPROVAL)
+        );
+        assert_eq!(
+            (
+                view.consumed_votes(),
+                view.first_voted_node(),
+                view.consumed_votes_from_first_voted_node()
+            ),
+            (0, 2, 0)
+        );
+        assert_eq!((view.mined_amount(), view.previous_hash()), (0, &h[..]));
+
+        // (d) the bitmap and the aggregate.
+        let ev = evidence_of(&e, 2);
+        assert_eq!((ev.deviation_sequence, ev.m), (7, 3));
+        assert_eq!(ev.bitmap, [0b101]);
+        assert!(aggregate_verifies_at(
+            &ev.aggregate,
+            7,
+            2,
+            &h,
+            &[members[0], members[2]]
+        ));
+        #[cfg(feature = "schnorr")]
+        assert!(
+            !aggregate_verifies_at(&ev.aggregate, 7, 2, &h, &[members[2], members[0]]),
+            "bound to the rank order"
+        );
+
+        // (e) DEC-216 at `p − 1` (`g` is at #6): `B_k = r_eff · Σ_{j ≤ k}
+        // (grown(av(n_j)) + vs)`, minus `d`'s consumed votes.
+        let engine = &g.vote_engine;
+        let vs = u64::from(
+            g.chain_config
+                .active_configuration()
+                .expect("config")
+                .vote_scale()
+                .get(),
+        );
+        let u = engine.top_creator().expect("a top");
+        assert_eq!(u, d.view().first_voted_node());
+        let mut above: std::vec::Vec<u32> = (0..16).filter(|&n| engine.ranks_above(n, 2)).collect();
+        above.sort_by(|&a, &b| {
+            if engine.ranks_above(a, b) {
+                core::cmp::Ordering::Less
+            } else if engine.ranks_above(b, a) {
+                core::cmp::Ordering::Greater
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        });
+        assert!(above.len() >= 2, "k ≥ 2");
+        let sum: u64 = above
+            .iter()
+            .chain(&[2])
+            .map(|&n| u64::from(engine.grown(engine.accumulated_vote_of(n)).expect("grows")) + vs)
+            .sum();
+        let cv = u64::from(d.view().consumed_votes());
+        assert!(cv > 0, "d consumes votes");
+        assert_eq!(ev.supporter_vote_sum, 2 * sum - cv);
+
+        // (f) the late list: the ranks above the proposer but `u`, in creator
+        // order, valued after the evidence's interest step at the tip (`d`).
+        let late: std::vec::Vec<(u32, u32)> = above
+            .iter()
+            .filter(|&&n| n != u)
+            .map(|&n| {
+                (
+                    n,
+                    l.vote_engine
+                        .grown(l.vote_engine.accumulated_vote_of(n))
+                        .expect("grows"),
+                )
+            })
+            .collect();
+        assert_eq!(ev.late, late);
+
+        // (b) a second node admits it on `d`.
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&g), (8, e.view().hash()));
+    }
+
+    /// AC9 test 5 (f) — the late list is the prefix that fits: one entry room.
+    #[test]
+    fn the_late_list_is_truncated_to_the_room() {
+        let (_, mut l, _, d, d_idx) = proposer_chain(2);
+        accumulate(&mut l, &d, d_idx, 2);
+        let full = l.build_evidence_block(d_idx, 0).expect("untruncated");
+        assert_eq!(
+            evidence_of(&full, 2).late.len(),
+            2,
+            "nodes 5 and 0 above it"
+        );
+        let fixed = moonblokz_chain_types::approval_fixed_size(3, 2);
+        let with_room = |l: &mut SupportChain, room: usize| {
+            crate::approval::test_seams::PAYLOAD_ROOM.with(|cell| cell.set(room));
+            let e = l.build_evidence_block(d_idx, 0);
+            crate::approval::test_seams::PAYLOAD_ROOM.with(|cell| cell.set(usize::MAX));
+            e
+        };
+        let one = with_room(&mut l, fixed + APPROVAL_LATE_ENTRY_SIZE).expect("one entry");
+        let ev = evidence_of(&one, 2);
+        assert_eq!(
+            ev.late,
+            evidence_of(&full, 2).late[..1],
+            "the prefix in creator order"
+        );
+        assert_eq!(ev.late[0].0, 5);
+        assert_eq!(one.view().payload().len(), fixed + APPROVAL_LATE_ENTRY_SIZE);
+        let none = with_room(&mut l, fixed).expect("no room for a late entry");
+        assert!(evidence_of(&none, 2).late.is_empty());
+        assert_eq!(none.view().payload().len(), fixed);
+        assert!(
+            with_room(&mut l, fixed - 1).is_none(),
+            "the fixed part does not fit"
+        );
+    }
+
+    /// AC9 test 5 — the DEC-200 sibling case builds, from `d`'s own branch
+    /// projected off the active chain, exactly the block the direct case
+    /// builds; the live engine (at `y`) is restored. Below the threshold:
+    /// nothing.
+    #[test]
+    fn the_sibling_case_builds_the_direct_case_block() {
+        let (_, mut direct, _, d, direct_idx) = proposer_chain(2);
+        accumulate(&mut direct, &d, direct_idx, 1);
+        assert!(
+            direct.build_evidence_block(direct_idx, 0).is_none(),
+            "below r_eff"
+        );
+        let member = direct.approval.members()[1];
+        assert_eq!(
+            intake(&mut direct, &support_by(member, 2, 6, d.view().hash())),
+            ReceiveSupportOutcome::Accepted
+        );
+        let expected = direct.build_evidence_block(direct_idx, 0).expect("direct");
+
+        let (mut g, mut l, _, sibling_d, d_idx, _) = sibling_proposer();
+        assert_eq!(sibling_d.view().hash(), d.view().hash());
+        accumulate(&mut l, &sibling_d, d_idx, 2);
+        let before = engine_votes(&l);
+        let e = l.build_evidence_block(d_idx, 0).expect("sibling");
+        assert_eq!(engine_votes(&l), before, "the engine stays at y");
+        assert_ne!(
+            engine_votes(&l),
+            engine_votes(&direct),
+            "y, not d, is applied"
+        );
+        assert_eq!(e.serialized_bytes(), expected.serialized_bytes());
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
+    }
+
+    /// AC9 test 7 — every branch of FR29's decision function.
+    #[test]
+    fn approval_step_follows_fr29() {
+        let (_, fresh, _) = support_chain(5);
+        assert_eq!(
+            fresh.approval_step(6, Ok(TailObligation::None), 0, 0),
+            ApprovalStep::Hold
+        );
+
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        let delay = u64::from(
+            l.chain_config
+                .active_configuration()
+                .expect("config")
+                .deviation_replay_insertion_delay_ms(),
+        );
+        accumulate(&mut l, &d, d_idx, 1);
+        let seed = Ok(TailObligation::SeedSource);
+        assert_eq!(
+            l.approval_step(6, Ok(TailObligation::None), 0, 0),
+            ApprovalStep::Hold
+        );
+        assert_eq!(
+            l.approval_step(6, Err(TailUnreadable), 0, 0),
+            ApprovalStep::Hold
+        );
+        // Paced from the last emission (`d`'s, then each replay's), not from
+        // `now`; the boundary is inclusive.
+        assert_eq!(
+            l.approval_step(6, seed, 100, 150),
+            ApprovalStep::WaitUntil(100 + delay)
+        );
+        assert_eq!(
+            l.approval_step(6, seed, 100, 100 + delay - 1),
+            ApprovalStep::WaitUntil(100 + delay)
+        );
+        assert_eq!(
+            l.approval_step(6, seed, 100, 100 + delay),
+            ApprovalStep::Replay
+        );
+        assert_eq!(
+            l.approval_step(6, Ok(TailObligation::Utxo), 100, 100 + delay),
+            ApprovalStep::Replay,
+            "any obligation kind"
+        );
+        // D6 cap while incomplete: a replay at 13 would close `p = 6` (`H = 7`).
+        assert_eq!(l.approval_step(11, seed, 0, delay), ApprovalStep::Replay);
+        assert_eq!(l.approval_step(12, seed, 0, delay), ApprovalStep::Hold);
+
+        let member = l.approval.members()[1];
+        assert_eq!(
+            intake(&mut l, &support_by(member, 5, 6, d.view().hash())),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert_eq!(
+            l.approval_step(6, Ok(TailObligation::None), 100, 100),
+            ApprovalStep::Evidence,
+            "never paced"
+        );
+        assert_eq!(
+            l.approval_step(6, Err(TailUnreadable), 100, 100),
+            ApprovalStep::Hold,
+            "an unreadable tail is never taken as no obligation"
+        );
+        assert_eq!(
+            l.approval_step(12, seed, 0, delay),
+            ApprovalStep::Replay,
+            "cap lifted"
+        );
+    }
+
+    /// AC9 test 7 — a complete package stays live past the bound while its
+    /// own blocks carry it (D6), an incomplete one does not, and the evidence
+    /// is still built over the longer rewind.
+    #[test]
+    fn a_complete_package_outlives_the_bound() {
+        for complete in [true, false] {
+            let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
+            accumulate(&mut l, &d, d_idx, if complete { 2 } else { 1 });
+            assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+            let mut prev = d;
+            for salt in 0..7 {
+                let next = normal_after(&g, &prev, 5, 10 + salt);
+                assert_eq!(
+                    receive(&mut g, &next),
+                    ReceiveBlockOutcome::AcceptedSilently
+                );
+                assert_eq!(
+                    receive(&mut l, &next),
+                    ReceiveBlockOutcome::AcceptedSilently
+                );
+                prev = next;
+            }
+            assert_eq!(head_of(&l).0, 13);
+            assert!(l.non_conflict.floor() >= 6, "F passed p");
+            assert_eq!(l.approval_live(), complete);
+            let tip = l.active_chain_head_idx;
+            assert_eq!(l.build_evidence_block(tip, 0).is_some(), complete);
+        }
+    }
+
+    /// AC9 test 8 — the ordering pin: on `W = 7` the evidence on `d@6` would
+    /// drop #0, node #0's seed source, without its replay; a Ready node refuses
+    /// it (Story 9.1's binding), and `approval_step` asks for the replay first.
+    #[test]
+    fn an_evidence_over_an_obligated_drop_is_refused() {
+        let (mut g, mut l, blocks) = support_chain_on(4, local_storage(4), 7, |_| {});
+        let d = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("held");
+        accumulate(&mut l, &d, d_idx, 2);
+        let zero = l.blocks.find(0, &blocks[0].view().hash()).expect("#0");
+        let obligation = classify_tail_drop(&l.blocks, &l.node_info, zero);
+        assert_eq!(obligation, Ok(TailObligation::SeedSource));
+        let delay = u64::from(
+            l.chain_config
+                .active_configuration()
+                .expect("config")
+                .deviation_replay_insertion_delay_ms(),
+        );
+        assert_eq!(
+            l.approval_step(6, obligation, 0, delay),
+            ApprovalStep::Replay,
+            "the replay comes first"
+        );
+        let e = l.build_evidence_block(d_idx, 0).expect("built regardless");
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(
+            receive(&mut g, &e),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            "Tier 3: the drop of #0 is not preserved"
+        );
+        assert_eq!(head_of(&g), (6, d.view().hash()));
+    }
+
+    type FailingSupportStorage = FailingReadStorage<{ 16 * MAX_BLOCK_SIZE + 8000 }>;
+
+    fn failing_storage(local: u32) -> FailingSupportStorage {
+        FailingReadStorage {
+            inner: local_storage(local),
+            failing_slot: u32::MAX,
+            reads_left: core::cell::Cell::new(0),
+            failures_left: core::cell::Cell::new(u32::MAX),
+            attempts: core::cell::Cell::new(0),
+            reads: core::cell::Cell::new(0),
+        }
+    }
+
+    /// Proposer 5 over a failing backend, complete, with its own block `d7`
+    /// above `d`: returns the node, `d`'s slot and the head's.
+    fn failing_proposer() -> (Chain16<FailingSupportStorage>, u32, u32) {
+        let (mut g, mut l, blocks) = support_chain_on(5, failing_storage(5), 16, |_| {});
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d7 = normal_after(&g, &d, 5, 2);
+        assert_eq!(receive(&mut l, &d7), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        accumulate(&mut l, &d, d_idx, 2);
+        let tip = l.active_chain_head_idx;
+        (l, d_idx, tip)
+    }
+
+    /// AC9 test 8b — the scoped rewind: a read failure during the rewind
+    /// restores the engine; a failure while restoring re-enters collecting; a
+    /// refused pre-check changes nothing.
+    #[test]
+    fn the_rewind_restores_or_reenters_collecting() {
+        // `d`'s second read is the rewind's undo of `d` (after the builder's
+        // header read): fails, `d7` is re-applied.
+        let (mut l, d_idx, tip) = failing_proposer();
+        let before = engine_votes(&l);
+        l.storage.failing_slot = d_idx;
+        l.storage.reads_left.set(1);
+        assert!(l.build_evidence_block(tip, 0).is_none());
+        assert_eq!(engine_votes(&l), before);
+        assert_eq!(
+            l.storage.attempts.get(),
+            2,
+            "it failed at the rewind's undo of d"
+        );
+        assert!(l.is_ready());
+        assert!(l.approval.deviation().is_some());
+        l.storage.failing_slot = u32::MAX;
+        let before = engine_votes(&l);
+        assert!(
+            l.build_evidence_block(tip, 0).is_some(),
+            "the fault was transient"
+        );
+        assert_eq!(engine_votes(&l), before);
+
+        // `d7`'s second read is the restore's re-apply: re-entry (DEC-205).
+        let (mut l, _, tip) = failing_proposer();
+        l.storage.failing_slot = tip;
+        l.storage.reads_left.set(1);
+        assert!(l.build_evidence_block(tip, 0).is_none());
+        assert!(!l.is_ready(), "re-entered collecting");
+        assert!(l.approval.deviation().is_none());
+
+        // A tip that is not the head in the direct case: refused up front.
+        let (mut l, d_idx, _) = failing_proposer();
+        let (before, reads) = (engine_votes(&l), l.storage.reads.get());
+        assert!(l.build_evidence_block(d_idx, 0).is_none());
+        assert_eq!(engine_votes(&l), before);
+        assert_eq!(
+            l.storage.reads.get() - reads,
+            1,
+            "the header read only: no vote step ran"
+        );
+        assert!(l.is_ready() && l.approval.deviation().is_some());
+    }
+
+    /// AC9 test 8b — a failure on the sibling branch's first application:
+    /// `y` is re-applied and the engine is byte-identical.
+    #[test]
+    fn a_failed_sibling_application_restores_the_engine() {
+        let (g, mut l, blocks) = support_chain_on(2, failing_storage(2), 16, |_| {});
+        let d = deviation_after(&g, &blocks[5], 2, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let y = deviation_after(&g, &blocks[5], 5, 4);
+        assert_eq!(receive(&mut l, &y), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        accumulate(&mut l, &d, d_idx, 2);
+        let before = engine_votes(&l);
+        let reads = l.storage.attempts.get();
+        l.storage.failing_slot = d_idx;
+        // `d`'s read before the application: the builder's header read.
+        l.storage.reads_left.set(1);
+        assert!(l.build_evidence_block(d_idx, 0).is_none());
+        assert_eq!(engine_votes(&l), before);
+        assert!(l.is_ready());
+        assert_eq!(
+            l.storage.attempts.get() - reads,
+            2,
+            "it failed at the application"
+        );
+    }
+
+    /// AC9 test 9 — AR16 replay: a fixed support stream (duplicates,
+    /// non-members, a bad signature) and fixed ticks, run twice on fresh
+    /// modules, give byte-identical evidence and steps.
+    #[test]
+    fn the_evidence_is_replay_deterministic() {
+        fn run() -> (std::vec::Vec<u8>, [ApprovalStep; 3]) {
+            let (_, mut l, _, d, d_idx) = proposer_chain(2);
+            assert!(l.open_approval(d_idx));
+            let h = d.view().hash();
+            let members: std::vec::Vec<u32> = l.approval.members().to_vec();
+            let stream = [
+                forged(support_by(members[1], 2, 6, h)),
+                support_by(1, 2, 6, h),
+                support_by(members[2], 2, 6, h),
+                support_by(members[2], 2, 6, h),
+                support_by(members[0], 2, 6, h),
+                support_by(members[1], 2, 6, h),
+            ];
+            for message in &stream {
+                let _ = intake(&mut l, message);
+            }
+            let steps = [
+                l.approval_step(6, Ok(TailObligation::Utxo), 10, 20),
+                l.approval_step(6, Ok(TailObligation::None), 10, 20),
+                l.approval_step(6, Err(TailUnreadable), 10, 20),
+            ];
+            let e = l.build_evidence_block(d_idx, 30).expect("evidence");
+            (e.serialized_bytes().to_vec(), steps)
+        }
+        assert_eq!(run(), run());
+    }
+
+    /// Story 6.6 (the investigation that found it, 2026-11-17): a valid block
+    /// with bytes after its last transaction, signed over all its wire bytes,
+    /// was accepted live and lost at restart (the restart trims it to its
+    /// framed length, which no longer verifies, and cut the chain below it).
+    /// Tier 1 now refuses it as exact evidence; the clean block survives a
+    /// restart.
+    #[test]
+    fn a_block_with_bytes_after_its_payload_is_refused() {
+        let (g, mut l, blocks) = support_chain(3);
+        let clean = normal_after(&g, &blocks[5], 1, 7);
+        let mut raw = std::vec::Vec::from(clean.serialized_bytes());
+        raw.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        let signature_at = HEADER_SIZE - SIGNATURE_SIZE;
+        raw[signature_at..HEADER_SIZE].fill(0);
+        let signer = Crypto::new([key_of(1); PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("key");
+        let signature = signer.sign(&raw);
+        raw[signature_at..HEADER_SIZE].copy_from_slice(signature.serialize());
+        let trailing = Block::from_bytes(&raw).ok().expect("parses");
+        assert_eq!(trailing.content_length(), Some(clean.len()));
+        assert_eq!(
+            receive(&mut l, &trailing),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(head_of(&l).0, 5);
+
+        assert_eq!(
+            receive(&mut l, &clean),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let mut restarted = local_node(3, l.storage);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+        assert_eq!(outcome, InitOutcome::ResumedReady);
+        assert_eq!(
+            head_of(&restarted),
+            (6, clean.view().hash()),
+            "survives a restart"
+        );
+    }
+
+    /// Code review P1 — a dead accumulator does not stand in for (iv-b): with
+    /// `p ≤ F` while incomplete, an own-tuple support from a node outside the
+    /// subgroup is classified as a plain relay, (iv-b) included, and rejected.
+    #[test]
+    fn a_dead_accumulator_does_not_skip_the_subgroup_check() {
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        l.non_conflict.raise_floor(6);
+        let evals = counted(&SUBGROUP_EVALS);
+        assert_eq!(
+            intake(&mut l, &support_by(2, 5, 6, d.view().hash())),
+            ReceiveSupportOutcome::Rejected,
+            "node 2 is outside A at p − 1"
+        );
+        assert_eq!(counted(&SUBGROUP_EVALS) - evals, 1, "(iv-b) ran");
+    }
+
+    /// Code review P2 — the sibling branch is applied only when its vote
+    /// header matches the `p − 1` state: `d` claims consumed votes its creator
+    /// never held, so `undo_block` could not restore the engine; the builder
+    /// refuses and the engine is byte-identical.
+    #[test]
+    fn a_sibling_branch_with_a_wrong_vote_header_is_not_applied() {
+        let (g, mut l, blocks) = support_chain(2);
+        let top = g.vote_engine.top_creator().expect("a top");
+        let snapshot = |n| vote_snapshot(g.vote_engine.accumulated_vote_of(n));
+        let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 0, 1, 1));
+        let d = reheader(
+            &template,
+            2,
+            snapshot(2) + 77,
+            top,
+            snapshot(top) + 77,
+            key_of(2),
+        );
+        // `y` first: `d` arrives as a side block, which no Tier 3 judges.
+        let y = deviation_after(&g, &blocks[5], 5, 4);
+        assert_eq!(receive(&mut l, &y), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l), (6, y.view().hash()), "d is a held sibling");
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        accumulate(&mut l, &d, d_idx, 2);
+        let before = engine_votes(&l);
+        assert!(l.build_evidence_block(d_idx, 0).is_none());
+        assert_eq!(engine_votes(&l), before);
+        assert!(l.is_ready());
+    }
+
+    /// Code review (tests) — DEC-256 on a real evidence block: framed, it
+    /// passes Tier 1; one byte after it, it is malformed.
+    #[test]
+    fn tier1_refuses_a_framed_evidence_with_a_byte_after_it() {
+        let e = node_four_evidence();
+        let (_, l, _) = support_chain(3);
+        let gate = |view: &BlockView| {
+            tier1_gate(
+                view,
+                &l.node_zero_public_key,
+                MAX_BLOCK_SIZE as u32,
+                UTXO_BITFIELD_WIDTH,
+                &l.crypto,
+            )
+        };
+        assert_eq!(gate(&e.view()), Ok(()));
+        let n = e.len();
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[..n].copy_from_slice(e.serialized_bytes());
+        let longer = BlockView::from_bytes(&bytes[..n + 1]).ok().expect("parses");
+        assert_eq!(gate(&longer), Err(Tier1Failure::MalformedPayload));
+    }
+
+    // ---- Story 6.6 code review (tests): the remaining branches ----
+
+    /// [`plant`] with a parent: a retained child of `parent`.
+    fn plant_child<S: StorageTrait>(
+        bc: &mut Chain16<S>,
+        block: &Block,
+        parent: u32,
+        verified: bool,
+        stored: bool,
+    ) {
+        let view = block.view();
+        let mut entry = BlockEntry::new(view.hash(), parent, view.sequence());
+        entry.set_payload_type(view.payload_type());
+        entry.set_len(block.len() as u32);
+        if verified {
+            entry.set_signature_verified();
+        }
+        let idx = bc.blocks.insert(entry).expect("a free slot");
+        if stored {
+            bc.storage.save_block(idx, block).ok().expect("save");
+        }
+    }
+
+    /// An evidence block at 8 for proposer 2's deviation at 7 (the DEC-216
+    /// fixture): it names sequence 7.
+    fn evidence_naming_seven() -> Block {
+        let (mut g, mut l, blocks) = support_chain(2);
+        let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 2, 1, 600));
+        let a6 = real_on(&g, &template, 3, key_of(3));
+        assert_eq!(receive(&mut g, &a6), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut l, &a6), ReceiveBlockOutcome::AcceptedSilently);
+        let d = deviation_after(&g, &a6, 2, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(7, &d.view().hash()).expect("d");
+        accumulate(&mut l, &d, d_idx, 2);
+        l.build_evidence_block(d_idx, 0).expect("evidence")
+    }
+
+    /// ADR-015 with a `required_support`: the `m` smallest node values.
+    fn expected_members_rs(p: u32, proposer: u32, a_prime: &[u32], rs: u8) -> std::vec::Vec<u32> {
+        let seed = subgroup_seed(p, CIRCULATING_CURRENCY_STUB, proposer);
+        let mut ids: std::vec::Vec<u32> = a_prime.to_vec();
+        ids.sort_by_key(|&n| node_value(&seed, n));
+        let m = subgroup_size(rs, a_prime.len() as u32).expect("A' not empty") as usize;
+        ids.truncate(m);
+        ids
+    }
+
+    /// AC9 test 1 — the sibling shape: the active block at `p` is the
+    /// proposer's own twin, not another proposer's deviation.
+    #[test]
+    fn open_refuses_a_twin_as_the_sibling() {
+        let (g, mut l, blocks) = support_chain(2);
+        let twin = deviation_after(&g, &blocks[5], 2, 9);
+        let d = deviation_after(&g, &blocks[5], 2, 1);
+        assert_eq!(
+            receive(&mut l, &twin),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let (head, d_hash) = (head_of(&l).1, d.view().hash());
+        let (active, side) = if head == d_hash {
+            (&d, &twin)
+        } else {
+            (&twin, &d)
+        };
+        assert_eq!(head, active.view().hash());
+        let idx = l.blocks.find(6, &side.view().hash()).expect("held");
+        assert_refused(
+            &mut l,
+            idx,
+            "the active block at p is the proposer's own twin",
+        );
+    }
+
+    /// AC9 test 1 — `m < |A'|`: with `required_support = 1`, `r_eff = m = 1`
+    /// of `A' = {0, 3, 4}`, so the bounded insertion evicts; one support
+    /// completes it, and the evidence carries one signer.
+    #[test]
+    fn the_subgroup_keeps_the_m_smallest_node_values() {
+        let (g, mut l, blocks) = support_chain_on(5, local_storage(5), 16, |c| {
+            c.add_literal(parameter::REQUIRED_SUPPORT, &[1u8])
+                .ok()
+                .expect("a one-byte literal");
+        });
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        assert!(l.open_approval(d_idx));
+        let expected = expected_members_rs(6, 5, &[0, 3, 4], 1);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(l.approval.members(), &expected[..]);
+        assert_eq!(l.approval.counts(), (1, 1, 0));
+        let other = *[0u32, 3, 4]
+            .iter()
+            .find(|&&n| n != expected[0])
+            .expect("a non-member");
+        let h = d.view().hash();
+        assert_eq!(
+            intake(&mut l, &support_by(other, 5, 6, h)),
+            ReceiveSupportOutcome::Rejected
+        );
+        assert_eq!(
+            intake(&mut l, &support_by(expected[0], 5, 6, h)),
+            ReceiveSupportOutcome::Accepted
+        );
+        let e = l
+            .build_evidence_block(d_idx, 0)
+            .expect("one signer completes it");
+        let ev = evidence_of(&e, 1);
+        assert_eq!((ev.m, ev.bitmap.as_slice()), (1, &[0b1][..]));
+    }
+
+    /// AC9 test 3 — DEC-200: a heavier approval-less sibling arriving after
+    /// the open demotes `d`, and the accumulator lives on.
+    #[test]
+    fn a_heavier_sibling_after_the_open_keeps_the_accumulator() {
+        let (g, mut l, blocks) = support_chain(2);
+        let d = deviation_after(&g, &blocks[5], 2, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        assert!(l.open_approval(d_idx));
+        let y = deviation_after(&g, &blocks[5], 5, 4);
+        assert_eq!(receive(&mut l, &y), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l), (6, y.view().hash()), "demoted by FR22");
+        assert!(l.approval_live());
+        assert_eq!(l.approval.deviation(), Some((6, &d.view().hash())));
+    }
+
+    /// AC4 — the FR5 recovery clears the accumulator.
+    #[test]
+    fn the_fr5_recovery_clears_the_accumulator() {
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        l.lifecycle_phase = LifecyclePhase::Processing;
+        l.recover_from_failed_pass(ProcessingError::StorageRead, NONE_REF);
+        assert!(l.approval.deviation().is_none());
+    }
+
+    /// AC5 / AC6 — before a deferred verification the read half runs: a
+    /// validated evidence at `p` clears the accumulator at the intake, and
+    /// the support is a plain relay.
+    #[test]
+    fn a_deferred_support_after_a_validated_evidence_clears_it() {
+        let evidence = node_four_evidence();
+        let (_, mut l, _, d, d_idx, _) = sibling_proposer();
+        assert!(l.open_approval(d_idx));
+        plant(&mut l, &evidence, true, true);
+        let member = *l
+            .approval
+            .members()
+            .iter()
+            .find(|&&n| n != 0)
+            .expect("a member");
+        assert_eq!(
+            intake(&mut l, &support_by(member, 2, 6, d.view().hash())),
+            ReceiveSupportOutcome::Accepted
+        );
+        assert!(l.approval.deviation().is_none());
+        assert_eq!(held(&l), 0);
+    }
+
+    /// AC6 — local I/O never discards: `d`'s header unreadable leaves the
+    /// evidence half alone; a `u`-candidate whose read fails does not count;
+    /// an evidence naming another sequence does not stop.
+    #[test]
+    fn local_read_failures_and_other_sequences_never_discard() {
+        let evidence = node_four_evidence();
+        let (mut l, d_idx, _) = failing_proposer();
+        l.storage.failing_slot = d_idx;
+        assert!(
+            l.approval_live(),
+            "d unreadable: only the evidence half runs"
+        );
+        plant(&mut l, &evidence, true, true);
+        assert!(
+            !l.approval_live(),
+            "which still stops at a validated evidence"
+        );
+
+        let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        let parent = l.blocks.get(d_idx).expect("d").parent_ref();
+        let u = u_block(&blocks, &[&d]);
+        plant_child(&mut l, &u, parent, true, false);
+        assert!(
+            l.approval_live(),
+            "an unreadable u-candidate does not count"
+        );
+        let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        let parent = l.blocks.get(d_idx).expect("d").parent_ref();
+        let u = u_block(&blocks, &[&d]);
+        plant_child(&mut l, &u, parent, true, true);
+        assert!(!l.approval_live(), "the control: a readable one does");
+
+        let seven = evidence_naming_seven();
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        plant(&mut l, &seven, true, true);
+        assert!(l.approval_live(), "evidence for the deviation at 7, not 6");
+    }
+
+    /// AC7 — the builder refuses: a validated `u`-block at `p` although the
+    /// package is complete; a tip off `d`'s branch; a foreign creator above
+    /// `d` (the engine is restored).
+    #[test]
+    fn the_builder_refuses_a_resolved_or_foreign_branch() {
+        let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
+        accumulate(&mut l, &d, d_idx, 2);
+        let u = u_block(&blocks, &[&d]);
+        assert_eq!(receive(&mut l, &u), ReceiveBlockOutcome::AcceptedSilently);
+        assert!(l.build_evidence_block(d_idx, 0).is_none(), "resolved at p");
+
+        let (_, mut l, _, d, d_idx, y) = sibling_proposer();
+        accumulate(&mut l, &d, d_idx, 2);
+        let y_idx = l.blocks.find(6, &y.view().hash()).expect("y");
+        let parent = l.blocks.get(d_idx).expect("d").parent_ref();
+        assert!(l.build_evidence_block(y_idx, 0).is_none(), "y's branch");
+        assert!(l.build_evidence_block(parent, 0).is_none(), "below p");
+        assert!(l.build_evidence_block(d_idx, 0).is_some(), "the control");
+
+        let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
+        accumulate(&mut l, &d, d_idx, 2);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let foreign = normal_after(&g, &d, 3, 2);
+        assert_eq!(
+            receive(&mut l, &foreign),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let before = engine_votes(&l);
+        let head = l.active_chain_head_idx;
+        assert!(
+            l.build_evidence_block(head, 0).is_none(),
+            "not the proposer's branch"
+        );
+        assert_eq!(engine_votes(&l), before);
+        assert!(l.is_ready());
+    }
+
+    /// The DEC-200 sibling case with branches longer than one block: the
+    /// active `y@6, y7` (node 5) and the proposer's held `d@6, d7` (node 2).
+    /// Returns the proposer, complete, with `d`'s and `d7`'s slots.
+    fn long_sibling<S: StorageTrait>(storage: S) -> (Chain16<S>, Block, u32, u32) {
+        let (mut g, mut l, blocks) = support_chain_on(2, storage, 16, |_| {});
+        let (mut gy, _, _) = support_chain(2);
+        let y = deviation_after(&g, &blocks[5], 5, 4);
+        assert_eq!(receive(&mut gy, &y), ReceiveBlockOutcome::AcceptedSilently);
+        let y7 = normal_after(&gy, &y, 5, 5);
+        let d = deviation_after(&g, &blocks[5], 2, 1);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d7 = normal_after(&g, &d, 2, 2);
+        for block in [&y, &y7, &d, &d7] {
+            assert_eq!(
+                receive(&mut l, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(head_of(&l), (7, y7.view().hash()), "y's branch is active");
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        let d7_idx = l.blocks.find(7, &d7.view().hash()).expect("d7");
+        accumulate(&mut l, &d, d_idx, 2);
+        (l, d7, d_idx, d7_idx)
+    }
+
+    /// AC9 tests 5 / 8b — a sibling branch of two blocks: the evidence on
+    /// `d7` equals the direct case's; a failure applying `d7` (after `d`)
+    /// undoes `d` and restores; a failure undoing `d7` re-enters collecting.
+    #[test]
+    fn a_longer_sibling_branch_builds_and_restores() {
+        let (mut l, d7, _, d7_idx) = long_sibling(local_storage(2));
+        let before = engine_votes(&l);
+        let e = l.build_evidence_block(d7_idx, 0).expect("evidence on d7");
+        assert_eq!(engine_votes(&l), before);
+        let (_, mut direct, _, d, d_idx) = proposer_chain(2);
+        assert_eq!(
+            receive(&mut direct, &d7),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        accumulate(&mut direct, &d, d_idx, 2);
+        let tip = direct.active_chain_head_idx;
+        let expected = direct.build_evidence_block(tip, 0).expect("direct");
+        assert_eq!(e.serialized_bytes(), expected.serialized_bytes());
+
+        let (mut l, _, _, d7_idx) = long_sibling(failing_storage(2));
+        let before = engine_votes(&l);
+        l.storage.failing_slot = d7_idx;
+        assert!(l.build_evidence_block(d7_idx, 0).is_none());
+        assert_eq!(l.storage.attempts.get(), 1, "the application of d7");
+        assert_eq!(engine_votes(&l), before);
+        assert!(l.is_ready());
+
+        let (mut l, _, _, d7_idx) = long_sibling(failing_storage(2));
+        l.storage.failing_slot = d7_idx;
+        l.storage.reads_left.set(1);
+        assert!(l.build_evidence_block(d7_idx, 0).is_none());
+        // The second read (the undo) fails; the re-entry reads it again, and
+        // its spine may reach Ready again in the same call (DEC-205), so the
+        // re-entry shows in the cleared accumulator.
+        assert!(l.storage.attempts.get() >= 2, "the undo of d7");
+        assert!(l.approval.deviation().is_none(), "re-entered collecting");
+    }
+
+    /// AC9 test 8b — a block above `p − 1` not held: refused before any vote
+    /// step, the engine untouched.
+    #[test]
+    fn a_missing_block_above_the_parent_refuses_up_front() {
+        let (mut g, mut l, blocks) = support_chain_on(5, failing_storage(5), 16, |_| {});
+        let d = deviation_after(&g, &blocks[5], 5, 1);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let d7 = normal_after(&g, &d, 5, 2);
+        assert_eq!(receive(&mut g, &d7), ReceiveBlockOutcome::AcceptedSilently);
+        let d8 = normal_after(&g, &d7, 5, 3);
+        for block in [&d, &d7, &d8] {
+            assert_eq!(
+                receive(&mut l, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        accumulate(&mut l, &d, d_idx, 2);
+        let d7_idx = l.blocks.find(7, &d7.view().hash()).expect("d7");
+        l.blocks.delete(d7_idx);
+        let (before, reads) = (engine_votes(&l), l.storage.reads.get());
+        let head = l.active_chain_head_idx;
+        assert!(l.build_evidence_block(head, 0).is_none());
+        assert_eq!(engine_votes(&l), before);
+        assert_eq!(l.storage.reads.get() - reads, 1, "the header read only");
     }
 }

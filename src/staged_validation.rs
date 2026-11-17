@@ -42,7 +42,7 @@ use moonblokz_crypto::{
 /// The only block header `version` the MVP supports (FR9 Tier 1). chain-types
 /// already rejects `version == 0` at parse; Tier 1 restricts to the supported
 /// set, currently `{1}`.
-const SUPPORTED_VERSION: u8 = 1;
+pub(crate) const SUPPORTED_VERSION: u8 = 1;
 
 /// Node #0's canonical id — the FR69 trust-anchor subject and the FR6 /
 /// FR54 permanent self-vote exception's node.
@@ -107,8 +107,8 @@ pub(crate) enum Tier1Failure {
     /// `payload_type` matches no known schema (∉ {1,2,3,4}).
     UnknownPayloadType,
     /// A managed payload does not parse coherently — the declared item count
-    /// disagrees with the bytes actually present, or a transaction/input/output
-    /// is truncated. (The chain-types iterators stop silently on truncation;
+    /// disagrees with the bytes actually present, a transaction/input/output
+    /// is truncated, or bytes follow the payload's framed length. (The chain-types iterators stop silently on truncation;
     /// this is where the deferred Story 1.1/1.4 payload-coherence watch-item
     /// is enforced.)
     MalformedPayload,
@@ -320,11 +320,20 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
         PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
         PAYLOAD_TYPE_APPROVAL => {
-            // Recognized schema. Approval-evidence payload Tier 1/3 checks are
-            // owned by Epic 6 (FR12/FR27) — nothing to gate from block bytes
-            // alone here beyond schema recognition.
+            // Recognized schema; its DEC-195 field checks are Story 6.7's.
+            // The exact framing below already applies to it.
         }
         _ => return Err(Tier1Failure::UnknownPayloadType),
+    }
+
+    // No bytes after the payload's framed length, for every type (FR27 "no
+    // trailing bytes", Story 6.6): the hash and the signature cover the whole
+    // wire bytes, while FR59's restart recovers the block from its padded
+    // slot by that framing (`content_length`). A block with trailing bytes
+    // would be accepted live and lost at restart, its trimmed bytes no longer
+    // verifying, which would cut a restarted node's chain below it.
+    if block.content_length() != Some(block.len()) {
+        return Err(Tier1Failure::MalformedPayload);
     }
 
     Ok(())
@@ -826,6 +835,39 @@ mod tests {
     }
 
     // --- AC2/AC3: transaction-payload checks --------------------------------
+
+    /// Story 6.6 (FR27 "no trailing bytes", every type): a passing block with
+    /// one byte appended after its framed payload is malformed, and so is an
+    /// approval block whose payload does not frame (the empty one).
+    #[test]
+    fn tier1_rejects_bytes_after_the_framed_payload() {
+        let a = crypto(1);
+        let pk_a = pubkey_bytes(&a);
+        let cases = [
+            (
+                node_transfer_block(5, 3, 4, 7, &a),
+                pubkey_bytes(&crypto(2)),
+            ),
+            (balance_block(5, 0, &pk_a, &a), pk_a),
+            (chain_config_block(5, &EMPTY_CONFIG_CONTENT, &a), pk_a),
+        ];
+        for (block, anchor) in &cases {
+            let gate = |view: &BlockView| tier1_gate(view, anchor, NORMAL_LIMIT, UTXO_LIMIT, &a);
+            assert_eq!(gate(&block.view()), Ok(()), "the passing fixture");
+            let n = block.len();
+            let mut bytes = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+            bytes[..n].copy_from_slice(block.serialized_bytes());
+            bytes[n] = 0xAB;
+            let longer = BlockView::from_bytes(&bytes[..n + 1]).ok().expect("parses");
+            assert_eq!(gate(&longer), Err(Tier1Failure::MalformedPayload));
+        }
+        let bytes = raw_block(1, 5, PAYLOAD_TYPE_APPROVAL);
+        let empty = BlockView::from_bytes(&bytes).ok().expect("parses");
+        assert_eq!(
+            tier1_gate(&empty, &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            Err(Tier1Failure::MalformedPayload)
+        );
+    }
 
     #[test]
     fn tier1_accepts_wellformed_node_transfer() {

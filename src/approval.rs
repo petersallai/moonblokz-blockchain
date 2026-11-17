@@ -4,11 +4,12 @@
 //! chain state alone, whether it endorses a deviating block, and the message it
 //! sends when it does: the outbound [`SupportMessage`]. Story 6.5 adds the
 //! inbound side, the FR26 intake: the [`SupportView`] a received support is
-//! parsed into and the relay-dedupe cache. The proposer-side accumulation and
-//! the evidence block are Story 6.6's.
+//! parsed into and the relay-dedupe cache. Story 6.6 adds the proposer side:
+//! the [`ApprovalAccumulator`] that collects the subgroup's supports for the
+//! local node's own deviation, and the FR29 [`ApprovalStep`].
 
 use moonblokz_chain_types::{HASH_SIZE, calculate_hash};
-use moonblokz_crypto::MULTI_SIGNATURE_SIZE;
+use moonblokz_crypto::{MAX_AGGREGATED_SIGNATURES, MULTI_SIGNATURE_SIZE};
 
 /// FR12 — the support message a node returns, through
 /// [`crate::ReceiveBlockOutcome::AcceptedAndSendSupport`], when it endorses a
@@ -607,6 +608,168 @@ impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
     }
 }
 
+/// The largest subgroup, the DEC-195 bound chain-types states (`m = 2·r_eff −
+/// 1` with `r_eff ≤ MAX_AGGREGATED_SIGNATURES`, ADR-015); it fits the `u8`
+/// `m` and ranks (asserted there).
+pub(crate) const MAX_SUBGROUP: usize = moonblokz_chain_types::APPROVAL_MAX_SUBGROUP;
+
+/// The `p` of a closed accumulator.
+const NONE_SEQ: u32 = u32::MAX;
+
+/// FR27 / DEC-236 — the proposer-side accumulator: the subgroup's supports for
+/// the local node's own deviation `d` at `p`, until the evidence block can be
+/// built (Story 6.6 D2).
+///
+/// The subgroup is computed once, at open: its `m` member ids in rank order
+/// (ascending `node_value`, ADR-015), so a support's rank is a lookup.
+/// Exactly `r_eff` supports are kept, one per rank, the first arrival wins;
+/// each signature in its serialized wire form, aggregated only when the
+/// evidence block is built. About 3.7 KB with Schnorr (`MULTI_SIGNATURE_SIZE`
+/// × 50 of it), 2.9 KB `bls-min-sig`, 5.3 KB `bls-min-pk`.
+///
+/// One at a time: a new deviation replaces it. Non-durable (FR59): a restart
+/// is a fresh `init`; a re-entry to collecting and the FR5 recovery clear it.
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct ApprovalAccumulator {
+    p: u32,
+    hash: [u8; HASH_SIZE],
+    m: u8,
+    r_eff: u8,
+    held: u8,
+    members: [u32; MAX_SUBGROUP],
+    ranks: [u8; MAX_AGGREGATED_SIGNATURES],
+    sigs: [[u8; MULTI_SIGNATURE_SIZE]; MAX_AGGREGATED_SIGNATURES],
+}
+
+impl ApprovalAccumulator {
+    /// In-place construction: closed, every byte zero but `p`. Never a stack
+    /// temporary of its size.
+    pub(crate) fn init(slot: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
+        let p = slot.as_mut_ptr();
+        // SAFETY: `p` comes from a live `&mut MaybeUninit<Self>`, so it is
+        // non-null, aligned, valid for writes of `Self` and not aliased. Every
+        // field is an integer or an integer array, for which all-zero bytes are
+        // valid; `p` is then written.
+        unsafe {
+            p.cast::<u8>().write_bytes(0, core::mem::size_of::<Self>());
+            (&raw mut (*p).p).write(NONE_SEQ);
+        }
+        // SAFETY: every byte of `Self` was written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// The by-value constructor, the executable specification of
+    /// [`Self::init`]. Test-only.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            p: NONE_SEQ,
+            hash: [0; HASH_SIZE],
+            m: 0,
+            r_eff: 0,
+            held: 0,
+            members: [0; MAX_SUBGROUP],
+            ranks: [0; MAX_AGGREGATED_SIGNATURES],
+            sigs: [[0; MULTI_SIGNATURE_SIZE]; MAX_AGGREGATED_SIGNATURES],
+        }
+    }
+
+    /// Opens for the deviation `(p, hash)` with the subgroup `members` (rank
+    /// order, `m = members.len()`), replacing any previous one. `false`, and
+    /// nothing changed, unless `1 ≤ m ≤ MAX_SUBGROUP`.
+    pub(crate) fn open(&mut self, p: u32, hash: &[u8; HASH_SIZE], members: &[u32]) -> bool {
+        let m = members.len();
+        if m == 0 || m > MAX_SUBGROUP || p == NONE_SEQ {
+            return false;
+        }
+        self.p = p;
+        self.hash = *hash;
+        self.m = m as u8;
+        // ADR-015: `h = ⌊m/2⌋ + 1 = r_eff`.
+        self.r_eff = (m / 2 + 1) as u8;
+        self.held = 0;
+        self.members[..m].copy_from_slice(members);
+        true
+    }
+
+    /// Closes it.
+    pub(crate) fn clear(&mut self) {
+        self.p = NONE_SEQ;
+        self.held = 0;
+    }
+
+    /// The open deviation `(p, hash)`, or `None`.
+    pub(crate) fn deviation(&self) -> Option<(u32, &[u8; HASH_SIZE])> {
+        (self.p != NONE_SEQ).then_some((self.p, &self.hash))
+    }
+
+    /// `(m, r_eff, held)`.
+    pub(crate) fn counts(&self) -> (u8, u8, u8) {
+        (self.m, self.r_eff, self.held)
+    }
+
+    /// Whether `r_eff` supports are held.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.held >= self.r_eff
+    }
+
+    /// The subgroup in rank order.
+    pub(crate) fn members(&self) -> &[u32] {
+        &self.members[..usize::from(self.m)]
+    }
+
+    /// `node`'s rank in the subgroup, or `None` for a non-member (FR27's
+    /// authoritative subgroup check).
+    pub(crate) fn rank_of(&self, node: u32) -> Option<u8> {
+        self.members()
+            .iter()
+            .position(|&n| n == node)
+            .map(|j| j as u8)
+    }
+
+    /// Whether a support for rank `j` is held.
+    pub(crate) fn holds_rank(&self, j: u8) -> bool {
+        self.ranks[..usize::from(self.held)].contains(&j)
+    }
+
+    /// Stores the support of rank `j`. The caller has checked that the
+    /// accumulator is open and incomplete and `j` is not held.
+    pub(crate) fn store(&mut self, j: u8, signature: &[u8]) {
+        let at = usize::from(self.held);
+        self.ranks[at] = j;
+        self.sigs[at].copy_from_slice(signature);
+        self.held += 1;
+    }
+
+    /// The held supports in ascending rank order: `(rank, signature bytes)`.
+    pub(crate) fn held_in_rank_order(
+        &self,
+    ) -> impl Iterator<Item = (u8, &[u8; MULTI_SIGNATURE_SIZE])> {
+        let held = &self.ranks[..usize::from(self.held)];
+        (0..self.m).filter_map(move |j| {
+            held.iter()
+                .position(|&r| r == j)
+                .map(|i| (j, &self.sigs[i]))
+        })
+    }
+}
+
+/// FR29 / FR27 (Story 6.6 AC8) — what the proposer's branch does next.
+// Read by Story 8.4's emission, which has no production caller yet.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub(crate) enum ApprovalStep {
+    /// Emit the evidence block now: it is never delayed by the pacing (FR29)
+    /// nor gated by FR45's fill threshold or timer (FR27).
+    Evidence,
+    /// Emit the due replay block now.
+    Replay,
+    /// Emit the due replay block at this instant (FR29's insertion delay).
+    WaitUntil(u64),
+    /// Nothing to emit for this proposal.
+    Hold,
+}
+
 /// Test-only overrides of the production seams (AC9). Production compiles each
 /// seam to its constant: no field, no branch.
 #[cfg(test)]
@@ -617,6 +780,34 @@ pub(crate) mod test_seams {
         /// The answer of `grace_admits` (D3); production returns `false` until
         /// Story 8.5.
         pub(crate) static GRACE_ADMITS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    std::thread_local! {
+        /// Multi-signature verifications of supports on this test thread (Story
+        /// 6.6 AC9: no support is verified twice).
+        pub(crate) static VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
+        /// FR26 (iv-b) evaluations on this test thread (Story 6.6 AC9: the
+        /// proposer's own tuple skips it).
+        pub(crate) static SUBGROUP_EVALS: Cell<u32> = const { Cell::new(0) };
+        /// A cap on the evidence payload's room (Story 6.6 AC9 test 5f: the
+        /// late list truncated without a block-size limit too small for the
+        /// fixture chain's own blocks).
+        pub(crate) static PAYLOAD_ROOM: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    /// The evidence payload room under this thread's cap.
+    pub(crate) fn payload_room(room: usize) -> usize {
+        room.min(PAYLOAD_ROOM.with(Cell::get))
+    }
+
+    /// Counts one event in `counter`.
+    pub(crate) fn count(counter: &'static std::thread::LocalKey<Cell<u32>>) {
+        counter.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    /// Reads `counter`.
+    pub(crate) fn counted(counter: &'static std::thread::LocalKey<Cell<u32>>) -> u32 {
+        counter.with(Cell::get)
     }
 
     /// Sets the grace answer for this test thread.
@@ -1010,5 +1201,52 @@ mod tests {
         assert!(cache.contains(1, 1, 1));
         assert!(cache.contains(1000, 1000, 1000));
         assert_eq!(core::mem::size_of::<SupportDedupe>(), 128 * 12 + 1 + 8);
+    }
+
+    // ---- Story 6.6: the accumulator ----
+
+    #[test]
+    fn the_accumulator_opens_only_on_a_bounded_subgroup() {
+        let mut acc = ApprovalAccumulator::new();
+        assert!(acc.deviation().is_none());
+        assert!(!acc.open(6, &[1; HASH_SIZE], &[]), "m = 0");
+        assert!(
+            !acc.open(6, &[1; HASH_SIZE], &[0; MAX_SUBGROUP + 1]),
+            "m too large"
+        );
+        assert!(!acc.open(NONE_SEQ, &[1; HASH_SIZE], &[3]), "p = NONE_SEQ");
+        assert!(acc == ApprovalAccumulator::new(), "refusals change nothing");
+        assert!(acc.open(6, &[1; HASH_SIZE], &[9, 4, 7]));
+        assert_eq!(acc.deviation(), Some((6, &[1; HASH_SIZE])));
+        assert_eq!(acc.counts(), (3, 2, 0), "r_eff = ⌊m/2⌋ + 1");
+        assert!(acc.open(6, &[1; HASH_SIZE], &[0; MAX_SUBGROUP]));
+        assert_eq!(
+            acc.counts(),
+            (MAX_SUBGROUP as u8, MAX_AGGREGATED_SIGNATURES as u8, 0)
+        );
+    }
+
+    #[test]
+    fn the_accumulator_ranks_stores_and_yields_in_rank_order() {
+        let mut acc = ApprovalAccumulator::new();
+        assert!(acc.open(6, &[1; HASH_SIZE], &[9, 4, 7, 2, 5]));
+        assert_eq!(
+            (acc.rank_of(9), acc.rank_of(5), acc.rank_of(3)),
+            (Some(0), Some(4), None)
+        );
+        acc.store(3, &[3; MULTI_SIGNATURE_SIZE]);
+        acc.store(0, &[0; MULTI_SIGNATURE_SIZE]);
+        assert!(acc.holds_rank(3) && acc.holds_rank(0) && !acc.holds_rank(1));
+        assert!(!acc.is_complete());
+        acc.store(1, &[1; MULTI_SIGNATURE_SIZE]);
+        assert!(acc.is_complete());
+        let order: std::vec::Vec<(u8, u8)> = acc
+            .held_in_rank_order()
+            .map(|(rank, sig)| (rank, sig[0]))
+            .collect();
+        assert_eq!(order, [(0, 0), (1, 1), (3, 3)]);
+        acc.clear();
+        assert!(acc.deviation().is_none());
+        assert_eq!(acc.counts().2, 0);
     }
 }
