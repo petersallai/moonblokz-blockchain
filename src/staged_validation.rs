@@ -42,7 +42,7 @@ use moonblokz_crypto::{
 /// The only block header `version` the MVP supports (FR9 Tier 1). chain-types
 /// already rejects `version == 0` at parse; Tier 1 restricts to the supported
 /// set, currently `{1}`.
-const SUPPORTED_VERSION: u8 = 1;
+pub(crate) const SUPPORTED_VERSION: u8 = 1;
 
 /// Node #0's canonical id — the FR69 trust-anchor subject and the FR6 /
 /// FR54 permanent self-vote exception's node.
