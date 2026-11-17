@@ -608,9 +608,10 @@ impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
     }
 }
 
-/// The largest subgroup: `m = 2·r_eff − 1` with `r_eff ≤
-/// MAX_AGGREGATED_SIGNATURES` (ADR-015).
-pub(crate) const MAX_SUBGROUP: usize = 2 * MAX_AGGREGATED_SIGNATURES - 1;
+/// The largest subgroup, the DEC-195 bound chain-types states (`m = 2·r_eff −
+/// 1` with `r_eff ≤ MAX_AGGREGATED_SIGNATURES`, ADR-015); it fits the `u8`
+/// `m` and ranks (asserted there).
+pub(crate) const MAX_SUBGROUP: usize = moonblokz_chain_types::APPROVAL_MAX_SUBGROUP;
 
 /// The `p` of a closed accumulator.
 const NONE_SEQ: u32 = u32::MAX;
@@ -754,8 +755,9 @@ impl ApprovalAccumulator {
 }
 
 /// FR29 / FR27 (Story 6.6 AC8) — what the proposer's branch does next.
-#[cfg_attr(test, derive(Debug))]
-#[derive(PartialEq, Eq)]
+// Read by Story 8.4's emission, which has no production caller yet.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) enum ApprovalStep {
     /// Emit the evidence block now: it is never delayed by the pacing (FR29)
     /// nor gated by FR45's fill threshold or timer (FR27).

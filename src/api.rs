@@ -19,7 +19,8 @@
 //! therefore yield identical state (FR62 / FR63 precondition).
 
 use moonblokz_chain_types::{
-    APPROVAL_LATE_ENTRY_SIZE, APPROVAL_PREFIX_SIZE, ApprovalView, Block, BlockBuilder, BlockHeader,
+    APPROVAL_DEVIATION_SEQUENCE_OFFSET, APPROVAL_LATE_COUNT_SIZE, APPROVAL_LATE_ENTRY_SIZE,
+    APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, ApprovalView, Block, BlockBuilder, BlockHeader,
     BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
     NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
     PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE, Registration,
@@ -2763,9 +2764,10 @@ impl<
     /// key at `p − 1`: keys never change); a verified support is not verified
     /// again. The first support of each rank is stored until `r_eff` are held;
     /// a valid support for a held rank, or past `r_eff`, stays `Accepted`, not
-    /// stored. Before any of it the accumulator's liveness is checked (RAM;
-    /// before a deferred verification also its reads), and a dead accumulator
-    /// is cleared and the support classified as a plain relay.
+    /// stored. The accumulator's liveness is checked first after the FR26
+    /// checks (RAM; before a deferred verification also its reads): a dead
+    /// accumulator is cleared, and the support is classified as a plain relay,
+    /// (iv-b) included.
     ///
     /// The state it changes is the dedupe cache (an `Accepted` message is
     /// cached as relayed) and the accumulator. A node that refused its restart
@@ -2816,7 +2818,10 @@ impl<
                     .is_ok_and(|(tail, head)| tail <= p && p <= head)
         });
         if let Some(d_idx) = on_chain {
-            let own = self.is_own_tuple(p, &hash, proposer);
+            // The accumulator's rank lookup replaces (iv-b) only while it is
+            // live: a dead one is cleared at the hook and the support is a
+            // plain relay, which (iv-b) still classifies.
+            let own = self.is_own_tuple(p, &hash, proposer) && self.approval_live_ram().is_some();
             if !self.on_chain_support_holds(d_idx, p, supporter, proposer, own) {
                 return None;
             }
@@ -2836,9 +2841,10 @@ impl<
     }
 
     /// Story 6.6 AC5 (D3) — the accumulation step for a support every FR26
-    /// check passed (`verified`: whether (ii) checked its signature). `false`
-    /// only for the proposer's own tuple, a non-member or a bad signature:
-    /// `Rejected`. See [`Self::receive_support`].
+    /// check passed (`verified`: whether (ii) checked its signature). Another
+    /// tuple is untouched (`true`). For the proposer's own tuple, `false`
+    /// (`Rejected`) for a non-member or a bad signature. See
+    /// [`Self::receive_support`].
     fn accumulate_support(&mut self, support: &SupportView<'_>, verified: bool) -> bool {
         if !self.is_own_tuple(
             support.deviation_sequence(),
@@ -2931,17 +2937,20 @@ impl<
     /// evidence). The proposer's own evidence, once admitted, makes it false:
     /// the FR27 release.
     fn approval_live_reads(&self, d_idx: u32) -> bool {
+        self.approval_live_reads_with(d_idx, self.header_at(d_idx).map(|(_, u)| u))
+    }
+
+    /// [`Self::approval_live_reads`] with `u = first_voted(d)` already read
+    /// (`None`: the read failed, so only the evidence half is evaluable).
+    fn approval_live_reads_with(&self, d_idx: u32, u: Option<u32>) -> bool {
         let Some(entry) = self.blocks.get(d_idx) else {
             return false;
         };
         let (p, parent) = (entry.sequence(), entry.parent_ref());
-        if self.holds_evidence_at(p) == Some(true) {
-            return false;
-        }
-        let Some((_, u)) = self.header_at(d_idx) else {
-            return true;
-        };
-        self.creator_block_at(parent, p, u, [d_idx, d_idx], true) != Some(true)
+        self.holds_evidence_at(p) != Some(true)
+            && u.is_none_or(|u| {
+                self.creator_block_at(parent, p, u, [d_idx, d_idx], true) != Some(true)
+            })
     }
 
     /// Story 6.6 AC6 — whether a validated evidence block (`payload_type` 4,
@@ -3677,10 +3686,11 @@ impl<
     /// D3) and the signers are distinct (one support per rank, D2).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build_evidence_block(&mut self, tip_idx: u32, now: u64) -> Option<Block> {
-        if !self.approval_live() || !self.approval.is_complete() {
+        let d_idx = self.approval_live_ram()?;
+        let (cv_d, u) = self.deviation_votes(d_idx)?;
+        if !self.approval.is_complete() || !self.approval_live_reads_with(d_idx, Some(u)) {
             return None;
         }
-        let d_idx = self.approval_live_ram()?;
         let p = self.blocks.get(d_idx)?.sequence();
         let tip = self.blocks.get(tip_idx)?;
         let (tip_seq, tip_hash) = (tip.sequence(), *tip.hash());
@@ -3691,7 +3701,6 @@ impl<
         let vote_scale = u64::from(configuration.vote_scale().get());
         let (m, r_eff, _) = self.approval.counts();
         let (m, r_eff) = (usize::from(m), usize::from(r_eff));
-        let (cv_d, u) = self.deviation_votes(d_idx)?;
 
         let room = (self.block_size_limit() as usize)
             .checked_sub(HEADER_SIZE)?
@@ -3707,16 +3716,18 @@ impl<
 
         // DEC-195, little-endian: `supporter_vote_sum u64 ‖ deviation_sequence
         // u32 ‖ m u8 ‖ bitmap ‖ aggregate ‖ late_count u16 ‖ late entries`.
-        payload[8..12].copy_from_slice(&p.to_le_bytes());
-        payload[12] = m as u8;
+        payload[APPROVAL_DEVIATION_SEQUENCE_OFFSET..APPROVAL_M_OFFSET]
+            .copy_from_slice(&p.to_le_bytes());
+        payload[APPROVAL_M_OFFSET] = m as u8;
         let bitmap_end = APPROVAL_PREFIX_SIZE + m.div_ceil(8);
         payload[APPROVAL_PREFIX_SIZE..bitmap_end].fill(0);
         for (rank, _) in self.approval.held_in_rank_order() {
             // D7: rank `j` is bit `j % 8` of byte `j / 8`, LSB-first.
             payload[APPROVAL_PREFIX_SIZE + usize::from(rank) / 8] |= 1 << (rank % 8);
         }
-        let aggregate_len = self.aggregate_supports(p, &mut payload[bitmap_end..fixed - 2])?;
-        if bitmap_end + aggregate_len + 2 != fixed {
+        let late_count_at = fixed - APPROVAL_LATE_COUNT_SIZE;
+        let aggregate_len = self.aggregate_supports(p, &mut payload[bitmap_end..late_count_at])?;
+        if bitmap_end + aggregate_len != late_count_at {
             return None;
         }
 
@@ -3794,13 +3805,14 @@ impl<
             let Some(supporter_vote_sum) = supporter_vote_sum else {
                 return false;
             };
-            payload[..8].copy_from_slice(&supporter_vote_sum.to_le_bytes());
+            payload[..APPROVAL_DEVIATION_SEQUENCE_OFFSET]
+                .copy_from_slice(&supporter_vote_sum.to_le_bytes());
             true
         });
         if !projected {
             return None;
         }
-        payload[fixed - 2..fixed].copy_from_slice(&(late_count as u16).to_le_bytes());
+        payload[late_count_at..fixed].copy_from_slice(&(late_count as u16).to_le_bytes());
         builder
             .approval_payload_mut(fixed + APPROVAL_LATE_ENTRY_SIZE * late_count)
             .ok()?;
@@ -3944,7 +3956,7 @@ impl<
             let Some(idx) = at(self, head, s_head - undone) else {
                 break;
             };
-            if !self.vote_step(idx, true, creator) {
+            if !self.vote_step(idx, true, creator, false) {
                 break;
             }
             undone += 1;
@@ -3958,7 +3970,7 @@ impl<
                 let Some(idx) = at(self, tip_idx, p + applied) else {
                     break;
                 };
-                if !self.vote_step(idx, false, Some(local)) {
+                if !self.vote_step(idx, false, Some(local), true) {
                     break;
                 }
                 applied += 1;
@@ -3966,9 +3978,9 @@ impl<
             ok = p + applied > tip_seq && step(self, true);
             while applied > 0 {
                 let restored = at(self, tip_idx, p + applied - 1)
-                    .is_some_and(|idx| self.vote_step(idx, true, None));
+                    .is_some_and(|idx| self.vote_step(idx, true, None, false));
                 if !restored {
-                    self.reenter_collecting(now);
+                    self.reenter_after_failed_restore(now);
                     return false;
                 }
                 applied -= 1;
@@ -3976,9 +3988,9 @@ impl<
         }
         while undone > 0 {
             let restored = at(self, head, s_head - undone + 1)
-                .is_some_and(|idx| self.vote_step(idx, false, None));
+                .is_some_and(|idx| self.vote_step(idx, false, None, false));
             if !restored {
-                self.reenter_collecting(now);
+                self.reenter_after_failed_restore(now);
                 return false;
             }
             undone -= 1;
@@ -3986,17 +3998,33 @@ impl<
         ok && (!direct || step(self, true))
     }
 
+    /// D4's failed restore, 6.3's `RestoreFailed`: re-enter collecting
+    /// (DEC-205) and, when the re-entry reaches Ready again, run the restart's
+    /// FR22 comparison, as [`Self::compare_and_switch`] does.
+    fn reenter_after_failed_restore(&mut self, now: u64) {
+        if let Some(driver_best) = self.reenter_collecting(now) {
+            self.compare_and_switch([None, driver_best], now);
+        }
+    }
+
     /// One vote step of the projection (D4) on the block at `idx`: `undo_block`
     /// or `apply_block`, after an optional creator check. `false` on a failed
     /// read, a foreign creator or a refused step (atomic: nothing changed). Its
     /// own read buffer.
     #[inline(never)]
-    fn vote_step(&mut self, idx: u32, undo: bool, creator: Option<u32>) -> bool {
+    fn vote_step(&mut self, idx: u32, undo: bool, creator: Option<u32>, check: bool) -> bool {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let Some(view) = self.view_retained(idx, &mut buf) else {
             return false;
         };
         if creator.is_some_and(|c| c != view.creator()) {
+            return false;
+        }
+        // A block the engine has never applied (the DEC-200 sibling branch):
+        // its vote header must match the engine's state (I-09; a Ready
+        // projection is complete), or `undo_block`, which restores the creator
+        // from that header, would not be its exact inverse.
+        if check && self.vote_engine.check_header(&view, true, |_| true) != Ok(true) {
             return false;
         }
         if undo {
@@ -22771,12 +22799,12 @@ mod tests {
     /// refused pre-check changes nothing.
     #[test]
     fn the_rewind_restores_or_reenters_collecting() {
-        // `d`'s third read is the rewind's undo of `d` (after the liveness
-        // read and the header read): fails, `d7` is re-applied.
+        // `d`'s second read is the rewind's undo of `d` (after the builder's
+        // header read): fails, `d7` is re-applied.
         let (mut l, d_idx, tip) = failing_proposer();
         let before = engine_votes(&l);
         l.storage.failing_slot = d_idx;
-        l.storage.reads_left.set(2);
+        l.storage.reads_left.set(1);
         assert!(l.build_evidence_block(tip, 0).is_none());
         assert_eq!(engine_votes(&l), before);
         assert!(l.is_ready());
@@ -22821,14 +22849,14 @@ mod tests {
         let before = engine_votes(&l);
         let reads = l.storage.attempts.get();
         l.storage.failing_slot = d_idx;
-        // `d`'s reads before the application: the liveness header, the votes.
-        l.storage.reads_left.set(2);
+        // `d`'s read before the application: the builder's header read.
+        l.storage.reads_left.set(1);
         assert!(l.build_evidence_block(d_idx, 0).is_none());
         assert_eq!(engine_votes(&l), before);
         assert!(l.is_ready());
         assert_eq!(
             l.storage.attempts.get() - reads,
-            3,
+            2,
             "it failed at the application"
         );
     }
@@ -22904,5 +22932,53 @@ mod tests {
             (6, clean.view().hash()),
             "survives a restart"
         );
+    }
+
+    /// Code review P1 — a dead accumulator does not stand in for (iv-b): with
+    /// `p ≤ F` while incomplete, an own-tuple support from a node outside the
+    /// subgroup is classified as a plain relay, (iv-b) included, and rejected.
+    #[test]
+    fn a_dead_accumulator_does_not_skip_the_subgroup_check() {
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        l.non_conflict.raise_floor(6);
+        let evals = counted(&SUBGROUP_EVALS);
+        assert_eq!(
+            intake(&mut l, &support_by(2, 5, 6, d.view().hash())),
+            ReceiveSupportOutcome::Rejected,
+            "node 2 is outside A at p − 1"
+        );
+        assert_eq!(counted(&SUBGROUP_EVALS) - evals, 1, "(iv-b) ran");
+    }
+
+    /// Code review P2 — the sibling branch is applied only when its vote
+    /// header matches the `p − 1` state: `d` claims consumed votes its creator
+    /// never held, so `undo_block` could not restore the engine; the builder
+    /// refuses and the engine is byte-identical.
+    #[test]
+    fn a_sibling_branch_with_a_wrong_vote_header_is_not_applied() {
+        let (g, mut l, blocks) = support_chain(2);
+        let top = g.vote_engine.top_creator().expect("a top");
+        let snapshot = |n| vote_snapshot(g.vote_engine.accumulated_vote_of(n));
+        let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 0, 1, 1));
+        let d = reheader(
+            &template,
+            2,
+            snapshot(2) + 77,
+            top,
+            snapshot(top) + 77,
+            key_of(2),
+        );
+        // `y` first: `d` arrives as a side block, which no Tier 3 judges.
+        let y = deviation_after(&g, &blocks[5], 5, 4);
+        assert_eq!(receive(&mut l, &y), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&l), (6, y.view().hash()), "d is a held sibling");
+        let d_idx = l.blocks.find(6, &d.view().hash()).expect("d");
+        accumulate(&mut l, &d, d_idx, 2);
+        let before = engine_votes(&l);
+        assert!(l.build_evidence_block(d_idx, 0).is_none());
+        assert_eq!(engine_votes(&l), before);
+        assert!(l.is_ready());
     }
 }
