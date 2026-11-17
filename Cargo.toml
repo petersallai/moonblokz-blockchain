@@ -31,14 +31,12 @@ moonblokz-vote = { path = "../moonblokz-vote", default-features = false, feature
 moonblokz-storage = { path = "../moonblokz-storage", default-features = false, features = ["backend-memory"] }
 
 [features]
-# The single Schnorr crypto backend for the whole stack is selected here at the
-# top of the graph and forwarded to every crate that carries one (vote,
-# chain-types, crypto, storage). Choose exactly one; the default is the
-# embedded-oriented crypto-bigint backend. Every crate below is now
-# backend-generic, so any of the three backends is selectable end-to-end via
-# `--no-default-features --features <backend>` (storage's `backend-memory`
-# storage backend stays enabled directly — it is orthogonal to this choice).
-default = ["schnorr-crypto-bigint", "block-size-2016"]
+# The signature scheme for the whole stack is selected here at the top of the
+# graph and forwarded to every crate that carries one (vote, configuration,
+# chain-types, crypto, storage). The features name the scheme (DEC-246); choose
+# exactly one, the default is `schnorr` (BIP-340). Storage's `backend-memory`
+# storage backend stays enabled directly — it is orthogonal to this choice.
+default = ["schnorr", "block-size-2016"]
 block-size-2016 = [
     "moonblokz-vote/block-size-2016",
     "moonblokz-configuration/block-size-2016",
@@ -51,24 +49,24 @@ block-size-65536 = [
     "moonblokz-chain-types/block-size-65536",
     "moonblokz-storage/block-size-65536",
 ]
-schnorr-crypto-bigint = [
-    "moonblokz-vote/schnorr-crypto-bigint",
-    "moonblokz-configuration/schnorr-crypto-bigint",
-    "moonblokz-chain-types/schnorr-crypto-bigint",
-    "moonblokz-crypto/schnorr-crypto-bigint",
-    "moonblokz-storage/schnorr-crypto-bigint",
+schnorr = [
+    "moonblokz-vote/schnorr",
+    "moonblokz-configuration/schnorr",
+    "moonblokz-chain-types/schnorr",
+    "moonblokz-crypto/schnorr",
+    "moonblokz-storage/schnorr",
 ]
-schnorr-malachite = [
-    "moonblokz-vote/schnorr-malachite",
-    "moonblokz-configuration/schnorr-malachite",
-    "moonblokz-chain-types/schnorr-malachite",
-    "moonblokz-crypto/schnorr-malachite",
-    "moonblokz-storage/schnorr-malachite",
+bls-min-sig = [
+    "moonblokz-vote/bls-min-sig",
+    "moonblokz-configuration/bls-min-sig",
+    "moonblokz-chain-types/bls-min-sig",
+    "moonblokz-crypto/bls-min-sig",
+    "moonblokz-storage/bls-min-sig",
 ]
-schnorr-num-bigint-dig = [
-    "moonblokz-vote/schnorr-num-bigint-dig",
-    "moonblokz-configuration/schnorr-num-bigint-dig",
-    "moonblokz-chain-types/schnorr-num-bigint-dig",
-    "moonblokz-crypto/schnorr-num-bigint-dig",
-    "moonblokz-storage/schnorr-num-bigint-dig",
+bls-min-pk = [
+    "moonblokz-vote/bls-min-pk",
+    "moonblokz-configuration/bls-min-pk",
+    "moonblokz-chain-types/bls-min-pk",
+    "moonblokz-crypto/bls-min-pk",
+    "moonblokz-storage/bls-min-pk",
 ]
