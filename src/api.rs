@@ -22864,4 +22864,45 @@ mod tests {
         }
         assert_eq!(run(), run());
     }
+
+    /// Story 6.6 (the investigation that found it, 2026-11-17): a valid block
+    /// with bytes after its last transaction, signed over all its wire bytes,
+    /// was accepted live and lost at restart (the restart trims it to its
+    /// framed length, which no longer verifies, and cut the chain below it).
+    /// Tier 1 now refuses it as exact evidence; the clean block survives a
+    /// restart.
+    #[test]
+    fn a_block_with_bytes_after_its_payload_is_refused() {
+        let (g, mut l, blocks) = support_chain(3);
+        let clean = normal_after(&g, &blocks[5], 1, 7);
+        let mut raw = std::vec::Vec::from(clean.serialized_bytes());
+        raw.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        let signature_at = HEADER_SIZE - SIGNATURE_SIZE;
+        raw[signature_at..HEADER_SIZE].fill(0);
+        let signer = Crypto::new([key_of(1); PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("key");
+        let signature = signer.sign(&raw);
+        raw[signature_at..HEADER_SIZE].copy_from_slice(signature.serialize());
+        let trailing = Block::from_bytes(&raw).ok().expect("parses");
+        assert_eq!(trailing.content_length(), Some(clean.len()));
+        assert_eq!(
+            receive(&mut l, &trailing),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(head_of(&l).0, 5);
+
+        assert_eq!(
+            receive(&mut l, &clean),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let mut restarted = local_node(3, l.storage);
+        let (outcome, _) = restarted.initialize_from_storage(500);
+        assert_eq!(outcome, InitOutcome::ResumedReady);
+        assert_eq!(
+            head_of(&restarted),
+            (6, clean.view().hash()),
+            "survives a restart"
+        );
+    }
 }
