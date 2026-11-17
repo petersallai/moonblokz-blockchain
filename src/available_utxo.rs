@@ -27,11 +27,15 @@
 //! read is Story 7.1; the carry-forward driver is Story 9.5.
 
 use moonblokz_chain_types::BlockView;
+use moonblokz_crypto::PUBLIC_KEY_SIZE;
 
 /// Returns the `output_index`-th output of `view`'s UTXO-output stream as
 /// `(address, amount)`, or `None` when the block has fewer UTXO outputs (or
 /// is not a transaction block).
-pub(crate) fn utxo_output_at(view: &BlockView, output_index: u16) -> Option<([u8; 32], u64)> {
+pub(crate) fn utxo_output_at(
+    view: &BlockView,
+    output_index: u16,
+) -> Option<([u8; PUBLIC_KEY_SIZE], u64)> {
     view.transactions()?
         .iter()
         .filter_map(|tx| tx.as_complex())

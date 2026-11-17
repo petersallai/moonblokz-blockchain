@@ -70,3 +70,28 @@ bls-min-pk = [
     "moonblokz-crypto/bls-min-pk",
     "moonblokz-storage/bls-min-pk",
 ]
+
+# Debug test runs build the curve code optimized (DEC-255): a BLS pairing in an
+# unoptimized build is very slow. Only takes effect when this crate is the Cargo root.
+[profile.dev.package.moonblokz-crypto]
+opt-level = 3
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.primeorder]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.bls12_381]
+opt-level = 3
+[profile.dev.package.ff]
+opt-level = 3
+[profile.dev.package.group]
+opt-level = 3
+[profile.dev.package.pairing]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.subtle]
+opt-level = 3

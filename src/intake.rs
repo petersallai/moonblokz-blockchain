@@ -264,9 +264,11 @@ mod tests {
     /// The base override set as a **content region**: the window `W` declared
     /// at `TestChain`'s capacity, every other parameter at its code-baked
     /// default. Leaving the window out would resolve it to the default 500,
-    /// which this harness cannot hold, so acceptance would refuse it (FR8).
-    const BASE_CONFIG_CONTENT: [u8; 20] = [
-        3,
+    /// which this harness cannot hold, so acceptance would refuse it (FR8). The
+    /// last entry declares the build's signature scheme, which a chain on any
+    /// scheme but `schnorr` must state (configuration check 19, DEC-252).
+    const BASE_CONFIG_CONTENT: [u8; 23] = [
+        4,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         4,
@@ -286,12 +288,15 @@ mod tests {
         N.to_le_bytes()[1],
         N.to_le_bytes()[2],
         N.to_le_bytes()[3],
+        parameter::SIGNATURE_SCHEME,
+        1,
+        moonblokz_crypto::SIGNATURE_SCHEME,
     ];
 
     /// A second content region, equally valid and distinct in bytes: the base
     /// entry plus a literal declaring `vote_interest`'s own default value.
-    const OTHER_CONFIG_CONTENT: [u8; 23] = [
-        4,
+    const OTHER_CONFIG_CONTENT: [u8; 26] = [
+        5,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         4,
@@ -314,6 +319,9 @@ mod tests {
         parameter::VOTE_INTEREST,
         1,
         5,
+        parameter::SIGNATURE_SCHEME,
+        1,
+        moonblokz_crypto::SIGNATURE_SCHEME,
     ];
 
     /// Frames `content` as a chain-config payload: the content region followed
@@ -388,7 +396,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder
@@ -428,7 +436,7 @@ mod tests {
                 first_voted_node: 0,
                 consumed_votes_from_first_voted_node: 0,
                 previous_hash: [0u8; 32],
-                signature: [0u8; 64],
+                signature: [0u8; SIGNATURE_SIZE],
             })
             .build_signed(&crypto())
             .ok()
@@ -681,8 +689,8 @@ mod tests {
     /// out-of-window sequence.
     #[test]
     fn classify_window_width_is_the_configured_w() {
-        const W8_CONFIG_CONTENT: [u8; 20] = [
-            3,
+        const W8_CONFIG_CONTENT: [u8; 23] = [
+            4,
             0,
             parameter::ACTIVE_CHAIN_LENGTH,
             4,
@@ -702,6 +710,9 @@ mod tests {
             N.to_le_bytes()[1],
             N.to_le_bytes()[2],
             N.to_le_bytes()[3],
+            parameter::SIGNATURE_SCHEME,
+            1,
+            moonblokz_crypto::SIGNATURE_SCHEME,
         ];
         let mut bc = locked_test_chain(&W8_CONFIG_CONTENT);
 

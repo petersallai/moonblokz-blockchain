@@ -1042,6 +1042,9 @@ impl<
     /// - `node_count_max` — `MAX_NODES`, the node-indexed arrays. The chain's
     ///   `max_node_count` must fit it (§6 check 18), so every registered node id
     ///   has a slot (DEC-228).
+    /// - `signature_scheme` — `moonblokz_crypto::SIGNATURE_SCHEME`, the build's
+    ///   scheme. The chain's `signature_scheme` (ID 33, default `schnorr`) must
+    ///   equal it (§6 check 19, DEC-252).
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
         utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
@@ -1083,6 +1086,9 @@ impl<
             );
             MAX_NODES as u32
         },
+        // The scheme the crypto crate was built with: a chain founded on
+        // another one is refused at acceptance (configuration check 19, DEC-252).
+        signature_scheme: moonblokz_crypto::SIGNATURE_SCHEME,
     };
 
     /// Constructs the node in place, inside caller-provided storage, and
@@ -1399,7 +1405,7 @@ impl<
             // Ignored by `BlockBuilder::build_signed`; the builder signs the
             // full canonical block bytes with this field zero-filled, then
             // stores the generated signature here.
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
 
         // The chain-types builder errors only on payload-type mismatch or
@@ -1430,7 +1436,7 @@ impl<
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: block_0.hash(),
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut cfg_builder = BlockBuilder::new().header(block_1_header);
         // The framed payload was bounded by `MAX_PAYLOAD_SIZE` above, so it fits
@@ -4946,9 +4952,9 @@ impl<
     }
 
     /// Verifies the FR6 block-creator signature (AC2b) over the canonical signing
-    /// preimage (the full block bytes with the trailing-64 header signature field
+    /// preimage (the full block bytes with the header signature field
     /// zero-filled — exactly what `BlockBuilder::build_signed` signs; the
-    /// signature is the last 64 bytes of the fixed `HEADER_SIZE` header). Returns
+    /// signature is the last `SIGNATURE_SIZE` bytes of the `HEADER_SIZE` header). Returns
     /// `Some(valid)`, or `None` when the creator's public key is not yet derivable
     /// (pre-seed zone → the block is trusted, not re-proved). Node #0 resolves to
     /// the FR69 trust anchor (`node_zero_public_key`), available from construction.
@@ -4962,8 +4968,7 @@ impl<
         } else {
             *self.node_info.public_key_of(creator)?
         };
-        const SIG_LEN: usize = 64;
-        let sig_off = HEADER_SIZE - SIG_LEN;
+        let sig_off = HEADER_SIZE - SIGNATURE_SIZE;
         let bytes = view.serialized_bytes();
         let len = bytes.len();
         let mut preimage = [0u8; MAX_BLOCK_SIZE];
@@ -5005,11 +5010,11 @@ impl<
 
     /// Verifies a node-transfer / registration transaction signature (AC3): the
     /// signer (the `signer_node_id`, resolved to its derived key) signs the full
-    /// transaction bytes with the trailing-64 signature field zero-filled (the
-    /// `*::new_signed` convention — the signature is the last 64 bytes of the
-    /// fixed-size transaction). Returns `false` on an unresolvable signer key or a
+    /// transaction bytes with the trailing signature field zero-filled (the
+    /// `*::new_signed` convention — the signature is the last `SIGNATURE_SIZE`
+    /// bytes of the fixed-size transaction). Returns `false` on an unresolvable signer key or a
     /// bad signature. Only node-transfer / registration transactions have this
-    /// fixed trailing-64 layout; balance/UTXO input signatures (embedded, no
+    /// fixed trailing-signature layout; balance/UTXO input signatures (embedded, no
     /// `new_signed` convention) are a deferred seam.
     fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
         let Some(key) = self.node_info.public_key_of(signer_node_id) else {
@@ -5017,18 +5022,18 @@ impl<
         };
         let key = *key;
         let len = tx_bytes.len();
-        if !(64..=REGISTRATION_SIZE).contains(&len) {
+        if !(SIGNATURE_SIZE..=REGISTRATION_SIZE).contains(&len) {
             return false;
         }
         let mut preimage = [0u8; REGISTRATION_SIZE];
         preimage[..len].copy_from_slice(tx_bytes);
-        for b in preimage[len - 64..len].iter_mut() {
+        for b in preimage[len - SIGNATURE_SIZE..len].iter_mut() {
             *b = 0;
         }
         verify_signature_bytes(
             &self.crypto,
             &preimage[..len],
-            &tx_bytes[len - 64..len],
+            &tx_bytes[len - SIGNATURE_SIZE..len],
             &key,
         )
     }
@@ -5069,7 +5074,7 @@ impl<
         output_index: u16,
         declared_amount: u64,
         trust_below_anchor: bool,
-    ) -> Result<Option<[u8; 32]>, UtxoSpendError> {
+    ) -> Result<Option<[u8; PUBLIC_KEY_SIZE]>, UtxoSpendError> {
         let ref_idx = match self.locate_utxo_source(parent_idx, consuming_seq, block_sequence)? {
             Some(ref_idx) => ref_idx,
             None if trust_below_anchor => return Ok(None),
@@ -5132,7 +5137,7 @@ impl<
         &self,
         ref_idx: u32,
         output_index: u16,
-    ) -> Result<Option<([u8; 32], u64)>, UtxoSpendError> {
+    ) -> Result<Option<([u8; PUBLIC_KEY_SIZE], u64)>, UtxoSpendError> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self
             .view_retained(ref_idx, &mut buf)
@@ -7712,9 +7717,10 @@ mod tests {
     /// declaring `active_chain_length = TEST_W`. Every other parameter resolves
     /// to its code-baked default, and those defaults are exactly the constants
     /// the retired `FixedChainConfig` returned — which is why the suite's
-    /// expected values are unchanged.
-    const BASE_CONFIG_CONTENT: [u8; 20] = [
-        3,
+    /// expected values are unchanged. The last entry declares the build's
+    /// signature scheme ([`declare_build_scheme`]).
+    const BASE_CONFIG_CONTENT: [u8; 23] = [
+        4,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         4,
@@ -7734,13 +7740,16 @@ mod tests {
         TEST_MAX_NODES.to_le_bytes()[1],
         TEST_MAX_NODES.to_le_bytes()[2],
         TEST_MAX_NODES.to_le_bytes()[3],
+        parameter::SIGNATURE_SCHEME,
+        1,
+        moonblokz_crypto::SIGNATURE_SCHEME,
     ];
 
     /// A second content region, valid and **distinct in bytes** but resolving
     /// identically: the base entry plus a literal declaring `vote_interest`'s
     /// own default. Used where a test needs two different chain-config contents.
-    const OTHER_CONFIG_CONTENT: [u8; 23] = [
-        4,
+    const OTHER_CONFIG_CONTENT: [u8; 26] = [
+        5,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
         4,
@@ -7763,6 +7772,9 @@ mod tests {
         parameter::VOTE_INTEREST,
         1,
         5,
+        parameter::SIGNATURE_SCHEME,
+        1,
+        moonblokz_crypto::SIGNATURE_SCHEME,
     ];
 
     /// An override set declaring the window `w` and its test horizon — the
@@ -7786,7 +7798,22 @@ mod tests {
             .add_literal(parameter::MAX_NODE_COUNT, &TEST_MAX_NODES.to_le_bytes())
             .ok()
             .expect("a four-byte literal is well-formed");
+        declare_build_scheme(&mut builder);
         builder
+    }
+
+    /// Declares the build's signature scheme, which every chain must state
+    /// unless it is the default `schnorr` (configuration check 19, DEC-252):
+    /// the test configurations state it on every scheme, so one fixture set
+    /// serves all three.
+    fn declare_build_scheme(builder: &mut ChainConfigPayloadBuilder) {
+        builder
+            .add_literal(
+                parameter::SIGNATURE_SCHEME,
+                &[moonblokz_crypto::SIGNATURE_SCHEME],
+            )
+            .ok()
+            .expect("a one-byte literal is well-formed");
     }
 
     /// Storage whose control plane is fine and whose block writes are not.
@@ -8361,10 +8388,10 @@ mod tests {
     fn chain_info_reads_the_derived_watermark() {
         let mut bc = new_test_chain();
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0xB1)], 1);
+        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0x31)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let reg = registration_block(101, anchor.view().hash(), 1, 2, 0xC5);
+        let reg = registration_block(101, anchor.view().hash(), 1, 2, 0x45);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -8711,7 +8738,7 @@ mod tests {
         let h = test_horizon(TEST_W).to_le_bytes();
         let n = TEST_MAX_NODES.to_le_bytes();
         let content = [
-            4u8,
+            5u8,
             0,
             parameter::BLOCK_SIZE_LIMIT,
             4,
@@ -8737,6 +8764,9 @@ mod tests {
             n[1],
             n[2],
             n[3],
+            parameter::SIGNATURE_SCHEME,
+            1,
+            moonblokz_crypto::SIGNATURE_SCHEME,
         ];
 
         let outcome = bc.process_genesis(1_000_000_000, &content);
@@ -8819,7 +8849,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder
@@ -8844,7 +8874,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder
@@ -8905,7 +8935,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder
@@ -9303,7 +9333,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder
@@ -9787,12 +9817,12 @@ mod tests {
             .ok()
             .expect("new key");
         let new_pk = *new_signer.public_key().serialize();
-        let mut new_key_sig = [0u8; 64];
-        new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..64]);
+        let mut new_key_sig = [0u8; SIGNATURE_SIZE];
+        new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..SIGNATURE_SIZE]);
         // The transaction signature signs the tx bytes with its signature field
         // zeroed and the new-key signature already present (the `new_signed`
         // convention), produced here by the initializer's key.
-        let zero = [0u8; 64];
+        let zero = [0u8; SIGNATURE_SIZE];
         let unsigned = Registration::new(
             0,
             initializer,
@@ -9803,8 +9833,9 @@ mod tests {
             &new_key_sig,
             &zero,
         );
-        let mut tx_sig = [0u8; 64];
-        tx_sig.copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..64]);
+        let mut tx_sig = [0u8; SIGNATURE_SIZE];
+        tx_sig
+            .copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..SIGNATURE_SIZE]);
         let reg = Registration::new(
             0,
             initializer,
@@ -9826,7 +9857,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder
@@ -9894,7 +9925,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let payload = payload_builder.build_signed(&signer);
         let mut builder = BlockBuilder::new().header(header);
@@ -9921,14 +9952,26 @@ mod tests {
 
     /// A deliberately small — but entirely legal — `block_size_limit`, used to
     /// build a tentative configuration that disagrees with a candidate's own.
-    /// Above `HEADER_SIZE` (122), so the configuration module accepts it, and far
+    /// Above `HEADER_SIZE`, so the configuration module accepts it, and far
     /// below the build's block capacity, so a realistic block can exceed it.
     ///
-    /// Above the test configuration blocks (212 B with the four-byte `W`, `H`,
-    /// block-size and node-cap entries, Story 6.15) and the one-entry balance
-    /// block (178 B); below the three-entry balance block (274 B) and the
-    /// three-output transaction block (254 B) the fixtures exceed it with.
-    const SMALL_BLOCK_SIZE_LIMIT: u32 = 220;
+    /// Five bytes above the larger of the test configuration block (its 29-byte
+    /// content: the four-byte `W`, `H`, block-size and node-cap entries and the
+    /// one-byte scheme) and the one-entry balance block, so both fit; below the
+    /// three-entry balance block and the three-output transaction block the
+    /// fixtures exceed it with. Derived from the scheme's sizes (Story 6.17):
+    /// 220 / 231 / 284 B under `schnorr` / `bls-min-sig` / `bls-min-pk`,
+    /// against 254 / 430 / 334 B for the smaller of the two large fixtures.
+    const SMALL_BLOCK_SIZE_LIMIT: u32 = {
+        let config_block = HEADER_SIZE + 29 + SIGNATURE_SIZE;
+        let balance_block = HEADER_SIZE + 8 + NODE_INFO_SIZE;
+        let larger = if config_block > balance_block {
+            config_block
+        } else {
+            balance_block
+        };
+        (larger + 5) as u32
+    };
 
     /// An override set declaring [`SMALL_BLOCK_SIZE_LIMIT`] and the window `w`.
     fn small_limit_config_builder(w: u32) -> ChainConfigPayloadBuilder {
@@ -10004,7 +10047,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for &(owner, balance, vote_count, _pk_byte) in entries {
@@ -10050,7 +10093,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder.add_node_transfer(&nt).ok().expect("add transfer");
@@ -10067,7 +10110,7 @@ mod tests {
         // block in scope, so the segment is anchored by one. Inert with
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)], 2);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31), (2, 300, 20, 0x32)], 2);
         let ai = bc
             .tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("balance anchor admitted");
@@ -10104,12 +10147,12 @@ mod tests {
         // block in scope, so the segment is anchored by one. Inert with
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0xB1)], 1);
+        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0x31)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // FR6 registration monotonicity: `new_node_id` must be the pre-block
         // watermark + 1 (watermark is 1 from the balance block's max_node_id → 2).
-        let reg = registration_block(101, anchor.view().hash(), 1, 2, 0xC5);
+        let reg = registration_block(101, anchor.view().hash(), 1, 2, 0x45);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -10142,7 +10185,7 @@ mod tests {
         // block in scope, so the segment is anchored by one. Inert with
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31), (2, 300, 0, 0x32)], 2);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // vote 0 — the permanent node-#0 vote-target exception (FR37/FR54), so the
@@ -10220,7 +10263,7 @@ mod tests {
         let anchor = balance_block(
             100,
             cfg_hash,
-            &[(1, 1000, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
+            &[(1, 1000, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
             3,
         );
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
@@ -10251,7 +10294,7 @@ mod tests {
         // block in scope, so the segment is anchored by one. Inert with
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], 1);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let tx = transfer_block(101, anchor.view().hash(), 1, 1, 0, 3, 0);
@@ -10287,7 +10330,7 @@ mod tests {
             // block in scope, so the segment is anchored by one. Inert with
             // respect to everything below — see `chain_config_anchor_block`.
             let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-            let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2)], 2);
+            let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31), (2, 300, 0, 0x32)], 2);
             let _ai = bc
                 .tier1_admit(&anchor.view(), &anchor.view().hash(), now_base)
                 .expect("anchor admitted");
@@ -10358,7 +10401,7 @@ mod tests {
         let genesis = node_transfer_block(0, 0, 0, 0);
         let cfg = chain_config_anchor_block(1, genesis.view().hash());
         // Out-of-sequence registration child (new_node_id 5, expected 1).
-        let child = registration_block(2, cfg.view().hash(), 1, 5, 0xC5);
+        let child = registration_block(2, cfg.view().hash(), 1, 5, 0x45);
         // Admit the upper blocks first, while they are still orphans (Stored, no
         // FR2 — not yet anchored), then the genesis, so the continuous
         // genesis-anchored candidate qualifies on that last admission.
@@ -10548,13 +10591,13 @@ mod tests {
         // block in scope, so the segment is anchored by one. Inert with
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)], 5);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31), (2, 300, 20, 0x32)], 5);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
         bc.tier1_admit(&tx.view(), &tx.view().hash(), 0)
             .expect("tx admitted");
-        let reg = registration_block(102, tx.view().hash(), 1, 3, 0xC3);
+        let reg = registration_block(102, tx.view().hash(), 1, 3, 0x43);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -10606,7 +10649,7 @@ mod tests {
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Window-anchored candidate: balance seed (watermark 5) → valid transfer
         // → out-of-sequence registration (id 3, expected 6).
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1), (2, 300, 20, 0xB2)], 5);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31), (2, 300, 20, 0x32)], 5);
         let ai = bc
             .tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
@@ -10614,7 +10657,7 @@ mod tests {
         let ti = bc
             .tier1_admit(&tx.view(), &tx.view().hash(), 0)
             .expect("tx admitted");
-        let reg = registration_block(102, tx.view().hash(), 1, 3, 0xC3);
+        let reg = registration_block(102, tx.view().hash(), 1, 3, 0x43);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -10809,7 +10852,7 @@ mod tests {
             // offender (Story 5.9, AC3) — see
             // `fr5_seam_recovers_and_retries_invalid_candidate_in_one_call`.
             let cfg = chain_config_anchor_block(1, genesis.view().hash());
-            let child = registration_block(2, cfg.view().hash(), 1, 5, 0xC5);
+            let child = registration_block(2, cfg.view().hash(), 1, 5, 0x45);
             let (first, _) = bc.receive_block(child.view(), now);
             bc.receive_block(cfg.view(), now.saturating_add(1_000));
             let (second, _) = bc.receive_block(genesis.view(), now.saturating_add(9_000));
@@ -10893,7 +10936,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder.add_node_transfer(&nt).ok().expect("add transfer");
@@ -10939,7 +10982,7 @@ mod tests {
         // max_node_id 9 so the transfer's (unseeded, pre-window) initializer 7 and
         // receiver 9 are within the valid node-id range — only node 3 is
         // individually seeded (partial FR50 coverage).
-        let anchor = balance_block(100, cfg_hash, &[(3, 100, 0, 0xB3)], 9);
+        let anchor = balance_block(100, cfg_hash, &[(3, 100, 0, 0x33)], 9);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         let blk = credit_block(101, anchor.view().hash(), 3, 500, 7, 9, 0);
@@ -10970,10 +11013,10 @@ mod tests {
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Balance block declares max_node_id 5 → watermark 5; the next valid
         // registration id is 6. A registration for id 3 violates the stride-1 rule.
-        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0xB1)], 5);
+        let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0x31)], 5);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let reg = registration_block(101, anchor.view().hash(), 1, 3, 0xC3);
+        let reg = registration_block(101, anchor.view().hash(), 1, 3, 0x43);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted (Tier 1 does not check the watermark)");
@@ -11008,7 +11051,7 @@ mod tests {
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // max_node_id 8 so the transfer's initializer 1 and receiver 2 are in range;
         // the vote target 9 is beyond the watermark → cannot exist.
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 8);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 8);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // Vote target 9 is beyond max_known_node_id (8) → not a possible node.
@@ -11039,7 +11082,7 @@ mod tests {
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Window-anchored, watermark 5 (only node 1 individually seeded).
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 5);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 5);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // Output side: receiver 99 is beyond the watermark.
@@ -11088,7 +11131,7 @@ mod tests {
         // Partial-coverage balance block: seeds only node 1, but declares
         // max_node_id = 10 (nodes 2..=10 exist pre-window / elsewhere in the window
         // but are not individually seeded by THIS block).
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 10);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 10);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // Node 1 (seeded) votes for node 5: 5 ∉ seeded-set but 5 ≤ watermark(10).
@@ -11135,12 +11178,12 @@ mod tests {
         // Orphan anchor (seq 100, window-anchored): a registration for node 7 —
         // stride-1 against a 0 watermark would demand id 1, so the OLD per-0 check
         // would reject it. It precedes the segment's only balance block (seq 101).
-        let reg = registration_block(100, cfg_hash, 1, 7, 0xC7);
+        let reg = registration_block(100, cfg_hash, 1, 7, 0x47);
         bc.tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
         // Balance block at seq 101: declares the full count (max_node_id 10) — the
         // existence floor — and seeds node 1.
-        let bal = balance_block(101, reg.view().hash(), &[(1, 100, 0, 0xB1)], 10);
+        let bal = balance_block(101, reg.view().hash(), &[(1, 100, 0, 0x31)], 10);
         let bi = bc
             .tier1_admit(&bal.view(), &bal.view().hash(), 0)
             .expect("balance admitted");
@@ -11180,7 +11223,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         builder.add_node_transfer(&nt).ok().expect("add transfer");
@@ -11219,11 +11262,11 @@ mod tests {
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
         // Earliest balance block → watermark initialized to 1.
-        let b0 = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 1);
+        let b0 = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 1);
         bc.tier1_admit(&b0.view(), &b0.view().hash(), 0)
             .expect("earliest balance block admitted");
         // A later balance block claims max_node_id 5 ≠ the tracked watermark 1.
-        let b1 = balance_block(101, b0.view().hash(), &[(1, 400, 0, 0xB1)], 5);
+        let b1 = balance_block(101, b0.view().hash(), &[(1, 400, 0, 0x31)], 5);
         let i1 = bc
             .tier1_admit(&b1.view(), &b1.view().hash(), 0)
             .expect("later balance block admitted");
@@ -11256,7 +11299,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
         let mut builder = BlockBuilder::new().header(header);
@@ -11293,7 +11336,7 @@ mod tests {
         // block in scope, so the segment is anchored by one. Inert with
         // respect to everything below — see `chain_config_anchor_block`.
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0xB1)], 1);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
         // pk_byte == 1 ⇒ new_public_key == pubkey([1u8]) == node 1's seeded key.
@@ -11916,8 +11959,8 @@ mod tests {
                 bc.receive_block(block.view(), 0);
             }
             // The locked content as a fingerprint: its first two bytes are the
-            // `config_value_count`, which is 3 for the base override set config A
-            // carries (window, horizon and node cap) and 4 for config B's.
+            // `config_value_count`, which is 4 for the base override set config A
+            // carries (window, horizon, node cap and scheme) and 5 for config B's.
             let locked = bc
                 .chain_config
                 .durable_content()
@@ -11934,7 +11977,7 @@ mod tests {
         );
         assert_eq!(
             a_first,
-            (true, 4, [3, 0]),
+            (true, 4, [4, 0]),
             "and they converge on config A — the candidate's own — with the side branch gone"
         );
     }
@@ -11973,7 +12016,7 @@ mod tests {
         let big = balance_block(
             100,
             below.view().hash(),
-            &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2), (3, 100, 0, 0xB3)],
+            &[(1, 500, 0, 0x31), (2, 300, 0, 0x32), (3, 100, 0, 0x33)],
             9,
         );
         assert!(
@@ -12050,7 +12093,7 @@ mod tests {
         let mut bc = new_unconfigured_test_chain();
         let genesis = node_transfer_block(0, 0, 0, 0);
         // Out-of-sequence registration (new_node_id 5, expected 1) — invalid.
-        let bad = registration_block(1, genesis.view().hash(), 1, 5, 0xC5);
+        let bad = registration_block(1, genesis.view().hash(), 1, 5, 0x45);
         let cfg = chain_config_anchor_block(2, bad.view().hash());
         for block in [&cfg, &bad] {
             bc.receive_block(block.view(), 0);
@@ -12099,7 +12142,7 @@ mod tests {
         let big = balance_block(
             100,
             [0xAB; 32],
-            &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2), (3, 100, 0, 0xB3)],
+            &[(1, 500, 0, 0x31), (2, 300, 0, 0x32), (3, 100, 0, 0x33)],
             9,
         );
         assert!(big.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
@@ -12135,7 +12178,7 @@ mod tests {
         let big = balance_block(
             100,
             below.view().hash(),
-            &[(1, 500, 0, 0xB1), (2, 300, 0, 0xB2), (3, 100, 0, 0xB3)],
+            &[(1, 500, 0, 0x31), (2, 300, 0, 0x32), (3, 100, 0, 0x33)],
             9,
         );
         assert!(big.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
@@ -13167,6 +13210,58 @@ mod tests {
         assert_eq!(bc.block_tree_len(), 2);
     }
 
+    /// Story 6.17 D10 (DEC-252) — genesis founds a chain only on the build's own
+    /// signature scheme: a content naming another scheme is refused, and one
+    /// that leaves ID 33 out (the shape the encoder writes for a Schnorr chain)
+    /// is accepted on `schnorr` only, since the default is `schnorr`.
+    #[test]
+    fn genesis_founds_a_chain_of_the_builds_scheme_only() {
+        let content = |scheme: Option<u8>| {
+            let mut builder = ChainConfigPayloadBuilder::new();
+            for (id, value) in [
+                (parameter::ACTIVE_CHAIN_LENGTH, TEST_W),
+                (parameter::VERIFICATION_HORIZON, test_horizon(TEST_W)),
+                (parameter::MAX_NODE_COUNT, TEST_MAX_NODES),
+            ] {
+                builder
+                    .add_literal(id, &value.to_le_bytes())
+                    .ok()
+                    .expect("a four-byte literal is well-formed");
+            }
+            if let Some(scheme) = scheme {
+                builder
+                    .add_literal(parameter::SIGNATURE_SCHEME, &[scheme])
+                    .ok()
+                    .expect("a one-byte literal is well-formed");
+            }
+            builder
+        };
+        // The outcome and how many blocks it wrote.
+        let genesis = |scheme: Option<u8>| {
+            let (crypto, storage, chain_config) = test_backends();
+            let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+            let outcome = match bc.process_genesis(1_000_000_000, content(scheme).content()) {
+                Ok(_) => "founded",
+                Err(GenesisRejectReason::InitialChainConfigRejected) => "content refused",
+                Err(_) => "another refusal",
+            };
+            (outcome, bc.block_tree_len())
+        };
+        let own = moonblokz_crypto::SIGNATURE_SCHEME;
+        assert_eq!(genesis(Some((own + 1) % 3)), ("content refused", 0));
+        assert_eq!(genesis(Some((own + 2) % 3)), ("content refused", 0));
+        assert_eq!(genesis(Some(own)), ("founded", 2));
+        assert_eq!(
+            genesis(None),
+            if own == 0 {
+                ("founded", 2)
+            } else {
+                ("content refused", 0)
+            },
+            "an absent ID 33 means schnorr"
+        );
+    }
+
     /// AC2 — `W = 1` admits no verification horizon (`1 ≤ H < W` is empty,
     /// DEC-207), so genesis refuses the content before anything is written.
     #[test]
@@ -13684,7 +13779,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for tx in txs {
@@ -13720,18 +13815,18 @@ mod tests {
     ) -> moonblokz_chain_types::ComplexTransaction {
         let mut cx = moonblokz_chain_types::ComplexTransaction::new(vote);
         for &(block_sequence, output_index, amount) in utxo_inputs {
-            cx.add_utxo_input(block_sequence, output_index, amount, &[0u8; 64])
+            cx.add_utxo_input(block_sequence, output_index, amount, &[0u8; SIGNATURE_SIZE])
                 .ok()
                 .expect("add utxo input");
         }
         if let Some((initializer, amount)) = balance_input {
-            cx.add_balance_input(seq - 1, initializer, amount, 0, &[0u8; 64])
+            cx.add_balance_input(seq - 1, initializer, amount, 0, &[0u8; SIGNATURE_SIZE])
                 .ok()
                 .expect("add balance input");
         }
         for output in outputs {
             match *output {
-                Ok(amount) => cx.add_utxo_output(&[0xA5; 32], amount),
+                Ok(amount) => cx.add_utxo_output(&[0xA5; PUBLIC_KEY_SIZE], amount),
                 Err((receiver, amount)) => cx.add_balance_output(receiver, amount),
             }
             .ok()
@@ -13753,7 +13848,7 @@ mod tests {
         let seed = balance_block(
             100,
             cfg_hash,
-            &[(1, 100, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
+            &[(1, 100, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
             3,
         );
         admit(&mut bc, &seed);
@@ -13884,7 +13979,7 @@ mod tests {
             let cfg = w4_config_anchor_block(99, [0xAB; 32]);
             bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
                 .expect("config admitted");
-            let seed = balance_block(100, cfg.view().hash(), &[(2, 0, 0, 0xB2)], 3);
+            let seed = balance_block(100, cfg.view().hash(), &[(2, 0, 0, 0x32)], 3);
             bc.tier1_admit(&seed.view(), &seed.view().hash(), 0)
                 .expect("seed admitted");
             let tx = utxo_tx(101, &[(referenced, 0, 5)], None, &[Err((2, 5))]);
@@ -14243,7 +14338,7 @@ mod tests {
         let seed = balance_block(
             100,
             cfg.view().hash(),
-            &[(1, 100, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
+            &[(1, 100, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
             3,
         );
         failing_read_admit(&mut bc, &seed);
@@ -14453,7 +14548,7 @@ mod tests {
         let seed = balance_block(
             100,
             cfg.view().hash(),
-            &[(1, 100, 0, 0xB1), (2, 0, 0, 0xB2), (3, 0, 0, 0xB3)],
+            &[(1, 100, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
             3,
         );
         admit(&mut bc, &seed);
@@ -14500,10 +14595,10 @@ mod tests {
         let mut bc = new_unconfigured_w4_chain();
         // The block below the window (`W + H`, DEC-177) is a one-entry balance
         // block, within the small limit; #100 repeats its snapshot.
-        let below = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let below = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
         let (outcome, _) = bc.receive_block(below.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        let base = balance_block(100, below.view().hash(), &[(3, 0, 0, 0xB3)], 3);
+        let base = balance_block(100, below.view().hash(), &[(3, 0, 0, 0x33)], 3);
         let one = utxo_tx(101, &[], None, &[Ok(5)]);
         let b101 = complex_tx_block(101, base.view().hash(), 3, 0, &[&one]);
         let three = utxo_tx(102, &[], None, &[Ok(5), Ok(6), Ok(7)]);
@@ -14579,9 +14674,9 @@ mod tests {
             .ok()
             .expect("new key");
         let new_pk = *new_signer.public_key().serialize();
-        let mut new_key_sig = [0u8; 64];
-        new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..64]);
-        let zero = [0u8; 64];
+        let mut new_key_sig = [0u8; SIGNATURE_SIZE];
+        new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..SIGNATURE_SIZE]);
+        let zero = [0u8; SIGNATURE_SIZE];
         let unsigned = Registration::new(
             0,
             initializer,
@@ -14592,8 +14687,9 @@ mod tests {
             &new_key_sig,
             &zero,
         );
-        let mut tx_sig = [0u8; 64];
-        tx_sig.copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..64]);
+        let mut tx_sig = [0u8; SIGNATURE_SIZE];
+        tx_sig
+            .copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..SIGNATURE_SIZE]);
         Registration::new(
             0,
             initializer,
@@ -14625,7 +14721,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         add(&mut builder);
@@ -14729,7 +14825,7 @@ mod tests {
     /// UTXO outputs (60, 40) from node #0's balance. Returns the node and #3.
     fn utxo_genesis() -> (TestChain, Block) {
         let (mut bc, _, b1) = ready_genesis(16);
-        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        let reg = register(2, b1.view().hash(), 1, 0x31);
         assert_eq!(
             receive(&mut bc, &reg),
             ReceiveBlockOutcome::AcceptedSilently
@@ -14755,7 +14851,7 @@ mod tests {
         let (twin, _) = utxo_genesis();
         let (seq, prev) = (4, mint.view().hash());
         let nt = transfer_tx(seq, 1, 500);
-        let reg = registration_tx(0, 2, 0xB2);
+        let reg = registration_tx(0, 2, 0x32);
         let cx = utxo_tx(seq, &[(3, 1, 40)], Some((0, 10)), &[Err((1, 45))]);
         let blocks = [
             tx_block(seq, prev, 0, |b| {
@@ -14777,7 +14873,7 @@ mod tests {
     #[test]
     fn forward_extension_promotes_each_direct_extension() {
         let (mut bc, _, b1) = ready_genesis(16);
-        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        let reg = register(2, b1.view().hash(), 1, 0x31);
         let t3 = transfer(3, reg.view().hash(), 1, 100);
         let t4 = transfer(4, t3.view().hash(), 1, 50);
         for block in [&reg, &t3, &t4] {
@@ -14907,8 +15003,8 @@ mod tests {
         assert_refused_at_intake(genesis, &overspend, ValidationReason::InsufficientBalance);
 
         // A duplicate key after an earlier registration's debit and seeding.
-        let first = registration_tx(0, 1, 0xB1);
-        let dup = registration_tx(0, 2, 0xB1);
+        let first = registration_tx(0, 1, 0x31);
+        let dup = registration_tx(0, 2, 0x31);
         let duplicate = tx_block(2, prev, 0, |b| {
             b.add_registration(&first).ok().expect("first");
             b.add_registration(&dup).ok().expect("second");
@@ -15029,7 +15125,7 @@ mod tests {
             .process_genesis(CURRENCY, window_config_builder(16).content())
             .ok()
             .expect("genesis");
-        let reg = register(2, genesis.block_one.view().hash(), 1, 0xB1);
+        let reg = register(2, genesis.block_one.view().hash(), 1, 0x31);
         assert_eq!(
             receive(&mut bc, &reg),
             ReceiveBlockOutcome::AcceptedSilently
@@ -15235,7 +15331,7 @@ mod tests {
             );
         }
         assert!(m.is_ready(), "the mesh node joined through FR3");
-        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        let reg = register(2, b1.view().hash(), 1, 0x31);
         let t3 = transfer(3, reg.view().hash(), 1, 100);
         for block in [&reg, &t3] {
             assert_eq!(
@@ -15265,7 +15361,7 @@ mod tests {
     /// the blocks in chain order, #0 first.
     fn extended_genesis() -> (TestChain, [Block; 7]) {
         let (mut bc, b0, b1) = ready_genesis(16);
-        let reg = register(2, b1.view().hash(), 1, 0xB1);
+        let reg = register(2, b1.view().hash(), 1, 0x31);
         receive(&mut bc, &reg);
         let t3 = transfer(3, reg.view().hash(), 1, 100);
         receive(&mut bc, &t3);
@@ -15406,7 +15502,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for &(owner, balance, vote_count, _) in entries {
@@ -15426,7 +15522,7 @@ mod tests {
         // #3 gives #1 a vote so the snapshot has a non-trivial vote count.
         let build = || {
             let (mut bc, _, b1) = ready_genesis(16);
-            let reg = register(2, b1.view().hash(), 1, 0xB1);
+            let reg = register(2, b1.view().hash(), 1, 0x31);
             receive(&mut bc, &reg);
             let nt = NodeTransfer::new_signed(
                 1,
@@ -15453,7 +15549,7 @@ mod tests {
         for entry in [
             (owner, balance - 1, votes, 0),
             (owner, balance, votes + 1, 0),
-            // Node #1's key is `pubkey(0xB1)`; the builder writes node #0's.
+            // Node #1's key is `pubkey(0x31)`; the builder writes node #0's.
             (
                 1,
                 bc.node_info.balance_of(1),
@@ -15563,7 +15659,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let nt = transfer_tx(2, 0, 1);
         let mut builder = BlockBuilder::new().header(header);
@@ -15654,7 +15750,7 @@ mod tests {
         // Node 0 (the creator) is listed; node 4 exists but is not.
         let seed = balance_block(100, cfg_hash, &[(0, 1_000, 0, 0)], 4);
         admit(&mut bc, &seed);
-        let reg = registration_block(101, seed.view().hash(), 4, 5, 0xC5);
+        let reg = registration_block(101, seed.view().hash(), 4, 5, 0x45);
         let tip = admit(&mut bc, &reg);
         assert_eq!(bc.run_processing_pass(tip).map(|_| ()), Ok(()));
         assert!(
@@ -15767,7 +15863,7 @@ mod tests {
             first_voted_node: creator,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: view.previous_hash().try_into().expect("32 bytes"),
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         if let Some(txs) = view.transactions() {
@@ -15808,7 +15904,7 @@ mod tests {
     // ===================================================================
 
     /// Node #1's key byte wherever these fixtures register it.
-    const NODE_ONE_KEY: u8 = 0xB1;
+    const NODE_ONE_KEY: u8 = 0x31;
 
     /// `I(av)`: FR37 step 1 under the test configuration (`vote_scale` 1000,
     /// `vote_interest` 5, so the bump is `min(⌊av / 200⌋, 1000)`) — the
@@ -16684,7 +16780,7 @@ mod tests {
             first_voted_node: first_voted,
             consumed_votes_from_first_voted_node: recorded,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         add(&mut builder);
@@ -16772,7 +16868,9 @@ mod tests {
         }
         let tip = a3.view();
         for lower_hash in [true, false] {
-            let smaller = (100..400)
+            // Open-ended: the tip's hash follows the scheme's keys, and a tip
+            // near either end leaves few siblings on that side.
+            let smaller = (100..100_000)
                 .map(|amount| valued(3, a2.view().hash(), 1005, amount))
                 .find(|blk| (blk.view().hash() < tip.hash()) == lower_hash)
                 .expect("a one-transaction sibling");
@@ -16808,7 +16906,7 @@ mod tests {
         for want_lower in [true, false] {
             let (mut bc, _, a2, a3) = two_creator_chain();
             let tip = a3.view();
-            let side = (100..400)
+            let side = (100..100_000)
                 .map(|amount| valued(3, a2.view().hash(), 1005, amount))
                 .find(|blk| {
                     let view = blk.view();
@@ -17048,7 +17146,7 @@ mod tests {
         }
         assert!(!attempted(&bc, &g2));
         let tip = a3.view();
-        let side = (100..400)
+        let side = (100..100_000)
             .map(|amount| valued(3, g2.view().hash(), 1000, amount))
             .find(|blk| blk.view().len() == tip.len() && blk.view().hash() < tip.hash())
             .expect("a same-size extension with a lower hash");
@@ -17254,7 +17352,7 @@ mod tests {
         for (creator, salt) in [(5, 30), (6, 31)] {
             let free = bc.blocks.next_free_index();
             assert_eq!(
-                receive(&mut bc, &side(creator, 0x77, salt)),
+                receive(&mut bc, &side(creator, 0x66, salt)),
                 ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
                 "node {creator}: forged"
             );
@@ -17270,7 +17368,7 @@ mod tests {
                 "node {creator}: marked"
             );
         }
-        let inside = side(7, 0x77, 40);
+        let inside = side(7, 0x66, 40);
         assert_eq!(
             receive(&mut bc, &inside),
             ReceiveBlockOutcome::AcceptedSilently
@@ -17408,8 +17506,8 @@ mod tests {
         let (mut bc, _, b1) = ready_genesis(16);
         let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
         assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
-        let forged_fork = resign(&valued(3, b1.view().hash(), 500, 20), 0, 500, 0x77);
-        let forged_orphan = resign(&transfer(9, [0x55; 32], 0, 5), 0, 0, 0x77);
+        let forged_fork = resign(&valued(3, b1.view().hash(), 500, 20), 0, 500, 0x66);
+        let forged_orphan = resign(&transfer(9, [0x55; 32], 0, 5), 0, 0, 0x66);
         let bad_form = headed(3, b1.view().hash(), 0, 1, 10, 1, 5, votes_for(3, 0, 1, 21));
         for bad in [&forged_fork, &forged_orphan, &bad_form] {
             let free = bc.blocks.next_free_index();
@@ -17430,7 +17528,7 @@ mod tests {
         // branch-independent, so a bad signature is not judged at intake.
         // Worth 0, below the larger active tip `a2`: no chain switch (Story
         // 6.3), which would refuse it (node #1 is registered in `a2`).
-        let unjudged = resign(&valued(2, b1.view().hash(), 0, 23), 1, 0, 0x77);
+        let unjudged = resign(&valued(2, b1.view().hash(), 0, 23), 1, 0, 0x66);
         assert_eq!(
             receive(&mut bc, &unjudged),
             ReceiveBlockOutcome::AcceptedSilently
@@ -17457,7 +17555,7 @@ mod tests {
                 &alt(3, a2.view().hash(), 1, 1, 0, 8, false),
                 1,
                 vote_snapshot(1000),
-                0x77,
+                0x66,
             );
             assert_eq!(
                 receive(&mut bc, &bad3),
@@ -18001,7 +18099,7 @@ mod tests {
                 first_voted_node: 0,
                 consumed_votes_from_first_voted_node: 0,
                 previous_hash: r2.view().hash(),
-                signature: [0u8; 64],
+                signature: [0u8; SIGNATURE_SIZE],
             };
             let mut builder = BlockBuilder::new().header(header);
             for (owner, balance, vote, byte) in [(0, balance0, vote0, 1), (1, 0, 0, NODE_ONE_KEY)] {
@@ -18401,7 +18499,7 @@ mod tests {
     #[test]
     fn fr23_signature_prepass() {
         let (mut bc, _, a2, a3) = failing_two_creator_chain();
-        let forged_sibling = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x77);
+        let forged_sibling = resign(&heavier_sibling(&a2), 1, vote_snapshot(1000), 0x66);
         assert_eq!(
             receive(&mut bc, &forged_sibling),
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
@@ -18417,7 +18515,7 @@ mod tests {
             &alt(4, s3.view().hash(), 0, 1, 0, 41, false),
             1,
             vote_snapshot(1000),
-            0x77,
+            0x66,
         );
         bc.storage.failing_slot = slot(&bc, &a3);
         bc.storage.reads_left.set(1);
@@ -18441,7 +18539,7 @@ mod tests {
             &alt(3, n2.view().hash(), 1, 1, 3, 56, false),
             1,
             vote_snapshot(1000),
-            0x77,
+            0x66,
         );
         for blk in [&n3, &n2] {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
@@ -18655,7 +18753,7 @@ mod tests {
     #[test]
     fn fr3_pass_seeds_a_window_anchored_vote_at_a_plus_h() {
         let mut bc = new_w4_chain();
-        let floor = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let floor = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
         let cfg = w4_config_anchor_block(100, floor.view().hash());
         let early = headed(
             101,
@@ -18669,7 +18767,7 @@ mod tests {
         );
         // The vote seed: the entry repeats #3's balance (credited #101's fee)
         // and states a vote the pass never derived.
-        let seed = balance_block(102, early.view().hash(), &[(3, 1, 1000, 0xB3)], 3);
+        let seed = balance_block(102, early.view().hash(), &[(3, 1, 1000, 0x33)], 3);
         let tip = tx_block(103, seed.view().hash(), 0, votes_for(103, 3, 1, 41));
         let late = headed(
             103,
@@ -18844,7 +18942,7 @@ mod tests {
     /// branch, and the commit's sweep deletes the demoted head.
     #[test]
     fn a_switch_undoes_seed_points_as_identity() {
-        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0xB3)], 4);
+        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 4);
         let cfg = w4_config_anchor_block(99, floor.view().hash());
         let early = headed(
             100,
@@ -18857,7 +18955,7 @@ mod tests {
             votes_for(100, 3, 1, 40),
         );
         let b101 = tx_block(101, early.view().hash(), 0, votes_for(101, 3, 1, 41));
-        let entries = [(3, 1, 1000, 0xB3), (4, 70, 500, 0xB4)];
+        let entries = [(3, 1, 1000, 0x33), (4, 70, 500, 0x34)];
         let seed = balance_block(102, b101.view().hash(), &entries, 4);
         let joiner = || {
             let mut bc = new_w4_chain();
@@ -19016,7 +19114,7 @@ mod tests {
     /// past the switch (a horizon release): the joiner's head, window, root,
     /// tree size, values and the two nodes' derived state.
     fn switch_across_a_vote_seed(now: u64) -> (W4Chain, [u8; 32]) {
-        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3);
+        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
         let cfg = w4_config_anchor_block(99, floor.view().hash());
         let early = headed(
             100,
@@ -19029,8 +19127,8 @@ mod tests {
             votes_for(100, 3, 1, 40),
         );
         let b101 = tx_block(101, early.view().hash(), 0, votes_for(101, 3, 1, 41));
-        let seed = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0xB3)], 3);
-        let replay = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0xB3)], 3);
+        let seed = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
+        let replay = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
         let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
         let mut bc = new_w4_chain();
         for blk in [&floor, &cfg, &early, &b101, &seed, &f102] {
@@ -19065,7 +19163,7 @@ mod tests {
             a.blocks
                 .find(
                     98,
-                    &balance_block(98, [0xAB; 32], &[(3, 0, 0, 0xB3)], 3)
+                    &balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 3)
                         .view()
                         .hash()
                 )
@@ -19090,6 +19188,7 @@ mod tests {
                 .ok()
                 .expect("a four-byte literal is well-formed");
         }
+        declare_build_scheme(&mut builder);
         builder
     }
 
@@ -19107,7 +19206,7 @@ mod tests {
             .expect("genesis succeeds");
         assert!(bc.is_ready());
 
-        let one = register(2, genesis.block_one.view().hash(), 1, 0xB1);
+        let one = register(2, genesis.block_one.view().hash(), 1, 0x31);
         assert_eq!(
             receive(&mut bc, &one),
             ReceiveBlockOutcome::AcceptedSilently
@@ -19115,7 +19214,7 @@ mod tests {
         assert_eq!(head_of(&bc).1, one.view().hash());
         assert!(bc.node_info.is_seeded(1), "an id below the cap registers");
 
-        let two = register(3, one.view().hash(), 2, 0xB2);
+        let two = register(3, one.view().hash(), 2, 0x32);
         assert_eq!(
             receive(&mut bc, &two),
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
@@ -19132,12 +19231,12 @@ mod tests {
             .process_genesis(CURRENCY, capped_config_builder(TEST_W, 3).content())
             .ok()
             .expect("genesis succeeds");
-        let one = register(2, wide_genesis.block_one.view().hash(), 1, 0xB1);
+        let one = register(2, wide_genesis.block_one.view().hash(), 1, 0x31);
         assert_eq!(
             receive(&mut wide, &one),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        let two = register(3, one.view().hash(), 2, 0xB2);
+        let two = register(3, one.view().hash(), 2, 0x32);
         assert_eq!(
             receive(&mut wide, &two),
             ReceiveBlockOutcome::AcceptedSilently
@@ -19152,10 +19251,10 @@ mod tests {
     fn fr6_registration_at_the_node_cap_is_evidence_in_the_pass() {
         let mut bc = new_test_chain();
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES - 1);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31)], TEST_MAX_NODES - 1);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let reg = registration_block(101, anchor.view().hash(), 1, TEST_MAX_NODES, 0xC3);
+        let reg = registration_block(101, anchor.view().hash(), 1, TEST_MAX_NODES, 0x43);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -19175,10 +19274,10 @@ mod tests {
     fn fr6_registration_just_below_the_node_cap_registers() {
         let mut bc = new_test_chain();
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES - 2);
+        let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31)], TEST_MAX_NODES - 2);
         bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
             .expect("anchor admitted");
-        let reg = registration_block(101, anchor.view().hash(), 1, TEST_MAX_NODES - 1, 0xC3);
+        let reg = registration_block(101, anchor.view().hash(), 1, TEST_MAX_NODES - 1, 0x43);
         let ri = bc
             .tier1_admit(&reg.view(), &reg.view().hash(), 0)
             .expect("registration admitted");
@@ -19193,7 +19292,7 @@ mod tests {
     fn fr6_balance_block_at_the_node_cap_is_evidence() {
         let mut bc = new_test_chain();
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let over = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES);
+        let over = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31)], TEST_MAX_NODES);
         let oi = bc
             .tier1_admit(&over.view(), &over.view().hash(), 0)
             .expect("admitted");
@@ -19209,7 +19308,7 @@ mod tests {
 
         let mut bc = new_test_chain();
         let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-        let at_limit = balance_block(100, cfg_hash, &[(1, 500, 10, 0xB1)], TEST_MAX_NODES - 1);
+        let at_limit = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31)], TEST_MAX_NODES - 1);
         let ai = bc
             .tier1_admit(&at_limit.view(), &at_limit.view().hash(), 0)
             .expect("admitted");
@@ -19221,8 +19320,9 @@ mod tests {
     /// AC2 — the size pin (deferred-work D8): the owned support message and the
     /// outcome that carries it. Three `u32`s, the hash and the backend's
     /// serialized multi-signature, with no padding; the outcome adds its tag,
-    /// rounded to the `u32` alignment. 108 B and 112 B on Schnorr (64-byte
-    /// signature), 92 B and 96 B on BLS (48 bytes).
+    /// rounded to the `u32` alignment: 108 / 112 B on `schnorr` (64-byte
+    /// signature), 92 / 96 B on `bls-min-sig` (48), 140 / 144 B on `bls-min-pk`
+    /// (96).
     #[test]
     fn the_support_outcome_has_its_pinned_size() {
         use moonblokz_chain_types::HASH_SIZE;
@@ -19242,7 +19342,7 @@ mod tests {
             4,
             a3.view().hash(),
             1,
-            0xC3,
+            0x43,
             0,
             1,
             0,
@@ -19292,7 +19392,7 @@ mod tests {
             3,
             a2.view().hash(),
             1,
-            0xC3,
+            0x43,
             0,
             1,
             0,
@@ -19353,7 +19453,7 @@ mod tests {
             first_voted_node: first_voted,
             consumed_votes_from_first_voted_node: recorded,
             previous_hash: view.previous_hash().try_into().expect("32 bytes"),
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         if let Some(txs) = view.transactions() {
@@ -19398,7 +19498,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for &n in nodes {
@@ -19438,9 +19538,13 @@ mod tests {
         )
     }
 
-    /// The key byte of node `n` in these fixtures (node #0's is `1`).
+    /// The key byte of node `n` in these fixtures (node #0's is `1`). Every
+    /// fixture key byte stays below `0x74`: a BLS private key is a big-endian
+    /// scalar below the group order `r = 0x73ed…`, so `[0x74; 32]` and above
+    /// are not keys under `bls-min-sig` / `bls-min-pk`.
     fn key_of(n: u32) -> u8 {
-        if n == 0 { 1 } else { 0xB0 + n as u8 }
+        assert!(n < 0x44, "a fixture key byte must stay below 0x74");
+        if n == 0 { 1 } else { 0x30 + n as u8 }
     }
 
     /// A node with its own key and id over `storage`, trusting node #0's key
@@ -20245,10 +20349,19 @@ mod tests {
     }
 
     /// A light block by `u` (node 1) on #5: its own normal-form block at 6,
-    /// signed with its real key.
-    fn u_block(blocks: &[Block; 6], salt: u64) -> Block {
-        let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 0, 1, salt));
-        reheader(&template, 1, 0, 1, 0, key_of(1))
+    /// signed with its real key, whose hash is above every block in `beside`.
+    /// The equal-value siblings at 6 are retained in hash order, so a `u`-block
+    /// below the deviation would not be held at all. The hashes follow the
+    /// keys, which differ per signature scheme, so the vote's amount is
+    /// searched rather than fixed.
+    fn u_block(blocks: &[Block; 6], beside: &[&Block]) -> Block {
+        (0..100_000)
+            .map(|salt| {
+                let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 0, 1, salt));
+                reheader(&template, 1, 0, 1, 0, key_of(1))
+            })
+            .find(|u| beside.iter().all(|b| u.view().hash() > b.view().hash()))
+            .expect("a u-block above its siblings")
     }
 
     /// AC7 test 1 — the message node 3 emits for node 4's direct deviation
@@ -20612,7 +20725,7 @@ mod tests {
             intake(&mut r, &support_by(0, 4, 6, h)),
             ReceiveSupportOutcome::Accepted
         );
-        let u = u_block(&blocks, 77);
+        let u = u_block(&blocks, &[&x]);
         assert_eq!(receive(&mut r, &u), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(verified(&r, &u), Some(true));
         assert_eq!(head_of(&r), (6, h), "d stays active");
@@ -20634,7 +20747,7 @@ mod tests {
         let template = balance_snapshot(&g, 6, blocks[5].view().hash(), &[1]);
         let d = reheader(&template, 5, snapshot(5), top, snapshot(top), key_of(5));
         assert!(support_for(&mut l, &d).is_some());
-        let u = u_block(&blocks, 78);
+        let u = u_block(&blocks, &[&d]);
         assert_eq!(receive(&mut l, &u), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(verified(&l, &u), Some(false), "node 1's key moved above #5");
         assert_eq!(head_of(&l), (6, d.view().hash()));
@@ -20667,7 +20780,7 @@ mod tests {
             intake(&mut r, &support_by(0, 2, 6, h)),
             ReceiveSupportOutcome::Accepted
         );
-        let u = u_block(&blocks, 79);
+        let u = u_block(&blocks, &[&d, &x]);
         assert_eq!(receive(&mut r, &u), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(verified(&r, &u), Some(true));
         assert_eq!(
@@ -20688,7 +20801,7 @@ mod tests {
             intake(&mut r, &support_by(0, 2, 6, unknown)),
             ReceiveSupportOutcome::Accepted
         );
-        let u = u_block(&blocks, 80);
+        let u = u_block(&blocks, &[&d]);
         assert_eq!(receive(&mut r, &u), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(
             intake(&mut r, &support_by(3, 2, 6, unknown)),
@@ -20731,7 +20844,7 @@ mod tests {
         let (g, mut r, blocks) = support_chain_on(2, storage, 16, |_| {});
         let x = deviation_after(&g, &blocks[5], 4, 1);
         assert_eq!(receive(&mut r, &x), ReceiveBlockOutcome::AcceptedSilently);
-        let u = u_block(&blocks, 77);
+        let u = u_block(&blocks, &[&x]);
         assert_eq!(receive(&mut r, &u), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(
             verified(&r, &u),
