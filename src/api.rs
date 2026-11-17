@@ -1042,6 +1042,9 @@ impl<
     /// - `node_count_max` — `MAX_NODES`, the node-indexed arrays. The chain's
     ///   `max_node_count` must fit it (§6 check 18), so every registered node id
     ///   has a slot (DEC-228).
+    /// - `signature_scheme` — `moonblokz_crypto::SIGNATURE_SCHEME`, the build's
+    ///   scheme. The chain's `signature_scheme` (ID 33, default `schnorr`) must
+    ///   equal it (§6 check 19, DEC-252).
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
         utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
@@ -4949,9 +4952,9 @@ impl<
     }
 
     /// Verifies the FR6 block-creator signature (AC2b) over the canonical signing
-    /// preimage (the full block bytes with the trailing-64 header signature field
+    /// preimage (the full block bytes with the header signature field
     /// zero-filled — exactly what `BlockBuilder::build_signed` signs; the
-    /// signature is the last 64 bytes of the fixed `HEADER_SIZE` header). Returns
+    /// signature is the last `SIGNATURE_SIZE` bytes of the `HEADER_SIZE` header). Returns
     /// `Some(valid)`, or `None` when the creator's public key is not yet derivable
     /// (pre-seed zone → the block is trusted, not re-proved). Node #0 resolves to
     /// the FR69 trust anchor (`node_zero_public_key`), available from construction.
@@ -5007,9 +5010,9 @@ impl<
 
     /// Verifies a node-transfer / registration transaction signature (AC3): the
     /// signer (the `signer_node_id`, resolved to its derived key) signs the full
-    /// transaction bytes with the trailing-64 signature field zero-filled (the
-    /// `*::new_signed` convention — the signature is the last 64 bytes of the
-    /// fixed-size transaction). Returns `false` on an unresolvable signer key or a
+    /// transaction bytes with the trailing signature field zero-filled (the
+    /// `*::new_signed` convention — the signature is the last `SIGNATURE_SIZE`
+    /// bytes of the fixed-size transaction). Returns `false` on an unresolvable signer key or a
     /// bad signature. Only node-transfer / registration transactions have this
     /// fixed trailing-signature layout; balance/UTXO input signatures (embedded, no
     /// `new_signed` convention) are a deferred seam.
@@ -13207,6 +13210,58 @@ mod tests {
         assert_eq!(bc.block_tree_len(), 2);
     }
 
+    /// Story 6.17 D10 (DEC-252) — genesis founds a chain only on the build's own
+    /// signature scheme: a content naming another scheme is refused, and one
+    /// that leaves ID 33 out (the shape the encoder writes for a Schnorr chain)
+    /// is accepted on `schnorr` only, since the default is `schnorr`.
+    #[test]
+    fn genesis_founds_a_chain_of_the_builds_scheme_only() {
+        let content = |scheme: Option<u8>| {
+            let mut builder = ChainConfigPayloadBuilder::new();
+            for (id, value) in [
+                (parameter::ACTIVE_CHAIN_LENGTH, TEST_W),
+                (parameter::VERIFICATION_HORIZON, test_horizon(TEST_W)),
+                (parameter::MAX_NODE_COUNT, TEST_MAX_NODES),
+            ] {
+                builder
+                    .add_literal(id, &value.to_le_bytes())
+                    .ok()
+                    .expect("a four-byte literal is well-formed");
+            }
+            if let Some(scheme) = scheme {
+                builder
+                    .add_literal(parameter::SIGNATURE_SCHEME, &[scheme])
+                    .ok()
+                    .expect("a one-byte literal is well-formed");
+            }
+            builder
+        };
+        // The outcome and how many blocks it wrote.
+        let genesis = |scheme: Option<u8>| {
+            let (crypto, storage, chain_config) = test_backends();
+            let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+            let outcome = match bc.process_genesis(1_000_000_000, content(scheme).content()) {
+                Ok(_) => "founded",
+                Err(GenesisRejectReason::InitialChainConfigRejected) => "content refused",
+                Err(_) => "another refusal",
+            };
+            (outcome, bc.block_tree_len())
+        };
+        let own = moonblokz_crypto::SIGNATURE_SCHEME;
+        assert_eq!(genesis(Some((own + 1) % 3)), ("content refused", 0));
+        assert_eq!(genesis(Some((own + 2) % 3)), ("content refused", 0));
+        assert_eq!(genesis(Some(own)), ("founded", 2));
+        assert_eq!(
+            genesis(None),
+            if own == 0 {
+                ("founded", 2)
+            } else {
+                ("content refused", 0)
+            },
+            "an absent ID 33 means schnorr"
+        );
+    }
+
     /// AC2 — `W = 1` admits no verification horizon (`1 ≤ H < W` is empty,
     /// DEC-207), so genesis refuses the content before anything is written.
     #[test]
@@ -16815,7 +16870,7 @@ mod tests {
         for lower_hash in [true, false] {
             // Open-ended: the tip's hash follows the scheme's keys, and a tip
             // near either end leaves few siblings on that side.
-            let smaller = (100..)
+            let smaller = (100..100_000)
                 .map(|amount| valued(3, a2.view().hash(), 1005, amount))
                 .find(|blk| (blk.view().hash() < tip.hash()) == lower_hash)
                 .expect("a one-transaction sibling");
@@ -16851,7 +16906,7 @@ mod tests {
         for want_lower in [true, false] {
             let (mut bc, _, a2, a3) = two_creator_chain();
             let tip = a3.view();
-            let side = (100..)
+            let side = (100..100_000)
                 .map(|amount| valued(3, a2.view().hash(), 1005, amount))
                 .find(|blk| {
                     let view = blk.view();
@@ -17091,7 +17146,7 @@ mod tests {
         }
         assert!(!attempted(&bc, &g2));
         let tip = a3.view();
-        let side = (100..)
+        let side = (100..100_000)
             .map(|amount| valued(3, g2.view().hash(), 1000, amount))
             .find(|blk| blk.view().len() == tip.len() && blk.view().hash() < tip.hash())
             .expect("a same-size extension with a lower hash");
@@ -19265,8 +19320,9 @@ mod tests {
     /// AC2 — the size pin (deferred-work D8): the owned support message and the
     /// outcome that carries it. Three `u32`s, the hash and the backend's
     /// serialized multi-signature, with no padding; the outcome adds its tag,
-    /// rounded to the `u32` alignment. 108 B and 112 B on Schnorr (64-byte
-    /// signature), 92 B and 96 B on BLS (48 bytes).
+    /// rounded to the `u32` alignment: 108 / 112 B on `schnorr` (64-byte
+    /// signature), 92 / 96 B on `bls-min-sig` (48), 140 / 144 B on `bls-min-pk`
+    /// (96).
     #[test]
     fn the_support_outcome_has_its_pinned_size() {
         use moonblokz_chain_types::HASH_SIZE;
@@ -19487,6 +19543,7 @@ mod tests {
     /// scalar below the group order `r = 0x73ed…`, so `[0x74; 32]` and above
     /// are not keys under `bls-min-sig` / `bls-min-pk`.
     fn key_of(n: u32) -> u8 {
+        assert!(n < 0x44, "a fixture key byte must stay below 0x74");
         if n == 0 { 1 } else { 0x30 + n as u8 }
     }
 
@@ -20298,7 +20355,7 @@ mod tests {
     /// keys, which differ per signature scheme, so the vote's amount is
     /// searched rather than fixed.
     fn u_block(blocks: &[Block; 6], beside: &[&Block]) -> Block {
-        (0..)
+        (0..100_000)
             .map(|salt| {
                 let template = tx_block(6, blocks[5].view().hash(), 0, votes_for(6, 0, 1, salt));
                 reheader(&template, 1, 0, 1, 0, key_of(1))
