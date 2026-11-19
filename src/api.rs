@@ -26101,4 +26101,194 @@ mod tests {
         assert_eq!(first.4[4], None, "the junk deleted");
         assert_eq!(first, run());
     }
+
+    // -- Story 6.7 follow-up: the evidence check's local faults (N24a, N23),
+    // the tentative intake (N31), the registration signature on restore (N35b) --
+
+    /// Node 4's `d@6`, its replay `r@7`, its evidence `e@8` built over `r` (the
+    /// rewind reads `r`), and node 2's sibling `x@6` (a later admission).
+    fn replay_evidence() -> (Block, Block, Block, Block) {
+        let (mut g, mut l, blocks, d, d_idx) = proposer_chain(4);
+        let sibling = normal_after(&g, &blocks[5], 2, 91);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let r = normal_after(&g, &d, 4, 2);
+        assert_eq!(receive(&mut l, &r), ReceiveBlockOutcome::AcceptedSilently);
+        accumulate(&mut l, &d, d_idx, 2);
+        let tip = l.active_chain_head_idx;
+        let e = l.build_evidence_block(tip, 0).expect("evidence over r");
+        assert_eq!(e.view().sequence(), 8);
+        (d, r, e, sibling)
+    }
+
+    /// Node 3 over a failing backend, Ready at `r` (`d`, `r` received).
+    fn failing_observer(d: &Block, r: &Block) -> Chain16<FailingSupportStorage> {
+        let (_, mut l, _) = support_chain_on(3, failing_storage(3), 16, |_| {});
+        for block in [d, r] {
+            assert_eq!(
+                receive(&mut l, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(head_of(&l), (7, r.view().hash()));
+        l
+    }
+
+    /// N24a (AC5) — a refused rewind is a local fault, not evidence: with
+    /// `r`'s slot unreadable the projection cannot undo `r` (the run rules
+    /// read only `d`'s header and pass), so the evidence is admitted Stored,
+    /// unmarked and off the chain, the head unchanged; once the read works, a
+    /// later admission's continuation judges it and accepts it.
+    #[test]
+    fn an_unreadable_rewind_leaves_the_evidence_stored() {
+        let (d, r, e, sibling) = replay_evidence();
+        let mut l = failing_observer(&d, &r);
+        l.storage.failing_slot = l.active_chain_head_idx;
+        assert_eq!(receive(&mut l, &e), ReceiveBlockOutcome::AcceptedSilently);
+        assert!(l.storage.attempts.get() > 0, "the rewind read r");
+        let (status, active, accepted, _) = entry_of(&l, &e).expect("held, not deleted");
+        assert_eq!(
+            (status, active, accepted),
+            (BlockStatus::Stored, false, false),
+            "unjudged and unmarked"
+        );
+        assert_eq!(head_of(&l), (7, r.view().hash()));
+        assert!(l.is_ready());
+        l.storage.failing_slot = u32::MAX;
+        let verified = counted(&AGGREGATE_VERIFICATIONS);
+        assert_eq!(
+            receive(&mut l, &sibling),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(head_of(&l), (8, e.view().hash()), "judged and accepted");
+        assert_eq!(counted(&AGGREGATE_VERIFICATIONS) - verified, 1);
+        assert!(entry_of(&l, &e).expect("held").2);
+    }
+
+    /// N23 (AC8) — a failed restore inside the evidence check escalates at the
+    /// root: `r`'s first read (the rewind's undo) succeeds and its second (the
+    /// restore's re-apply) fails once. The check returns a local fault and
+    /// marks the re-entry due; the continuation's retry of the stored evidence
+    /// in the same call is refused (the engine is not at `r`), and
+    /// `receive_block` then re-enters collecting, whose spine re-derives the
+    /// tree and reaches Ready again at the evidence. Nothing is deleted, the
+    /// flag is consumed, and the engine equals a node that judged the evidence
+    /// without a fault.
+    #[test]
+    fn a_failed_restore_in_the_evidence_check_reenters_at_the_root() {
+        let (d, r, e, _) = replay_evidence();
+        let reference = {
+            let mut clean = failing_observer(&d, &r);
+            assert_eq!(
+                receive(&mut clean, &e),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            assert_eq!(head_of(&clean), (8, e.view().hash()));
+            engine_votes(&clean)
+        };
+        let mut l = failing_observer(&d, &r);
+        l.storage.failing_slot = l.active_chain_head_idx;
+        l.storage.reads_left.set(1);
+        l.storage.failures_left.set(1);
+        assert_eq!(receive(&mut l, &e), ReceiveBlockOutcome::AcceptedSilently);
+        assert!(l.storage.attempts.get() >= 2, "the restore's read of r");
+        assert_eq!(l.storage.failures_left.get(), 0, "the fault was hit");
+        assert!(!l.reentry_due, "consumed at the root");
+        assert!(l.is_ready(), "the re-entry's spine reached Ready again");
+        assert_eq!(head_of(&l), (8, e.view().hash()));
+        let (status, active, accepted, _) = entry_of(&l, &e).expect("not deleted");
+        assert!(status == BlockStatus::Active && active && accepted);
+        assert_eq!(
+            engine_votes(&l),
+            reference,
+            "re-derived, not the broken engine"
+        );
+    }
+
+    /// N31 (AC4, FR9) — outside Ready, intake judges rules 1–3 only until the
+    /// configuration is durably locked: a Collecting node holding the
+    /// tentative configuration of #1 (no genesis #0, so it stays Collecting)
+    /// admits a registration at the slot #7 (rule 5 waits for the lock), and
+    /// refuses a foreign creator above node 4's open run at #6
+    /// (`DeviationRun`).
+    #[test]
+    fn a_tentative_intake_judges_only_rules_one_to_three() {
+        let (blocks, d, x6, foreign) = {
+            let (mut g, _, blocks) = support_chain(3);
+            let d = deviation_after(&g, &blocks[5], 4, 1);
+            let x6 = normal_after(&g, &blocks[5], 2, 61);
+            assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+            let foreign = normal_after(&g, &d, 3, 71);
+            (blocks, d, x6, foreign)
+        };
+        let unclean = register(7, x6.view().hash(), 6, key_of(6));
+        let mut c = local_node(3, local_storage(3));
+        for block in blocks[1..].iter().chain([&d, &x6]) {
+            assert_eq!(
+                receive(&mut c, block),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        assert_eq!(c.lifecycle_phase, LifecyclePhase::Collecting);
+        assert!(c.chain_config.active_configuration().is_some(), "tentative");
+        assert!(!c.chain_config.is_durable_locked());
+        assert_eq!(
+            slot_rule(&unclean.view(), Some(TEST_H)),
+            Err(ValidationReason::SlotNotClean)
+        );
+        assert_eq!(
+            receive(&mut c, &unclean),
+            ReceiveBlockOutcome::AcceptedSilently,
+            "rule 5 waits for the lock"
+        );
+        assert!(entry_of(&c, &unclean).is_some());
+        assert_eq!(
+            c.tier1_admit(&foreign.view(), &foreign.view().hash(), 0),
+            Err(AdmitError::Rejected(Tier1Failure::DeviationRun))
+        );
+        assert_eq!(
+            receive(&mut c, &foreign),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(entry_of(&c, &foreign), None, "not stored");
+    }
+
+    /// N35b (AC6) — the registration signature is final with bit 6: an
+    /// aborted switch over junk undoes and restores node 1's registration
+    /// block `x6` (heavier than node 5's `d@6`) without verifying its
+    /// registration again; only `d`'s transaction is verified, forward.
+    #[test]
+    fn a_restore_verifies_no_registration_again() {
+        let (d5, e5, _) = evidence_by(5);
+        let junk = evidence_with(&e5, 2, |ev| ev.supporter_vote_sum = u64::MAX);
+        let (mut g, _, blocks) = support_chain(3);
+        let x6 = real_on(
+            &g,
+            &register(6, blocks[5].view().hash(), 6, key_of(6)),
+            1,
+            key_of(1),
+        );
+        assert!(
+            x6.view().consumed_votes() > d5.view().consumed_votes(),
+            "x6 is heavier"
+        );
+        assert_eq!(receive(&mut g, &x6), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut g, &d5), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&g), (6, x6.view().hash()));
+        let value = g.active_branch_value;
+        let signatures = counted(&TX_SIGNATURE_VERIFICATIONS);
+        assert_eq!(
+            receive(&mut g, &junk),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(entry_of(&g, &junk), None, "deleted by the walk");
+        assert_eq!(head_of(&g), (6, x6.view().hash()), "restored");
+        assert_eq!(
+            g.node_info.max_known_node_id(),
+            6,
+            "the registration restored"
+        );
+        let d_txs = d5.view().transactions().expect("txs").iter().count() as u32;
+        assert_eq!(counted(&TX_SIGNATURE_VERIFICATIONS) - signatures, d_txs);
+        assert_eq!(g.active_branch_value, value);
+    }
 }
