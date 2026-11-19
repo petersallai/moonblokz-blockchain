@@ -1,4 +1,4 @@
-//! Tests of `api/utxo.rs`.
+//! Tests of the ADR-016 UTXO input checks in `api/step.rs` (Story 6.8).
 
 use super::*;
 

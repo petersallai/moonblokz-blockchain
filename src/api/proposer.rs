@@ -1,5 +1,6 @@
-//! Proposer side of approval: the accumulator, the evidence block and the vote
-//! projection (Story 6.6).
+//! Proposer side of approval: the accumulator, the evidence block, the vote
+//! projection and the approval step, with the grace seam, the circulating-
+//! currency stub and the re-entry after a failed restore (Story 6.6).
 
 use super::*;
 

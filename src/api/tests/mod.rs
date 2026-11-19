@@ -1,6 +1,7 @@
-//! Tests of `api`: the harness (backends, chain constructors, common builders).
-//! Each test file mirrors a production module of `api`; fixtures shared by
-//! more than one file live in `fixtures.rs`.
+//! Tests of `api`: the harness (test sizes and configurations, storage and
+//! crypto backends, the base constructors). Each test file holds the tests of
+//! one production area of `api`; fixtures used by more than one test file,
+//! the shared chain constructors among them, live in `fixtures.rs`.
 
 use super::*;
 use moonblokz_chain_types::{ChainConfigPayloadBuilder, MAX_BLOCK_SIZE};
