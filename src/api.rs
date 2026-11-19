@@ -4015,17 +4015,9 @@ impl<
         if direct && tip_idx != self.active_chain_head_idx {
             return None;
         }
-        // Story 6.7 (AC10, AC11): no evidence on `d ..= tip` yet (the run is
-        // closed by the first one; the proposer's own side evidence included),
-        // and the evidence fits the run bound `p + H` (D1).
-        let mut cur = tip_idx;
-        while cur != NONE_REF && cur != d_idx {
-            let entry = self.blocks.get(cur)?;
-            if entry.payload_type() == PAYLOAD_TYPE_APPROVAL {
-                return None;
-            }
-            cur = entry.parent_ref();
-        }
+        // Story 6.7 (AC11, D1): the evidence fits the run bound `p + H`. An
+        // evidence already held above `d` released the accumulator above
+        // (`holds_own_evidence`, AC10).
         if u64::from(tip_seq) + 1 > u64::from(p) + u64::from(self.verification_horizon()?) {
             return None;
         }
