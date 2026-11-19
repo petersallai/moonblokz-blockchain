@@ -90,13 +90,21 @@ impl<
         // or, as a `parent.is_none()` orphan, create a `sequence == 0` Stored head
         // that emits a perpetual bogus parent-recovery request for a nonexistent
         // seq-0 parent (violating the `chain_heads` "tail-point never has sequence
-        // 0" invariant). NOTE: authenticity (only node #0 may sign a genesis) is
-        // not yet enforced — the block-creator signature is not a Tier-1 check
-        // until FR69 lands — so this guard enforces single-*anchor* structurally,
-        // not *authenticity*; a forged first-arriving seq-0 would anchor until
-        // FR69. See the Story-5.1 code-review record.
+        // 0" invariant). This guard enforces single-*anchor*; authenticity is
+        // the check right below it.
         if block.sequence() == 0 && self.active_chain_head_idx != NONE_REF {
             return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
+        }
+        // DEC-270 (Story 6.10): the first block #0 — `tier1_gate` already
+        // pinned its FR54 shape, so its creator is node #0 — must carry the trust
+        // anchor's signature before it takes the single anchor slot, in every
+        // phase; a forged one would otherwise lock the real genesis out with
+        // `DuplicateGenesis` until the FR3 pass condemned it. After the guard,
+        // so a block #0 arriving once an anchor is held costs no verification.
+        // The pass is marked below and does not verify it again (DEC-157).
+        let genesis_signature_verified = block.sequence() == 0;
+        if genesis_signature_verified && self.verify_block_creator_signature(block) != Some(true) {
+            return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
         }
 
         // FR19 parent resolution (Story 4.4), a pure RAM lookup. Resolved here,
@@ -119,27 +127,28 @@ impl<
         // only ever verifies more. FR12 needs it: a deviating sibling must be
         // signature-verified to be endorsed, and a bad signature is exact
         // evidence here, before the write.
-        let signature_verified = self.lifecycle_phase == LifecyclePhase::Ready
-            && self
-                .blocks
-                .get(self.snake_chain_tail_idx)
-                .is_some_and(|tail| {
-                    let parent_on_chain = parent
-                        .and_then(|p| self.blocks.get(p))
-                        .filter(|entry| entry.is_on_active_chain())
-                        .map(|entry| entry.sequence());
-                    let bound =
-                        parent_on_chain.map_or(tail.sequence(), |seq| seq.max(tail.sequence()));
-                    self.key_is_branch_independent(block.creator(), bound)
-                })
-            && match self.verify_block_creator_signature(block) {
-                Some(false) => {
-                    return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
-                }
-                Some(true) => true,
-                // No key verdict: nothing is judged or marked here.
-                None => false,
-            };
+        let signature_verified = genesis_signature_verified
+            || (self.lifecycle_phase == LifecyclePhase::Ready
+                && self
+                    .blocks
+                    .get(self.snake_chain_tail_idx)
+                    .is_some_and(|tail| {
+                        let parent_on_chain = parent
+                            .and_then(|p| self.blocks.get(p))
+                            .filter(|entry| entry.is_on_active_chain())
+                            .map(|entry| entry.sequence());
+                        let bound =
+                            parent_on_chain.map_or(tail.sequence(), |seq| seq.max(tail.sequence()));
+                        self.key_is_branch_independent(block.creator(), bound)
+                    })
+                && match self.verify_block_creator_signature(block) {
+                    Some(false) => {
+                        return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
+                    }
+                    Some(true) => true,
+                    // No key verdict: nothing is judged or marked here.
+                    None => false,
+                });
 
         // Story 6.7 AC4 (D4): a block whose parent is held is judged against
         // the FR27 run rules now, before the write — they read only the block

@@ -602,7 +602,7 @@ impl<
         for (owner, source) in owners.iter().zip(sources) {
             self.node_info.move_seed_source(*owner, *source);
         }
-        if view.sequence() > 1 && self.node_info.is_seeded(view.creator()) {
+        if !is_fr36_exempt(&view) && self.node_info.is_seeded(view.creator()) {
             self.node_info
                 .debit(view.creator(), view.mined_amount() as u64 + fees);
         }

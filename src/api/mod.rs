@@ -88,7 +88,7 @@ pub use outcomes::{
     ReceiveSupportOutcome, ReceiveTransactionOutcome, RejectReason, RestartRejectReason,
     TickOutcome, TransactionState, TxStateQueryError,
 };
-use step::fees_and_utxo_outputs;
+use step::{fees_and_utxo_outputs, is_fr36_exempt};
 
 /// Why the active-chain snake-chain window is unavailable — the `Err` side of
 /// [`Blockchain::active_snake_chain_window`]. A `Result` rather than `Option`
