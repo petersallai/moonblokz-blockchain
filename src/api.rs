@@ -20,11 +20,11 @@
 
 use moonblokz_chain_types::{
     APPROVAL_DEVIATION_SEQUENCE_OFFSET, APPROVAL_LATE_COUNT_SIZE, APPROVAL_LATE_ENTRY_SIZE,
-    APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, ApprovalView, Block, BlockBuilder, BlockHeader,
-    BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
-    NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
-    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE, Registration,
-    TransactionView,
+    APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, APPROVAL_SUPPORTER_VOTE_SUM_OFFSET, ApprovalView,
+    Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE,
+    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL,
+    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE,
+    Registration, TransactionView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
@@ -41,7 +41,7 @@ use crate::approval::{
     ActiveSetCounter, ApprovalAccumulator, ApprovalStep, CIRCULATING_CURRENCY_STUB,
     DEDUPE_SALT_LABEL, MAX_SUBGROUP, NonConflictRing, RING_KIND_SUPPORT, RingCheck,
     SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView, in_subgroup, node_value,
-    subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
+    required_signers, subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
 };
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
@@ -921,7 +921,6 @@ fn run_before(run: u32, block: &BlockView<'_>) -> u32 {
 /// The result of [`Blockchain::vote_projection`] (Story 6.7 AC8): the engine
 /// was read and restored, nothing was read (restored, byte-identical), or the
 /// restore failed (the caller escalates it at its root, DEC-205).
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Projected {
     Done,
     Refused,
@@ -933,8 +932,9 @@ enum Projected {
 /// proposer and every registered node (`0..=last_node`, the same range on
 /// every node at the same chain position) ranked above it, minus `cv(d)`,
 /// with checked arithmetic; and `k`, the number of nodes ranked above the
-/// proposer (`u` included). `None` on an engine refusal, an overflow, or `k =
-/// 0`. The caller checks that `u` heads the order.
+/// proposer (`u` included). `Ok(None)` on an overflow or `k = 0` (the chain's
+/// data: evidence); `Err` on an engine refusal (local). The caller checks that
+/// `u` heads the order.
 fn deviation_sum<const MAX_NODES: usize>(
     engine: &VoteEngine<MAX_NODES>,
     last_node: u32,
@@ -942,24 +942,34 @@ fn deviation_sum<const MAX_NODES: usize>(
     vote_scale: u64,
     r_eff: u64,
     cv_d: u32,
-) -> Option<(u64, u32)> {
-    let mut sum = 0u64;
+) -> Result<Option<(u64, u32)>, ()> {
+    let mut sum = Some(0u64);
     let mut k = 0u32;
     for n in 0..=last_node {
         let above = engine.ranks_above(n, proposer);
         if n != proposer && !above {
             continue;
         }
-        let grown = engine.grown(engine.accumulated_vote_of(n)).ok()?;
-        sum = sum.checked_add(u64::from(grown) + vote_scale)?;
+        let grown = engine
+            .grown(engine.accumulated_vote_of(n))
+            .map_err(|_| ())?;
+        sum = sum.and_then(|sum| sum.checked_add(u64::from(grown) + vote_scale));
         k += u32::from(above);
     }
-    if k == 0 {
-        return None;
-    }
-    sum.checked_mul(r_eff)?
-        .checked_sub(u64::from(cv_d))
-        .map(|value| (value, k))
+    Ok(sum
+        .filter(|_| k != 0)
+        .and_then(|sum| sum.checked_mul(r_eff))
+        .and_then(|sum| sum.checked_sub(u64::from(cv_d)))
+        .map(|value| (value, k)))
+}
+
+/// DEC-195's late-list room, shared by the builder (6.6) and the evidence
+/// check (6.7 AC8): the late entries that fit in `room` payload bytes beside
+/// the fixed part of an evidence with subgroup `m` and `n` signers, at most
+/// `u16::MAX`. `None` when the fixed part does not fit.
+fn late_room(room: usize, m: usize, n: usize) -> Option<usize> {
+    room.checked_sub(moonblokz_chain_types::approval_fixed_size(m, n))
+        .map(|free| (free / APPROVAL_LATE_ENTRY_SIZE).min(u16::MAX as usize))
 }
 
 /// DEC-184's late node: ranked above the proposer at `p − 1`, other than `u`.
@@ -1012,9 +1022,11 @@ fn run_rules(
 
 /// Story 6.7 AC4 rule 5 (D8, DEC-265): a block at `s ≡ H − 1 (mod H)` is
 /// clean — an approval evidence block, or a transaction block with no
-/// registration and no UTXO output (a balance output leaves no obligation) — so its drop off the tail never carries an
-/// obligation. Configuration §6 check 21 makes the block a slot drops a slot
-/// itself and keeps genesis #0 / #1 off the slots.
+/// registration and no UTXO output (a balance output leaves no obligation) —
+/// so its drop off the tail never carries an obligation. Configuration §6
+/// check 21 makes the block a slot drops a slot itself and keeps genesis #0 /
+/// #1 off the slots; it also guarantees `H ≥ 3`, so the `h > 1` filter only
+/// keeps a `% 0` out of an unlocked caller's path.
 fn slot_rule(block: &BlockView<'_>, h: Option<u32>) -> Result<(), ValidationReason> {
     let Some(h) = h.filter(|&h| h > 1) else {
         return Ok(());
@@ -2625,16 +2637,19 @@ impl<
                         .get(q)
                         .is_some_and(|entry| entry.status() != BlockStatus::Stored)
             });
-        if !judged_later
-            && let Some(q) = parent
-            && let Ok(run) = self.deviation_run_at(q)
-        {
+        if !judged_later && let Some(q) = parent {
             let h = if self.chain_config.is_durable_locked() {
                 self.verification_horizon()
             } else {
                 None
             };
-            if run_rules(block, run, h).is_err() {
+            // An unreadable ancestry leaves rules 1–4 to a later judgement;
+            // the slot rule reads the block alone.
+            let verdict = match self.deviation_run_at(q) {
+                Ok(run) => run_rules(block, run, h),
+                Err(()) => slot_rule(block, h),
+            };
+            if verdict.is_err() {
                 return Err(AdmitError::Rejected(Tier1Failure::DeviationRun));
             }
         }
@@ -3208,16 +3223,22 @@ impl<
     }
 
     /// Story 6.7 AC10 (D3) — whether a held evidence block descends from the
-    /// local deviation at `d_idx` (sequence `p`): RAM only. The AC4 rules admit
-    /// above `d` only its creator's blocks, and the first evidence closes the
-    /// run, so any such block is the proposer's own evidence (also as a side
-    /// block, while a heavier approval-less sibling is the head): the release.
+    /// local deviation at `d_idx` (sequence `p`) and was created by the local
+    /// node: a RAM scan, then one header read per candidate. The AC4 rules
+    /// admit above `d` only its creator's blocks, and the first evidence
+    /// closes the run, so such a block is the proposer's own evidence (also as
+    /// a side block, while a heavier approval-less sibling is the head): the
+    /// release. The creator check keeps out a block stored unjudged (a walk
+    /// fault at intake); an unreadable header does not release.
     fn holds_own_evidence(&self, d_idx: u32, p: u32) -> bool {
         (0..MAX_BLOCKS as u32).any(|idx| {
             self.blocks.get(idx).is_some_and(|entry| {
                 entry.payload_type() == PAYLOAD_TYPE_APPROVAL
                     && entry.sequence() > p
                     && self.ancestor_at(idx, p).ok().flatten() == Some(d_idx)
+                    && self
+                        .header_at(idx)
+                        .is_some_and(|(creator, _)| creator == self.local_node_id)
             })
         })
     }
@@ -4044,8 +4065,7 @@ impl<
         #[cfg(test)]
         let room = crate::approval::test_seams::payload_room(room);
         let fixed = moonblokz_chain_types::approval_fixed_size(m, r_eff);
-        let late_room =
-            (room.checked_sub(fixed)? / APPROVAL_LATE_ENTRY_SIZE).min(u16::MAX as usize);
+        let late_room = late_room(room, m, r_eff)?;
         let mut builder =
             BlockBuilder::new().header(self.post_deviation_header(tip_seq, tip_hash)?);
         let payload = builder.approval_payload_mut(room).ok()?;
@@ -4103,7 +4123,7 @@ impl<
             if engine.top_creator() != Some(u) {
                 return false;
             }
-            let Some((supporter_vote_sum, _)) =
+            let Ok(Some((supporter_vote_sum, _))) =
                 deviation_sum(engine, last_node, local, vote_scale, r_eff as u64, cv_d)
             else {
                 return false;
@@ -4125,7 +4145,7 @@ impl<
                 payload[slot(at)..slot(at) + 4].copy_from_slice(&n.to_le_bytes());
                 late_count = (late_count + 1).min(late_room);
             }
-            payload[..APPROVAL_DEVIATION_SEQUENCE_OFFSET]
+            payload[APPROVAL_SUPPORTER_VOTE_SUM_OFFSET..APPROVAL_DEVIATION_SEQUENCE_OFFSET]
                 .copy_from_slice(&supporter_vote_sum.to_le_bytes());
             true
         });
@@ -4343,12 +4363,15 @@ impl<
     ///    order.
     ///
     /// In a window-anchored FR3 pass the check is exact only when the window at
-    /// `p − 1` lies in the segment (`p − W ≥ a`) and the roster, every node's
-    /// vote and every signer's key are seeded at `p − 1` (D5, DEC-177's
-    /// predicate); otherwise the content is trusted. A local fault (a failed
-    /// read, a refused rewind, the guard that `u` heads the order at `p − 1`,
-    /// which `d`'s accepted header implies) is never evidence; a failed restore
-    /// also marks the re-entry due at the root (`reentry_due`).
+    /// `p − 1` lies in the segment (`p − W ≥ a`, judged first, before `d` is
+    /// resolved) and the roster, every node's vote and every signer's key are
+    /// seeded at `p − 1` (D5, DEC-177's predicate; a vote whose latest seed
+    /// source lies at or above `p` was not seeded at `p − 1` as far as the pass
+    /// can tell); otherwise the content is trusted. A local fault (a failed
+    /// read, a refused rewind or engine step, the guard that `u` heads the
+    /// order at `p − 1`, which `d`'s accepted header implies) is never
+    /// evidence; outside the pass a failed restore also marks the re-entry due
+    /// at the root (`reentry_due`; the pass's own local failure resets it).
     #[inline(never)]
     fn judge_evidence(
         &mut self,
@@ -4364,6 +4387,29 @@ impl<
             return Err(invalid(ValidationReason::MalformedPayload));
         };
         let p = evidence.deviation_sequence();
+        let Some(configuration) = self.chain_config.active_configuration() else {
+            return Err(ProcessingError::StorageRead);
+        };
+        let (w, required_support, vote_scale, limit) = (
+            configuration.active_chain_length(),
+            configuration.required_support(),
+            u64::from(configuration.vote_scale().get()),
+            configuration.block_size_limit(),
+        );
+        let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
+        // D5: a window-anchored pass checks only where it can — the window
+        // condition first, so a `d` below the anchor is never resolved.
+        let in_pass = projection.counter_tail == u32::MAX;
+        let trusted_zone = in_pass && !projection.complete;
+        if trusted_zone
+            && (p
+                .checked_sub(w)
+                .is_none_or(|bottom| bottom < projection.anchor)
+                || !projection.roster_bounded
+                || !(0..=last_node).all(|n| self.vote_seeded_below(n, p, projection)))
+        {
+            return Ok(());
+        }
         let tip = self
             .blocks
             .get(idx)
@@ -4378,27 +4424,6 @@ impl<
         let Some((creator_d, u, cv_d)) = self.header_votes_at(d_idx) else {
             return Err(ProcessingError::StorageRead);
         };
-        let Some(configuration) = self.chain_config.active_configuration() else {
-            return Err(ProcessingError::StorageRead);
-        };
-        let (w, required_support, vote_scale, limit) = (
-            configuration.active_chain_length(),
-            configuration.required_support(),
-            u64::from(configuration.vote_scale().get()),
-            configuration.block_size_limit(),
-        );
-        let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
-        // D5: a window-anchored pass checks only where it can.
-        let trusted_zone = projection.counter_tail == u32::MAX && !projection.complete;
-        if trusted_zone
-            && (p
-                .checked_sub(w)
-                .is_none_or(|bottom| bottom < projection.anchor)
-                || !projection.roster_bounded
-                || !(0..=last_node).all(|n| self.vote_seeded(n, projection)))
-        {
-            return Ok(());
-        }
 
         // 1–2. The subgroup at `p − 1` and the signers in rank order.
         let mut members = [0u32; MAX_SUBGROUP];
@@ -4417,7 +4442,7 @@ impl<
             Ok(None) => return Err(invalid(ValidationReason::EvidenceSubgroup)),
             Ok(Some(m)) => m,
         };
-        let r_eff = m / 2 + 1;
+        let r_eff = required_signers(m);
         let n = evidence.signer_count() as usize;
         if usize::from(evidence.m()) != m || n < r_eff {
             return Err(invalid(ValidationReason::EvidenceSubgroup));
@@ -4452,17 +4477,17 @@ impl<
         let room = (limit as usize)
             .saturating_sub(HEADER_SIZE)
             .min(MAX_PAYLOAD_SIZE);
-        let late_room = room
-            .checked_sub(moonblokz_chain_types::approval_fixed_size(m, n))
-            .map_or(0, |free| {
-                (free / APPROVAL_LATE_ENTRY_SIZE).min(u16::MAX as usize)
-            });
+        let late_room = late_room(room, m, n).unwrap_or(0);
         let claimed = evidence.supporter_vote_sum();
         let late_count = usize::from(evidence.late_count());
         let mut verdict = None;
         let projected = self.vote_projection(d_idx, tip, creator_d, true, |bc, at_tip| {
             let engine = &bc.vote_engine;
             if at_tip {
+                // A verdict at `p − 1` already stands: nothing more to read.
+                if verdict.is_some() {
+                    return true;
+                }
                 // DEC-184: each listed vote after the evidence's interest step.
                 for i in 0..late_count {
                     let Some((id, vote)) = evidence.late_entry(i) else {
@@ -4480,12 +4505,15 @@ impl<
             if engine.top_creator() != Some(u) {
                 return false;
             }
-            let Some((sum, k)) =
-                deviation_sum(engine, last_node, creator_d, vote_scale, r_eff as u64, cv_d)
-            else {
-                verdict = Some(ValidationReason::EvidenceVoteSum);
-                return true;
-            };
+            let (sum, k) =
+                match deviation_sum(engine, last_node, creator_d, vote_scale, r_eff as u64, cv_d) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        verdict = Some(ValidationReason::EvidenceVoteSum);
+                        return true;
+                    }
+                    Err(()) => return false,
+                };
             if sum != claimed {
                 verdict = Some(ValidationReason::EvidenceVoteSum);
                 return true;
@@ -4524,7 +4552,7 @@ impl<
             Projected::Done => {}
             Projected::Refused => return Err(ProcessingError::StorageRead),
             Projected::RestoreFailed => {
-                self.reentry_due = true;
+                self.reentry_due |= !in_pass;
                 return Err(ProcessingError::StorageRead);
             }
         }
@@ -4576,6 +4604,9 @@ impl<
             }
             (0, 0)
         } else {
+            if !self.active_set.is_valid() {
+                return Err(());
+            }
             let tip_seq = self.blocks.get(tip).ok_or(())?.sequence();
             match self.parent_set_correction(
                 tip,
@@ -5273,7 +5304,7 @@ impl<
         // phase reversion still happen, nothing is deleted, nothing panics.
         //
         // Stack: `[u32; MAX_BLOCKS]` is 2.4 KB at the default `MAX_BLOCKS = 600`
-        // on the 24 KB blockchain-task stack (DEC-137). It does not coexist with
+        // on the Core 1 blockchain-task stack (DEC-137, sized per scheme). It does not coexist with
         // `run_processing_pass`'s equally-sized `marked` buffer — that is a local
         // of *that* function, whose frame is already released at this seam. This
         // must be re-checked if the recovery call ever moves inside the pass.
@@ -5629,37 +5660,29 @@ impl<
         // Available-UTXO bits set or cleared mid-pass are rolled back below on any
         // abort (the FR5 working-set rollback's UTXO half); on success they persist
         // as the active chain's unspent-output state.
+        // The earliest block `a` of a window-anchored segment and `a + H`
+        // (DEC-177's seed bound, D4's unknown-run bound); 0 when complete.
+        let (anchor, anchor_plus_h) = if genesis_anchored {
+            (0, 0)
+        } else {
+            let a = self
+                .blocks
+                .get(marked[count - 1])
+                .map_or(0, |e| e.sequence());
+            (
+                a,
+                a.saturating_add(self.verification_horizon().unwrap_or(0)),
+            )
+        };
         let mut projection = Projection {
             complete: genesis_anchored,
             roster_bounded,
             saw_balance_block: false,
-            vote_seed_from: if genesis_anchored {
-                0
-            } else {
-                let a = self
-                    .blocks
-                    .get(marked[count - 1])
-                    .map_or(0, |e| e.sequence());
-                a.saturating_add(self.verification_horizon().unwrap_or(0))
-            },
+            vote_seed_from: anchor_plus_h,
             first_segment_registration: u32::MAX,
-            run_unknown_below: if genesis_anchored {
-                0
-            } else {
-                let a = self
-                    .blocks
-                    .get(marked[count - 1])
-                    .map_or(0, |e| e.sequence());
-                a.saturating_add(self.verification_horizon().unwrap_or(0))
-            },
+            run_unknown_below: anchor_plus_h,
             counter_tail: u32::MAX,
-            anchor: if genesis_anchored {
-                0
-            } else {
-                self.blocks
-                    .get(marked[count - 1])
-                    .map_or(0, |e| e.sequence())
-            },
+            anchor,
         };
         let mut prev_hash: Option<[u8; 32]> = None;
         // Story 6.1 D5: the FR21 value of the window the promotion will
@@ -5764,17 +5787,6 @@ impl<
         self.commit_block(view, idx, derivation)
     }
 
-    /// The fallible half of the per-block step, in the D1 order: block-level
-    /// checks; per transaction, its checks and then its invertible effects;
-    /// the balance-block checks (D9); the creator-credit overflow check. On
-    /// `Err` the effects already applied are inverted, newest first.
-    ///
-    /// Every check reads the state derived from the preceding blocks and from
-    /// the earlier transactions of this block, so a balance spent by tx 1
-    /// limits tx 2, and a key registered by tx 1 is a duplicate in tx 2. In a
-    /// non-complete FR3 projection (D3) the per-node state-dependent checks
-    /// are gated on the actor being seeded: a window-anchored candidate trusts
-    /// history it cannot re-derive.
     /// Whether a non-complete FR3 pass may judge `node`'s accumulated vote
     /// (DEC-177, Story 6.14 AC8): always in a complete projection; for a node
     /// registered inside the segment (vote 0 is exact); otherwise once its
@@ -5791,6 +5803,20 @@ impl<
                 .is_some_and(|source| source.sequence() >= projection.vote_seed_from)
     }
 
+    /// Story 6.7 D5 — [`Self::vote_seeded`] at `p − 1` in a window-anchored
+    /// pass standing at a later tip: a node whose latest seed source lies at
+    /// or above `p` had an earlier one at `p − 1`, which the pass no longer
+    /// knows, so its vote there is not known to be exact.
+    fn vote_seeded_below(&self, node: u32, p: u32, projection: &Projection) -> bool {
+        projection.complete
+            || node >= projection.first_segment_registration
+            || self
+                .node_info
+                .seed_source_of(node)
+                .and_then(|slot| self.blocks.get(slot))
+                .is_some_and(|source| (projection.vote_seed_from..p).contains(&source.sequence()))
+    }
+
     /// Story 6.7 AC4 (D4) — the open deviation run ending at the held block
     /// `q`, by a walk over its own ancestry: `Ok(Some((p, creator of d)))`,
     /// `Ok(None)` for no open run, `Err` when it cannot be told (a failed read,
@@ -5798,8 +5824,11 @@ impl<
     /// stops on the RAM evidence flag (a closed run), at a normal-form block
     /// with `consumed_votes ≠ 0` or by another creator (no run), or at a
     /// deviation-form block (the run's `d`). One header read in the normal
-    /// case, at most `H + 1` inside a run (the run bound). Side blocks and
-    /// non-Ready intake use it; the active head reads `active_open_run`.
+    /// case, at most `H + 1` inside a run (the run bound). Genesis #0 is never
+    /// in a run. A side block's Tier 2 check and the intake of a block whose
+    /// parent is neither the active head nor Connected / Active in Ready use it
+    /// (outside Ready, or a Stored parent in Ready); the active head reads
+    /// `active_open_run`.
     fn deviation_run_at(&self, q: u32) -> Result<Option<(u32, u32)>, ()> {
         let steps = self
             .verification_horizon()
@@ -5812,6 +5841,9 @@ impl<
                 return Ok(None);
             }
             let (sequence, parent) = (entry.sequence(), entry.parent_ref());
+            if sequence == 0 {
+                return Ok(None);
+            }
             let (c, first_voted, consumed) = self.header_votes_at(cur).ok_or(())?;
             if creator.is_some_and(|run_creator| run_creator != c) {
                 return Ok(None);
@@ -5879,6 +5911,17 @@ impl<
         run_rules(view, run, h).map_err(invalid)
     }
 
+    /// The fallible half of the per-block step, in the D1 order: block-level
+    /// checks; per transaction, its checks and then its invertible effects;
+    /// the balance-block checks (D9); the creator-credit overflow check. On
+    /// `Err` the effects already applied are inverted, newest first.
+    ///
+    /// Every check reads the state derived from the preceding blocks and from
+    /// the earlier transactions of this block, so a balance spent by tx 1
+    /// limits tx 2, and a key registered by tx 1 is a duplicate in tx 2. In a
+    /// non-complete FR3 projection (D3) the per-node state-dependent checks
+    /// are gated on the actor being seeded: a window-anchored candidate trusts
+    /// history it cannot re-derive.
     fn derive_block(
         &mut self,
         view: &BlockView<'_>,
@@ -6072,10 +6115,10 @@ impl<
                 }
             }
             _ => {
-                // Approval-evidence (payload_type=4): full validation is deferred
-                // to Epic 6 (the deterministic supporting-subgroup primitive it
-                // needs, ADR-015 / FR27/FR28, is unbuilt). The shared tail still
-                // applies this block's FR37 vote effects.
+                // Approval evidence (payload_type 4): its Tier 3 (Story 6.7
+                // AC5) runs after this step at the two Tier-3 drivers
+                // (`judge_evidence_step`), off genesis' static path (D6). The
+                // shared tail applies its FR37 vote effects.
             }
         }
 
@@ -6663,14 +6706,6 @@ impl<
         }
     }
 
-    /// Verifies a node-transfer / registration transaction signature (AC3): the
-    /// signer (the `signer_node_id`, resolved to its derived key) signs the full
-    /// transaction bytes with the trailing signature field zero-filled (the
-    /// `*::new_signed` convention — the signature is the last `SIGNATURE_SIZE`
-    /// bytes of the fixed-size transaction). Returns `false` on an unresolvable signer key or a
-    /// bad signature. Only node-transfer / registration transactions have this
-    /// fixed trailing-signature layout; balance/UTXO input signatures (embedded, no
-    /// `new_signed` convention) are a deferred seam.
     /// Story 6.7 D2: whether the block at `idx` carries `BlockEntry` bit 6
     /// (its Tier-3 signature checks are final), so the per-block step does not
     /// verify its transaction signatures or its evidence again (a restore, a
@@ -6681,6 +6716,14 @@ impl<
             .is_some_and(|entry| entry.is_signatures_accepted())
     }
 
+    /// Verifies a node-transfer / registration transaction signature (AC3): the
+    /// signer (the `signer_node_id`, resolved to its derived key) signs the full
+    /// transaction bytes with the trailing signature field zero-filled (the
+    /// `*::new_signed` convention — the signature is the last `SIGNATURE_SIZE`
+    /// bytes of the fixed-size transaction). Returns `false` on an unresolvable signer key or a
+    /// bad signature. Only node-transfer / registration transactions have this
+    /// fixed trailing-signature layout; balance/UTXO input signatures (embedded, no
+    /// `new_signed` convention) are a deferred seam.
     fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
         #[cfg(test)]
         crate::approval::test_seams::count(
@@ -6836,15 +6879,20 @@ impl<
     ) -> Result<(), ProcessingError> {
         // Story 6.7 AC4 (D4): the FR27 run rules and the FR48 clean slot for a
         // block off the active head, from its own ancestry (a header walk);
-        // the configuration is locked in Ready. An unreadable ancestry gives
-        // no verdict here; the switch's Tier 3 judges the block again.
-        if let Ok(run) = self.deviation_run_at(parent_idx) {
-            run_rules(view, run, self.verification_horizon()).map_err(|reason| {
-                ProcessingError::Invalid {
-                    block_idx: idx,
-                    reason,
-                }
-            })?;
+        // the configuration is locked in Ready. An unreadable ancestry judges
+        // only the slot rule, which reads the block alone, and is then a local
+        // fault: the block stays Stored and the driver judges it again.
+        let h = self.verification_horizon();
+        let invalid = |reason| ProcessingError::Invalid {
+            block_idx: idx,
+            reason,
+        };
+        match self.deviation_run_at(parent_idx) {
+            Ok(run) => run_rules(view, run, h).map_err(invalid)?,
+            Err(()) => {
+                slot_rule(view, h).map_err(invalid)?;
+                return Err(ProcessingError::StorageRead);
+            }
         }
         let Some(txs) = view.transactions() else {
             return Ok(());
@@ -6932,8 +6980,12 @@ impl<
                 advance = Some(step);
             }
         }
+        // The counter's tail: without it the evidence check has no `A'`.
+        let Some(counter_tail) = self.blocks.get(tail).map(|e| e.sequence()) else {
+            return Extension::Local;
+        };
         let mut projection = Projection {
-            counter_tail: self.blocks.get(tail).map_or(u32::MAX, |e| e.sequence()),
+            counter_tail,
             ..Projection::COMPLETE
         };
         match self
@@ -7251,7 +7303,11 @@ impl<
             let Some(head) = self.switch_target(candidates) else {
                 return;
             };
-            if !matches!(self.switch_toward(head), SwitchOutcome::RestoreFailed) {
+            // Story 6.7 AC8: an evidence check on the walk whose projection
+            // could not restore the engine asks for the same re-entry.
+            if !matches!(self.switch_toward(head), SwitchOutcome::RestoreFailed)
+                && !self.reentry_due
+            {
                 return;
             }
             let Some(driver_best) = self.reenter_collecting(now) else {
@@ -20349,7 +20405,9 @@ mod tests {
         bc.storage.failing_read_slot = slot(&bc, &mint);
         assert_eq!(receive(&mut bc, &n5), ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(head_of(&bc), (4, o4.view().hash()), "kept");
-        assert_eq!(status_of(&bc, &n5), Some(BlockStatus::Connected));
+        // Story 6.7 review: `n5`'s run walk cannot read the mint, so its Tier 2
+        // gives no verdict and it stays Stored (local).
+        assert_eq!(status_of(&bc, &n5), Some(BlockStatus::Stored));
         bc.storage.failing_read_slot = NONE_REF;
         // `n5`'s transfer credited node #0 once.
         let n6 = resign(
@@ -25635,6 +25693,102 @@ mod tests {
         assert_eq!(l.active_open_run, 6);
     }
 
+    // -- Story 6.7 code review (production code): the regressions --
+
+    /// Review (header-walk faults) — genesis #0 is never inside a run: the
+    /// walk from it answers "no run", not "unknown".
+    #[test]
+    fn the_run_walk_ends_at_genesis() {
+        let (_, l, blocks) = support_chain(3);
+        let genesis = l.blocks.find(0, &blocks[0].view().hash()).expect("#0");
+        assert_eq!(l.deviation_run_at(genesis), Ok(None));
+    }
+
+    /// Review (header-walk faults) — at intake an unreadable ancestry still
+    /// judges the slot rule, which reads the block alone: a balance block at a
+    /// slot above a Stored deviation whose header cannot be read is refused
+    /// before its write, while a clean block there gets no verdict (held).
+    #[test]
+    fn an_unreadable_ancestry_still_judges_the_slot_at_intake() {
+        let (mut g, mut l, blocks) = support_chain_on(3, failing_storage(3), 16, |_| {});
+        let h = l.verification_horizon().expect("locked");
+        assert_eq!(7 % h, h - 1, "#7 is a slot");
+        let d = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        plant(&mut l, &d, false, true);
+        l.storage.failing_slot = l.blocks.find(6, &d.view().hash()).expect("d");
+        let template = balance_snapshot(&g, 7, d.view().hash(), &[2]);
+        let unclean = reheader(&template, 4, 0, 4, 0, key_of(4));
+        assert_eq!(
+            receive(&mut l, &unclean),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert!(entry_of(&l, &unclean).is_none(), "not stored");
+        let clean = normal_after(&g, &d, 4, 71);
+        assert_eq!(
+            receive(&mut l, &clean),
+            ReceiveBlockOutcome::AcceptedSilently,
+            "no verdict"
+        );
+        assert!(entry_of(&l, &clean).is_some(), "held");
+    }
+
+    /// Review (AC10, D3) — only the local node's own evidence above `d`
+    /// releases its accumulator: another creator's evidence held above `d`
+    /// unjudged (a walk fault at intake) does not.
+    #[test]
+    fn a_foreign_evidence_above_d_does_not_release() {
+        let (_, e, _) = evidence_by(4);
+        let ev = evidence_of(&e, 2);
+        let (_, mut l, _, d, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        let foreign = evidence_block(7, d.view().hash(), 3, &ev);
+        plant_child(&mut l, &foreign, d_idx, true, true);
+        assert!(l.approval_live(), "not the proposer's");
+        let own = evidence_block(7, d.view().hash(), 5, &ev);
+        plant_child(&mut l, &own, d_idx, true, true);
+        assert!(!l.approval_live(), "the proposer's own releases");
+    }
+
+    /// Review (AC8) — outside the pass the evidence check reads the
+    /// active-set counter only while it is valid: an invalid counter is a
+    /// local fault, never an `EvidenceSubgroup` verdict.
+    #[test]
+    fn an_invalid_counter_is_a_local_fault() {
+        let (mut g, _, e) = evidence_observer(4);
+        let ready = ready_projection(&g);
+        g.active_set.invalidate();
+        assert_eq!(judge_on(&mut g, &e, &ready), Err(None));
+    }
+
+    /// Review (AC8) — a failed restore inside the FR3 pass is the pass's own
+    /// local failure: it does not also mark the root's re-entry due (a
+    /// second, spurious re-entry). Every read budget of `r` is tried; at least
+    /// one hits the restore (the engine is left changed).
+    #[test]
+    fn a_failed_restore_in_the_pass_marks_no_reentry() {
+        let (d, r, e, _) = replay_evidence();
+        let pass = Projection {
+            counter_tail: u32::MAX,
+            ..Projection::COMPLETE
+        };
+        let mut restore_failures = 0;
+        for reads in 0..4 {
+            let mut l = failing_observer(&d, &r);
+            let before = engine_votes(&l);
+            l.storage.failing_slot = l.active_chain_head_idx;
+            l.storage.reads_left.set(reads);
+            l.storage.failures_left.set(1);
+            let verdict = judge_on(&mut l, &e, &pass);
+            if engine_votes(&l) != before {
+                restore_failures += 1;
+                assert_eq!(verdict, Err(None), "reads {reads}");
+            }
+            assert!(!l.reentry_due, "reads {reads}");
+        }
+        assert!(restore_failures > 0, "a restore failed");
+    }
+
     // -- AC5 / AC6: the Tier-3 evidence check and the accepted mark --
 
     /// AC5 / AC6: a valid evidence admitted by a second node as a direct
@@ -26063,11 +26217,31 @@ mod tests {
         (g, e)
     }
 
+    /// Review (D5) — the window condition is judged before `d` is resolved:
+    /// an evidence whose `d` the pass cannot resolve (here above the tip) is
+    /// trusted under `p − W < a`, and a local fault only in the exact zone.
+    #[test]
+    fn the_window_condition_is_judged_before_d() {
+        let (mut g, e) = w8_evidence();
+        let unresolvable = evidence_with(&e, 3, |ev| ev.deviation_sequence = 100);
+        assert_eq!(
+            judge_on(&mut g, &unresolvable, &window_anchored(200)),
+            Ok(())
+        );
+        assert_eq!(
+            judge_on(&mut g, &unresolvable, &window_anchored(0)),
+            Err(None),
+            "the exact zone"
+        );
+    }
+
     /// AC7 (D5) — the exact zone of a window-anchored pass: with `p − W = a`
     /// the evidence is checked exactly (the real one verifies, a junk claim is
     /// refused); trusted when each condition fails alone: `p − W = a − 1`,
     /// the roster unknown, one registered node (#0, its seed source #0 below
-    /// `vote_seed_from`) not vote-seeded.
+    /// `vote_seed_from`) not vote-seeded, and node 2, whose latest seed source
+    /// is `d` itself (its balance lists node 2), so its vote at `p − 1` is not
+    /// known to be exact.
     #[test]
     fn a_window_anchored_pass_checks_its_exact_zone() {
         let (mut g, e) = w8_evidence();
@@ -26085,17 +26259,13 @@ mod tests {
         seeded_from_one.vote_seed_from = 1;
         let mut seeded_from_zero = window_anchored(0);
         seeded_from_zero.first_segment_registration = u32::MAX;
-        assert_eq!(
-            judge_on(&mut g, &junk, &seeded_from_zero),
-            Err(Some(ValidationReason::EvidenceVoteSum)),
-            "every node seeded: exact"
-        );
         let mut unknown_roster = window_anchored(0);
         unknown_roster.roster_bounded = false;
         for (projection, why) in [
             (window_anchored(1), "p − W = a − 1"),
             (unknown_roster, "the roster unknown"),
             (seeded_from_one, "node #0 not vote-seeded"),
+            (seeded_from_zero, "node 2 seeded at `p` only"),
         ] {
             assert_eq!(judge_on(&mut g, &junk, &projection), Ok(()), "{why}");
         }

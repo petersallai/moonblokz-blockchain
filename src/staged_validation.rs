@@ -201,11 +201,13 @@ pub(crate) enum Tier1Failure {
     /// not yet Tier-1-verified (FR69, later epic), so a forged first-arriving
     /// seq-0 would anchor until that check lands.
     DuplicateGenesis,
-    /// FR16 / FR27 (Story 6.7 AC4, D4): outside Ready, a block whose parent is
-    /// held breaks a rule of the open deviation run below it (another creator,
-    /// a non-override header, a misplaced evidence block, the run bound) or the
-    /// FR48 clean slot once the configuration is locked. Produced in
-    /// `tier1_admit` from the block and its ancestry, before the write.
+    /// FR16 / FR27 (Story 6.7 AC4, D4): a block whose parent is held — outside
+    /// Ready, or a Stored parent in Ready — breaks a rule of the open deviation
+    /// run below it (another creator, a non-override header, a misplaced
+    /// evidence block, the run bound) or the FR48 clean slot once the
+    /// configuration is locked (the slot rule also when the ancestry cannot be
+    /// read). Produced in `tier1_admit` from the block and its ancestry, before
+    /// the write.
     DeviationRun,
 }
 

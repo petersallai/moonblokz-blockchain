@@ -497,8 +497,8 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     }
 
     /// Test-only: overwrites the cached payload type of the entry at `idx`
-    /// (Story 6.5: an approval block on the active chain, which no admission
-    /// path can produce before Stories 6.6 and 6.7).
+    /// (Story 6.5: an approval entry on the active chain without building a
+    /// valid evidence block).
     #[cfg(test)]
     pub(crate) fn stamp_payload_type(&mut self, idx: u32, payload_type: u8) {
         let entry = &mut self.blocks[idx as usize];
