@@ -8539,15 +8539,28 @@ mod tests {
     /// it. The test backend stores eight blocks, so a `TEST_W` chain never
     /// holds a head above #7: at 7 the FR58 bound never binds there, and the
     /// bound, the horizon and the reclamation are exercised on the W4 harness,
-    /// which declares `H = 3` or its own.
-    const TEST_H: u32 = 7;
+    /// which declares `H = 2` or its own. `H` divides `W` and is at least 2
+    /// (configuration §6 check 21, Story 6.7 D8), so 8 replaced 7.
+    const TEST_H: u32 = 8;
 
     /// The horizon a test configuration with window `w` declares: `TEST_H` on
-    /// the `TEST_W` harnesses, and the smallest legal horizon, 1, on every
-    /// smaller window — the W4 harness then joins on `W + H = 5` blocks and
-    /// keeps three of the backend's eight slots for forks.
+    /// the `TEST_W` harnesses, and the smallest legal horizon on every smaller
+    /// window: the least divisor of `w` from 2 up (check 21; `H < W`, check 15).
+    /// The W4 harness then declares 2 and joins on `W + H = 6` blocks, keeping
+    /// three of its backend's nine slots for forks ([`W4Storage`]). A window with no such
+    /// divisor (a prime) has no legal horizon and is refused at compile time.
     const fn test_horizon(w: u32) -> u32 {
-        if w >= TEST_W { TEST_H } else { 1 }
+        if w >= TEST_W {
+            return TEST_H;
+        }
+        let mut h = 2;
+        while h < w {
+            if w.is_multiple_of(h) {
+                return h;
+            }
+            h += 1;
+        }
+        panic!("no legal horizon below this window");
     }
 
     /// The network node cap every test configuration declares (DEC-228): the
@@ -9587,12 +9600,14 @@ mod tests {
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
         // `block_size_limit` (id 3) declared as 300: legal for the registry
         // (> HEADER_SIZE, <= MAX_BLOCK_SIZE), smaller than Block #0. The window
-        // entry is the one every content on this harness carries.
+        // entry is the one every content on this harness carries. A support
+        // threshold of 1 keeps the limit above the room a one-signer approval
+        // needs (configuration §6 check 20), so only the genesis size refuses.
         let w = TEST_W.to_le_bytes();
         let h = test_horizon(TEST_W).to_le_bytes();
         let n = TEST_MAX_NODES.to_le_bytes();
         let content = [
-            5u8,
+            6u8,
             0,
             parameter::BLOCK_SIZE_LIMIT,
             4,
@@ -9600,6 +9615,9 @@ mod tests {
             0x01,
             0,
             0,
+            parameter::REQUIRED_SUPPORT,
+            1,
+            1,
             parameter::ACTIVE_CHAIN_LENGTH,
             4,
             w[0],
@@ -10230,7 +10248,9 @@ mod tests {
         // The tail carries the configuration the node is locked on, as the FR8
         // final check requires.
         let below = w4_horizon_block();
-        bc.receive_block(below.view(), 0);
+        for block in [&w4_horizon_base(), &below] {
+            bc.receive_block(block.view(), 0);
+        }
         let tail = w4_config_anchor_block(100, below.view().hash());
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
@@ -10241,14 +10261,14 @@ mod tests {
         }
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "segment length 4 < W + H = 5"
+            "segment length 5 < W + H = 6"
         );
 
         let last = linked_transfer_block(103, prev);
         bc.receive_block(last.view(), 0);
         assert!(
             bc.is_ready(),
-            "segment length 5 = W + H qualifies, on a build that allocated 16"
+            "segment length 6 = W + H qualifies, on a build that allocated 16"
         );
     }
 
@@ -10417,17 +10437,26 @@ mod tests {
     /// A test chain with a small active-chain capacity (`SNAKE_CHAIN_LENGTH_MAX =
     /// 4`), configured with a window of the same length, so an active-length
     /// segment fits the test harness's block storage. Same shape as
-    /// `new_test_chain` otherwise (local_node_id 5, join/Collecting).
-    type W4Chain = Blockchain<
-        Crypto,
-        MemoryBackend<{ 8 * MAX_BLOCK_SIZE + 8000 }>,
-        TestConfig,
-        16,
-        4,
-        16,
-        4,
-        16,
-    >;
+    /// `new_test_chain` otherwise (local_node_id 5, join/Collecting), but on
+    /// [`W4Storage`].
+    type W4Chain = Blockchain<Crypto, W4Storage, TestConfig, 16, 4, 16, 4, 16>;
+
+    /// The W4 harness's storage: nine block slots, one more than the other
+    /// harnesses'. The smallest legal horizon on `W = 4` is 2 (configuration
+    /// §6 check 21), so a window-anchored join holds `W + H = 6` blocks; nine
+    /// slots keep three of them for forks and extensions, as eight did when
+    /// the harness joined on five.
+    type W4Storage = MemoryBackend<{ 9 * MAX_BLOCK_SIZE + 8000 }>;
+
+    /// A [`W4Storage`] initialized as [`test_backends`]' storage is.
+    fn w4_storage() -> W4Storage {
+        let mut storage = W4Storage::new();
+        storage
+            .init([1u8; PRIVATE_KEY_SIZE], 0, [0u8; INIT_PARAMS_SIZE])
+            .ok()
+            .expect("the test backend initializes");
+        storage
+    }
 
     fn new_w4_chain() -> W4Chain {
         new_w4_chain_h(test_horizon(W4))
@@ -10436,7 +10465,8 @@ mod tests {
     /// [`new_w4_chain`] locked on the horizon `h` (a few FR21 / FR22 tests
     /// need a fork deeper than the head's parent to stay inside FR58's bound).
     fn new_w4_chain_h(h: u32) -> W4Chain {
-        let (crypto, storage, _) = test_backends();
+        let (crypto, _, _) = test_backends();
+        let storage = w4_storage();
         // This harness's own capacities, not `TestChain`'s: its window is 4.
         let mut chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
         chain_config
@@ -10453,7 +10483,8 @@ mod tests {
     /// As [`new_w4_chain`], but holding **no** configuration — the joining node's
     /// starting state on the small-window harness.
     fn new_unconfigured_w4_chain() -> W4Chain {
-        let (crypto, storage, _) = test_backends();
+        let (crypto, _, _) = test_backends();
+        let storage = w4_storage();
         let chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
@@ -10467,11 +10498,13 @@ mod tests {
     #[test]
     fn fr2_active_length_triggers_at_w() {
         let mut bc = new_w4_chain();
-        // The orphan #99 (unresolved parent), the chain-config block #100 the
-        // FR8 final check requires in scope (Story 5.9, AC3), then children up
-        // to length 4 — one below `W + H = 5` (DEC-177).
+        // The orphan #98 (unresolved parent) and its child #99, the chain-config
+        // block #100 the FR8 final check requires in scope (Story 5.9, AC3),
+        // then children up to length 5 — one below `W + H = 6` (DEC-177).
         let below = w4_horizon_block();
-        bc.receive_block(below.view(), 0);
+        for block in [&w4_horizon_base(), &below] {
+            bc.receive_block(block.view(), 0);
+        }
         let tail = w4_config_anchor_block(100, below.view().hash());
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
@@ -10480,13 +10513,13 @@ mod tests {
             prev = blk.view().hash();
             bc.receive_block(blk.view(), 0);
         }
-        assert_eq!(bc.block_tree_len(), 4);
+        assert_eq!(bc.block_tree_len(), 5);
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "segment length 4 = W, below W + H = 5"
+            "segment length 5 >= W, below W + H = 6"
         );
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
-        // The 5th block brings the continuous segment to length W + H = 5 → FR2
+        // The 6th block brings the continuous segment to length W + H = 6 → FR2
         // qualifies, and the window-anchored candidate (unseeded initializers, so
         // the per-node FR6 checks are pre-seed-skipped, and every block is
         // node-#0-signed against the trust anchor) validates → Ready (Story 5.4).
@@ -10494,7 +10527,7 @@ mod tests {
         bc.receive_block(last.view(), 0);
         assert!(
             bc.is_ready(),
-            "segment length 5 >= W + H → FR2 qualifies, FR6 validates → Ready"
+            "segment length 6 >= W + H → FR2 qualifies, FR6 validates → Ready"
         );
     }
 
@@ -10599,11 +10632,13 @@ mod tests {
         let cfg = w4_config_anchor_block(1, g.view().hash());
         bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
             .expect("config admitted");
-        // A separate non-genesis branch of length W = 4 (tail seq 100 → tip 103),
-        // its tail naming the same configuration.
+        // A separate non-genesis branch of length W + H = 6 (#98 → tip 103),
+        // its window tail #100 naming the same configuration.
         let below = w4_horizon_block();
-        bc.tier1_admit(&below.view(), &below.view().hash(), 0)
-            .expect("the block below the window admitted");
+        for block in [&w4_horizon_base(), &below] {
+            bc.tier1_admit(&block.view(), &block.view().hash(), 0)
+                .expect("the blocks below the window admitted");
+        }
         let tail = w4_config_anchor_block(100, below.view().hash());
         bc.tier1_admit(&tail.view(), &tail.view().hash(), 0)
             .expect("tail admitted");
@@ -10809,15 +10844,16 @@ mod tests {
     /// Above `HEADER_SIZE`, so the configuration module accepts it, and far
     /// below the build's block capacity, so a realistic block can exceed it.
     ///
-    /// Five bytes above the larger of the test configuration block (its 29-byte
+    /// Five bytes above the larger of the test configuration block (its 32-byte
     /// content: the four-byte `W`, `H`, block-size and node-cap entries and the
-    /// one-byte scheme) and the one-entry balance block, so both fit; below the
-    /// three-entry balance block and the three-output transaction block the
-    /// fixtures exceed it with. Derived from the scheme's sizes (Story 6.17):
-    /// 220 / 231 / 284 B under `schnorr` / `bls-min-sig` / `bls-min-pk`,
-    /// against 254 / 430 / 334 B for the smaller of the two large fixtures.
+    /// one-byte scheme and support entries) and the one-entry balance block, so
+    /// both fit; below the three-entry balance block and the three-output
+    /// transaction block the fixtures exceed it with. Derived from the scheme's
+    /// sizes (Story 6.17): 223 / 231 / 287 B under `schnorr` / `bls-min-sig` /
+    /// `bls-min-pk`, against 254 / 430 / 334 B for the smaller of the two large
+    /// fixtures.
     const SMALL_BLOCK_SIZE_LIMIT: u32 = {
-        let config_block = HEADER_SIZE + 29 + SIGNATURE_SIZE;
+        let config_block = HEADER_SIZE + 32 + SIGNATURE_SIZE;
         let balance_block = HEADER_SIZE + 8 + NODE_INFO_SIZE;
         let larger = if config_block > balance_block {
             config_block
@@ -10828,6 +10864,10 @@ mod tests {
     };
 
     /// An override set declaring [`SMALL_BLOCK_SIZE_LIMIT`] and the window `w`.
+    /// It also declares `required_support = 1`: a limit this small leaves room
+    /// only for a one-signer approval evidence, and acceptance refuses a limit
+    /// below the evidence the declared threshold needs (configuration §6
+    /// check 20; the default threshold 40 needs well over a kilobyte).
     fn small_limit_config_builder(w: u32) -> ChainConfigPayloadBuilder {
         let mut builder = window_config_builder(w);
         builder
@@ -10837,6 +10877,10 @@ mod tests {
             )
             .ok()
             .expect("a four-byte literal is well-formed");
+        builder
+            .add_literal(parameter::REQUIRED_SUPPORT, &[1])
+            .ok()
+            .expect("a one-byte literal is well-formed");
         builder
     }
 
@@ -12393,40 +12437,45 @@ mod tests {
     /// once per re-qualification.
     #[test]
     fn fr2_segment_naming_no_configuration_is_not_a_candidate() {
-        // A window-anchored segment of exactly W = 4 blocks, none of them a
-        // chain-config block, on a configured node.
+        // A window-anchored segment of W + 1 = 5 blocks (#99..=#103), none of
+        // them a chain-config block, on a configured node.
         let mut bc = new_w4_chain();
-        let tail = node_transfer_block(100, 3, 99, 7);
-        bc.receive_block(tail.view(), 0);
+        let base = node_transfer_block(99, 3, 98, 7);
+        bc.receive_block(base.view(), 0);
+        let tail = linked_transfer_block(100, base.view().hash());
         let b101 = linked_transfer_block(101, tail.view().hash());
         let b102 = linked_transfer_block(102, b101.view().hash());
         let b103 = linked_transfer_block(103, b102.view().hash());
-        for blk in [&b101, &b102, &b103] {
+        for blk in [&tail, &b101, &b102, &b103] {
             bc.receive_block(blk.view(), 0);
         }
 
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "length W, but the segment names no configuration"
+            "longer than W, but the segment names no configuration"
         );
         assert!(
             bc.current_phase() == LifecyclePhase::Collecting,
             "no pass ran"
         );
-        assert_eq!(bc.block_tree_len(), 4, "nothing was deleted");
+        assert_eq!(bc.block_tree_len(), 5, "nothing was deleted");
 
         // The segment's own configuration arriving above it makes it a
         // candidate, which validates.
         let cfg = w4_config_anchor_block(104, b103.view().hash());
         bc.receive_block(cfg.view(), 0);
         assert!(bc.is_ready(), "the segment now names its configuration");
-        // Nothing was deleted for the waiting: the five-block segment is
-        // exactly `W + H`, so its Ready entry keeps #100 in the horizon (FR58,
-        // Story 6.14).
-        assert_eq!(bc.block_tree_len(), 5, "every block survived the wait");
+        // Nothing was deleted for the waiting: the six-block segment is
+        // exactly `W + H`, so its Ready entry keeps #99 and #100 in the horizon
+        // (FR58, Story 6.14).
+        assert_eq!(bc.block_tree_len(), 6, "every block survived the wait");
+        assert!(
+            bc.block_tree_contains(99, &base.view().hash()),
+            "#99 is the horizon root"
+        );
         assert!(
             bc.block_tree_contains(100, &tail.view().hash()),
-            "#100 is the horizon"
+            "#100 is in the horizon"
         );
         for blk in [&b101, &b102, &b103, &cfg] {
             let view = blk.view();
@@ -12865,8 +12914,10 @@ mod tests {
         // and 9) are inside the derived node-id range; three entries so the block
         // comfortably exceeds the stray's declared limit.
         let below = w4_horizon_block();
-        let (outcome, _) = bc.receive_block(below.view(), 0);
-        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        for block in [&w4_horizon_base(), &below] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
         let big = balance_block(
             100,
             below.view().hash(),
@@ -12898,7 +12949,7 @@ mod tests {
         );
 
         // (3) The candidate's own chain-config block completes the segment at
-        // W + H = 5 and triggers FR2.
+        // W + H = 6 and triggers FR2.
         let cfg = w4_config_anchor_block(103, b102.view().hash());
         let (outcome, _) = bc.receive_block(cfg.view(), 0);
 
@@ -13024,11 +13075,13 @@ mod tests {
     #[test]
     fn fr9_size_limit_is_reevaluated_at_the_durable_lock() {
         let mut bc = new_unconfigured_w4_chain();
-        // A five-block (`W + H`) window-anchored candidate whose own chain-config
+        // A six-block (`W + H`) window-anchored candidate whose own chain-config
         // declares a limit the balance block near its base exceeds.
         let below = w4_horizon_block();
-        let (outcome, _) = bc.receive_block(below.view(), 0);
-        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        for block in [&w4_horizon_base(), &below] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
         let big = balance_block(
             100,
             below.view().hash(),
@@ -14010,25 +14063,38 @@ mod tests {
         bc
     }
 
-    /// The block below every W4 window-anchored segment: with `H = 1` a
-    /// window-anchored join needs `W + H = 5` blocks (DEC-177), so each segment
-    /// `100..` starts one block lower, at #99, which then lies in the FR58
-    /// horizon below the window `100..=103`. A plain transfer: it carries no
-    /// essential state, so dropping it binds nothing.
+    /// The upper of the two blocks below every W4 window-anchored segment: with
+    /// `H = 2` a window-anchored join needs `W + H = 6` blocks (DEC-177), so
+    /// each segment `100..` starts two blocks lower, at #98 ([`w4_horizon_base`])
+    /// and #99, which then lie in the FR58 horizon below the window
+    /// `100..=103`. Plain transfers: they carry no essential state, so dropping
+    /// them binds nothing. Their vote names the creator, node #0, whose vote
+    /// the creator-vote reset clears in the same block, so they move no vote: a
+    /// restart that re-admits #99 from its released slot (lazy release) and
+    /// re-derives over it reaches the projection a node fed only the retained
+    /// blocks does (AC12.6, [`the_horizon_holds_only_the_active_path`]).
     fn w4_horizon_block() -> Block {
-        linked_transfer_block(99, [0xAB; 32])
+        salted_linked_block(99, w4_horizon_base().view().hash(), 0)
     }
 
-    /// A `W4Chain` that went Ready on the window-anchored segment `99..=last`
-    /// (#99 from [`w4_horizon_block`]),
+    /// The lower block below every W4 window-anchored segment, #98: the parent
+    /// of [`w4_horizon_block`], itself an orphan.
+    fn w4_horizon_base() -> Block {
+        salted_linked_block(98, [0xAB; 32], 0)
+    }
+
+    /// A `W4Chain` that went Ready on the window-anchored segment `98..=last`
+    /// (#98 and #99 from [`w4_horizon_base`] and [`w4_horizon_block`]),
     /// its tail block #100 the chain-config block the FR8 final check requires.
     /// Returns the node and the hash of each block, indexed by `seq - 100`.
     fn w4_ready_on_segment(last: u32) -> (W4Chain, [[u8; 32]; 8]) {
         let mut bc = new_w4_chain();
         let mut hashes = [[0u8; 32]; 8];
+        for below in [w4_horizon_base(), w4_horizon_block()] {
+            bc.tier1_admit(&below.view(), &below.view().hash(), 0)
+                .expect("the blocks below the window admitted");
+        }
         let below = w4_horizon_block();
-        bc.tier1_admit(&below.view(), &below.view().hash(), 0)
-            .expect("the block below the window admitted");
         let anchor = w4_config_anchor_block(100, below.view().hash());
         hashes[0] = anchor.view().hash();
         bc.tier1_admit(&anchor.view(), &hashes[0], 0)
@@ -14080,13 +14146,28 @@ mod tests {
         assert_eq!(bc.block_tree_len(), 2);
     }
 
-    /// AC2 — `W = 2`: genesis is already `W` long; the tail stays at #0 and
-    /// nothing is released.
+    /// AC2 — `W = 2` admits no verification horizon: `H` must be at least 2,
+    /// below `W` and divide it (configuration §6 checks 15 and 21, Story 6.7
+    /// D8), so neither `H = 1` nor `H = 2` is legal, and genesis refuses the
+    /// content before anything is written. (This test pinned that a `W = 2`
+    /// genesis is already `W` long and releases nothing; the smallest window
+    /// with a legal horizon is now 4, which genesis never fills.)
     #[test]
-    fn snake_genesis_at_w_two_releases_nothing() {
-        let bc = genesis_node_with_window(2);
-        assert_eq!(bc.active_snake_chain_window(), Ok((0, 1)));
-        assert_eq!(bc.block_tree_len(), 2);
+    fn snake_genesis_at_w_two_is_refused() {
+        for h in [1, 2] {
+            let (crypto, storage, chain_config) = test_backends();
+            let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+            let builder = window_horizon_config_builder(2, h);
+            assert!(
+                matches!(
+                    bc.process_genesis(1_000_000_000, builder.content()),
+                    Err(GenesisRejectReason::InitialChainConfigRejected)
+                ),
+                "W = 2, H = {h} is refused"
+            );
+            assert_eq!(bc.block_tree_len(), 0, "nothing was written");
+            assert!(!bc.chain_config.is_durable_locked());
+        }
     }
 
     /// Story 6.17 D10 (DEC-252) — genesis founds a chain only on the build's own
@@ -14141,13 +14222,14 @@ mod tests {
         );
     }
 
-    /// AC2 — `W = 1` admits no verification horizon (`1 ≤ H < W` is empty,
-    /// DEC-207), so genesis refuses the content before anything is written.
+    /// AC2 — `W = 1` admits no verification horizon (`2 ≤ H < W` is empty,
+    /// DEC-207, Story 6.7 D8), so genesis refuses the content before anything
+    /// is written.
     #[test]
     fn snake_genesis_at_w_one_is_refused() {
         let (crypto, storage, chain_config) = test_backends();
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
-        let builder = window_config_builder(1);
+        let builder = window_horizon_config_builder(1, 1);
         assert!(matches!(
             bc.process_genesis(1_000_000_000, builder.content()),
             Err(GenesisRejectReason::InitialChainConfigRejected)
@@ -14168,7 +14250,7 @@ mod tests {
         let mut prev = genesis.view().hash();
         bc.tier1_admit(&genesis.view(), &prev, 0)
             .expect("genesis admitted");
-        for seq in 1..=5 {
+        for seq in 1..=6 {
             let cfg = w4_config_anchor_block(seq, prev);
             prev = cfg.view().hash();
             bc.tier1_admit(&cfg.view(), &prev, 0)
@@ -14176,8 +14258,8 @@ mod tests {
         }
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready());
-        assert_eq!(bc.active_snake_chain_window(), Ok((2, 5)));
-        assert_eq!(bc.block_tree_len(), 5, "W blocks and H = 1 below them");
+        assert_eq!(bc.active_snake_chain_window(), Ok((3, 6)));
+        assert_eq!(bc.block_tree_len(), 6, "W blocks and H = 2 below them");
         assert!(bc.blocks.get(0).is_none(), "#0 left the horizon: released");
         let root = bc.blocks.get(1).expect("#1 in the horizon");
         assert_eq!(root.sequence(), 1);
@@ -14185,24 +14267,26 @@ mod tests {
         assert!(root.is_on_active_chain());
         assert_eq!(bc.horizon_root(), 1);
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
-        assert_eq!(tail.parent_ref(), 1, "the tail stays linked to the horizon");
+        assert_eq!(tail.sequence(), 3);
+        assert_eq!(tail.parent_ref(), 2, "the tail stays linked to the horizon");
         assert!(tail.is_on_active_chain());
         assert!(!bc.chain_heads.has_stored_head());
     }
 
     /// AC10.3; Story 6.14 AC6 — Ready entry on a window-anchored segment of
-    /// exactly `W + H` releases nothing: the window is `100..=103` and #99 is
-    /// the horizon.
+    /// exactly `W + H` releases nothing: the window is `100..=103` and #98 and
+    /// #99 are the horizon.
     #[test]
     fn snake_ready_entry_on_exactly_w_plus_h_releases_nothing() {
         let (bc, _) = w4_ready_on_segment(103);
         assert_eq!(bc.active_snake_chain_window(), Ok((100, 103)));
-        assert_eq!(bc.block_tree_len(), 5);
+        assert_eq!(bc.block_tree_len(), 6);
         let below = w4_horizon_block();
+        assert!(slot_of(&bc, 99, &below.view().hash()).is_some(), "#99 kept");
         assert_eq!(
             Some(bc.horizon_root()),
-            slot_of(&bc, 99, &below.view().hash()),
-            "#99 is the root"
+            slot_of(&bc, 98, &w4_horizon_base().view().hash()),
+            "#98 is the root"
         );
         // O-024: the adopted chain's head is Connected, not a Stored head still
         // asking for the anchor's parent.
@@ -14230,16 +14314,23 @@ mod tests {
         let b105 = w4_config_anchor_block(105, b104.view().hash());
         extend_active_head(&mut bc, &b105, 0);
         assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
+        assert!(
+            bc.node_info.is_seed_source(slot_100),
+            "#100 is still in the horizon (H = 2) and keeps the pointer"
+        );
+        let b106 = w4_config_anchor_block(106, b105.view().hash());
+        extend_active_head(&mut bc, &b106, 0);
+        assert_eq!(bc.active_snake_chain_window(), Ok((103, 106)));
         assert!(slot_of(&bc, 100, &h[0]).is_none(), "#100 left the horizon");
         assert!(bc.node_info.is_seeded(1), "the node stays seeded");
         assert!(bc.node_info.key_is_registered(&key));
         assert!(!bc.node_info.is_seed_source(slot_100));
-        // #105 took #99's freed slot; the next admission reuses #100's.
-        assert_eq!(slot_of(&bc, 105, &b105.view().hash()), Some(slot_99));
-        let orphan = node_transfer_block(107, 3, 106, 7);
+        // #106 took #99's freed slot; the next admission reuses #100's.
+        assert_eq!(slot_of(&bc, 106, &b106.view().hash()), Some(slot_99));
+        let orphan = node_transfer_block(108, 3, 107, 7);
         let (outcome, _) = bc.receive_block(orphan.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(slot_of(&bc, 107, &orphan.view().hash()), Some(slot_100));
+        assert_eq!(slot_of(&bc, 108, &orphan.view().hash()), Some(slot_100));
         assert_eq!(
             classify_tail_drop(&bc.blocks, &bc.node_info, slot_100),
             Ok(TailObligation::None),
@@ -14302,23 +14393,24 @@ mod tests {
         (s_tail, released, obligation, binding)
     }
 
-    /// The AC10.4 drive (Story 6.14): from the window `100..=103` with #99 in
-    /// the horizon (`W = 4`, `H = 1`), two head extensions. Only forks inside
-    /// FR58's bound can arrive (`S_new > S_head − H`): before the first, a fork
-    /// off #102, two blocks deep; before the second, a fork off #103; after
-    /// it, a fork off #104. Returns the trace, the node, and the hashes
-    /// `[#102 fork, its child, #103 fork, #104 fork, #104]`.
+    /// The AC10.4 drive (Story 6.14): from the window `100..=103` with #98 and
+    /// #99 in the horizon (`W = 4`, `H = 2`), two head extensions. Only forks
+    /// inside FR58's bound can arrive (`S_new > S_head − H`), each forking at
+    /// the deepest point the bound admits: before the first, a fork off #101,
+    /// two blocks deep; before the second, a fork off #102; after it, a fork
+    /// off #103. Returns the trace, the node, and the hashes
+    /// `[#101 fork, its child, #102 fork, #103 fork, #104]`.
     fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [[u8; 32]; 5]) {
         let (mut bc, h) = w4_ready_on_segment(103);
-        let fork_a = salted_linked_block(103, h[2], 5);
-        let fork_a_child = salted_linked_block(104, fork_a.view().hash(), 5);
+        let fork_a = salted_linked_block(102, h[1], 5);
+        let fork_a_child = salted_linked_block(103, fork_a.view().hash(), 5);
         for blk in [&fork_a, &fork_a_child] {
             admit_fork(&mut bc, blk, now);
         }
         // Dropping #100 (chain-config) needs a chain-config extension (FR49).
         let b104 = w4_config_anchor_block(104, h[3]);
         let first = drive_step(&mut bc, &b104, now);
-        let fork_b = salted_linked_block(104, h[3], 8);
+        let fork_b = salted_linked_block(103, h[2], 8);
         admit_fork(&mut bc, &fork_b, now);
         assert!(!bc.chain_heads.has_stored_head(), "every fork is Connected");
         // A Ready projection is complete (Story 6.0 D3): this segment seeds no
@@ -14326,7 +14418,7 @@ mod tests {
         let b105 = w4_config_anchor_block(105, b104.view().hash());
         let second = drive_step(&mut bc, &b105, now);
         // A fork inside the bound (`A = S_head − H`) is kept.
-        let keep = salted_linked_block(105, b104.view().hash(), 6);
+        let keep = salted_linked_block(104, h[3], 6);
         admit_fork(&mut bc, &keep, now);
         (
             [first, second],
@@ -14349,11 +14441,13 @@ mod tests {
     /// branch inside the bound is kept, and nothing is left asking for a parent.
     #[test]
     fn snake_drive_past_w() {
-        let (h, slot_99, slot_100, slot_101) = {
+        let (h, slot_98, slot_99, slot_100, slot_101) = {
             let (bc, h) = w4_ready_on_segment(103);
+            let lowest = w4_horizon_base();
             let below = w4_horizon_block();
             (
                 h,
+                slot_of(&bc, 98, &lowest.view().hash()),
                 slot_of(&bc, 99, &below.view().hash()),
                 slot_of(&bc, 100, &h[0]),
                 slot_of(&bc, 101, &h[1]),
@@ -14381,41 +14475,48 @@ mod tests {
         );
         assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
 
-        // The horizon keeps #101, the block the window dropped last; #99 and
-        // #100 left the horizon and were released.
+        // The horizon keeps #100 and #101, the blocks the window dropped; #98
+        // and #99 left the horizon and were released.
+        let lowest = w4_horizon_base();
         let below = w4_horizon_block();
+        assert!(slot_of(&bc, 98, &lowest.view().hash()).is_none());
         assert!(slot_of(&bc, 99, &below.view().hash()).is_none());
-        assert!(slot_of(&bc, 100, &h[0]).is_none());
+        assert!(slot_98.is_some(), "precondition: #98 was retained at entry");
         assert!(slot_99.is_some(), "precondition: #99 was retained at entry");
-        let root_idx = slot_of(&bc, 101, &h[1]).expect("#101 in the horizon");
+        let root_idx = slot_of(&bc, 100, &h[0]).expect("#100 in the horizon");
         assert_eq!(bc.horizon_root(), root_idx);
         let root = bc.blocks.get(root_idx).expect("root");
         assert_eq!(root.parent_ref(), NONE_REF, "unlinked from the freed slot");
         assert!(root.is_on_active_chain(), "D1: the horizon keeps the flag");
         assert_eq!(root.status(), BlockStatus::Active);
+        let upper_idx = slot_of(&bc, 101, &h[1]).expect("#101 in the horizon");
+        let upper = bc.blocks.get(upper_idx).expect("#101");
+        assert_eq!(upper.parent_ref(), root_idx);
+        assert!(upper.is_on_active_chain(), "D1: the horizon keeps the flag");
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
         assert_eq!(tail.sequence(), 102);
-        assert_eq!(tail.parent_ref(), root_idx, "the tail stays linked");
+        assert_eq!(tail.parent_ref(), upper_idx, "the tail stays linked");
 
-        // FR58: the branch forked at #102 left the bound with #104's
-        // extension; the one forked at #103 with #105's.
-        assert!(slot_of(&bc, 103, &fork_a).is_none(), "#102 fork deleted");
+        // FR58: the branch forked at #101 left the bound with #104's
+        // extension; the one forked at #102 with #105's.
+        assert!(slot_of(&bc, 102, &fork_a).is_none(), "#101 fork deleted");
         assert!(
-            slot_of(&bc, 104, &fork_a_child).is_none(),
+            slot_of(&bc, 103, &fork_a_child).is_none(),
             "with its descendant"
         );
-        assert!(slot_of(&bc, 104, &fork_b).is_none(), "#103 fork deleted");
-        let keep_idx = slot_of(&bc, 105, &keep).expect("in-bound fork retained");
-        let b104_idx = slot_of(&bc, 104, &b104).expect("#104");
+        assert!(slot_of(&bc, 103, &fork_b).is_none(), "#102 fork deleted");
+        let keep_idx = slot_of(&bc, 104, &keep).expect("in-bound fork retained");
+        let b103_idx = slot_of(&bc, 103, &h[3]).expect("#103");
         assert_eq!(
             bc.blocks.get(keep_idx).map(|e| e.parent_ref()),
-            Some(b104_idx),
-            "still attached to #104"
+            Some(b103_idx),
+            "still attached to #103, the bound"
         );
+        assert!(slot_of(&bc, 104, &b104).is_some(), "#104");
         assert_eq!(
             bc.block_tree_len(),
-            6,
-            "#101 in the horizon, #102..#105, and the #104 fork"
+            7,
+            "#100 and #101 in the horizon, #102..#105, and the #103 fork"
         );
 
         // No head is left asking for a parent.
@@ -14423,7 +14524,7 @@ mod tests {
         assert_eq!(
             bc.chain_heads.count(),
             2,
-            "the active head and the #104 fork"
+            "the active head and the #103 fork"
         );
         let (outcome, _) = bc.on_tick(u64::MAX / 2);
         assert!(!matches!(
@@ -14450,7 +14551,9 @@ mod tests {
             "precondition: the Collecting bootstrap anchor"
         );
         let below = w4_horizon_block();
-        bc.receive_block(below.view(), 0);
+        for block in [&w4_horizon_base(), &below] {
+            bc.receive_block(block.view(), 0);
+        }
         let anchor = w4_config_anchor_block(100, below.view().hash());
         bc.receive_block(anchor.view(), 0);
         let mut prev = anchor.view().hash();
@@ -14465,7 +14568,7 @@ mod tests {
             slot_of(&bc, 0, &genesis.view().hash()).is_none(),
             "island reclaimed"
         );
-        assert_eq!(bc.block_tree_len(), 5, "#99..#103");
+        assert_eq!(bc.block_tree_len(), 6, "#98..#103");
         assert_eq!(bc.chain_heads.count(), 1, "only the active head");
         assert!(!bc.chain_heads.has_stored_head());
     }
@@ -14479,9 +14582,9 @@ mod tests {
     #[test]
     fn snake_extension_reclaims_fragments_that_can_never_connect() {
         let (mut bc, h) = w4_ready_on_segment(103);
-        // After the extension, S_head − H = 103.
-        let stale = node_transfer_block(104, 3, 103, 7); // q = 103
-        let alive = node_transfer_block(105, 3, 104, 7); // q = 104
+        // After the extension, S_head − H = 102.
+        let stale = node_transfer_block(103, 3, 102, 7); // q = 102
+        let alive = node_transfer_block(104, 3, 103, 7); // q = 103
         for blk in [&stale, &alive] {
             let (outcome, _) = bc.receive_block(blk.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
@@ -14495,10 +14598,10 @@ mod tests {
         assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
 
         assert!(
-            slot_of(&bc, 104, &stale.view().hash()).is_none(),
+            slot_of(&bc, 103, &stale.view().hash()).is_none(),
             "stale fragment deleted"
         );
-        let alive_idx = slot_of(&bc, 105, &alive.view().hash()).expect("may still connect");
+        let alive_idx = slot_of(&bc, 104, &alive.view().hash()).expect("may still connect");
         let stored_after: [Option<u32>; 4] =
             core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
         assert_eq!(
@@ -14508,6 +14611,8 @@ mod tests {
         );
         assert!(stored_after.contains(&Some(alive_idx)));
         // The active chain and the horizon are untouched by the reclamation.
+        let below = w4_horizon_block();
+        assert!(slot_of(&bc, 99, &below.view().hash()).is_some(), "#99 kept");
         for (i, seq) in (100..=104).enumerate() {
             let hash = if seq == 104 { b104.view().hash() } else { h[i] };
             assert!(slot_of(&bc, seq, &hash).is_some(), "active #{seq} kept");
@@ -14552,7 +14657,7 @@ mod tests {
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
-            "below S_tail — a block at the just-released sequence #100"
+            "below S_tail — a block at #100, the horizon's sequence"
         );
         let (outcome, _) = bc.receive_block(node_transfer_block(108, 3, 107, 7).view(), 0);
         assert_eq!(
@@ -14613,11 +14718,11 @@ mod tests {
     #[test]
     fn snake_restart_rereleases_a_resurrected_tail_block() {
         let (bc, h) = w4_ready_on_segment(104);
-        assert_eq!(bc.block_tree_len(), 5);
-        let below = w4_horizon_block();
+        assert_eq!(bc.block_tree_len(), 6);
+        let lowest = w4_horizon_base();
         assert!(
-            slot_of(&bc, 99, &below.view().hash()).is_none(),
-            "#99 released"
+            slot_of(&bc, 98, &lowest.view().hash()).is_none(),
+            "#98 released"
         );
         let storage = bc.storage;
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
@@ -14630,10 +14735,15 @@ mod tests {
         restarted.initialize_from_storage(500);
         assert!(restarted.is_ready());
         assert_eq!(restarted.active_snake_chain_window(), Ok((101, 104)));
-        assert_eq!(restarted.block_tree_len(), 5);
-        assert!(slot_of(&restarted, 99, &below.view().hash()).is_none());
-        let root = slot_of(&restarted, 100, &h[0]).expect("#100 in the horizon");
+        assert_eq!(restarted.block_tree_len(), 6);
+        assert!(slot_of(&restarted, 98, &lowest.view().hash()).is_none());
+        let below = w4_horizon_block();
+        let root = slot_of(&restarted, 99, &below.view().hash()).expect("#99 in the horizon");
         assert_eq!(restarted.horizon_root(), root);
+        assert!(
+            slot_of(&restarted, 100, &h[0]).is_some(),
+            "#100 in the horizon"
+        );
     }
 
     // --- Story 6.8: ADR-016 sequence-indexed UTXO input -----------------------
@@ -15472,11 +15582,14 @@ mod tests {
     #[test]
     fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
         let mut bc = new_unconfigured_w4_chain();
-        // The block below the window (`W + H`, DEC-177) is a one-entry balance
-        // block, within the small limit; #100 repeats its snapshot.
-        let below = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
-        let (outcome, _) = bc.receive_block(below.view(), 0);
-        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        // The two blocks below the window (`W + H`, DEC-177) are one-entry
+        // balance blocks, within the small limit; #100 repeats their snapshot.
+        let lowest = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
+        let below = balance_block(99, lowest.view().hash(), &[(3, 0, 0, 0x33)], 3);
+        for block in [&lowest, &below] {
+            let (outcome, _) = bc.receive_block(block.view(), 0);
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+        }
         let base = balance_block(100, below.view().hash(), &[(3, 0, 0, 0x33)], 3);
         let one = utxo_tx(101, &[], None, &[Ok(5)]);
         let b101 = complex_tx_block(101, base.view().hash(), 3, 0, &[&one]);
@@ -15484,7 +15597,7 @@ mod tests {
         let b102 = complex_tx_block(102, b101.view().hash(), 3, 0, &[&three]);
         let cfg =
             chain_config_block_from(103, b102.view().hash(), &mut small_limit_config_builder(W4));
-        for small in [&below, &base, &b101, &cfg] {
+        for small in [&lowest, &below, &base, &b101, &cfg] {
             assert!(small.len() <= SMALL_BLOCK_SIZE_LIMIT as usize);
         }
         assert!(b102.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
@@ -16940,7 +17053,7 @@ mod tests {
     }
 
     /// The window-anchored W4 segment `100..=103` with the values 2 (the
-    /// chain-config anchor), 3, 5, 7, Ready through FR3, above `H = 1` plain
+    /// chain-config anchor), 3, 5, 7, Ready through FR3, above `H = 2` plain
     /// blocks (the horizon). Returns the node and the four blocks.
     fn valued_w4() -> (W4Chain, [Block; 4]) {
         valued_w4_h(test_horizon(W4))
@@ -19625,8 +19738,8 @@ mod tests {
     }
 
     /// AC8 / AC12.9 (DEC-177) — on a window-anchored candidate with `a = 99`
-    /// and `H = 1`, node #3's vote is seeded by its first entry at or after
-    /// #100: before it, its forged header at #101 is auto-accepted and the
+    /// and `H = 2`, node #3's vote is seeded by its first entry at or after
+    /// #101 (the entry at #102): before it, its forged header at #101 is auto-accepted and the
     /// D9 vote compare is skipped; after it, its forged header at #103 is
     /// judged and refused.
     #[test]
@@ -19676,13 +19789,13 @@ mod tests {
 
     /// AC5 / AC12.5 (DEC-208) — Ready intake refuses a block at `S_new ≤ S_head
     /// − H` as Out-of-Snake-Chain-Window and stores nothing: a late child of a
-    /// window block and a late child of the horizon block. A re-sent horizon
+    /// window block and a late child of a horizon block. A re-sent horizon
     /// block is already known; a fork inside the bound is admitted.
     #[test]
     fn ready_intake_refuses_blocks_outside_the_switch_bound() {
         let (mut bc, h) = w4_ready_on_segment(103);
         let len = bc.block_tree_len();
-        let late = salted_linked_block(102, h[1], 9);
+        let late = salted_linked_block(101, h[0], 9);
         let below = w4_horizon_block();
         let under = salted_linked_block(100, below.view().hash(), 9);
         for blk in [&late, &under] {
@@ -19696,7 +19809,7 @@ mod tests {
             bc.receive_block(below.view(), 0).0,
             ReceiveBlockOutcome::DuplicateKnown
         );
-        let fork = salted_linked_block(103, h[2], 9);
+        let fork = salted_linked_block(102, h[1], 9);
         admit_fork(&mut bc, &fork, 0);
         assert_eq!(bc.block_tree_len(), len + 1);
     }
@@ -19728,7 +19841,7 @@ mod tests {
     #[test]
     fn the_horizon_holds_only_the_active_path() {
         let (_, bc, _) = drive_past_w(1_000);
-        assert_horizon_is_the_active_path(&bc, 1);
+        assert_horizon_is_the_active_path(&bc, 2);
 
         let storage = bc.storage;
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
@@ -19741,7 +19854,7 @@ mod tests {
         restarted.initialize_from_storage(500);
         assert!(restarted.is_ready());
         assert_eq!(restarted.active_snake_chain_window(), Ok((102, 105)));
-        assert_horizon_is_the_active_path(&restarted, 1);
+        assert_horizon_is_the_active_path(&restarted, 2);
 
         // AC12.6 — the restarted node's projections equal a fresh node's fed
         // the same retained blocks.
@@ -19812,16 +19925,17 @@ mod tests {
 
     /// AC4 / AC12.4 / AC5 (DEC-211, DEC-208) — a switch on a window-anchored
     /// node may undo the balance block that seeded nodes in its FR3 pass: the
-    /// head #102 floor-seeds node #4 and vote-seeds node #3 (`a = 98`, `H = 1`,
-    /// #3 floor-seeded at #98). The undo is identity on the values, so the
+    /// head #102 floor-seeds node #4 and vote-seeds node #3 (`a = 97`, `H = 2`,
+    /// #3 floor-seeded at #97). The undo is identity on the values, so the
     /// switched node ends where a node that joined the new chain directly ends
     /// — the ground truth, since a fresh pass on honest blocks is (Story 6.0's
     /// FR3 equivalence). A forged twin of the winner is refused by the replay
-    /// and leaves the node exactly as it was; the winner arrives as a two-block
-    /// branch, and the commit's sweep deletes the demoted head.
+    /// and leaves the node exactly as it was; the winner arrives as a
+    /// three-block branch, and the commit's sweep deletes the demoted head.
     #[test]
     fn a_switch_undoes_seed_points_as_identity() {
-        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 4);
+        let lowest = balance_block(97, [0xAB; 32], &[(3, 0, 0, 0x33)], 4);
+        let floor = balance_block(98, lowest.view().hash(), &[(3, 0, 0, 0x33)], 4);
         let cfg = w4_config_anchor_block(99, floor.view().hash());
         let early = headed(
             100,
@@ -19838,7 +19952,7 @@ mod tests {
         let seed = balance_block(102, b101.view().hash(), &entries, 4);
         let joiner = || {
             let mut bc = new_w4_chain();
-            for blk in [&floor, &cfg, &early, &b101, &seed] {
+            for blk in [&lowest, &floor, &cfg, &early, &b101, &seed] {
                 assert_eq!(
                     bc.receive_block(blk.view(), 0).0,
                     ReceiveBlockOutcome::AcceptedSilently
@@ -19871,7 +19985,7 @@ mod tests {
 
         // The ground truth: a node that joins the new chain directly.
         let mut direct = new_w4_chain();
-        for blk in [&floor, &cfg, &early, &b101, &f102] {
+        for blk in [&lowest, &floor, &cfg, &early, &b101, &f102] {
             assert_eq!(
                 direct.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
@@ -19885,10 +19999,17 @@ mod tests {
             1,
         );
         extend_active_head(&mut direct, &f103, 0);
+        let f104 = real_on(
+            &direct,
+            &w4_config_anchor_block(104, f103.view().hash()),
+            0,
+            1,
+        );
+        extend_active_head(&mut direct, &f104, 0);
 
-        // The two-block branch, orphan first: the switch goes to #103 across
-        // both seed points.
-        for blk in [&f103, &f102] {
+        // The three-block branch, orphan first: the switch goes to #104
+        // across both seed points.
+        for blk in [&f104, &f103, &f102] {
             assert_eq!(
                 j.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
@@ -19896,7 +20017,7 @@ mod tests {
         }
         assert_eq!(
             j.blocks.get(j.active_chain_head_idx).map(|e| *e.hash()),
-            Some(f103.view().hash()),
+            Some(f104.view().hash()),
             "switched across the seed points"
         );
         assert!(
@@ -19923,21 +20044,52 @@ mod tests {
         );
         let b105 = w4_config_anchor_block(105, b104.view().hash());
         extend_active_head(&mut bc, &b105, 0);
+        assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
+        assert_eq!(
+            bc.blocks.utxo_available(slot_100, 0),
+            Some(true),
+            "still in the horizon (H = 2)"
+        );
+        let b106 = w4_config_anchor_block(106, b105.view().hash());
+        extend_active_head(&mut bc, &b106, 0);
         assert!(slot_of(&bc, 100, &h[0]).is_none(), "#100 left the horizon");
         assert_ne!(bc.blocks.utxo_available(slot_100, 0), Some(true));
     }
 
     /// AC12.2 — the configured `H` reaches the bound: the same late block is
-    /// refused at `H = 1` and admitted at `H = 2`.
+    /// refused at `H = 2` and admitted at `H = 3`. `W = 4` admits only
+    /// `H = 2` (configuration §6 check 21: `H ≥ 2` divides `W`), and 6 is the
+    /// smallest window with two legal horizons, so the pair runs on a genesis
+    /// chain of `TestChain`, whose capacity holds it: the head is #5 and the
+    /// late block a child of #2, at `S_new = S_head − 2`.
     #[test]
     fn the_configured_horizon_reaches_the_bound() {
         for (h, expected) in [
-            (1, ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)),
-            (2, ReceiveBlockOutcome::AcceptedSilently),
+            (2, ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)),
+            (3, ReceiveBlockOutcome::AcceptedSilently),
         ] {
-            let (mut bc, [_, b101, _, _]) = valued_w4_h(h);
-            let late = salted_linked_block(102, b101.view().hash(), 9);
-            assert_eq!(bc.receive_block(late.view(), 0).0, expected, "H = {h}");
+            let (crypto, storage, chain_config) = test_backends();
+            let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+            let genesis = bc
+                .process_genesis(CURRENCY, window_horizon_config_builder(6, h).content())
+                .ok()
+                .expect("genesis succeeds");
+            let mut prev = genesis.block_one.view().hash();
+            let mut at_two = prev;
+            for seq in 2..=5 {
+                let blk = transfer(seq, prev, 0, 7);
+                assert_eq!(
+                    receive(&mut bc, &blk),
+                    ReceiveBlockOutcome::AcceptedSilently
+                );
+                prev = blk.view().hash();
+                if seq == 2 {
+                    at_two = prev;
+                }
+            }
+            assert_eq!(head_of(&bc), (5, prev));
+            let late = transfer(3, at_two, 0, 8);
+            assert_eq!(receive(&mut bc, &late), expected, "H = {h}");
         }
     }
 
@@ -19946,13 +20098,17 @@ mod tests {
     #[test]
     fn ready_entry_reclaims_a_deep_fork() {
         let mut bc = new_w4_chain();
+        let lowest = w4_horizon_base();
         let below = w4_horizon_block();
         let anchor = w4_config_anchor_block(100, below.view().hash());
         let b101 = linked_transfer_block(101, anchor.view().hash());
         let b102 = linked_transfer_block(102, b101.view().hash());
         let b103 = linked_transfer_block(103, b102.view().hash());
         let deep = salted_linked_block(101, anchor.view().hash(), 5);
-        admit_all(&mut bc, &[&below, &anchor, &b101, &deep, &b102, &b103]);
+        admit_all(
+            &mut bc,
+            &[&lowest, &below, &anchor, &b101, &deep, &b102, &b103],
+        );
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready());
         assert_eq!(
@@ -19963,7 +20119,7 @@ mod tests {
             bc.blocks.find(101, &deep.view().hash()).is_none(),
             "forked at #100 ≤ S_head − H − 1"
         );
-        assert_eq!(bc.block_tree_len(), 5);
+        assert_eq!(bc.block_tree_len(), 6);
         assert_eq!(bc.chain_heads.count(), 1);
     }
 
@@ -19993,7 +20149,8 @@ mod tests {
     /// past the switch (a horizon release): the joiner's head, window, root,
     /// tree size, values and the two nodes' derived state.
     fn switch_across_a_vote_seed(now: u64) -> (W4Chain, [u8; 32]) {
-        let floor = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
+        let lowest = balance_block(97, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
+        let floor = balance_block(98, lowest.view().hash(), &[(3, 0, 0, 0x33)], 3);
         let cfg = w4_config_anchor_block(99, floor.view().hash());
         let early = headed(
             100,
@@ -20010,7 +20167,7 @@ mod tests {
         let replay = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
         let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
         let mut bc = new_w4_chain();
-        for blk in [&floor, &cfg, &early, &b101, &seed, &f102] {
+        for blk in [&lowest, &floor, &cfg, &early, &b101, &seed, &f102] {
             assert_eq!(
                 bc.receive_block(blk.view(), now).0,
                 ReceiveBlockOutcome::AcceptedSilently
@@ -20038,16 +20195,15 @@ mod tests {
         assert_eq!(a.active_branch_value, b.active_branch_value);
         assert!(a.node_info == b.node_info);
         assert!(a.vote_engine == b.vote_engine);
+        let lowest = balance_block(97, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
         assert!(
-            a.blocks
-                .find(
-                    98,
-                    &balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 3)
-                        .view()
-                        .hash()
-                )
-                .is_none(),
-            "#98 left the horizon"
+            a.blocks.find(97, &lowest.view().hash()).is_none(),
+            "#97 left the horizon"
+        );
+        let floor = balance_block(98, lowest.view().hash(), &[(3, 0, 0, 0x33)], 3);
+        assert!(
+            a.blocks.find(98, &floor.view().hash()).is_some(),
+            "#98 is still in the horizon (H = 2)"
         );
     }
 
@@ -20842,21 +20998,26 @@ mod tests {
     }
 
     /// Story 6.6 AC6 / D6 pin (flipped from 6.4's M5) — FR12's replay
-    /// completion is anchored at `p`: on `W = 7` the chain `0..=6` is full once
+    /// completion is anchored at `p`: on `W = 8` the chain `0..=7` is full once
     /// `x` lands and the next extension would drop #0, node #0's seed source,
-    /// but `x` at #6 itself drops nothing, so it is endorsed.
+    /// but `x` at #7 itself drops nothing, so it is endorsed. (`W = 7`, which
+    /// needed no block #6, has no legal horizon: configuration §6 check 21.)
     #[test]
     fn support_ignores_an_obligation_due_above_the_deviation() {
         set_grace_admits(true);
-        let (g, mut l, blocks) = support_chain_on(3, local_storage(3), 7, |_| {});
-        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let (mut g, mut l, blocks) = support_chain_on(3, local_storage(3), 8, |_| {});
+        let b6 = normal_after(&g, &blocks[5], 1, 2);
+        for node in [&mut g, &mut l] {
+            assert_eq!(receive(node, &b6), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let x = deviation_after(&g, &b6, 4, 1);
         assert!(support_for(&mut l, &x).is_some());
-        assert_eq!(head_of(&l), (6, x.view().hash()), "x is active");
+        assert_eq!(head_of(&l), (7, x.view().hash()), "x is active");
         set_grace_admits(false);
     }
 
     /// AC9 — `p + H ≤ S_head` after the head advanced in the same call: `x`
-    /// arrives after its seven descendants (`H = 7` on these `W = 16`
+    /// arrives after its eight descendants (`H = 8` on these `W = 16`
     /// chains), which the drive promotes behind it, so `x` is out of the
     /// switch bound by the time it is evaluated.
     #[test]
@@ -20865,7 +21026,7 @@ mod tests {
         let (mut g, mut l, blocks) = support_chain(3);
         let x = deviation_after(&g, &blocks[5], 4, 1);
         let _ = receive(&mut g, &x);
-        let mut descendants = core::array::from_fn::<Option<Block>, 7, _>(|_| None);
+        let mut descendants = core::array::from_fn::<Option<Block>, 8, _>(|_| None);
         let mut prev_hash = x.view().hash();
         for (i, slot) in descendants.iter_mut().enumerate() {
             let seq = 7 + i as u32;
@@ -20885,7 +21046,7 @@ mod tests {
             );
         }
         assert_eq!(support_for(&mut l, &x), None);
-        assert_eq!(head_of(&l).0, 13, "the drive promoted the descendants");
+        assert_eq!(head_of(&l).0, 14, "the drive promoted the descendants");
         set_grace_admits(false);
     }
 
@@ -21045,7 +21206,7 @@ mod tests {
         set_grace_admits(false);
     }
 
-    /// The Story 6.4 chain on `W = 8` (`H = 1`) carried past genesis, so its
+    /// The Story 6.4 chain on `W = 8` (`H = 2`) carried past genesis, so its
     /// tail has advanced: [`support_chain_on`]'s `b0..=a5`, then `a6` (node 2,
     /// one credit for node 3), `a7` (node 5, one for node 2), `r8` (node #0's
     /// balance replay of node #0, dropping #0), `r9` (node 3's chain-config
@@ -21497,9 +21658,9 @@ mod tests {
         );
     }
 
-    /// AC7 test 3 — at `p + H ≤ S_head` (W = 8, H = 1, `d` at 12, its
-    /// creator's block at 13) the subgroup half is deferred, while the
-    /// watermark and the evidence half still run.
+    /// AC7 test 3 — at `p + H ≤ S_head` (W = 8, H = 2, `d` at 12, its
+    /// creator's block at 13, the top's at 14) the subgroup half is deferred,
+    /// while the watermark and the evidence half still run.
     #[test]
     fn a_deep_deviation_defers_only_the_subgroup_half() {
         let (mut g, mut r, blocks) = long_support_chain(2);
@@ -21508,7 +21669,13 @@ mod tests {
         let _ = receive(&mut g, &d);
         let y = normal_after(&g, &d, 4, 2);
         assert_eq!(receive(&mut r, &y), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(head_of(&r).0, 13);
+        let _ = receive(&mut g, &y);
+        // `H = 2` (Story 6.7 D8): one more block, by the top at 13, puts
+        // `p + H` at the head.
+        let top = g.vote_engine.top_creator().expect("a top creator");
+        let z = normal_after(&g, &y, top, 3);
+        assert_eq!(receive(&mut r, &z), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&r).0, 14);
         let h = d.view().hash();
         // `u` (node 1) is outside `A'`: accepted only because (iv-b) defers.
         assert_eq!(
@@ -22205,10 +22372,10 @@ mod tests {
         let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
         assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
         let mut prev = d;
-        for salt in 0..7 {
-            if salt == 6 {
-                // Head 12: `p + H = 13 > 12`, the last head that opens.
-                assert_eq!(head_of(&l).0, 12);
+        for salt in 0..8 {
+            if salt == 7 {
+                // Head 13: `p + H = 14 > 13`, the last head that opens.
+                assert_eq!(head_of(&l).0, 13);
                 assert!(l.open_approval(d_idx), "the boundary control");
                 l.approval.clear();
             }
@@ -22223,7 +22390,7 @@ mod tests {
             );
             prev = next;
         }
-        assert_eq!(head_of(&l).0, 13);
+        assert_eq!(head_of(&l).0, 14);
         // `F` followed `S_head − H` to 6: reset it, so only the bound refuses.
         l.non_conflict = NonConflictRing::new();
         assert_refused(&mut l, d_idx, "p + H ≤ S_head");
@@ -22780,9 +22947,9 @@ mod tests {
             ApprovalStep::Replay,
             "any obligation kind"
         );
-        // D6 cap while incomplete: a replay at 13 would close `p = 6` (`H = 7`).
-        assert_eq!(l.approval_step(11, seed, 0, delay), ApprovalStep::Replay);
-        assert_eq!(l.approval_step(12, seed, 0, delay), ApprovalStep::Hold);
+        // D6 cap while incomplete: a replay at 14 would close `p = 6` (`H = 8`).
+        assert_eq!(l.approval_step(12, seed, 0, delay), ApprovalStep::Replay);
+        assert_eq!(l.approval_step(13, seed, 0, delay), ApprovalStep::Hold);
 
         let member = l.approval.members()[1];
         assert_eq!(
@@ -22800,7 +22967,7 @@ mod tests {
             "an unreadable tail is never taken as no obligation"
         );
         assert_eq!(
-            l.approval_step(12, seed, 0, delay),
+            l.approval_step(13, seed, 0, delay),
             ApprovalStep::Replay,
             "cap lifted"
         );
@@ -22816,7 +22983,7 @@ mod tests {
             accumulate(&mut l, &d, d_idx, if complete { 2 } else { 1 });
             assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
             let mut prev = d;
-            for salt in 0..7 {
+            for salt in 0..8 {
                 let next = normal_after(&g, &prev, 5, 10 + salt);
                 assert_eq!(
                     receive(&mut g, &next),
@@ -22828,7 +22995,7 @@ mod tests {
                 );
                 prev = next;
             }
-            assert_eq!(head_of(&l).0, 13);
+            assert_eq!(head_of(&l).0, 14);
             assert!(l.non_conflict.floor() >= 6, "F passed p");
             assert_eq!(l.approval_live(), complete);
             let tip = l.active_chain_head_idx;
@@ -22836,15 +23003,21 @@ mod tests {
         }
     }
 
-    /// AC9 test 8 — the ordering pin: on `W = 7` the evidence on `d@6` would
+    /// AC9 test 8 — the ordering pin: on `W = 8` the evidence on `d@7` would
     /// drop #0, node #0's seed source, without its replay; a Ready node refuses
     /// it (Story 9.1's binding), and `approval_step` asks for the replay first.
+    /// (`W = 7`, which put `d` at 6, has no legal horizon: configuration §6
+    /// check 21; node 1's normal block `b6` fills the extra window slot.)
     #[test]
     fn an_evidence_over_an_obligated_drop_is_refused() {
-        let (mut g, mut l, blocks) = support_chain_on(4, local_storage(4), 7, |_| {});
-        let d = deviation_after(&g, &blocks[5], 4, 1);
+        let (mut g, mut l, blocks) = support_chain_on(4, local_storage(4), 8, |_| {});
+        let b6 = normal_after(&g, &blocks[5], 1, 2);
+        for node in [&mut g, &mut l] {
+            assert_eq!(receive(node, &b6), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let d = deviation_after(&g, &b6, 4, 1);
         assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
-        let d_idx = l.blocks.find(6, &d.view().hash()).expect("held");
+        let d_idx = l.blocks.find(7, &d.view().hash()).expect("held");
         accumulate(&mut l, &d, d_idx, 2);
         let zero = l.blocks.find(0, &blocks[0].view().hash()).expect("#0");
         let obligation = classify_tail_drop(&l.blocks, &l.node_info, zero);
@@ -22856,7 +23029,7 @@ mod tests {
                 .deviation_replay_insertion_delay_ms(),
         );
         assert_eq!(
-            l.approval_step(6, obligation, 0, delay),
+            l.approval_step(7, obligation, 0, delay),
             ApprovalStep::Replay,
             "the replay comes first"
         );
@@ -22867,7 +23040,7 @@ mod tests {
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
             "Tier 3: the drop of #0 is not preserved"
         );
-        assert_eq!(head_of(&g), (6, d.view().hash()));
+        assert_eq!(head_of(&g), (7, d.view().hash()));
     }
 
     type FailingSupportStorage = FailingReadStorage<{ 16 * MAX_BLOCK_SIZE + 8000 }>;
