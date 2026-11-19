@@ -256,7 +256,6 @@ impl StorageTrait for CorruptSlotsStorage {
 
     fn load_control_data(&mut self) -> Result<ControlPlaneData, StorageError> {
         Ok(ControlPlaneData {
-            private_key: [1u8; PRIVATE_KEY_SIZE],
             own_node_id: 0,
             init_params: [0u8; INIT_PARAMS_SIZE],
             chain_configuration: None,
@@ -298,7 +297,6 @@ impl StorageTrait for BlockWriteFailsStorage {
 
     fn load_control_data(&mut self) -> Result<ControlPlaneData, StorageError> {
         Ok(ControlPlaneData {
-            private_key: [1u8; PRIVATE_KEY_SIZE],
             own_node_id: 0,
             init_params: [0u8; INIT_PARAMS_SIZE],
             chain_configuration: None,
