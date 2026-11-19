@@ -20975,6 +20975,72 @@ mod tests {
         assert_eq!(fresh.active_branch_value, restarted.active_branch_value);
     }
 
+    /// AC12.6 (Story 6.14) on an FR50-complete projection (Story 6.7): a
+    /// released block below the horizon (#98) that moves node 3's vote, and a
+    /// restart that re-admits it from its intact slot and derives over it,
+    /// still give a fresh node's projection — node 3's latest seed source
+    /// (#102) lies in the window, as FR50 keeps every registered node's, so
+    /// both seed it there and nothing below it reaches the head. (The shared
+    /// W6 segment seeds only node #0; there an unseeded node's inexact vote
+    /// depends on the anchor, which is why its blocks below the window move
+    /// no vote.)
+    #[test]
+    fn a_restart_equals_a_fresh_node_once_every_vote_is_seeded() {
+        let b97 = salted_linked_block(97, [0xAB; 32], 0);
+        let b98 = salted_linked_block(98, b97.view().hash(), 3);
+        let b99 = salted_linked_block(99, b98.view().hash(), 0);
+        let mut bc = new_w6_chain();
+        for below in [&b97, &b98, &b99] {
+            bc.tier1_admit(&below.view(), &below.view().hash(), 0)
+                .expect("below the window");
+        }
+        let mut prev = w6_config_anchor_block(100, b99.view().hash());
+        bc.tier1_admit(&prev.view(), &prev.view().hash(), 0)
+            .expect("anchor");
+        for seq in 101..=105 {
+            let blk = if seq == 102 {
+                balance_block(seq, prev.view().hash(), &[(0, 0, 0, 1), (3, 0, 0, 1)], 9)
+            } else {
+                linked_transfer_block(seq, prev.view().hash())
+            };
+            bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
+                .expect("segment block");
+            prev = blk;
+        }
+        bc.drive_dominant_chain_acquisition();
+        assert!(bc.is_ready());
+        assert!(bc.node_info.is_seeded(3), "node 3 is seeded at #102");
+        for seq in [106, 107] {
+            let next = w6_extension(&bc, seq, prev.view().hash());
+            extend_active_head(&mut bc, &next, 0);
+            prev = next;
+        }
+        assert_eq!(bc.active_snake_chain_window(), Ok((102, 107)));
+
+        let storage = bc.storage;
+        let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+        let chain_config = empty_chain_config(W6Chain::BUILD_LIMITS);
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot = core::mem::MaybeUninit::uninit();
+        W6Chain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut restarted = unsafe { slot.assume_init() };
+        restarted.initialize_from_storage(500);
+        assert!(restarted.is_ready());
+
+        let mut fresh = new_w6_chain();
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        for idx in 0..16u32 {
+            if let Some(view) = restarted.view_retained(idx, &mut buf) {
+                fresh.receive_block(view, 0);
+            }
+        }
+        assert!(fresh.is_ready());
+        assert_same_nodes(&fresh, &restarted);
+        assert!(fresh.vote_engine == restarted.vote_engine);
+        assert_eq!(fresh.active_branch_value, restarted.active_branch_value);
+    }
+
     /// Compares two W6 nodes node by node (all 16) and block by block: the
     /// derived state a chain switch must leave exactly as a fresh pass does.
     /// Seed sources are compared by the block they name, not by slot.
