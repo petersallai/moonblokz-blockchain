@@ -30,9 +30,9 @@ use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
 };
 use moonblokz_crypto::{
-    AggregatedSignatureTrait, CryptoTrait, MAX_AGGREGATED_SIGNATURES, MULTI_SIGNATURE_SIZE,
-    MultiSignature, MultiSignatureTrait, PUBLIC_KEY_SIZE, PublicKey, PublicKeyTrait,
-    SIGNATURE_SIZE, SignatureTrait,
+    AggregatedSignature, AggregatedSignatureTrait, CryptoTrait, MAX_AGGREGATED_SIGNATURES,
+    MULTI_SIGNATURE_SIZE, MultiSignature, MultiSignatureTrait, PUBLIC_KEY_SIZE, PublicKey,
+    PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
 };
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
@@ -45,7 +45,7 @@ use crate::approval::{
 };
 use crate::available_utxo::utxo_output_at;
 use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
-use crate::branch_value::{Rank, block_value};
+use crate::branch_value::{Rank, block_value, value_cap};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
 use crate::lifecycle::is_legal_transition;
@@ -649,6 +649,32 @@ pub(crate) enum ValidationReason {
     /// replay — evaluated in the FR3 pass wherever the dropped block lies in
     /// the segment (Story 6.14 AC9, DEC-204).
     TailDropUnpreserved,
+    /// FR16 / FR27 (Story 6.7 AC4 rule 1): a block above an open deviation run
+    /// whose creator is not the deviation's creator.
+    RunCreator,
+    /// I-11 / FR27 (AC4 rule 2): a block above an open deviation run not in
+    /// override form (`first_voted_node == creator`, `consumed_votes == 0`).
+    RunHeader,
+    /// FR27 (AC4 rule 3): an approval evidence block that does not close an
+    /// open run by its creator, or names another deviation sequence.
+    EvidencePlacement,
+    /// FR27 (AC4 rule 4, D1): a run's non-evidence block above `p + H − 1`, or
+    /// its evidence block above `p + H`.
+    RunBound,
+    /// FR48 clean slot (AC4 rule 5, D8): a block at `s ≡ H − 1 (mod H)` that
+    /// is not clean.
+    SlotNotClean,
+    /// FR6 / FR12 / ADR-015 (Story 6.7 AC5): the evidence's `m`, its signer
+    /// count against `r_eff`, or a signer outside the subgroup at `p − 1`.
+    EvidenceSubgroup,
+    /// FR21 / DEC-216 (AC5): `supporter_vote_sum` is not `B_k − cv(d)`.
+    EvidenceVoteSum,
+    /// DEC-184 (AC5): the late-node list is not the prefix that fits, in
+    /// creator order at `p − 1`, or a listed vote is not its value at the tip.
+    EvidenceLateList,
+    /// FR6 / FR27 (AC5, D6): the aggregated signature does not verify over the
+    /// support content against the signers' keys in rank order.
+    EvidenceAggregate,
 }
 
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass
@@ -673,6 +699,20 @@ struct Projection {
     /// none: ids are contiguous, so every node from it on was registered here
     /// and its vote (0 at registration) is exact.
     first_segment_registration: u32,
+    /// Story 6.7 D4: rules 1–4 of an open deviation run are trusted below
+    /// this sequence while the run state is unknown. A window-anchored pass
+    /// sets `a + H` (its anchor `a` may sit inside a run begun below it, and a
+    /// run is at most `H` long); a deviation-form or evidence block settles
+    /// the state and clears it. 0 otherwise.
+    run_unknown_below: u32,
+    /// Story 6.7: the sequence of the active-set counter's window tail — the
+    /// physical tail in Ready, a chain switch's virtual one on the walk — the
+    /// bottom of the `A`-at-`p − 1` correction (AC5); `u32::MAX` where the
+    /// counter is not kept (the FR3 pass, genesis).
+    counter_tail: u32,
+    /// Story 6.7 D5: the earliest block `a` of a window-anchored FR3 pass, for
+    /// the evidence's window condition `p − W ≥ a`; 0 otherwise.
+    anchor: u32,
 }
 
 impl Projection {
@@ -683,6 +723,9 @@ impl Projection {
         saw_balance_block: true,
         vote_seed_from: 0,
         first_segment_registration: u32::MAX,
+        run_unknown_below: 0,
+        counter_tail: u32::MAX,
+        anchor: 0,
     };
 }
 
@@ -765,6 +808,10 @@ enum PrePass {
 /// seed-source scan (Story 6.3 AC2).
 const MAX_BALANCE_ENTRIES: usize = MAX_PAYLOAD_SIZE / NODE_INFO_SIZE;
 
+/// [`Blockchain`]'s `active_open_run` when the applied head is not inside an
+/// open deviation run (Story 6.7 D4). No block has sequence `u32::MAX` (FR53).
+const NO_OPEN_RUN: u32 = u32::MAX;
+
 /// FR36(b): the transaction-fee total the per-block step credited to the
 /// block's creator, recomputed from the payload for the committed-block undo
 /// (Story 6.3 AC2) — the sums of `apply_transaction` / `apply_complex`, whose
@@ -838,6 +885,159 @@ fn is_evidence(err: &ProcessingError) -> bool {
         ProcessingError::StorageRead
         | ProcessingError::MissingBlock
         | ProcessingError::MarkOverflow => false,
+    }
+}
+
+/// Story 6.7 D4: the open deviation run after `block` is applied on top of a
+/// head whose run state is `run` (a deviation's `p`, or [`NO_OPEN_RUN`]). A
+/// deviation-form block (`creator ≠ first_voted_node`) opens a run at its own
+/// sequence; an evidence block (`payload_type == 4`) closes it; any other block
+/// leaves it as it was (the run rules have already refused every block that
+/// may not extend an open run).
+fn run_after(run: u32, block: &BlockView<'_>) -> u32 {
+    if block.creator() != block.first_voted_node() {
+        block.sequence()
+    } else if block.payload_type() == PAYLOAD_TYPE_APPROVAL {
+        NO_OPEN_RUN
+    } else {
+        run
+    }
+}
+
+/// The exact inverse of [`run_after`] for the committed `block` being undone:
+/// no deviation starts inside an open run, so undoing one leaves no run; an
+/// evidence block names the run it closed, which undoing it reopens.
+fn run_before(run: u32, block: &BlockView<'_>) -> u32 {
+    if block.creator() != block.first_voted_node() {
+        NO_OPEN_RUN
+    } else if block.payload_type() == PAYLOAD_TYPE_APPROVAL {
+        ApprovalView::from_payload(block.payload())
+            .map_or(NO_OPEN_RUN, |evidence| evidence.deviation_sequence())
+    } else {
+        run
+    }
+}
+
+/// The result of [`Blockchain::vote_projection`] (Story 6.7 AC8): the engine
+/// was read and restored, nothing was read (restored, byte-identical), or the
+/// restore failed (the caller escalates it at its root, DEC-205).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Projected {
+    Done,
+    Refused,
+    RestoreFailed,
+}
+
+/// DEC-216's value at `p − 1`, shared by the builder (6.6) and the evidence
+/// check (6.7 AC8): `B_k = r_eff · Σ (grown(av(n)) + vote_scale)` over the
+/// proposer and every registered node (`0..=last_node`, the same range on
+/// every node at the same chain position) ranked above it, minus `cv(d)`,
+/// with checked arithmetic; and `k`, the number of nodes ranked above the
+/// proposer (`u` included). `None` on an engine refusal, an overflow, or `k =
+/// 0`. The caller checks that `u` heads the order.
+fn deviation_sum<const MAX_NODES: usize>(
+    engine: &VoteEngine<MAX_NODES>,
+    last_node: u32,
+    proposer: u32,
+    vote_scale: u64,
+    r_eff: u64,
+    cv_d: u32,
+) -> Option<(u64, u32)> {
+    let mut sum = 0u64;
+    let mut k = 0u32;
+    for n in 0..=last_node {
+        let above = engine.ranks_above(n, proposer);
+        if n != proposer && !above {
+            continue;
+        }
+        let grown = engine.grown(engine.accumulated_vote_of(n)).ok()?;
+        sum = sum.checked_add(u64::from(grown) + vote_scale)?;
+        k += u32::from(above);
+    }
+    if k == 0 {
+        return None;
+    }
+    sum.checked_mul(r_eff)?
+        .checked_sub(u64::from(cv_d))
+        .map(|value| (value, k))
+}
+
+/// DEC-184's late node: ranked above the proposer at `p − 1`, other than `u`.
+fn is_late<const MAX_NODES: usize>(
+    engine: &VoteEngine<MAX_NODES>,
+    n: u32,
+    proposer: u32,
+    u: u32,
+) -> bool {
+    n != u && engine.ranks_above(n, proposer)
+}
+
+/// Story 6.7 AC4 rules 1–5 for `block` on a parent whose open run is `run`
+/// (`(p, creator of d)`, or `None`) under the verification horizon `h` (the
+/// locked configuration's; `None` without one, when rules 4 and 5 cannot be
+/// judged and are skipped).
+fn run_rules(
+    block: &BlockView<'_>,
+    run: Option<(u32, u32)>,
+    h: Option<u32>,
+) -> Result<(), ValidationReason> {
+    let is_evidence = block.payload_type() == PAYLOAD_TYPE_APPROVAL;
+    match run {
+        None if is_evidence => return Err(ValidationReason::EvidencePlacement),
+        None => {}
+        Some((p, creator_d)) => {
+            if block.creator() != creator_d {
+                return Err(ValidationReason::RunCreator);
+            }
+            if block.first_voted_node() != block.creator() || block.consumed_votes() != 0 {
+                return Err(ValidationReason::RunHeader);
+            }
+            if is_evidence
+                && ApprovalView::from_payload(block.payload())
+                    .is_none_or(|evidence| evidence.deviation_sequence() != p)
+            {
+                return Err(ValidationReason::EvidencePlacement);
+            }
+            if let Some(h) = h {
+                // Replays end by `p + H − 1`, the evidence by `p + H` (D1).
+                let last = u64::from(p) + u64::from(h) - u64::from(!is_evidence);
+                if u64::from(block.sequence()) > last {
+                    return Err(ValidationReason::RunBound);
+                }
+            }
+        }
+    }
+    slot_rule(block, h)
+}
+
+/// Story 6.7 AC4 rule 5 (D8, DEC-265): a block at `s ≡ H − 1 (mod H)` is
+/// clean — an approval evidence block, or a transaction block with no
+/// registration and no UTXO output (a balance output leaves no obligation) — so its drop off the tail never carries an
+/// obligation. Configuration §6 check 21 makes the block a slot drops a slot
+/// itself and keeps genesis #0 / #1 off the slots.
+fn slot_rule(block: &BlockView<'_>, h: Option<u32>) -> Result<(), ValidationReason> {
+    let Some(h) = h.filter(|&h| h > 1) else {
+        return Ok(());
+    };
+    if block.sequence() % h != h - 1 {
+        return Ok(());
+    }
+    let clean = match block.payload_type() {
+        PAYLOAD_TYPE_APPROVAL => true,
+        PAYLOAD_TYPE_TRANSACTION => block.transactions().is_some_and(|txs| {
+            txs.iter().all(|tx| {
+                tx.as_registration().is_none()
+                    && tx
+                        .as_complex()
+                        .is_none_or(|cx| cx.outputs().all(|output| output.as_utxo().is_none()))
+            })
+        }),
+        _ => false,
+    };
+    if clean {
+        Ok(())
+    } else {
+        Err(ValidationReason::SlotNotClean)
     }
 }
 
@@ -1017,6 +1217,21 @@ pub struct Blockchain<
     // supports for the local node's own deviation, one at a time. Non-durable;
     // cleared by a re-entry to collecting and the FR5 recovery.
     approval: ApprovalAccumulator,
+    // FR27 open deviation run at the applied head (Story 6.7 D4, DEC-261): the
+    // sequence `p` of the deviation block whose run is open there, or
+    // `NO_OPEN_RUN`. 4 B. Kept at event time from the bytes of each block the
+    // per-block step commits and each committed block undone, so the Ready
+    // direct extension, the stored child, the FR23 walk and the FR3 pass read
+    // the run state below the block they judge without a storage read. Its
+    // inverse is exact by the run rules: no deviation starts inside a run (so
+    // undoing `d` leaves `NO_OPEN_RUN`), and an evidence block names its `p`.
+    // Reset by a re-entry to collecting, the FR5 recovery and a new pass.
+    active_open_run: u32,
+    // Story 6.7 AC5 / AC8: a vote projection inside the per-block step could
+    // not restore the engine (6.3's `RestoreFailed`, DEC-205). The step gives
+    // no verdict; the root re-enters collecting at the end of its call, never
+    // from inside the step or a switch. 1 B.
+    reentry_due: bool,
     // No completeness horizon (Story 6.14 D6, DEC-211, withdrawing DEC-167):
     // a balance entry is a snapshot of its node at its position, so the undo
     // of a seed is identity on the values, and every state below it follows
@@ -1245,6 +1460,8 @@ impl<
                 Prng::new(prng_seed).derive_subseed(DEDUPE_SALT_LABEL),
             ));
             ApprovalAccumulator::init(field_slot(&raw mut (*p).approval));
+            (&raw mut (*p).active_open_run).write(NO_OPEN_RUN);
+            (&raw mut (*p).reentry_due).write(false);
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -1292,6 +1509,8 @@ impl<
                 Prng::new(prng_seed).derive_subseed(DEDUPE_SALT_LABEL),
             ),
             approval: ApprovalAccumulator::new(),
+            active_open_run: NO_OPEN_RUN,
+            reentry_due: false,
         }
     }
 
@@ -2390,6 +2609,26 @@ impl<
                 None => false,
             };
 
+        // Story 6.7 AC4 (D4): outside Ready, a block whose parent is held is
+        // judged against the FR27 run rules now, before the write — they read
+        // only the block and its ancestry. Rules 4 and 5 read the
+        // configuration, so they wait for the lock (a tentative one may not be
+        // the chain's; the FR3 pass judges them). In Ready the direct
+        // extension's step and a side block's Tier 2 check judge them.
+        if self.lifecycle_phase != LifecyclePhase::Ready
+            && let Some(q) = parent
+            && let Ok(run) = self.deviation_run_at(q)
+        {
+            let h = if self.chain_config.is_durable_locked() {
+                self.verification_horizon()
+            } else {
+                None
+            };
+            if run_rules(block, run, h).is_err() {
+                return Err(AdmitError::Rejected(Tier1Failure::DeviationRun));
+            }
+        }
+
         // Peek the slot; the entry and the durable write both land there
         // (`persist` reconstructs the owned `Block` the storage seam takes).
         let idx = self.blocks.next_free_index().ok_or(AdmitError::TableFull)?;
@@ -2596,10 +2835,15 @@ impl<
         );
 
         if let Some(advance) = promote {
-            self.promote_head_extension(idx, block_value(block), block.creator(), advance);
+            self.promote_head_extension(
+                idx,
+                block_value::<MAX_NODES>(block),
+                block.creator(),
+                advance,
+            );
         }
         if side_judged && let Some(p) = parent {
-            self.connect_judged_side_block(idx, p, block_value(block), parent_value);
+            self.connect_judged_side_block(idx, p, block_value::<MAX_NODES>(block), parent_value);
         }
         Ok(idx)
     }
@@ -2715,6 +2959,13 @@ impl<
         // `chain_heads` and the active chain under them.
         if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
             self.compare_and_switch([admitted, driver_best], now);
+        }
+        // Story 6.7 AC8: an evidence check whose vote projection could not
+        // restore the engine (a transient read fault) left it unusable; the
+        // re-entry runs here, at the root, after the step and any switch.
+        if self.reentry_due {
+            self.reentry_due = false;
+            self.reenter_after_failed_restore(now);
         }
         // Story 6.4 (FR12, D3): support is decided once, here, on the state
         // the node now holds, and replaces `AcceptedSilently` only in the
@@ -2902,29 +3153,19 @@ impl<
 
     /// AC6's RAM half: an accumulator is open, `d` is held (its index is the
     /// result), its parent is the active block at `p − 1` inside the window,
-    /// and, only while incomplete, `p > F` and `p + H > S_head` (D6: a
-    /// complete package may be carried past the bound by its own replays).
-    ///
-    /// `p > F` is checked with the bound, not always: `F` is raised to `S_head
-    /// − H` at every evaluation, so an unconditional `p > F` would void D6's
-    /// lift. Its DEC-214 part, the ready-entry floor, was checked at open and
-    /// cannot rise past `p` while the accumulator lives: only a new ready
-    /// entry raises it that way, and the re-entry before it clears this.
+    /// `p > F` and `p + H > S_head`, complete or not (Story 6.7 D1, DEC-258:
+    /// the run bound withdrew DEC-240's lift, so a package is never carried
+    /// past `p + H`, and DEC-239's complete-package floor exemption with it).
     fn approval_live_ram(&self) -> Option<u32> {
         let (p, hash) = self.approval.deviation()?;
         let d_idx = self.blocks.find(p, hash)?;
         let parent = self.blocks.get(d_idx)?.parent_ref();
-        if !self.approval_parent_holds(p, parent) {
+        if !self.approval_parent_holds(p, parent) || p <= self.non_conflict.floor() {
             return None;
         }
-        if !self.approval.is_complete() {
-            if p <= self.non_conflict.floor() {
-                return None;
-            }
-            let s_head = self.blocks.get(self.active_chain_head_idx)?.sequence();
-            if p.checked_add(self.verification_horizon()?)? <= s_head {
-                return None;
-            }
+        let s_head = self.blocks.get(self.active_chain_head_idx)?.sequence();
+        if p.checked_add(self.verification_horizon()?)? <= s_head {
+            return None;
         }
         Some(d_idx)
     }
@@ -2947,14 +3188,30 @@ impl<
             return false;
         };
         let (p, parent) = (entry.sequence(), entry.parent_ref());
-        self.holds_evidence_at(p) != Some(true)
+        !self.holds_own_evidence(d_idx, p)
+            && self.holds_evidence_at(p) != Some(true)
             && u.is_none_or(|u| {
                 self.creator_block_at(parent, p, u, [d_idx, d_idx], true) != Some(true)
             })
     }
 
-    /// Story 6.6 AC6 — whether a validated evidence block (`payload_type` 4,
-    /// on the active chain or signature-verified) names a deviation at `p`:
+    /// Story 6.7 AC10 (D3) — whether a held evidence block descends from the
+    /// local deviation at `d_idx` (sequence `p`): RAM only. The AC4 rules admit
+    /// above `d` only its creator's blocks, and the first evidence closes the
+    /// run, so any such block is the proposer's own evidence (also as a side
+    /// block, while a heavier approval-less sibling is the head): the release.
+    fn holds_own_evidence(&self, d_idx: u32, p: u32) -> bool {
+        (0..MAX_BLOCKS as u32).any(|idx| {
+            self.blocks.get(idx).is_some_and(|entry| {
+                entry.payload_type() == PAYLOAD_TYPE_APPROVAL
+                    && entry.sequence() > p
+                    && self.ancestor_at(idx, p).ok().flatten() == Some(d_idx)
+            })
+        })
+    }
+
+    /// Story 6.6 AC6, Story 6.7 D3 — whether a validated evidence block
+    /// (`payload_type` 4, on the active chain) names a deviation at `p`:
     /// a RAM scan of the block table, then one read per candidate. `None` when
     /// none does but a read failed: the discard counts it as not held, the
     /// emission as held.
@@ -2964,10 +3221,13 @@ impl<
             let Some(entry) = self.blocks.get(idx) else {
                 continue;
             };
-            // The evidence extends the deviation's branch, so it lies above `p`.
+            // The evidence extends the deviation's branch, so it lies above `p`;
+            // only an active evidence block counts (Story 6.7 D3, DEC-260): it
+            // passed Tier 3 (or the pass's trust) and descends from the active
+            // `p − 1`.
             if entry.payload_type() != PAYLOAD_TYPE_APPROVAL
                 || entry.sequence() <= p
-                || (!entry.is_on_active_chain() && !entry.is_signature_verified())
+                || !entry.is_on_active_chain()
             {
                 continue;
             }
@@ -3472,8 +3732,14 @@ impl<
             return Some(false);
         }
         let mut returned = [false; MAX_NODES];
-        let Some(returning_d) =
-            self.parent_set_correction(p, above, w, creator_d, &mut returned)?
+        let Some(returning_d) = self.parent_set_correction(
+            self.active_chain_head_idx,
+            p,
+            self.physical_counter_tail(),
+            w,
+            creator_d,
+            &mut returned,
+        )?
         else {
             return Some(false);
         };
@@ -3497,28 +3763,30 @@ impl<
     }
 
     /// The `A`-at-`p − 1` correction (6.4 D2), shared by every `A'` computation
-    /// (6.4 emission, 6.5 intake, 6.6 open): the `above` active blocks in `[p,
-    /// S_head]`, all by `creator_d`, leave the window again, and the blocks they
-    /// dropped (`[p − W, S_head − W]`, in the horizon, one read each) return.
-    /// Their creators are marked in `returned`; the count of `creator_d`'s
-    /// returning blocks is the result. `Some(None)`: a returning creator id
-    /// beyond this build's capacity, chain data, so no member; `None`: a failed
-    /// read, local, not evaluable.
+    /// (6.4 emission, 6.5 intake, 6.6 open, 6.7 evidence): the active blocks
+    /// in `[p, tip]`, all by `creator_d`, leave the window again (the caller's
+    /// `above`), and the blocks that left the counter's window since `p − 1` —
+    /// `[p − W, counter_tail − 1]`, measured from the counter's actual tail
+    /// (the physical one in Ready, a chain switch's virtual one on the walk;
+    /// Story 6.7 AC8), in the horizon, one read each — return. Their creators
+    /// are marked in `returned`; the count of `creator_d`'s returning blocks
+    /// is the result. `Some(None)`: a returning creator id beyond this build's
+    /// capacity, chain data, so no member; `None`: a failed read, local, not
+    /// evaluable.
     fn parent_set_correction(
         &self,
+        tip: u32,
         p: u32,
-        above: u32,
+        counter_tail: u32,
         w: u32,
         creator_d: u32,
         returned: &mut [bool; MAX_NODES],
     ) -> Option<Option<u32>> {
-        let head = self.active_chain_head_idx;
-        let s_head = p + above - 1;
         let mut returning_d = 0u32;
-        if let Some(last) = s_head.checked_sub(w) {
+        if let Some(last) = counter_tail.checked_sub(1) {
             for sequence in p.saturating_sub(w)..=last {
                 let creator = self
-                    .ancestor_at(head, sequence)
+                    .ancestor_at(tip, sequence)
                     .ok()
                     .flatten()
                     .and_then(|idx| self.header_at(idx))
@@ -3612,7 +3880,14 @@ impl<
             creator_above
         };
         let mut returned = [false; MAX_NODES];
-        let returning = self.parent_set_correction(p, above, w, creator_above, &mut returned)??;
+        let returning = self.parent_set_correction(
+            self.active_chain_head_idx,
+            p,
+            self.physical_counter_tail(),
+            w,
+            creator_above,
+            &mut returned,
+        )??;
         let a_prime = APrime {
             proposer: creator_d,
             u,
@@ -3621,14 +3896,42 @@ impl<
             returning_d: returning,
             returned: &returned,
         };
+        let m = self.rank_subgroup(
+            &a_prime,
+            p,
+            parent,
+            creator_d,
+            configuration.required_support(),
+            out,
+        )?;
+        Some((p, hash, m))
+    }
+
+    /// The ranked subgroup core (ADR-015), shared by the proposer's open (6.6)
+    /// and the evidence check (6.7 AC8): over `A'` (`a_prime`, at `p − 1`),
+    /// `m = subgroup_size(required_support, |A'|)` and the `m` smallest node
+    /// values under the seed of `(p, the currency after parent, proposer)`, in
+    /// rank order (ascending value) into `out`. `None` when `A'` is empty. One
+    /// pass by bounded insertion into a transient `[u64; MAX_SUBGROUP]` in its
+    /// own frame.
+    #[inline(never)]
+    fn rank_subgroup(
+        &self,
+        a_prime: &APrime<'_, MAX_NODES>,
+        p: u32,
+        parent: u32,
+        proposer: u32,
+        required_support: u8,
+        out: &mut [u32; MAX_SUBGROUP],
+    ) -> Option<usize> {
         let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
         let member = |n: &u32| a_prime.contains(&self.active_set, *n);
         let eligible = (0..=last_node).filter(member).count() as u32;
-        let m = subgroup_size(configuration.required_support(), eligible)? as usize;
+        let m = subgroup_size(required_support, eligible)? as usize;
         if m > MAX_SUBGROUP {
             return None;
         }
-        let seed = subgroup_seed(p, self.circulating_currency_at(parent), creator_d);
+        let seed = subgroup_seed(p, self.circulating_currency_at(parent), proposer);
         let mut values = [u64::MAX; MAX_SUBGROUP];
         let mut len = 0usize;
         for n in (0..=last_node).filter(member) {
@@ -3648,7 +3951,15 @@ impl<
             // The low word of a node value is its id (ADR-015).
             *slot = *value as u32;
         }
-        Some((p, hash, m))
+        Some(m)
+    }
+
+    /// The sequence of the physical window tail, the active-set counter's
+    /// tail in Ready (0 before a window exists).
+    fn physical_counter_tail(&self) -> u32 {
+        self.blocks
+            .get(self.snake_chain_tail_idx)
+            .map_or(0, |entry| entry.sequence())
     }
 
     /// Whether `parent` is the active block at `p − 1` inside the window: the
@@ -3687,14 +3998,35 @@ impl<
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build_evidence_block(&mut self, tip_idx: u32, now: u64) -> Option<Block> {
         let d_idx = self.approval_live_ram()?;
-        let (cv_d, u) = self.deviation_votes(d_idx)?;
+        let (_, u, cv_d) = self.header_votes_at(d_idx)?;
         if !self.approval.is_complete() || !self.approval_live_reads_with(d_idx, Some(u)) {
             return None;
         }
-        let p = self.blocks.get(d_idx)?.sequence();
+        let (p, direct) = {
+            let d = self.blocks.get(d_idx)?;
+            (d.sequence(), d.is_on_active_chain())
+        };
         let tip = self.blocks.get(tip_idx)?;
         let (tip_seq, tip_hash) = (tip.sequence(), *tip.hash());
         if self.ancestor_at(tip_idx, p).ok()? != Some(d_idx) {
+            return None;
+        }
+        // The engine stands at the active head: a direct-case tip is the head.
+        if direct && tip_idx != self.active_chain_head_idx {
+            return None;
+        }
+        // Story 6.7 (AC10, AC11): no evidence on `d ..= tip` yet (the run is
+        // closed by the first one; the proposer's own side evidence included),
+        // and the evidence fits the run bound `p + H` (D1).
+        let mut cur = tip_idx;
+        while cur != NONE_REF && cur != d_idx {
+            let entry = self.blocks.get(cur)?;
+            if entry.payload_type() == PAYLOAD_TYPE_APPROVAL {
+                return None;
+            }
+            cur = entry.parent_ref();
+        }
+        if u64::from(tip_seq) + 1 > u64::from(p) + u64::from(self.verification_horizon()?) {
             return None;
         }
         let configuration = self.chain_config.active_configuration()?;
@@ -3735,7 +4067,9 @@ impl<
         // the late values at the tip.
         let late_at = fixed;
         let mut late_count = 0usize;
-        let projected = self.vote_projection(d_idx, tip_idx, now, |bc, at_tip| {
+        let local = self.local_node_id;
+        let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
+        let projected = self.vote_projection(d_idx, tip_idx, local, direct, |bc, at_tip| {
             let engine = &bc.vote_engine;
             let slot = |i: usize| late_at + APPROVAL_LATE_ENTRY_SIZE * i;
             let id_at = |payload: &[u8], i: usize| {
@@ -3758,33 +4092,22 @@ impl<
                 }
                 return true;
             }
-            // At `p − 1`: `u` heads the order; the proposer's rank `k`;
-            // DEC-216's `B_k = h · Σ_{j=0..k} (grown(av(n_j)) + vote_scale)`,
-            // `h = r_eff`; the late nodes are the ranks above the proposer but
-            // `u`, kept in creator order by bounded insertion.
-            let local = bc.local_node_id;
+            // At `p − 1`: `u` heads the order; DEC-216's value (shared with
+            // the evidence check, Story 6.7 AC8); the late nodes, the ranks
+            // above the proposer but `u`, kept in creator order by bounded
+            // insertion.
             if engine.top_creator() != Some(u) {
                 return false;
             }
-            let mut sum = 0u64;
-            let mut k = 0u32;
-            for n in 0..MAX_NODES as u32 {
-                let above = engine.ranks_above(n, local);
-                if n != local && !above {
+            let Some((supporter_vote_sum, _)) =
+                deviation_sum(engine, last_node, local, vote_scale, r_eff as u64, cv_d)
+            else {
+                return false;
+            };
+            for n in 0..=last_node {
+                if !is_late(engine, n, local, u) {
                     continue;
                 }
-                let Ok(grown) = engine.grown(engine.accumulated_vote_of(n)) else {
-                    return false;
-                };
-                let Some(next) = sum.checked_add(u64::from(grown) + vote_scale) else {
-                    return false;
-                };
-                sum = next;
-                if !above || n == u {
-                    k += u32::from(above);
-                    continue;
-                }
-                k += 1;
                 if late_count == late_room
                     && (late_room == 0 || !engine.ranks_above(n, id_at(payload, late_room - 1)))
                 {
@@ -3798,34 +4121,23 @@ impl<
                 payload[slot(at)..slot(at) + 4].copy_from_slice(&n.to_le_bytes());
                 late_count = (late_count + 1).min(late_room);
             }
-            let supporter_vote_sum = (k > 0)
-                .then(|| sum.checked_mul(r_eff as u64))
-                .flatten()
-                .and_then(|b_k| b_k.checked_sub(u64::from(cv_d)));
-            let Some(supporter_vote_sum) = supporter_vote_sum else {
-                return false;
-            };
             payload[..APPROVAL_DEVIATION_SEQUENCE_OFFSET]
                 .copy_from_slice(&supporter_vote_sum.to_le_bytes());
             true
         });
-        if !projected {
-            return None;
+        match projected {
+            Projected::Done => {}
+            Projected::Refused => return None,
+            Projected::RestoreFailed => {
+                self.reenter_after_failed_restore(now);
+                return None;
+            }
         }
         payload[late_count_at..fixed].copy_from_slice(&(late_count as u16).to_le_bytes());
         builder
             .approval_payload_mut(fixed + APPROVAL_LATE_ENTRY_SIZE * late_count)
             .ok()?;
         builder.build_signed(&self.crypto).ok()
-    }
-
-    /// AC7 — the `consumed_votes` and `first_voted_node` (`u`) of the
-    /// deviation at `idx`; `None` on a failed read. Its own read buffer.
-    #[inline(never)]
-    fn deviation_votes(&self, idx: u32) -> Option<(u32, u32)> {
-        let mut buf = [0u8; MAX_BLOCK_SIZE];
-        self.view_retained(idx, &mut buf)
-            .map(|view| (view.consumed_votes(), view.first_voted_node()))
     }
 
     /// AC7 (D1, D2, DEC-194) — aggregates the held supports, in ascending
@@ -3882,56 +4194,64 @@ impl<
         })
     }
 
-    /// Story 6.6 AC7 (D4, DEC-238) — the scoped in-place rewind of the live
-    /// vote engine for the deviation `d` at `d_idx` and its branch tip
-    /// `tip_idx`: `step(self, false)` reads the engine at `p − 1`, then
-    /// `step(self, true)` at the tip, and the engine is restored before this
-    /// returns. No copy of the engine is made, and no caller can leave it
-    /// rewound. Story 6.7 (an incoming evidence's Tier 3) and Story 8.5 (the
-    /// sibling's `cv` / `cvf`) reuse it.
+    /// Story 6.6 AC7 (D4, DEC-238), generalized by Story 6.7 (AC8, DEC-258) —
+    /// the scoped in-place rewind of the live vote engine for the deviation `d`
+    /// at `d_idx`, whose run is by `creator`, and its branch tip `tip_idx`:
+    /// `step(self, false)` reads the engine at `p − 1`, then `step(self, true)`
+    /// at the tip, and the engine is restored before this returns. No copy of
+    /// the engine is made, and no caller can leave it rewound. The builder
+    /// (6.6), the evidence check (6.7) and Story 8.5 share it.
     ///
-    /// 1. A RAM pre-check: every active block above `p − 1` and, in the
-    ///    DEC-200 sibling case, every block of `d`'s branch up to the tip is
-    ///    held; in the direct case the tip is the head.
-    /// 2. The rewind: `undo_block` over the active blocks above `p − 1`, head
-    ///    down, one read each; in the direct case they are `d`'s branch and
-    ///    must be the local node's.
+    /// `direct`, stated by the caller: the engine stands at the tip and `d ..=
+    /// tip` is applied (a Ready head, a chain switch's replayed head, the FR3
+    /// pass's current block); otherwise the DEC-200 sibling case — the engine
+    /// stands at the active head, and `d ..= tip` is off the active chain.
+    ///
+    /// 1. A RAM pre-check: every block from the rewind's top (the tip, or the
+    ///    active head) down to `p − 1` is held and on the path, and, in the
+    ///    sibling case, every block of `d ..= tip` is held and off the chain.
+    /// 2. The rewind: `undo_block` from the top down to `p`, one read each; in
+    ///    the direct case each must be by `creator`.
     /// 3. `step` at `p − 1`.
-    /// 4. To the tip: the direct case re-applies the undone blocks; the sibling
-    ///    case applies `d ..= tip` (the local node's), runs `step`, undoes them
-    ///    again and re-applies the active blocks.
+    /// 4. To the tip: the direct case re-applies the undone blocks and reads
+    ///    the tip; the sibling case applies `d ..= tip` (`creator`'s), runs
+    ///    `step`, undoes them again and re-applies the active blocks.
     ///
     /// Any failure before the restore (a read, a refused vote step, `step`
-    /// answering `false`) restores what this call did and returns `false`: the
+    /// answering `false`) restores what this call did: `Refused`, and the
     /// engine is byte-identical to its state before. A failure while
-    /// restoring (re-applying an undone active block, or undoing the applied
-    /// branch) is 6.3's `RestoreFailed`: the node re-enters collecting
-    /// (DEC-205). Expected only on a transient read fault, since the call
+    /// restoring is 6.3's `RestoreFailed`, returned to the caller, which
+    /// escalates it at its root (DEC-205; never from inside the per-block step
+    /// or a switch). Expected only on a transient read fault, since the call
     /// writes no storage. Power loss is harmless: the engine is RAM-only.
     fn vote_projection(
         &mut self,
         d_idx: u32,
         tip_idx: u32,
-        now: u64,
+        creator: u32,
+        direct: bool,
         mut step: impl FnMut(&Self, bool) -> bool,
-    ) -> bool {
-        let head = self.active_chain_head_idx;
-        let (Some(d), Some(head_entry), Some(tip)) = (
+    ) -> Projected {
+        let top = if direct {
+            tip_idx
+        } else {
+            self.active_chain_head_idx
+        };
+        let (Some(d), Some(top_entry), Some(tip)) = (
             self.blocks.get(d_idx),
-            self.blocks.get(head),
+            self.blocks.get(top),
             self.blocks.get(tip_idx),
         ) else {
-            return false;
+            return Projected::Refused;
         };
-        let (p, parent, direct) = (d.sequence(), d.parent_ref(), d.is_on_active_chain());
-        let (s_head, tip_seq) = (head_entry.sequence(), tip.sequence());
+        let (p, parent) = (d.sequence(), d.parent_ref());
+        let (s_top, tip_seq) = (top_entry.sequence(), tip.sequence());
         // 1. Pre-check, RAM only (`ancestor_at` walks held entries).
         let Some(parent_seq) = p.checked_sub(1) else {
-            return false;
+            return Projected::Refused;
         };
-        if self.ancestor_at(head, parent_seq).ok() != Some(Some(parent))
+        if self.ancestor_at(top, parent_seq).ok() != Some(Some(parent))
             || self.ancestor_at(tip_idx, p).ok() != Some(Some(d_idx))
-            || (direct && tip_idx != head)
             || (!direct
                 && (p..=tip_seq).any(|s| {
                     self.ancestor_at(tip_idx, s)
@@ -3944,19 +4264,17 @@ impl<
                         })
                 }))
         {
-            return false;
+            return Projected::Refused;
         }
-        let local = self.local_node_id;
-        let above = s_head - parent_seq;
+        let above = s_top - parent_seq;
         let at = |bc: &Self, from: u32, s: u32| bc.ancestor_at(from, s).ok().flatten();
         // 2. Rewind.
         let mut undone = 0u32;
         while undone < above {
-            let creator = direct.then_some(local);
-            let Some(idx) = at(self, head, s_head - undone) else {
+            let Some(idx) = at(self, top, s_top - undone) else {
                 break;
             };
-            if !self.vote_step(idx, true, creator, false) {
+            if !self.vote_step(idx, true, direct.then_some(creator), false) {
                 break;
             }
             undone += 1;
@@ -3970,7 +4288,7 @@ impl<
                 let Some(idx) = at(self, tip_idx, p + applied) else {
                     break;
                 };
-                if !self.vote_step(idx, false, Some(local), true) {
+                if !self.vote_step(idx, false, Some(creator), true) {
                     break;
                 }
                 applied += 1;
@@ -3980,22 +4298,341 @@ impl<
                 let restored = at(self, tip_idx, p + applied - 1)
                     .is_some_and(|idx| self.vote_step(idx, true, None, false));
                 if !restored {
-                    self.reenter_after_failed_restore(now);
-                    return false;
+                    return Projected::RestoreFailed;
                 }
                 applied -= 1;
             }
         }
         while undone > 0 {
-            let restored = at(self, head, s_head - undone + 1)
+            let restored = at(self, top, s_top - undone + 1)
                 .is_some_and(|idx| self.vote_step(idx, false, None, false));
             if !restored {
-                self.reenter_after_failed_restore(now);
-                return false;
+                return Projected::RestoreFailed;
             }
             undone -= 1;
         }
-        ok && (!direct || step(self, true))
+        if ok && (!direct || step(self, true)) {
+            Projected::Done
+        } else {
+            Projected::Refused
+        }
+    }
+
+    /// Story 6.7 AC5 (FR6, FR9 Tier 3, FR12, FR27; DEC-172, DEC-184, DEC-216;
+    /// D1, D5, D6) — the Tier-3 check of the approval evidence block `view` at
+    /// `idx`, whose parent (the tip) is the block the vote engine stands at:
+    /// the per-block step runs before its commit. The AC4 run rules held, so
+    /// `d = ancestor_at(tip, p)` is the open run's deviation and every block in
+    /// `[p, tip]` is its creator's. Cheap first, the aggregate verification
+    /// last:
+    ///
+    /// 1. `A'` at `p − 1`: the counter corrected from its actual tail (Ready,
+    ///    the walk), or built over the window at `p − 1` (the FR3 pass);
+    /// 2. `m == subgroup_size(required_support, |A'|)`, `r_eff = ⌊m/2⌋ + 1`,
+    ///    at least `r_eff` signers; the bitmap's ranks name `m` distinct
+    ///    members, so the signers' keys are distinct (roster uniqueness, FR6) —
+    ///    the precondition the crypto library does not check;
+    /// 3. the vote projection: `B_k − cv(d)` against `supporter_vote_sum`, the
+    ///    late list against the prefix that fits, in creator order, at `p − 1`,
+    ///    and its votes against their values at the tip (DEC-184);
+    /// 4. the aggregated signature over the support content, keys in rank
+    ///    order.
+    ///
+    /// In a window-anchored FR3 pass the check is exact only when the window at
+    /// `p − 1` lies in the segment (`p − W ≥ a`) and the roster, every node's
+    /// vote and every signer's key are seeded at `p − 1` (D5, DEC-177's
+    /// predicate); otherwise the content is trusted. A local fault (a failed
+    /// read, a refused rewind, the guard that `u` heads the order at `p − 1`,
+    /// which `d`'s accepted header implies) is never evidence; a failed restore
+    /// also marks the re-entry due at the root (`reentry_due`).
+    fn judge_evidence(
+        &mut self,
+        view: &BlockView<'_>,
+        idx: u32,
+        projection: &Projection,
+    ) -> Result<(), ProcessingError> {
+        let invalid = |reason| ProcessingError::Invalid {
+            block_idx: idx,
+            reason,
+        };
+        let Some(evidence) = ApprovalView::from_payload(view.payload()) else {
+            return Err(invalid(ValidationReason::MalformedPayload));
+        };
+        let p = evidence.deviation_sequence();
+        let tip = self
+            .blocks
+            .get(idx)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
+        let Some(d_idx) = self.ancestor_at(tip, p).ok().flatten() else {
+            return Err(ProcessingError::StorageRead);
+        };
+        let Some(d) = self.blocks.get(d_idx) else {
+            return Err(ProcessingError::StorageRead);
+        };
+        let (d_parent, d_hash) = (d.parent_ref(), *d.hash());
+        let Some((creator_d, u, cv_d)) = self.header_votes_at(d_idx) else {
+            return Err(ProcessingError::StorageRead);
+        };
+        let Some(configuration) = self.chain_config.active_configuration() else {
+            return Err(ProcessingError::StorageRead);
+        };
+        let (w, required_support, vote_scale, limit) = (
+            configuration.active_chain_length(),
+            configuration.required_support(),
+            u64::from(configuration.vote_scale().get()),
+            configuration.block_size_limit(),
+        );
+        let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
+        // D5: a window-anchored pass checks only where it can.
+        let trusted_zone = projection.counter_tail == u32::MAX && !projection.complete;
+        if trusted_zone
+            && (p
+                .checked_sub(w)
+                .is_none_or(|bottom| bottom < projection.anchor)
+                || !projection.roster_bounded
+                || !(0..=last_node).all(|n| self.vote_seeded(n, projection)))
+        {
+            return Ok(());
+        }
+
+        // 1–2. The subgroup at `p − 1` and the signers in rank order.
+        let mut members = [0u32; MAX_SUBGROUP];
+        let m = match self.evidence_members(
+            tip,
+            p,
+            d_parent,
+            creator_d,
+            u,
+            projection,
+            w,
+            required_support,
+            &mut members,
+        ) {
+            Err(()) => return Err(ProcessingError::StorageRead),
+            Ok(None) => return Err(invalid(ValidationReason::EvidenceSubgroup)),
+            Ok(Some(m)) => m,
+        };
+        let r_eff = m / 2 + 1;
+        let n = evidence.signer_count() as usize;
+        if usize::from(evidence.m()) != m || n < r_eff {
+            return Err(invalid(ValidationReason::EvidenceSubgroup));
+        }
+        let mut signers = [0u32; MAX_AGGREGATED_SIGNATURES];
+        let mut count = 0usize;
+        for (byte_at, byte) in evidence.bitmap().iter().enumerate() {
+            for bit in 0..8 {
+                if byte >> bit & 1 == 0 {
+                    continue;
+                }
+                // Tier 1 refused a bit at a rank `≥ m`; `n` is at most
+                // `MAX_AGGREGATED_SIGNATURES` (the framing).
+                let (Some(member), Some(slot)) =
+                    (members[..m].get(byte_at * 8 + bit), signers.get_mut(count))
+                else {
+                    return Err(invalid(ValidationReason::EvidenceSubgroup));
+                };
+                *slot = *member;
+                count += 1;
+            }
+        }
+        if trusted_zone
+            && signers[..count]
+                .iter()
+                .any(|&s| self.registered_key(s).is_none())
+        {
+            return Ok(());
+        }
+
+        // 3. The vote projection.
+        let room = (limit as usize)
+            .saturating_sub(HEADER_SIZE)
+            .min(MAX_PAYLOAD_SIZE);
+        let late_room = room
+            .checked_sub(moonblokz_chain_types::approval_fixed_size(m, n))
+            .map_or(0, |free| {
+                (free / APPROVAL_LATE_ENTRY_SIZE).min(u16::MAX as usize)
+            });
+        let claimed = evidence.supporter_vote_sum();
+        let late_count = usize::from(evidence.late_count());
+        let mut verdict = None;
+        let projected = self.vote_projection(d_idx, tip, creator_d, true, |bc, at_tip| {
+            let engine = &bc.vote_engine;
+            if at_tip {
+                // DEC-184: each listed vote after the evidence's interest step.
+                for i in 0..late_count {
+                    let Some((id, vote)) = evidence.late_entry(i) else {
+                        return false;
+                    };
+                    let Ok(grown) = engine.grown(engine.accumulated_vote_of(id)) else {
+                        return false;
+                    };
+                    if grown != vote && verdict.is_none() {
+                        verdict = Some(ValidationReason::EvidenceLateList);
+                    }
+                }
+                return true;
+            }
+            if engine.top_creator() != Some(u) {
+                return false;
+            }
+            let Some((sum, k)) =
+                deviation_sum(engine, last_node, creator_d, vote_scale, r_eff as u64, cv_d)
+            else {
+                verdict = Some(ValidationReason::EvidenceVoteSum);
+                return true;
+            };
+            if sum != claimed {
+                verdict = Some(ValidationReason::EvidenceVoteSum);
+                return true;
+            }
+            // The late list: the prefix of the late nodes in creator order
+            // that fits. Every listed id a late node, strictly descending in
+            // the order (so distinct), and exactly `L − 1` late nodes above the
+            // last one — no scratch list, the same predicates as the builder.
+            let expected = (k as usize - 1).min(late_room);
+            let mut previous = None;
+            let listed_ok = late_count == expected
+                && (0..late_count).all(|i| {
+                    let Some((id, _)) = evidence.late_entry(i) else {
+                        return false;
+                    };
+                    let ok = id <= last_node
+                        && is_late(engine, id, creator_d, u)
+                        && previous.is_none_or(|q| engine.ranks_above(q, id));
+                    previous = Some(id);
+                    ok
+                })
+                && previous.is_none_or(|last| {
+                    (0..=last_node)
+                        .filter(|&n| {
+                            is_late(engine, n, creator_d, u) && engine.ranks_above(n, last)
+                        })
+                        .count()
+                        == late_count - 1
+                });
+            if !listed_ok {
+                verdict = Some(ValidationReason::EvidenceLateList);
+            }
+            true
+        });
+        match projected {
+            Projected::Done => {}
+            Projected::Refused => return Err(ProcessingError::StorageRead),
+            Projected::RestoreFailed => {
+                self.reentry_due = true;
+                return Err(ProcessingError::StorageRead);
+            }
+        }
+        if let Some(reason) = verdict {
+            return Err(invalid(reason));
+        }
+
+        // 4. The aggregate, in its own frame (D6).
+        match self.verify_evidence_aggregate(
+            evidence.aggregate(),
+            &signers[..count],
+            creator_d,
+            p,
+            &d_hash,
+        ) {
+            Some(true) => Ok(()),
+            Some(false) => Err(invalid(ValidationReason::EvidenceAggregate)),
+            None => Err(ProcessingError::StorageRead),
+        }
+    }
+
+    /// AC5 steps 1–2 — `A'` at `p − 1` and its ranked subgroup into `out`:
+    /// `Ok(Some(m))`; `Ok(None)` when `A'` is empty; `Err` on a local fault.
+    /// In Ready and on the walk the counter is corrected from its actual tail
+    /// (`projection.counter_tail`); the FR3 pass has no counter, so it builds
+    /// one over the window at `p − 1` (at most `W` reads, rare) and leaves it
+    /// invalid again. Its own frame: the correction's `[bool; MAX_NODES]` and
+    /// the ranking's `[u64; MAX_SUBGROUP]`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn evidence_members(
+        &mut self,
+        tip: u32,
+        p: u32,
+        parent: u32,
+        creator_d: u32,
+        u: u32,
+        projection: &Projection,
+        w: u32,
+        required_support: u8,
+        out: &mut [u32; MAX_SUBGROUP],
+    ) -> Result<Option<usize>, ()> {
+        let mut returned = [false; MAX_NODES];
+        let in_pass = projection.counter_tail == u32::MAX;
+        let (above, returning_d) = if in_pass {
+            self.build_active_set_over(parent, p.saturating_sub(w));
+            if !self.active_set.is_valid() {
+                return Err(());
+            }
+            (0, 0)
+        } else {
+            let tip_seq = self.blocks.get(tip).ok_or(())?.sequence();
+            match self.parent_set_correction(
+                tip,
+                p,
+                projection.counter_tail,
+                w,
+                creator_d,
+                &mut returned,
+            ) {
+                Some(Some(returning_d)) => (tip_seq + 1 - p, returning_d),
+                _ => return Err(()),
+            }
+        };
+        let a_prime = APrime {
+            proposer: creator_d,
+            u,
+            creator_d,
+            above,
+            returning_d,
+            returned: &returned,
+        };
+        let m = self.rank_subgroup(&a_prime, p, parent, creator_d, required_support, out);
+        if in_pass {
+            self.active_set.invalidate();
+        }
+        Ok(m)
+    }
+
+    /// AC5 step 4 (D6) — whether the aggregated signature verifies over the
+    /// support content of `(proposer, p, hash(d))` against the `signers`'
+    /// registered keys in rank order. `Some(false)` for an aggregate or a key
+    /// that does not parse; `None` when a signer has no registered key (local).
+    /// Its own frame: the parsed keys and the crypto call never overlap a read
+    /// buffer.
+    #[inline(never)]
+    fn verify_evidence_aggregate(
+        &self,
+        aggregate: &[u8],
+        signers: &[u32],
+        proposer: u32,
+        p: u32,
+        hash: &[u8; HASH_SIZE],
+    ) -> Option<bool> {
+        let Ok(aggregate) = AggregatedSignature::new(aggregate) else {
+            return Some(false);
+        };
+        let mut keys: [Option<PublicKey>; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|_| None);
+        for (slot, signer) in keys.iter_mut().zip(signers) {
+            match PublicKey::new(self.registered_key(*signer)?) {
+                Ok(key) => *slot = Some(key),
+                Err(_) => return Some(false),
+            }
+        }
+        let first = keys[0].as_ref()?;
+        let refs: [&PublicKey; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| keys[i].as_ref().unwrap_or(first));
+        let message = support_message_bytes(proposer, p, hash);
+        Some(
+            self.crypto
+                .verify_aggregated_signature(&message, &aggregate, &refs[..signers.len()]),
+        )
     }
 
     /// D4's failed restore, 6.3's `RestoreFailed`: re-enter collecting
@@ -4045,9 +4682,9 @@ impl<
     /// 2. an unreadable tail: `Hold` (never taken as no obligation);
     /// 3. no obligation due: `Evidence` once `r_eff` supports are held, else
     ///    `Hold` — the evidence is never paced;
-    /// 4. a replay due while incomplete that would close `p` (`p ≤ tip_seq + 1
-    ///    − H`, the support floor and FR58): `Hold` (D6), so supports keep
-    ///    arriving and nothing drops;
+    /// 4. a replay due that would leave the evidence no position by `p + H`
+    ///    (`p ≤ tip_seq + 1 − H`; the run bound, complete or not, Story 6.7 D1):
+    ///    `Hold` (D6), so supports keep arriving and nothing drops;
     /// 5. otherwise the replay, once FR29's `deviation_replay_insertion_delay_ms`
     ///    (read at the active head's post-state, DEC-197) has passed since
     ///    `last_emit_ms`: `Replay`, or `WaitUntil` that instant.
@@ -4080,7 +4717,9 @@ impl<
         ) else {
             return ApprovalStep::Hold;
         };
-        if !complete && u64::from(p) + u64::from(h) <= u64::from(tip_seq) + 1 {
+        // Story 6.7 D1 (DEC-258): complete or not, a replay may not leave the
+        // evidence no position by `p + H` (the run bound).
+        if u64::from(p) + u64::from(h) <= u64::from(tip_seq) + 1 {
             return ApprovalStep::Hold;
         }
         let due = last_emit_ms.saturating_add(u64::from(
@@ -4119,12 +4758,26 @@ impl<
     }
 
     /// The `(creator, first_voted_node)` of a retained block's header; `None`
-    /// on a failed read. Its own read buffer (DEC-136).
-    #[inline(never)]
+    /// on a failed read.
     fn header_at(&self, idx: u32) -> Option<(u32, u32)> {
+        self.header_votes_at(idx)
+            .map(|(creator, first_voted, _)| (creator, first_voted))
+    }
+
+    /// The `(creator, first_voted_node, consumed_votes)` of a retained block's
+    /// header; `None` on a failed read. Its own read buffer (DEC-136). The one
+    /// header reader (Story 6.7 AC4 needs `consumed_votes` for the override
+    /// form; it absorbed 6.6's `deviation_votes`).
+    #[inline(never)]
+    fn header_votes_at(&self, idx: u32) -> Option<(u32, u32, u32)> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
-        self.view_retained(idx, &mut buf)
-            .map(|view| (view.creator(), view.first_voted_node()))
+        self.view_retained(idx, &mut buf).map(|view| {
+            (
+                view.creator(),
+                view.first_voted_node(),
+                view.consumed_votes(),
+            )
+        })
     }
 
     /// AC7 — signs the support content with the local node's multi-signature
@@ -4587,6 +5240,7 @@ impl<
         // Step 1 — unconditional working-set rollback (before any deletion
         // decision, and regardless of which deletion path is taken).
         self.approval.clear();
+        self.active_open_run = NO_OPEN_RUN;
         self.node_info.reset();
         self.reset_vote_engine();
 
@@ -4761,6 +5415,11 @@ impl<
         // AC5: clean working set on (re-)entry — no partial projection persists.
         self.node_info.reset();
         self.reset_vote_engine();
+        // Story 6.7: the pass derives the run state forward from its anchor,
+        // and judges every block's signatures itself (D2: a block trusted under
+        // one anchor may be exact under this one).
+        self.active_open_run = NO_OPEN_RUN;
+        self.blocks.clear_signatures_accepted();
 
         // AC1: backward mark tip → anchor along `parent_ref`, bounded by
         // MAX_BLOCKS. `marked[0] = tip … marked[count-1] = anchor`; the forward
@@ -4977,6 +5636,23 @@ impl<
                 a.saturating_add(self.verification_horizon().unwrap_or(0))
             },
             first_segment_registration: u32::MAX,
+            run_unknown_below: if genesis_anchored {
+                0
+            } else {
+                let a = self
+                    .blocks
+                    .get(marked[count - 1])
+                    .map_or(0, |e| e.sequence());
+                a.saturating_add(self.verification_horizon().unwrap_or(0))
+            },
+            counter_tail: u32::MAX,
+            anchor: if genesis_anchored {
+                0
+            } else {
+                self.blocks
+                    .get(marked[count - 1])
+                    .map_or(0, |e| e.sequence())
+            },
         };
         let mut prev_hash: Option<[u8; 32]> = None;
         // Story 6.1 D5: the FR21 value of the window the promotion will
@@ -5038,7 +5714,7 @@ impl<
                 break;
             }
             if view.sequence() > window_tail {
-                window_value += block_value(&view);
+                window_value += block_value::<MAX_NODES>(&view);
             }
             prev_hash = Some(this_hash);
         }
@@ -5101,6 +5777,89 @@ impl<
                 .is_some_and(|source| source.sequence() >= projection.vote_seed_from)
     }
 
+    /// Story 6.7 AC4 (D4) — the open deviation run ending at the held block
+    /// `q`, by a walk over its own ancestry: `Ok(Some((p, creator of d)))`,
+    /// `Ok(None)` for no open run, `Err` when it cannot be told (a failed read,
+    /// or the walk reached the lowest held block inside a possible run). It
+    /// stops on the RAM evidence flag (a closed run), at a normal-form block
+    /// with `consumed_votes ≠ 0` or by another creator (no run), or at a
+    /// deviation-form block (the run's `d`). One header read in the normal
+    /// case, at most `H + 1` inside a run (the run bound). Side blocks and
+    /// non-Ready intake use it; the active head reads `active_open_run`.
+    fn deviation_run_at(&self, q: u32) -> Result<Option<(u32, u32)>, ()> {
+        let steps = self
+            .verification_horizon()
+            .map_or(MAX_BLOCKS as u32, |h| h + 1);
+        let mut cur = q;
+        let mut creator = None;
+        for _ in 0..steps {
+            let entry = self.blocks.get(cur).ok_or(())?;
+            if entry.payload_type() == PAYLOAD_TYPE_APPROVAL {
+                return Ok(None);
+            }
+            let (sequence, parent) = (entry.sequence(), entry.parent_ref());
+            let (c, first_voted, consumed) = self.header_votes_at(cur).ok_or(())?;
+            if creator.is_some_and(|run_creator| run_creator != c) {
+                return Ok(None);
+            }
+            if c != first_voted {
+                return Ok(Some((sequence, c)));
+            }
+            if consumed != 0 {
+                return Ok(None);
+            }
+            if parent == NONE_REF {
+                return Err(());
+            }
+            creator = Some(c);
+            cur = parent;
+        }
+        // Longer than any run can be: not inside one.
+        Ok(None)
+    }
+
+    /// Story 6.7 AC4 in the per-block step: rules 1–5 for `view` at `idx`,
+    /// whose parent's run state is `active_open_run`. While a window-anchored
+    /// pass does not yet know the run state (below `run_unknown_below`), rules
+    /// 1–4 are trusted and a deviation-form or evidence block settles it; the
+    /// slot rule always applies. A failed read of the deviation's header is a
+    /// local fault, never evidence.
+    fn check_run_rules(
+        &self,
+        view: &BlockView<'_>,
+        idx: u32,
+        projection: &mut Projection,
+    ) -> Result<(), ValidationReason> {
+        let h = self.verification_horizon();
+        if view.sequence() < projection.run_unknown_below {
+            if view.creator() != view.first_voted_node()
+                || view.payload_type() == PAYLOAD_TYPE_APPROVAL
+            {
+                projection.run_unknown_below = 0;
+            }
+            return slot_rule(view, h);
+        }
+        let run = match self.active_open_run {
+            NO_OPEN_RUN => None,
+            p => {
+                let parent = self.blocks.get(idx).map_or(NONE_REF, |e| e.parent_ref());
+                let creator_d = self
+                    .ancestor_at(parent, p)
+                    .ok()
+                    .flatten()
+                    .and_then(|d| self.header_votes_at(d))
+                    .map(|(creator, _, _)| creator);
+                // An unreadable deviation header cannot be judged: no verdict
+                // here; the rest of the step still runs.
+                let Some(creator_d) = creator_d else {
+                    return slot_rule(view, h);
+                };
+                Some((p, creator_d))
+            }
+        };
+        run_rules(view, run, h)
+    }
+
     fn derive_block(
         &mut self,
         view: &BlockView<'_>,
@@ -5135,6 +5894,11 @@ impl<
         {
             return Err(invalid(ValidationReason::PreviousHashMismatch));
         }
+        // (b2) Story 6.7 AC4: the FR27 rules of a deviation-bearing branch and
+        //      the FR48 clean slot, against the run state below this block
+        //      (`active_open_run`, the parent's): RAM unless a run is open.
+        self.check_run_rules(view, idx, projection)
+            .map_err(&invalid)?;
         // (c) block-creator signature. Skipped when the creator's key is not
         //     yet derivable (pre-seed zone → trusted); node #0 always resolves
         //     to the FR69 trust anchor. In a complete projection a non-derivable
@@ -5347,6 +6111,13 @@ impl<
                 return Err(invalid(ValidationReason::BalanceOverflow));
             }
         }
+        // Story 6.7 AC5 (D6): the evidence's Tier 3 runs last, after every
+        // cheap check above, and never again once the block's signature
+        // checks are final (bit 6, D2). An evidence block carries no
+        // transaction, so nothing is left to invert on its failure.
+        if view.payload_type() == PAYLOAD_TYPE_APPROVAL && !self.signatures_accepted(idx) {
+            self.judge_evidence(view, idx, projection)?;
+        }
         Ok(derivation)
     }
 
@@ -5385,6 +6156,10 @@ impl<
         for bit in 0..derivation.utxo_outputs {
             self.blocks.set_utxo_available(idx, bit, true);
         }
+        // Story 6.7: the block's Tier-3 signature checks are final (D2), and
+        // the open deviation run moves with the head (D4).
+        self.blocks.mark_signatures_accepted(idx);
+        self.active_open_run = run_after(self.active_open_run, view);
         Ok(())
     }
 
@@ -5425,7 +6200,8 @@ impl<
             // anchor-before-block) are owned by the Tier-1 gate.
             if !is_genesis_zero && self.node_info.is_seeded(init) {
                 self.check_vote_target(vote).map_err(&invalid)?;
-                if !self.verify_tx_signature(tx.as_bytes(), init) {
+                if !self.signatures_accepted(idx) && !self.verify_tx_signature(tx.as_bytes(), init)
+                {
                     return Err(invalid(ValidationReason::TransactionSignatureInvalid));
                 }
             }
@@ -5500,7 +6276,9 @@ impl<
                 }
                 if debits {
                     self.check_vote_target(vote).map_err(&invalid)?;
-                    if !self.verify_tx_signature(tx.as_bytes(), init) {
+                    if !self.signatures_accepted(idx)
+                        && !self.verify_tx_signature(tx.as_bytes(), init)
+                    {
                         return Err(invalid(ValidationReason::TransactionSignatureInvalid));
                     }
                     if self.node_info.balance_of(init) < debit {
@@ -5861,6 +6639,16 @@ impl<
     /// bad signature. Only node-transfer / registration transactions have this
     /// fixed trailing-signature layout; balance/UTXO input signatures (embedded, no
     /// `new_signed` convention) are a deferred seam.
+    /// Story 6.7 D2: whether the block at `idx` carries `BlockEntry` bit 6
+    /// (its Tier-3 signature checks are final), so the per-block step does not
+    /// verify its transaction signatures or its evidence again (a restore, a
+    /// later walk).
+    fn signatures_accepted(&self, idx: u32) -> bool {
+        self.blocks
+            .get(idx)
+            .is_some_and(|entry| entry.is_signatures_accepted())
+    }
+
     fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
         let Some(key) = self.node_info.public_key_of(signer_node_id) else {
             return false;
@@ -6010,6 +6798,18 @@ impl<
         idx: u32,
         parent_idx: u32,
     ) -> Result<(), ProcessingError> {
+        // Story 6.7 AC4 (D4): the FR27 run rules and the FR48 clean slot for a
+        // block off the active head, from its own ancestry (a header walk);
+        // the configuration is locked in Ready. An unreadable ancestry gives
+        // no verdict here; the switch's Tier 3 judges the block again.
+        if let Ok(run) = self.deviation_run_at(parent_idx) {
+            run_rules(view, run, self.verification_horizon()).map_err(|reason| {
+                ProcessingError::Invalid {
+                    block_idx: idx,
+                    reason,
+                }
+            })?;
+        }
         let Some(txs) = view.transactions() else {
             return Ok(());
         };
@@ -6096,7 +6896,10 @@ impl<
                 advance = Some(step);
             }
         }
-        let mut projection = Projection::COMPLETE;
+        let mut projection = Projection {
+            counter_tail: self.blocks.get(tail).map_or(u32::MAX, |e| e.sequence()),
+            ..Projection::COMPLETE
+        };
         match self.derive_block(view, idx, Some(head_hash), &mut projection) {
             Ok(derivation) => Extension::Valid {
                 advance,
@@ -6156,7 +6959,7 @@ impl<
     fn tail_step_at(&self, idx: u32) -> Option<TailStep> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         self.view_retained(idx, &mut buf).map(|view| TailStep {
-            value: block_value(&view),
+            value: block_value::<MAX_NODES>(&view),
             creator: view.creator(),
         })
     }
@@ -6428,6 +7231,7 @@ impl<
     fn reenter_collecting(&mut self, now: u64) -> Option<Option<u32>> {
         // Story 6.6 AC4: the accumulator is Ready-state work.
         self.approval.clear();
+        self.active_open_run = NO_OPEN_RUN;
         self.node_info.reset();
         self.reset_vote_engine();
         for idx in 0..MAX_BLOCKS as u32 {
@@ -6724,7 +7528,7 @@ impl<
             let Some(view) = self.view_retained(cur, &mut buf) else {
                 return PrePass::Local;
             };
-            through = through.saturating_add(block_value(&view));
+            through = through.saturating_add(block_value::<MAX_NODES>(&view));
             if !verified && self.key_is_branch_independent(view.creator(), bound) {
                 match self.verify_block_creator_signature(&view) {
                     Some(true) => {
@@ -6860,7 +7664,7 @@ impl<
     ) -> Result<u32, ()> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf).ok_or(())?;
-        let value = block_value(&view);
+        let value = block_value::<MAX_NODES>(&view);
         let remaining_value = self.active_branch_value.checked_sub(value).ok_or(())?;
         // AC2 precondition, a real check: undone top-down, the block's bits are
         // exactly its own outputs, all set (every later spend of them is undone
@@ -6889,6 +7693,7 @@ impl<
         }
         self.invert_transactions(&view, idx, usize::MAX);
         self.active_branch_value = remaining_value;
+        self.active_open_run = run_before(self.active_open_run, &view);
         Ok(view.creator())
     }
 
@@ -7074,9 +7879,12 @@ impl<
     /// frame (DEC-136), gone before the caller deletes anything.
     #[inline(never)]
     fn walk_side_branch(&self, head: u32) -> Result<SideWalk, ()> {
-        // Every FR21 sum adds at most `MAX_BLOCKS` `u32` values (a branch, or
-        // the active window), so plain `u64` additions cannot overflow.
-        const { assert!((MAX_BLOCKS as u128) * (u32::MAX as u128) <= u64::MAX as u128) };
+        // Every FR21 sum adds at most `MAX_BLOCKS` values, each at most
+        // `value_cap` (an evidence block's clamp, Story 6.7 D7, DEC-264; any
+        // other block's `u32` header value is below it), so plain `u64`
+        // additions cannot overflow. It bounds the build: `MAX_BLOCKS ·
+        // MAX_NODES` stays below about 8.6 · 10⁷.
+        const { assert!((MAX_BLOCKS as u128) * (value_cap::<MAX_NODES>() as u128) <= u64::MAX as u128) };
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let mut branch = 0u64;
         let mut failing = None;
@@ -7090,7 +7898,7 @@ impl<
             }
             let (stored, parent) = (entry.status() == BlockStatus::Stored, entry.parent_ref());
             let view = self.view_retained(cur, &mut buf).ok_or(())?;
-            branch += block_value(&view);
+            branch += block_value::<MAX_NODES>(&view);
             if stored {
                 match self.tier2_check(&view, cur, parent) {
                     Ok(()) => {}
@@ -7115,7 +7923,7 @@ impl<
                 });
             }
             let parent = self.blocks.get(cur).ok_or(())?.parent_ref();
-            active += block_value(&self.view_retained(cur, &mut buf).ok_or(())?);
+            active += block_value::<MAX_NODES>(&self.view_retained(cur, &mut buf).ok_or(())?);
             cur = parent;
         }
         Err(())
@@ -7213,7 +8021,7 @@ impl<
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
         Some(Rank {
-            value: block_value(&view),
+            value: block_value::<MAX_NODES>(&view),
             len,
             hash,
         })
@@ -7235,7 +8043,7 @@ impl<
             } => match self.commit_block(&view, child, derivation) {
                 Ok(()) => ChildStep::Applied {
                     advance,
-                    value: block_value(&view),
+                    value: block_value::<MAX_NODES>(&view),
                     creator: view.creator(),
                 },
                 Err(err) if is_evidence(&err) => ChildStep::Invalid,
@@ -7413,19 +8221,32 @@ impl<
     /// Story 6.4 D2: builds the active set by one walk over the window, head
     /// to tail (at most `W` reads, one buffer in this frame, DEC-136). A failed
     /// read leaves it invalid: no support until the next ready entry.
-    #[inline(never)]
     fn build_active_set(&mut self) {
-        let tail = self.snake_chain_tail_idx;
+        match self.blocks.get(self.snake_chain_tail_idx) {
+            Some(tail) => {
+                let bottom = tail.sequence();
+                self.build_active_set_over(self.active_chain_head_idx, bottom);
+            }
+            None => self.active_set.invalidate(),
+        }
+    }
+
+    /// The active set over the window `[bottom, top]`, walked from `top` down
+    /// by `parent_ref` (at most `W` reads, one buffer in this frame, DEC-136):
+    /// the ready entry's window, or the FR3 pass's window at an evidence
+    /// block's `p − 1` (Story 6.7 AC7). A failed read leaves it invalid.
+    #[inline(never)]
+    fn build_active_set_over(&mut self, top: u32, bottom: u32) {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         self.active_set.start_build(0);
-        let mut cur = self.active_chain_head_idx;
+        let mut cur = top;
         for _ in 0..MAX_BLOCKS {
             let Some(view) = self.view_retained(cur, &mut buf) else {
                 break;
             };
             let creator = view.creator();
             self.active_set.add(creator);
-            if cur == tail {
+            if view.sequence() <= bottom {
                 self.active_set.set_tail_creator(creator);
                 return;
             }
@@ -8538,22 +9359,24 @@ mod tests {
     /// The default 50 is not below any test window, so a content must declare
     /// it. The test backend stores eight blocks, so a `TEST_W` chain never
     /// holds a head above #7: at 7 the FR58 bound never binds there, and the
-    /// bound, the horizon and the reclamation are exercised on the W4 harness,
-    /// which declares `H = 2` or its own. `H` divides `W` and is at least 2
-    /// (configuration §6 check 21, Story 6.7 D8), so 8 replaced 7.
+    /// bound, the horizon and the reclamation are exercised on the W6 harness,
+    /// which declares `H = 3`. `H` divides `W` and is at least 3
+    /// (configuration §6 check 21, Story 6.7 D8), so 8 replaced 7; the clean
+    /// slots (D8) are then #7, #15, ….
     const TEST_H: u32 = 8;
 
     /// The horizon a test configuration with window `w` declares: `TEST_H` on
     /// the `TEST_W` harnesses, and the smallest legal horizon on every smaller
-    /// window: the least divisor of `w` from 2 up (check 21; `H < W`, check 15).
-    /// The W4 harness then declares 2 and joins on `W + H = 6` blocks, keeping
-    /// three of its backend's nine slots for forks ([`W4Storage`]). A window with no such
-    /// divisor (a prime) has no legal horizon and is refused at compile time.
+    /// window: the least divisor of `w` from 3 up (check 21; `H < W`, check 15).
+    /// The W6 harness then declares 3 and joins on `W + H = 9` blocks, keeping
+    /// five of its backend's fourteen slots for forks ([`W6Storage`]). A window
+    /// with no such divisor (4 or a prime) has no legal horizon and is refused
+    /// at compile time.
     const fn test_horizon(w: u32) -> u32 {
         if w >= TEST_W {
             return TEST_H;
         }
-        let mut h = 2;
+        let mut h = 3;
         while h < w {
             if w.is_multiple_of(h) {
                 return h;
@@ -9019,6 +9842,8 @@ mod tests {
             non_conflict,
             support_dedupe,
             approval,
+            active_open_run,
+            reentry_due,
         } = &*bc;
 
         assert_eq!(*local_node_id, 7);
@@ -9055,6 +9880,9 @@ mod tests {
         // Story 6.6: no accumulator.
         assert!(approval.deviation().is_none());
         assert!(*approval == ApprovalAccumulator::new());
+        // Story 6.7: no open deviation run.
+        assert_eq!(*active_open_run, NO_OPEN_RUN);
+        assert!(!*reentry_due);
         assert_eq!(bc.local_node_id(), 7);
     }
 
@@ -9112,6 +9940,8 @@ mod tests {
             non_conflict,
             support_dedupe,
             approval,
+            active_open_run,
+            reentry_due,
         } = &*built;
         let Blockchain {
             crypto: _,
@@ -9135,6 +9965,8 @@ mod tests {
             non_conflict: spec_non_conflict,
             support_dedupe: spec_support_dedupe,
             approval: spec_approval,
+            active_open_run: spec_active_open_run,
+            reentry_due: spec_reentry_due,
         } = &spec;
 
         assert_eq!(local_node_id, spec_local_node_id);
@@ -9158,6 +9990,8 @@ mod tests {
         assert!(non_conflict == spec_non_conflict);
         assert!(support_dedupe == spec_support_dedupe);
         assert!(approval == spec_approval);
+        assert_eq!(active_open_run, spec_active_open_run);
+        assert_eq!(reentry_due, spec_reentry_due);
     }
 
     /// AC2 — the neutrality proof: with the base override set (the window alone)
@@ -10234,41 +11068,58 @@ mod tests {
 
     /// Story 5.11 — FR2 measures a window-anchored segment against the
     /// configured `W`, not the allocated capacity: on a build with capacity 16
-    /// configured with `W = 4`, four blocks qualify and three do not.
+    /// configured with `W = 6` (`H = 3`), nine blocks qualify and eight do
+    /// not. The build is `TestChain`'s over [`W6Storage`], whose twelve slots
+    /// hold the nine-block join.
     #[test]
     fn fr2_active_length_is_the_configured_w_not_the_capacity() {
-        let (crypto, storage, mut chain_config) = test_backends();
+        let (crypto, _, mut chain_config) = test_backends();
         chain_config
-            .load_durable(window_config_builder(W4).build_signed(&crypto))
+            .load_durable(window_config_builder(W6).build_signed(&crypto))
             .ok()
             .expect("a window below the capacity is accepted");
-        let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
-        assert_eq!(TestChain::BUILD_LIMITS.snake_chain_length_max, TEST_W);
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot = core::mem::MaybeUninit::<Chain16<W6Storage>>::uninit();
+        Blockchain::init(
+            &mut slot,
+            crypto,
+            w6_storage(),
+            chain_config,
+            5,
+            node_zero,
+            0,
+        );
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut bc = unsafe { slot.assume_init() };
+        assert_eq!(
+            Chain16::<W6Storage>::BUILD_LIMITS.snake_chain_length_max,
+            TEST_W
+        );
 
         // The tail carries the configuration the node is locked on, as the FR8
         // final check requires.
-        let below = w4_horizon_block();
-        for block in [&w4_horizon_base(), &below] {
+        let below = w6_horizon_block();
+        for block in &w6_below() {
             bc.receive_block(block.view(), 0);
         }
-        let tail = w4_config_anchor_block(100, below.view().hash());
+        let tail = w6_config_anchor_block(100, below.view().hash());
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
-        for seq in 101..=102 {
+        for seq in 101..=104 {
             let blk = linked_transfer_block(seq, prev);
             prev = blk.view().hash();
             bc.receive_block(blk.view(), 0);
         }
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "segment length 5 < W + H = 6"
+            "segment length 8 < W + H = 9"
         );
 
-        let last = linked_transfer_block(103, prev);
+        let last = linked_transfer_block(105, prev);
         bc.receive_block(last.view(), 0);
         assert!(
             bc.is_ready(),
-            "segment length 6 = W + H qualifies, on a build that allocated 16"
+            "segment length 9 = W + H qualifies, on a build that allocated 16"
         );
     }
 
@@ -10280,9 +11131,9 @@ mod tests {
     /// the window-anchored one still does not, because it names none.
     #[test]
     fn fr2_without_a_configuration_no_segment_qualifies() {
-        let mut bc = new_unconfigured_w4_chain();
+        let mut bc = new_unconfigured_w6_chain();
         let mut prev = [0xAB; 32];
-        for seq in 100..=103 {
+        for seq in 100..=105 {
             let blk = linked_transfer_block(seq, prev);
             prev = blk.view().hash();
             bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
@@ -10291,7 +11142,7 @@ mod tests {
         assert!(bc.chain_config.active_configuration().is_none());
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "four blocks fill the capacity of 4, but no window is known"
+            "six blocks fill the capacity of 6, but no window is known"
         );
 
         let genesis = node_transfer_block(0, 7, 0, 7);
@@ -10302,11 +11153,11 @@ mod tests {
             "a genesis alone names no configuration"
         );
 
-        let cfg = w4_config_anchor_block(1, genesis.view().hash());
+        let cfg = w6_config_anchor_block(1, genesis.view().hash());
         let cfg_idx = bc
             .tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
             .expect("block #1 is admitted");
-        assert_eq!(bc.active_chain_length(), Some(W4));
+        assert_eq!(bc.active_chain_length(), Some(W6));
         assert_eq!(
             bc.evaluate_stopping_condition(),
             Some(cfg_idx),
@@ -10431,26 +11282,28 @@ mod tests {
         );
     }
 
-    /// The window [`W4Chain`]'s configurations declare: its whole capacity.
-    const W4: u32 = 4;
+    /// The window [`W6Chain`]'s configurations declare: its whole capacity.
+    /// 6 is the smallest window with a legal horizon (configuration §6 check
+    /// 21: `H ≥ 3` divides `W`, `H < W`), and its horizon is 3, so the clean
+    /// slots (Story 6.7 D8) are the sequences `≡ 2 (mod 3)`.
+    const W6: u32 = 6;
 
     /// A test chain with a small active-chain capacity (`SNAKE_CHAIN_LENGTH_MAX =
-    /// 4`), configured with a window of the same length, so an active-length
+    /// 6`), configured with a window of the same length, so an active-length
     /// segment fits the test harness's block storage. Same shape as
     /// `new_test_chain` otherwise (local_node_id 5, join/Collecting), but on
-    /// [`W4Storage`].
-    type W4Chain = Blockchain<Crypto, W4Storage, TestConfig, 16, 4, 16, 4, 16>;
+    /// [`W6Storage`].
+    type W6Chain = Blockchain<Crypto, W6Storage, TestConfig, 16, 6, 16, 4, 16>;
 
-    /// The W4 harness's storage: nine block slots, one more than the other
-    /// harnesses'. The smallest legal horizon on `W = 4` is 2 (configuration
-    /// §6 check 21), so a window-anchored join holds `W + H = 6` blocks; nine
-    /// slots keep three of them for forks and extensions, as eight did when
-    /// the harness joined on five.
-    type W4Storage = MemoryBackend<{ 9 * MAX_BLOCK_SIZE + 8000 }>;
+    /// The W6 harness's storage: fourteen block slots. A window-anchored join
+    /// holds `W + H = 9` blocks; the others are kept for forks and extensions
+    /// (a switch across the seed points needs a four-block branch beside the
+    /// join).
+    type W6Storage = MemoryBackend<{ 14 * MAX_BLOCK_SIZE + 8000 }>;
 
-    /// A [`W4Storage`] initialized as [`test_backends`]' storage is.
-    fn w4_storage() -> W4Storage {
-        let mut storage = W4Storage::new();
+    /// A [`W6Storage`] initialized as [`test_backends`]' storage is.
+    fn w6_storage() -> W6Storage {
+        let mut storage = W6Storage::new();
         storage
             .init([1u8; PRIVATE_KEY_SIZE], 0, [0u8; INIT_PARAMS_SIZE])
             .ok()
@@ -10458,21 +11311,17 @@ mod tests {
         storage
     }
 
-    fn new_w4_chain() -> W4Chain {
-        new_w4_chain_h(test_horizon(W4))
-    }
-
-    /// [`new_w4_chain`] locked on the horizon `h` (a few FR21 / FR22 tests
-    /// need a fork deeper than the head's parent to stay inside FR58's bound).
-    fn new_w4_chain_h(h: u32) -> W4Chain {
+    /// A [`W6Chain`] durably locked on its configuration (`W = 6`, `H = 3`),
+    /// Collecting.
+    fn new_w6_chain() -> W6Chain {
         let (crypto, _, _) = test_backends();
-        let storage = w4_storage();
-        // This harness's own capacities, not `TestChain`'s: its window is 4.
-        let mut chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
+        let storage = w6_storage();
+        // This harness's own capacities, not `TestChain`'s: its window is 6.
+        let mut chain_config = empty_chain_config(W6Chain::BUILD_LIMITS);
         chain_config
-            .load_durable(window_horizon_config_builder(W4, h).build_signed(&crypto))
+            .load_durable(window_config_builder(W6).build_signed(&crypto))
             .ok()
-            .expect("the W4 configuration is accepted content");
+            .expect("the W6 configuration is accepted content");
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
         Blockchain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -10480,12 +11329,12 @@ mod tests {
         unsafe { slot.assume_init() }
     }
 
-    /// As [`new_w4_chain`], but holding **no** configuration — the joining node's
+    /// As [`new_w6_chain`], but holding **no** configuration — the joining node's
     /// starting state on the small-window harness.
-    fn new_unconfigured_w4_chain() -> W4Chain {
+    fn new_unconfigured_w6_chain() -> W6Chain {
         let (crypto, _, _) = test_backends();
-        let storage = w4_storage();
-        let chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
+        let storage = w6_storage();
+        let chain_config = empty_chain_config(W6Chain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
         Blockchain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -10493,41 +11342,43 @@ mod tests {
         unsafe { slot.assume_init() }
     }
 
-    /// AC2 — an active-length segment (`>= W = 4`) that does NOT reach genesis
-    /// triggers Processing; one block short (len 3) it stays Collecting.
+    /// AC2 — an active-length segment (`>= W + H = 9`, `W = 6`) that does NOT
+    /// reach genesis triggers Processing; one block short (len 8) it stays
+    /// Collecting.
     #[test]
     fn fr2_active_length_triggers_at_w() {
-        let mut bc = new_w4_chain();
-        // The orphan #98 (unresolved parent) and its child #99, the chain-config
-        // block #100 the FR8 final check requires in scope (Story 5.9, AC3),
-        // then children up to length 5 — one below `W + H = 6` (DEC-177).
-        let below = w4_horizon_block();
-        for block in [&w4_horizon_base(), &below] {
+        let mut bc = new_w6_chain();
+        // The orphan #97 (unresolved parent) and its children #98, #99, the
+        // chain-config block #100 the FR8 final check requires in scope (Story
+        // 5.9, AC3), then children up to length 8 — one below `W + H = 9`
+        // (DEC-177).
+        let below = w6_horizon_block();
+        for block in &w6_below() {
             bc.receive_block(block.view(), 0);
         }
-        let tail = w4_config_anchor_block(100, below.view().hash());
+        let tail = w6_config_anchor_block(100, below.view().hash());
         bc.receive_block(tail.view(), 0);
         let mut prev = tail.view().hash();
-        for seq in 101..=102 {
+        for seq in 101..=104 {
             let blk = linked_transfer_block(seq, prev);
             prev = blk.view().hash();
             bc.receive_block(blk.view(), 0);
         }
-        assert_eq!(bc.block_tree_len(), 5);
+        assert_eq!(bc.block_tree_len(), 8);
         assert!(
             bc.evaluate_stopping_condition().is_none(),
-            "segment length 5 >= W, below W + H = 6"
+            "segment length 8 >= W, below W + H = 9"
         );
         assert!(bc.current_phase() == LifecyclePhase::Collecting);
-        // The 6th block brings the continuous segment to length W + H = 6 → FR2
+        // The 9th block brings the continuous segment to length W + H = 9 → FR2
         // qualifies, and the window-anchored candidate (unseeded initializers, so
         // the per-node FR6 checks are pre-seed-skipped, and every block is
         // node-#0-signed against the trust anchor) validates → Ready (Story 5.4).
-        let last = linked_transfer_block(103, prev);
+        let last = linked_transfer_block(105, prev);
         bc.receive_block(last.view(), 0);
         assert!(
             bc.is_ready(),
-            "segment length 6 >= W + H → FR2 qualifies, FR6 validates → Ready"
+            "segment length 9 >= W + H → FR2 qualifies, FR6 validates → Ready"
         );
     }
 
@@ -10617,7 +11468,7 @@ mod tests {
     /// `active_chain_head_idx`).
     #[test]
     fn fr2_anchored_genesis_does_not_preempt_higher_branch() {
-        let mut bc = new_w4_chain();
+        let mut bc = new_w6_chain();
         // Anchored genesis (a short genesis-anchored candidate).
         let g = node_transfer_block(0, 7, 0, 7);
         bc.tier1_admit(&g.view(), &g.view().hash(), 0)
@@ -10629,29 +11480,29 @@ mod tests {
         );
         // Block #1 names the configuration, so the genesis branch is itself a
         // qualifying candidate (Story 5.13) — the one that must not win.
-        let cfg = w4_config_anchor_block(1, g.view().hash());
+        let cfg = w6_config_anchor_block(1, g.view().hash());
         bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
             .expect("config admitted");
-        // A separate non-genesis branch of length W + H = 6 (#98 → tip 103),
+        // A separate non-genesis branch of length W + H = 9 (#97 → tip 105),
         // its window tail #100 naming the same configuration.
-        let below = w4_horizon_block();
-        for block in [&w4_horizon_base(), &below] {
+        let below = w6_horizon_block();
+        for block in &w6_below() {
             bc.tier1_admit(&block.view(), &block.view().hash(), 0)
                 .expect("the blocks below the window admitted");
         }
-        let tail = w4_config_anchor_block(100, below.view().hash());
+        let tail = w6_config_anchor_block(100, below.view().hash());
         bc.tier1_admit(&tail.view(), &tail.view().hash(), 0)
             .expect("tail admitted");
         let mut prev = tail.view().hash();
         let mut tip_idx = 0;
-        for seq in 101..=103 {
+        for seq in 101..=105 {
             let blk = linked_transfer_block(seq, prev);
             prev = blk.view().hash();
             tip_idx = bc
                 .tier1_admit(&blk.view(), &blk.view().hash(), 0)
                 .expect("child admitted");
         }
-        // Highest tip sequence (103) wins over the anchored genesis (seq 0).
+        // Highest tip sequence (105) wins over the anchored genesis (seq 0).
         assert_eq!(
             bc.evaluate_stopping_condition(),
             Some(tip_idx),
@@ -10780,15 +11631,10 @@ mod tests {
         chain_config_block_from(seq, prev, &mut window_config_builder(TEST_W))
     }
 
-    /// [`chain_config_anchor_block`] for the [`W4Chain`] harness, whose
-    /// configuration declares its own window, [`W4`].
-    fn w4_config_anchor_block(seq: u32, prev: [u8; 32]) -> Block {
-        w4_config_anchor_block_h(seq, prev, test_horizon(W4))
-    }
-
-    /// [`w4_config_anchor_block`] for the [`new_w4_chain_h`] harness.
-    fn w4_config_anchor_block_h(seq: u32, prev: [u8; 32], h: u32) -> Block {
-        chain_config_block_from(seq, prev, &mut window_horizon_config_builder(W4, h))
+    /// [`chain_config_anchor_block`] for the [`W6Chain`] harness, whose
+    /// configuration declares its own window, [`W6`].
+    fn w6_config_anchor_block(seq: u32, prev: [u8; 32]) -> Block {
+        chain_config_block_from(seq, prev, &mut window_config_builder(W6))
     }
 
     /// A chain-config block at `seq`, chained to `prev`, carrying whatever
@@ -10844,23 +11690,27 @@ mod tests {
     /// Above `HEADER_SIZE`, so the configuration module accepts it, and far
     /// below the build's block capacity, so a realistic block can exceed it.
     ///
-    /// Five bytes above the larger of the test configuration block (its 32-byte
-    /// content: the four-byte `W`, `H`, block-size and node-cap entries and the
-    /// one-byte scheme and support entries) and the one-entry balance block, so
-    /// both fit; below the three-entry balance block and the three-output
+    /// Five bytes above the largest of the test configuration block (its
+    /// 32-byte content: the four-byte `W`, `H`, block-size and node-cap entries
+    /// and the one-byte scheme and support entries), the one-entry balance
+    /// block and the one-transfer block (a clean slot's, Story 6.7 D8), so all
+    /// fit; below the three-entry balance block and the three-output
     /// transaction block the fixtures exceed it with. Derived from the scheme's
-    /// sizes (Story 6.17): 223 / 231 / 287 B under `schnorr` / `bls-min-sig` /
+    /// sizes (Story 6.17): 230 / 231 / 294 B under `schnorr` / `bls-min-sig` /
     /// `bls-min-pk`, against 254 / 430 / 334 B for the smaller of the two large
     /// fixtures.
     const SMALL_BLOCK_SIZE_LIMIT: u32 = {
         let config_block = HEADER_SIZE + 32 + SIGNATURE_SIZE;
         let balance_block = HEADER_SIZE + 8 + NODE_INFO_SIZE;
-        let larger = if config_block > balance_block {
-            config_block
-        } else {
-            balance_block
-        };
-        (larger + 5) as u32
+        let transfer_block = HEADER_SIZE + 2 + moonblokz_chain_types::NODE_TRANSFER_SIZE;
+        let mut largest = config_block;
+        if balance_block > largest {
+            largest = balance_block;
+        }
+        if transfer_block > largest {
+            largest = transfer_block;
+        }
+        (largest + 5) as u32
     };
 
     /// An override set declaring [`SMALL_BLOCK_SIZE_LIMIT`] and the window `w`.
@@ -12437,16 +13287,17 @@ mod tests {
     /// once per re-qualification.
     #[test]
     fn fr2_segment_naming_no_configuration_is_not_a_candidate() {
-        // A window-anchored segment of W + 1 = 5 blocks (#99..=#103), none of
-        // them a chain-config block, on a configured node.
-        let mut bc = new_w4_chain();
-        let base = node_transfer_block(99, 3, 98, 7);
-        bc.receive_block(base.view(), 0);
-        let tail = linked_transfer_block(100, base.view().hash());
-        let b101 = linked_transfer_block(101, tail.view().hash());
-        let b102 = linked_transfer_block(102, b101.view().hash());
-        let b103 = linked_transfer_block(103, b102.view().hash());
-        for blk in [&tail, &b101, &b102, &b103] {
+        // A window-anchored segment of W + H − 1 = 8 blocks (#98..=#105),
+        // none of them a chain-config block, on a configured node.
+        let mut bc = new_w6_chain();
+        let base = node_transfer_block(98, 3, 97, 7);
+        let mut prev = base.view().hash();
+        let above: [Block; 7] = core::array::from_fn(|i| {
+            let blk = linked_transfer_block(99 + i as u32, prev);
+            prev = blk.view().hash();
+            blk
+        });
+        for blk in core::iter::once(&base).chain(&above) {
             bc.receive_block(blk.view(), 0);
         }
 
@@ -12458,33 +13309,29 @@ mod tests {
             bc.current_phase() == LifecyclePhase::Collecting,
             "no pass ran"
         );
-        assert_eq!(bc.block_tree_len(), 5, "nothing was deleted");
+        assert_eq!(bc.block_tree_len(), 8, "nothing was deleted");
 
         // The segment's own configuration arriving above it makes it a
-        // candidate, which validates.
-        let cfg = w4_config_anchor_block(104, b103.view().hash());
+        // candidate, which validates. #106 is not a clean slot (`H = 3`).
+        let cfg = w6_config_anchor_block(106, prev);
         bc.receive_block(cfg.view(), 0);
         assert!(bc.is_ready(), "the segment now names its configuration");
-        // Nothing was deleted for the waiting: the six-block segment is
-        // exactly `W + H`, so its Ready entry keeps #99 and #100 in the horizon
+        // Nothing was deleted for the waiting: the nine-block segment is
+        // exactly `W + H`, so its Ready entry keeps #98..=#100 in the horizon
         // (FR58, Story 6.14).
-        assert_eq!(bc.block_tree_len(), 6, "every block survived the wait");
+        assert_eq!(bc.block_tree_len(), 9, "every block survived the wait");
         assert!(
-            bc.block_tree_contains(99, &base.view().hash()),
-            "#99 is the horizon root"
+            bc.block_tree_contains(98, &base.view().hash()),
+            "#98 is the horizon root"
         );
-        assert!(
-            bc.block_tree_contains(100, &tail.view().hash()),
-            "#100 is in the horizon"
-        );
-        for blk in [&b101, &b102, &b103, &cfg] {
+        for blk in above.iter().chain([&cfg]) {
             let view = blk.view();
             assert!(bc.block_tree_contains(view.sequence(), &view.hash()));
         }
-        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 106)));
         assert_eq!(
             bc.current_active_head(),
-            Some(104),
+            Some(106),
             "the active head is the config block that completed the segment"
         );
     }
@@ -12907,14 +13754,14 @@ mod tests {
     /// `BlockTooLarge` under a limit no block on that chain was ever subject to.
     #[test]
     fn fr3_preload_prevents_a_stale_tentative_from_condemning_a_valid_block() {
-        let mut bc = new_unconfigured_w4_chain();
+        let mut bc = new_unconfigured_w6_chain();
         // (1) A balance block bigger than the small limit the stray will declare,
         // admitted while the node is unconfigured.
         // `max_node_id = 9` so the linked transfers' pre-window actors (nodes 7
         // and 9) are inside the derived node-id range; three entries so the block
         // comfortably exceeds the stray's declared limit.
-        let below = w4_horizon_block();
-        for block in [&w4_horizon_base(), &below] {
+        let below = w6_horizon_block();
+        for block in &w6_below() {
             let (outcome, _) = bc.receive_block(block.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
@@ -12930,7 +13777,9 @@ mod tests {
         );
         let b101 = linked_transfer_block(101, big.view().hash());
         let b102 = linked_transfer_block(102, b101.view().hash());
-        for block in [&big, &b101, &b102] {
+        let b103 = linked_transfer_block(103, b102.view().hash());
+        let b104 = linked_transfer_block(104, b103.view().hash());
+        for block in [&big, &b101, &b102, &b103, &b104] {
             let (outcome, _) = bc.receive_block(block.view(), 0);
             assert_eq!(
                 outcome,
@@ -12941,7 +13790,7 @@ mod tests {
 
         // (2) The stray loads a tentative declaring the small limit. Off-candidate
         // and alone, so it is never itself an FR2 candidate.
-        let stray = chain_config_block_from(500, [0xEE; 32], &mut small_limit_config_builder(W4));
+        let stray = chain_config_block_from(500, [0xEE; 32], &mut small_limit_config_builder(W6));
         bc.receive_block(stray.view(), 0);
         assert!(
             bc.chain_config.tentative_content().is_some(),
@@ -12949,8 +13798,8 @@ mod tests {
         );
 
         // (3) The candidate's own chain-config block completes the segment at
-        // W + H = 6 and triggers FR2.
-        let cfg = w4_config_anchor_block(103, b102.view().hash());
+        // W + H = 9 and triggers FR2.
+        let cfg = w6_config_anchor_block(105, b104.view().hash());
         let (outcome, _) = bc.receive_block(cfg.view(), 0);
 
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
@@ -13074,11 +13923,11 @@ mod tests {
     /// rollback with nothing promoted and nothing locked.
     #[test]
     fn fr9_size_limit_is_reevaluated_at_the_durable_lock() {
-        let mut bc = new_unconfigured_w4_chain();
-        // A six-block (`W + H`) window-anchored candidate whose own chain-config
-        // declares a limit the balance block near its base exceeds.
-        let below = w4_horizon_block();
-        for block in [&w4_horizon_base(), &below] {
+        let mut bc = new_unconfigured_w6_chain();
+        // A nine-block (`W + H`) window-anchored candidate whose own
+        // chain-config declares a limit the balance block near its base exceeds.
+        let below = w6_horizon_block();
+        for block in &w6_below() {
             let (outcome, _) = bc.receive_block(block.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
@@ -13091,9 +13940,11 @@ mod tests {
         assert!(big.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
         let b101 = linked_transfer_block(101, big.view().hash());
         let b102 = linked_transfer_block(102, b101.view().hash());
+        let b103 = linked_transfer_block(103, b102.view().hash());
+        let b104 = linked_transfer_block(104, b103.view().hash());
         let cfg =
-            chain_config_block_from(103, b102.view().hash(), &mut small_limit_config_builder(W4));
-        for block in [&big, &b101, &b102, &cfg] {
+            chain_config_block_from(105, b104.view().hash(), &mut small_limit_config_builder(W6));
+        for block in [&big, &b101, &b102, &b103, &b104, &cfg] {
             let (outcome, _) = bc.receive_block(block.view(), 0);
             assert_eq!(
                 outcome,
@@ -14063,50 +14914,119 @@ mod tests {
         bc
     }
 
-    /// The upper of the two blocks below every W4 window-anchored segment: with
-    /// `H = 2` a window-anchored join needs `W + H = 6` blocks (DEC-177), so
-    /// each segment `100..` starts two blocks lower, at #98 ([`w4_horizon_base`])
-    /// and #99, which then lie in the FR58 horizon below the window
-    /// `100..=103`. Plain transfers: they carry no essential state, so dropping
-    /// them binds nothing. Their vote names the creator, node #0, whose vote
-    /// the creator-vote reset clears in the same block, so they move no vote: a
-    /// restart that re-admits #99 from its released slot (lazy release) and
-    /// re-derives over it reaches the projection a node fed only the retained
-    /// blocks does (AC12.6, [`the_horizon_holds_only_the_active_path`]).
-    fn w4_horizon_block() -> Block {
-        salted_linked_block(99, w4_horizon_base().view().hash(), 0)
+    /// The three blocks below every W6 window-anchored segment, #97, #98 and
+    /// #99: with `H = 3` a window-anchored join needs `W + H = 9` blocks
+    /// (DEC-177), so each segment `100..` starts three blocks lower, and they
+    /// then lie in the FR58 horizon below the window `100..=105`. #97 is an
+    /// orphan. Plain transfers: they carry no essential state, so dropping
+    /// them binds nothing, and #98, a clean slot (Story 6.7 D8), is one. Their
+    /// vote names the creator, node #0, whose vote the creator-vote reset
+    /// clears in the same block, so they move no vote: a restart that
+    /// re-admits one from its released slot (lazy release) and re-derives over
+    /// it reaches the projection a node fed only the retained blocks does
+    /// (AC12.6, [`the_horizon_holds_only_the_active_path`]).
+    fn w6_below() -> [Block; 3] {
+        let b97 = salted_linked_block(97, [0xAB; 32], 0);
+        let b98 = salted_linked_block(98, b97.view().hash(), 0);
+        let b99 = salted_linked_block(99, b98.view().hash(), 0);
+        [b97, b98, b99]
     }
 
-    /// The lower block below every W4 window-anchored segment, #98: the parent
-    /// of [`w4_horizon_block`], itself an orphan.
-    fn w4_horizon_base() -> Block {
-        salted_linked_block(98, [0xAB; 32], 0)
+    /// The top block below the window, #99 (see [`w6_below`]).
+    fn w6_horizon_block() -> Block {
+        let [_, _, b99] = w6_below();
+        b99
     }
 
-    /// A `W4Chain` that went Ready on the window-anchored segment `98..=last`
-    /// (#98 and #99 from [`w4_horizon_base`] and [`w4_horizon_block`]),
-    /// its tail block #100 the chain-config block the FR8 final check requires.
-    /// Returns the node and the hash of each block, indexed by `seq - 100`.
-    fn w4_ready_on_segment(last: u32) -> (W4Chain, [[u8; 32]; 8]) {
-        let mut bc = new_w4_chain();
+    /// A node-#0 founder on the W6 configuration, Ready on its FR54 genesis
+    /// ([`Blockchain::process_genesis`]), and the blocks #0 and #1 it wrote.
+    fn w6_founder() -> (W6Chain, Block, Block) {
+        let (crypto, _, _) = test_backends();
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot = core::mem::MaybeUninit::<W6Chain>::uninit();
+        let chain_config = empty_chain_config(W6Chain::BUILD_LIMITS);
+        Blockchain::init(
+            &mut slot,
+            crypto,
+            w6_storage(),
+            chain_config,
+            0,
+            node_zero,
+            0,
+        );
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut founder = unsafe { slot.assume_init() };
+        let genesis = founder
+            .process_genesis(CURRENCY, window_config_builder(W6).content())
+            .ok()
+            .expect("genesis succeeds");
+        (founder, genesis.block_zero, genesis.block_one)
+    }
+
+    /// A clean (Story 6.7 D8) block at `seq` on `prev`: one node transfer of
+    /// nothing, fee 0, by node #0 to itself, voting for its creator. Valid
+    /// wherever node #0 is seeded, so it extends a Ready W6 head at any
+    /// position, a clean slot included.
+    fn w6_clean_block(seq: u32, prev: [u8; 32]) -> Block {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(0, seq - 1, 0, 0, 0, 0, 0, &signer);
+        tx_block(seq, prev, 0, |b| {
+            b.add_node_transfer(&nt).ok().expect("add transfer");
+        })
+    }
+
+    /// The W6 segment's balance block at `seq`, repeating node #0's entry as
+    /// `bc` holds it (the first, #102, seeds it with nothing).
+    fn w6_balance_block(bc: Option<&W6Chain>, seq: u32, prev: [u8; 32]) -> Block {
+        let (balance, vote, max) = bc.map_or((0, 0, 9), |bc| {
+            (
+                bc.node_info.balance_of(0),
+                bc.vote_engine.accumulated_vote_of(0),
+                bc.node_info.max_known_node_id(),
+            )
+        });
+        balance_block(seq, prev, &[(0, balance, vote, 1)], max)
+    }
+
+    /// The block that extends a Ready W6 head at `seq` (on `prev`, the head):
+    /// the replay the block it drops needs — chain-config for #100, #106, …
+    /// (FR49), node #0's balance for #102, #108, … (FR50) — and otherwise a
+    /// [`w6_clean_block`], which also fills the clean slots `≡ 2 (mod 3)`.
+    fn w6_extension(bc: &W6Chain, seq: u32, prev: [u8; 32]) -> Block {
+        match (seq - 100) % 6 {
+            0 => w6_config_anchor_block(seq, prev),
+            2 => w6_balance_block(Some(bc), seq, prev),
+            _ => w6_clean_block(seq, prev),
+        }
+    }
+
+    /// A `W6Chain` that went Ready on the window-anchored segment `97..=last`
+    /// (`last ≤ 107`; #97..=#99 from [`w6_below`]), its tail block #100 the
+    /// chain-config block the FR8 final check requires and #102 a balance
+    /// block seeding node #0, so a Ready extension can name it
+    /// ([`w6_extension`]); the others are plain transfers. Returns the node
+    /// and the hash of each block, indexed by `seq - 100`.
+    fn w6_ready_on_segment(last: u32) -> (W6Chain, [[u8; 32]; 8]) {
+        let mut bc = new_w6_chain();
         let mut hashes = [[0u8; 32]; 8];
-        for below in [w4_horizon_base(), w4_horizon_block()] {
+        for below in w6_below() {
             bc.tier1_admit(&below.view(), &below.view().hash(), 0)
                 .expect("the blocks below the window admitted");
         }
-        let below = w4_horizon_block();
-        let anchor = w4_config_anchor_block(100, below.view().hash());
+        let below = w6_horizon_block();
+        let anchor = w6_config_anchor_block(100, below.view().hash());
         hashes[0] = anchor.view().hash();
         bc.tier1_admit(&anchor.view(), &hashes[0], 0)
             .expect("anchor admitted");
         for seq in 101..=last {
-            // #104 drops the chain-config block #100, so it is its replay
+            // #106 drops the chain-config block #100, so it is its replay
             // (FR49): the FR3 pass binds it (Story 6.14 AC9).
             let prev = hashes[(seq - 101) as usize];
-            let blk = if seq == 104 {
-                w4_config_anchor_block(seq, prev)
-            } else {
-                linked_transfer_block(seq, prev)
+            let blk = match seq {
+                102 => w6_balance_block(None, seq, prev),
+                106 => w6_config_anchor_block(seq, prev),
+                107 => w6_clean_block(seq, prev),
+                _ => linked_transfer_block(seq, prev),
             };
             hashes[(seq - 100) as usize] = blk.view().hash();
             bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
@@ -14117,13 +15037,13 @@ mod tests {
         (bc, hashes)
     }
 
-    fn slot_of(bc: &W4Chain, seq: u32, hash: &[u8; 32]) -> Option<u32> {
+    fn slot_of(bc: &W6Chain, seq: u32, hash: &[u8; 32]) -> Option<u32> {
         bc.blocks.find(seq, hash)
     }
 
     /// Receives `block` as a child of the active head; the Story 6.0 forward
     /// extension makes it the new head and, past `W`, advances the tail.
-    fn extend_active_head(bc: &mut W4Chain, block: &Block, now: u64) -> u32 {
+    fn extend_active_head(bc: &mut W6Chain, block: &Block, now: u64) -> u32 {
         let (outcome, _) = bc.receive_block(block.view(), now);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         let view = block.view();
@@ -14146,12 +15066,12 @@ mod tests {
         assert_eq!(bc.block_tree_len(), 2);
     }
 
-    /// AC2 — `W = 2` admits no verification horizon: `H` must be at least 2,
+    /// AC2 — `W = 2` admits no verification horizon: `H` must be at least 3,
     /// below `W` and divide it (configuration §6 checks 15 and 21, Story 6.7
     /// D8), so neither `H = 1` nor `H = 2` is legal, and genesis refuses the
     /// content before anything is written. (This test pinned that a `W = 2`
     /// genesis is already `W` long and releases nothing; the smallest window
-    /// with a legal horizon is now 4, which genesis never fills.)
+    /// with a legal horizon is now 6, which genesis never fills.)
     #[test]
     fn snake_genesis_at_w_two_is_refused() {
         for h in [1, 2] {
@@ -14222,7 +15142,7 @@ mod tests {
         );
     }
 
-    /// AC2 — `W = 1` admits no verification horizon (`2 ≤ H < W` is empty,
+    /// AC2 — `W = 1` admits no verification horizon (`3 ≤ H < W` is empty,
     /// DEC-207, Story 6.7 D8), so genesis refuses the content before anything
     /// is written.
     #[test]
@@ -14242,24 +15162,37 @@ mod tests {
     /// of length `W + H + 1` keeps the window `W` long and `H` blocks below it,
     /// and releases exactly the one block beyond them. The extra blocks are
     /// chain-config replays, which FR6 accepts on a genesis-anchored candidate;
-    /// the retained #1 is one.
+    /// the retained #1 is one. The segment is a founder's FR54 genesis, which
+    /// seeds node #0, so the clean slots #2, #5 and #8 (Story 6.7 D8) hold
+    /// [`w6_clean_block`]s, and #6, which drops #0 (node #0's seed source),
+    /// is node #0's balance replay (FR50); the founder builds them.
     #[test]
     fn snake_ready_entry_on_a_longer_genesis_segment_releases_the_excess() {
-        let mut bc = new_w4_chain();
-        let genesis = node_transfer_block(0, 3, 0, 7);
-        let mut prev = genesis.view().hash();
-        bc.tier1_admit(&genesis.view(), &prev, 0)
-            .expect("genesis admitted");
-        for seq in 1..=6 {
-            let cfg = w4_config_anchor_block(seq, prev);
-            prev = cfg.view().hash();
-            bc.tier1_admit(&cfg.view(), &prev, 0)
-                .expect("config admitted");
+        let mut bc = new_w6_chain();
+        let (mut founder, genesis, b1) = w6_founder();
+        for block in [&genesis, &b1] {
+            bc.tier1_admit(&block.view(), &block.view().hash(), 0)
+                .expect("genesis admitted");
+        }
+        let mut prev = b1.view().hash();
+        for seq in 2..=9 {
+            let blk = match seq {
+                6 => w6_balance_block(Some(&founder), seq, prev),
+                _ if seq % 3 == 2 => w6_clean_block(seq, prev),
+                _ => w6_config_anchor_block(seq, prev),
+            };
+            assert_eq!(
+                founder.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            prev = blk.view().hash();
+            bc.tier1_admit(&blk.view(), &prev, 0)
+                .expect("block admitted");
         }
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready());
-        assert_eq!(bc.active_snake_chain_window(), Ok((3, 6)));
-        assert_eq!(bc.block_tree_len(), 6, "W blocks and H = 2 below them");
+        assert_eq!(bc.active_snake_chain_window(), Ok((4, 9)));
+        assert_eq!(bc.block_tree_len(), 9, "W blocks and H = 3 below them");
         assert!(bc.blocks.get(0).is_none(), "#0 left the horizon: released");
         let root = bc.blocks.get(1).expect("#1 in the horizon");
         assert_eq!(root.sequence(), 1);
@@ -14267,26 +15200,27 @@ mod tests {
         assert!(root.is_on_active_chain());
         assert_eq!(bc.horizon_root(), 1);
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
-        assert_eq!(tail.sequence(), 3);
-        assert_eq!(tail.parent_ref(), 2, "the tail stays linked to the horizon");
+        assert_eq!(tail.sequence(), 4);
+        assert_eq!(tail.parent_ref(), 3, "the tail stays linked to the horizon");
         assert!(tail.is_on_active_chain());
         assert!(!bc.chain_heads.has_stored_head());
     }
 
     /// AC10.3; Story 6.14 AC6 — Ready entry on a window-anchored segment of
-    /// exactly `W + H` releases nothing: the window is `100..=103` and #98 and
-    /// #99 are the horizon.
+    /// exactly `W + H` releases nothing: the window is `100..=105` and #97,
+    /// #98 and #99 are the horizon.
     #[test]
     fn snake_ready_entry_on_exactly_w_plus_h_releases_nothing() {
-        let (bc, _) = w4_ready_on_segment(103);
-        assert_eq!(bc.active_snake_chain_window(), Ok((100, 103)));
-        assert_eq!(bc.block_tree_len(), 6);
-        let below = w4_horizon_block();
-        assert!(slot_of(&bc, 99, &below.view().hash()).is_some(), "#99 kept");
+        let (bc, _) = w6_ready_on_segment(105);
+        assert_eq!(bc.active_snake_chain_window(), Ok((100, 105)));
+        assert_eq!(bc.block_tree_len(), 9);
+        let [b97, b98, b99] = w6_below();
+        assert!(slot_of(&bc, 98, &b98.view().hash()).is_some(), "#98 kept");
+        assert!(slot_of(&bc, 99, &b99.view().hash()).is_some(), "#99 kept");
         assert_eq!(
             Some(bc.horizon_root()),
-            slot_of(&bc, 98, &w4_horizon_base().view().hash()),
-            "#98 is the root"
+            slot_of(&bc, 97, &b97.view().hash()),
+            "#97 is the root"
         );
         // O-024: the adopted chain's head is Connected, not a Stored head still
         // asking for the anchor's parent.
@@ -14299,38 +15233,36 @@ mod tests {
     /// reuses the slot does not classify as a seed source.
     #[test]
     fn snake_released_seed_source_does_not_follow_the_slot() {
-        let (mut bc, h) = w4_ready_on_segment(103);
-        let slot_99 = slot_of(&bc, 99, &w4_horizon_block().view().hash()).expect("#99");
+        let (mut bc, h) = w6_ready_on_segment(105);
+        let slot_99 = slot_of(&bc, 99, &w6_horizon_block().view().hash()).expect("#99");
         let slot_100 = slot_of(&bc, 100, &h[0]).expect("#100");
         let key = *bc.crypto.public_key().serialize();
         bc.node_info.seed_node(1, &key, 0, slot_100);
-        let b104 = w4_config_anchor_block(104, h[3]);
-        extend_active_head(&mut bc, &b104, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
-        assert!(
-            bc.node_info.is_seed_source(slot_100),
-            "#100 entered the horizon and keeps the pointer"
-        );
-        let b105 = w4_config_anchor_block(105, b104.view().hash());
-        extend_active_head(&mut bc, &b105, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
-        assert!(
-            bc.node_info.is_seed_source(slot_100),
-            "#100 is still in the horizon (H = 2) and keeps the pointer"
-        );
-        let b106 = w4_config_anchor_block(106, b105.view().hash());
-        extend_active_head(&mut bc, &b106, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((103, 106)));
+        let mut prev = h[5];
+        let mut head = [0u8; 32];
+        for seq in 106..=109 {
+            let blk = w6_extension(&bc, seq, prev);
+            extend_active_head(&mut bc, &blk, 0);
+            prev = blk.view().hash();
+            head = prev;
+            assert_eq!(bc.active_snake_chain_window(), Ok((seq - 5, seq)));
+            if seq < 109 {
+                assert!(
+                    bc.node_info.is_seed_source(slot_100),
+                    "#100 entered the horizon (H = 3) and keeps the pointer"
+                );
+            }
+        }
         assert!(slot_of(&bc, 100, &h[0]).is_none(), "#100 left the horizon");
         assert!(bc.node_info.is_seeded(1), "the node stays seeded");
         assert!(bc.node_info.key_is_registered(&key));
         assert!(!bc.node_info.is_seed_source(slot_100));
-        // #106 took #99's freed slot; the next admission reuses #100's.
-        assert_eq!(slot_of(&bc, 106, &b106.view().hash()), Some(slot_99));
-        let orphan = node_transfer_block(108, 3, 107, 7);
+        // #109 took #99's freed slot; the next admission reuses #100's.
+        assert_eq!(slot_of(&bc, 109, &head), Some(slot_99));
+        let orphan = node_transfer_block(111, 3, 110, 7);
         let (outcome, _) = bc.receive_block(orphan.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(slot_of(&bc, 108, &orphan.view().hash()), Some(slot_100));
+        assert_eq!(slot_of(&bc, 111, &orphan.view().hash()), Some(slot_100));
         assert_eq!(
             classify_tail_drop(&bc.blocks, &bc.node_info, slot_100),
             Ok(TailObligation::None),
@@ -14342,10 +15274,10 @@ mod tests {
     /// tail that is off the active path or is the head.
     #[test]
     fn snake_advance_refuses_a_tail_off_the_active_path() {
-        let (mut bc, h) = w4_ready_on_segment(103);
-        let b104 = w4_config_anchor_block(104, h[3]);
-        extend_active_head(&mut bc, &b104, 0);
-        let fork = salted_linked_block(104, h[3], 9);
+        let (mut bc, h) = w6_ready_on_segment(105);
+        let b106 = w6_extension(&bc, 106, h[5]);
+        extend_active_head(&mut bc, &b106, 0);
+        let fork = salted_linked_block(106, h[5], 9);
         let fork_idx = admit_fork(&mut bc, &fork, 0);
         let len = bc.block_tree_len();
         let real_tail = bc.snake_chain_tail_idx;
@@ -14363,7 +15295,7 @@ mod tests {
     /// the reclamation, and a fork carrying a pre-window actor would lose the
     /// FR23 replay it could otherwise win on a hash tie (Story 6.14 D6 lets a
     /// window-anchored chain switch).
-    fn admit_fork(bc: &mut W4Chain, fork: &Block, now: u64) -> u32 {
+    fn admit_fork(bc: &mut W6Chain, fork: &Block, now: u64) -> u32 {
         let view = fork.view();
         let idx = bc
             .tier1_admit(&view, &view.hash(), now)
@@ -14382,7 +15314,7 @@ mod tests {
     /// One step of the drive in [`drive_past_w`]: classify the tail, decide
     /// the binding for `extension`, then extend — the forward extension
     /// advances the window. Returns the trace record.
-    fn drive_step(bc: &mut W4Chain, extension: &Block, now: u64) -> DriveRecord {
+    fn drive_step(bc: &mut W6Chain, extension: &Block, now: u64) -> DriveRecord {
         let released = bc.snake_chain_tail_idx;
         let obligation =
             classify_tail_drop(&bc.blocks, &bc.node_info, released).expect("the tail is readable");
@@ -14393,32 +15325,33 @@ mod tests {
         (s_tail, released, obligation, binding)
     }
 
-    /// The AC10.4 drive (Story 6.14): from the window `100..=103` with #98 and
-    /// #99 in the horizon (`W = 4`, `H = 2`), two head extensions. Only forks
-    /// inside FR58's bound can arrive (`S_new > S_head − H`), each forking at
-    /// the deepest point the bound admits: before the first, a fork off #101,
-    /// two blocks deep; before the second, a fork off #102; after it, a fork
-    /// off #103. Returns the trace, the node, and the hashes
-    /// `[#101 fork, its child, #102 fork, #103 fork, #104]`.
-    fn drive_past_w(now: u64) -> ([DriveRecord; 2], W4Chain, [[u8; 32]; 5]) {
-        let (mut bc, h) = w4_ready_on_segment(103);
-        let fork_a = salted_linked_block(102, h[1], 5);
-        let fork_a_child = salted_linked_block(103, fork_a.view().hash(), 5);
+    /// The AC10.4 drive (Story 6.14): from the window `100..=105` with #97,
+    /// #98 and #99 in the horizon (`W = 6`, `H = 3`), two head extensions.
+    /// Only forks inside FR58's bound can arrive (`S_new > S_head − H`), each
+    /// forking at the deepest point the bound admits: before the first, a fork
+    /// off #102, two blocks deep; before the second, a fork off #103; after
+    /// it, a fork off #104. Returns the trace, the node, and the hashes
+    /// `[#102 fork, its child, #103 fork, #104 fork, #106]`.
+    fn drive_past_w(now: u64) -> ([DriveRecord; 2], W6Chain, [[u8; 32]; 5]) {
+        let (mut bc, h) = w6_ready_on_segment(105);
+        let fork_a = salted_linked_block(103, h[2], 5);
+        let fork_a_child = salted_linked_block(104, fork_a.view().hash(), 5);
         for blk in [&fork_a, &fork_a_child] {
             admit_fork(&mut bc, blk, now);
         }
         // Dropping #100 (chain-config) needs a chain-config extension (FR49).
-        let b104 = w4_config_anchor_block(104, h[3]);
-        let first = drive_step(&mut bc, &b104, now);
-        let fork_b = salted_linked_block(103, h[2], 8);
+        let b106 = w6_extension(&bc, 106, h[5]);
+        let first = drive_step(&mut bc, &b106, now);
+        let fork_b = salted_linked_block(104, h[3], 8);
         admit_fork(&mut bc, &fork_b, now);
         assert!(!bc.chain_heads.has_stored_head(), "every fork is Connected");
         // A Ready projection is complete (Story 6.0 D3): this segment seeds no
-        // node but #0, so the extension must not name another actor.
-        let b105 = w4_config_anchor_block(105, b104.view().hash());
-        let second = drive_step(&mut bc, &b105, now);
+        // node but #0, so the extension names no other actor; #107 is a clean
+        // slot (Story 6.7 D8).
+        let b107 = w6_extension(&bc, 107, b106.view().hash());
+        let second = drive_step(&mut bc, &b107, now);
         // A fork inside the bound (`A = S_head − H`) is kept.
-        let keep = salted_linked_block(104, h[3], 6);
+        let keep = salted_linked_block(105, h[4], 6);
         admit_fork(&mut bc, &keep, now);
         (
             [first, second],
@@ -14428,7 +15361,7 @@ mod tests {
                 fork_a_child.view().hash(),
                 fork_b.view().hash(),
                 keep.view().hash(),
-                b104.view().hash(),
+                b106.view().hash(),
             ],
         )
     }
@@ -14441,19 +15374,18 @@ mod tests {
     /// branch inside the bound is kept, and nothing is left asking for a parent.
     #[test]
     fn snake_drive_past_w() {
-        let (h, slot_98, slot_99, slot_100, slot_101) = {
-            let (bc, h) = w4_ready_on_segment(103);
-            let lowest = w4_horizon_base();
-            let below = w4_horizon_block();
+        let [b97, b98, b99] = w6_below();
+        let (h, slot_97, slot_98, slot_100, slot_101) = {
+            let (bc, h) = w6_ready_on_segment(105);
             (
                 h,
-                slot_of(&bc, 98, &lowest.view().hash()),
-                slot_of(&bc, 99, &below.view().hash()),
+                slot_of(&bc, 97, &b97.view().hash()),
+                slot_of(&bc, 98, &b98.view().hash()),
                 slot_of(&bc, 100, &h[0]),
                 slot_of(&bc, 101, &h[1]),
             )
         };
-        let (trace, mut bc, [fork_a, fork_a_child, fork_b, keep, b104]) = drive_past_w(1_000);
+        let (trace, mut bc, [fork_a, fork_a_child, fork_b, keep, b106]) = drive_past_w(1_000);
 
         assert_eq!(
             trace[0],
@@ -14473,50 +15405,53 @@ mod tests {
                 TailBinding::Advance
             )
         );
-        assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
+        assert_eq!(bc.active_snake_chain_window(), Ok((102, 107)));
 
-        // The horizon keeps #100 and #101, the blocks the window dropped; #98
-        // and #99 left the horizon and were released.
-        let lowest = w4_horizon_base();
-        let below = w4_horizon_block();
-        assert!(slot_of(&bc, 98, &lowest.view().hash()).is_none());
-        assert!(slot_of(&bc, 99, &below.view().hash()).is_none());
+        // The horizon keeps #99, #100 and #101: #99 from the entry, and the
+        // blocks the window dropped; #97 and #98 left the horizon and were
+        // released.
+        assert!(slot_of(&bc, 97, &b97.view().hash()).is_none());
+        assert!(slot_of(&bc, 98, &b98.view().hash()).is_none());
+        assert!(slot_97.is_some(), "precondition: #97 was retained at entry");
         assert!(slot_98.is_some(), "precondition: #98 was retained at entry");
-        assert!(slot_99.is_some(), "precondition: #99 was retained at entry");
-        let root_idx = slot_of(&bc, 100, &h[0]).expect("#100 in the horizon");
+        let root_idx = slot_of(&bc, 99, &b99.view().hash()).expect("#99 in the horizon");
         assert_eq!(bc.horizon_root(), root_idx);
         let root = bc.blocks.get(root_idx).expect("root");
         assert_eq!(root.parent_ref(), NONE_REF, "unlinked from the freed slot");
         assert!(root.is_on_active_chain(), "D1: the horizon keeps the flag");
         assert_eq!(root.status(), BlockStatus::Active);
-        let upper_idx = slot_of(&bc, 101, &h[1]).expect("#101 in the horizon");
-        let upper = bc.blocks.get(upper_idx).expect("#101");
-        assert_eq!(upper.parent_ref(), root_idx);
-        assert!(upper.is_on_active_chain(), "D1: the horizon keeps the flag");
+        let mut below_idx = root_idx;
+        for (seq, hash) in [(100, &h[0]), (101, &h[1])] {
+            let idx = slot_of(&bc, seq, hash).expect("in the horizon");
+            let entry = bc.blocks.get(idx).expect("held");
+            assert_eq!(entry.parent_ref(), below_idx);
+            assert!(entry.is_on_active_chain(), "D1: the horizon keeps the flag");
+            below_idx = idx;
+        }
         let tail = bc.blocks.get(bc.snake_chain_tail_idx).expect("tail");
         assert_eq!(tail.sequence(), 102);
-        assert_eq!(tail.parent_ref(), upper_idx, "the tail stays linked");
+        assert_eq!(tail.parent_ref(), below_idx, "the tail stays linked");
 
-        // FR58: the branch forked at #101 left the bound with #104's
-        // extension; the one forked at #102 with #105's.
-        assert!(slot_of(&bc, 102, &fork_a).is_none(), "#101 fork deleted");
+        // FR58: the branch forked at #102 left the bound with #106's
+        // extension; the one forked at #103 with #107's.
+        assert!(slot_of(&bc, 103, &fork_a).is_none(), "#102 fork deleted");
         assert!(
-            slot_of(&bc, 103, &fork_a_child).is_none(),
+            slot_of(&bc, 104, &fork_a_child).is_none(),
             "with its descendant"
         );
-        assert!(slot_of(&bc, 103, &fork_b).is_none(), "#102 fork deleted");
-        let keep_idx = slot_of(&bc, 104, &keep).expect("in-bound fork retained");
-        let b103_idx = slot_of(&bc, 103, &h[3]).expect("#103");
+        assert!(slot_of(&bc, 104, &fork_b).is_none(), "#103 fork deleted");
+        let keep_idx = slot_of(&bc, 105, &keep).expect("in-bound fork retained");
+        let b104_idx = slot_of(&bc, 104, &h[4]).expect("#104");
         assert_eq!(
             bc.blocks.get(keep_idx).map(|e| e.parent_ref()),
-            Some(b103_idx),
-            "still attached to #103, the bound"
+            Some(b104_idx),
+            "still attached to #104, the bound"
         );
-        assert!(slot_of(&bc, 104, &b104).is_some(), "#104");
+        assert!(slot_of(&bc, 106, &b106).is_some(), "#106");
         assert_eq!(
             bc.block_tree_len(),
-            7,
-            "#100 and #101 in the horizon, #102..#105, and the #103 fork"
+            10,
+            "#99..#101 in the horizon, #102..#107, and the #104 fork"
         );
 
         // No head is left asking for a parent.
@@ -14524,7 +15459,7 @@ mod tests {
         assert_eq!(
             bc.chain_heads.count(),
             2,
-            "the active head and the #103 fork"
+            "the active head and the #104 fork"
         );
         let (outcome, _) = bc.on_tick(u64::MAX / 2);
         assert!(!matches!(
@@ -14541,7 +15476,7 @@ mod tests {
     /// pins that the head recompute runs before the Ready-entry reclamation.
     #[test]
     fn snake_ready_entry_reclaims_a_genesis_island() {
-        let mut bc = new_w4_chain();
+        let mut bc = new_w6_chain();
         let genesis = node_transfer_block(0, 3, 0, 7);
         let (outcome, _) = bc.receive_block(genesis.view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
@@ -14550,25 +15485,25 @@ mod tests {
             bc.blocks.get(gi).is_some_and(|e| e.is_on_active_chain()),
             "precondition: the Collecting bootstrap anchor"
         );
-        let below = w4_horizon_block();
-        for block in [&w4_horizon_base(), &below] {
+        let below = w6_horizon_block();
+        for block in &w6_below() {
             bc.receive_block(block.view(), 0);
         }
-        let anchor = w4_config_anchor_block(100, below.view().hash());
+        let anchor = w6_config_anchor_block(100, below.view().hash());
         bc.receive_block(anchor.view(), 0);
         let mut prev = anchor.view().hash();
-        for seq in 101..=103 {
+        for seq in 101..=105 {
             let blk = linked_transfer_block(seq, prev);
             prev = blk.view().hash();
             bc.receive_block(blk.view(), 0);
         }
         assert!(bc.is_ready(), "the window-anchored segment won");
-        assert_eq!(bc.active_snake_chain_window(), Ok((100, 103)));
+        assert_eq!(bc.active_snake_chain_window(), Ok((100, 105)));
         assert!(
             slot_of(&bc, 0, &genesis.view().hash()).is_none(),
             "island reclaimed"
         );
-        assert_eq!(bc.block_tree_len(), 6, "#98..#103");
+        assert_eq!(bc.block_tree_len(), 9, "#97..#105");
         assert_eq!(bc.chain_heads.count(), 1, "only the active head");
         assert!(!bc.chain_heads.has_stored_head());
     }
@@ -14581,10 +15516,10 @@ mod tests {
     /// extension (`S_new > S_head − H` at admission).
     #[test]
     fn snake_extension_reclaims_fragments_that_can_never_connect() {
-        let (mut bc, h) = w4_ready_on_segment(103);
-        // After the extension, S_head − H = 102.
-        let stale = node_transfer_block(103, 3, 102, 7); // q = 102
-        let alive = node_transfer_block(104, 3, 103, 7); // q = 103
+        let (mut bc, h) = w6_ready_on_segment(105);
+        // After the extension, S_head − H = 103.
+        let stale = node_transfer_block(104, 3, 103, 7); // q = 103
+        let alive = node_transfer_block(105, 3, 104, 7); // q = 104
         for blk in [&stale, &alive] {
             let (outcome, _) = bc.receive_block(blk.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
@@ -14593,15 +15528,15 @@ mod tests {
             core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
         assert_eq!(stored_before.iter().flatten().count(), 2, "precondition");
 
-        let b104 = w4_config_anchor_block(104, h[3]);
-        extend_active_head(&mut bc, &b104, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
+        let b106 = w6_extension(&bc, 106, h[5]);
+        extend_active_head(&mut bc, &b106, 0);
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 106)));
 
         assert!(
-            slot_of(&bc, 103, &stale.view().hash()).is_none(),
+            slot_of(&bc, 104, &stale.view().hash()).is_none(),
             "stale fragment deleted"
         );
-        let alive_idx = slot_of(&bc, 104, &alive.view().hash()).expect("may still connect");
+        let alive_idx = slot_of(&bc, 105, &alive.view().hash()).expect("may still connect");
         let stored_after: [Option<u32>; 4] =
             core::array::from_fn(|s| bc.chain_heads.stored_head_tail(s));
         assert_eq!(
@@ -14611,10 +15546,11 @@ mod tests {
         );
         assert!(stored_after.contains(&Some(alive_idx)));
         // The active chain and the horizon are untouched by the reclamation.
-        let below = w4_horizon_block();
-        assert!(slot_of(&bc, 99, &below.view().hash()).is_some(), "#99 kept");
-        for (i, seq) in (100..=104).enumerate() {
-            let hash = if seq == 104 { b104.view().hash() } else { h[i] };
+        let [_, b98, b99] = w6_below();
+        assert!(slot_of(&bc, 98, &b98.view().hash()).is_some(), "#98 kept");
+        assert!(slot_of(&bc, 99, &b99.view().hash()).is_some(), "#99 kept");
+        for (i, seq) in (100..=106).enumerate() {
+            let hash = if seq == 106 { b106.view().hash() } else { h[i] };
             assert!(slot_of(&bc, seq, &hash).is_some(), "active #{seq} kept");
         }
     }
@@ -14649,9 +15585,9 @@ mod tests {
             "S_head + W - 1"
         );
 
-        // W = 4, entered Ready on 100..=104 → window (101, 104).
-        let (mut bc, _) = w4_ready_on_segment(104);
-        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
+        // W = 6, entered Ready on 97..=106 → window (101, 106).
+        let (mut bc, _) = w6_ready_on_segment(106);
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 106)));
         let below = node_transfer_block(100, 3, 99, 7);
         let (outcome, _) = bc.receive_block(below.view(), 0);
         assert_eq!(
@@ -14659,12 +15595,12 @@ mod tests {
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow),
             "below S_tail — a block at #100, the horizon's sequence"
         );
-        let (outcome, _) = bc.receive_block(node_transfer_block(108, 3, 107, 7).view(), 0);
+        let (outcome, _) = bc.receive_block(node_transfer_block(112, 3, 111, 7).view(), 0);
         assert_eq!(
             outcome,
             ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)
         );
-        let (outcome, _) = bc.receive_block(node_transfer_block(107, 3, 106, 7).view(), 0);
+        let (outcome, _) = bc.receive_block(node_transfer_block(111, 3, 110, 7).view(), 0);
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
     }
 
@@ -14717,28 +15653,27 @@ mod tests {
     /// and the same horizon.
     #[test]
     fn snake_restart_rereleases_a_resurrected_tail_block() {
-        let (bc, h) = w4_ready_on_segment(104);
-        assert_eq!(bc.block_tree_len(), 6);
-        let lowest = w4_horizon_base();
+        let (bc, h) = w6_ready_on_segment(106);
+        assert_eq!(bc.block_tree_len(), 9);
+        let [lowest, b98, _] = w6_below();
         assert!(
-            slot_of(&bc, 98, &lowest.view().hash()).is_none(),
-            "#98 released"
+            slot_of(&bc, 97, &lowest.view().hash()).is_none(),
+            "#97 released"
         );
         let storage = bc.storage;
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
-        let chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
+        let chain_config = empty_chain_config(W6Chain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
-        W4Chain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
+        W6Chain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
         // SAFETY: `init` returned, so every field of `slot` is initialized.
         let mut restarted = unsafe { slot.assume_init() };
         restarted.initialize_from_storage(500);
         assert!(restarted.is_ready());
-        assert_eq!(restarted.active_snake_chain_window(), Ok((101, 104)));
-        assert_eq!(restarted.block_tree_len(), 6);
-        assert!(slot_of(&restarted, 98, &lowest.view().hash()).is_none());
-        let below = w4_horizon_block();
-        let root = slot_of(&restarted, 99, &below.view().hash()).expect("#99 in the horizon");
+        assert_eq!(restarted.active_snake_chain_window(), Ok((101, 106)));
+        assert_eq!(restarted.block_tree_len(), 9);
+        assert!(slot_of(&restarted, 97, &lowest.view().hash()).is_none());
+        let root = slot_of(&restarted, 98, &b98.view().hash()).expect("#98 in the horizon");
         assert_eq!(restarted.horizon_root(), root);
         assert!(
             slot_of(&restarted, 100, &h[0]).is_some(),
@@ -14750,6 +15685,9 @@ mod tests {
 
     /// A `payload_type=1` block of complex transactions, chained to `prev` and
     /// created by `creator`. The UTXO-side builder deferred-work D32 asked for.
+    /// The header is in override form (`first_voted_node == creator`,
+    /// Story 6.7 D4): a block by a creator other than `first_voted_node` is a
+    /// deviation, whose open run would bind every block above it.
     fn complex_tx_block(
         seq: u32,
         prev: [u8; 32],
@@ -14765,7 +15703,7 @@ mod tests {
             mined_amount,
             payload_type: PAYLOAD_TYPE_TRANSACTION,
             consumed_votes: 0,
-            first_voted_node: 0,
+            first_voted_node: creator,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: prev,
             signature: [0u8; SIGNATURE_SIZE],
@@ -14959,34 +15897,38 @@ mod tests {
         }
     }
 
-    /// DEC-129 boundary on a `W = 4` chain: exactly `W` back is trusted, one
-    /// more is not.
+    /// DEC-129 boundary on a `W = 6` chain: exactly `W` back is trusted, one
+    /// more is not. #101 is a clean slot (Story 6.7 D8), so the spend sits at
+    /// #102 above a [`w6_clean_block`].
     #[test]
     fn utxo_distance_bound_is_exactly_w() {
         fn verdict(referenced: u32) -> (Result<(), ProcessingError>, u32) {
-            let mut bc = new_w4_chain();
-            let cfg = w4_config_anchor_block(99, [0xAB; 32]);
+            let mut bc = new_w6_chain();
+            let cfg = w6_config_anchor_block(99, [0xAB; 32]);
             bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
                 .expect("config admitted");
             let seed = balance_block(100, cfg.view().hash(), &[(2, 0, 0, 0x32)], 3);
             bc.tier1_admit(&seed.view(), &seed.view().hash(), 0)
                 .expect("seed admitted");
-            let tx = utxo_tx(101, &[(referenced, 0, 5)], None, &[Err((2, 5))]);
-            let spend = complex_tx_block(101, seed.view().hash(), 3, 0, &[&tx]);
+            let clean = w6_clean_block(101, seed.view().hash());
+            bc.tier1_admit(&clean.view(), &clean.view().hash(), 0)
+                .expect("clean slot admitted");
+            let tx = utxo_tx(102, &[(referenced, 0, 5)], None, &[Err((2, 5))]);
+            let spend = complex_tx_block(102, clean.view().hash(), 3, 0, &[&tx]);
             let si = bc
                 .tier1_admit(&spend.view(), &spend.view().hash(), 0)
                 .expect("spend admitted");
             (bc.run_processing_pass(si).map(|_| ()), si)
         }
-        assert_eq!(verdict(97).0, Ok(()), "101 - 97 = W");
-        let (result, si) = verdict(96);
+        assert_eq!(verdict(96).0, Ok(()), "102 - 96 = W");
+        let (result, si) = verdict(95);
         assert_eq!(
             result,
             Err(ProcessingError::Invalid {
                 block_idx: si,
                 reason: ValidationReason::UtxoUnresolvable,
             }),
-            "101 - 96 > W"
+            "102 - 95 > W"
         );
     }
 
@@ -15581,27 +16523,39 @@ mod tests {
     /// ancestor of the offender may not keep advertising its outputs.
     #[test]
     fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
-        let mut bc = new_unconfigured_w4_chain();
-        // The two blocks below the window (`W + H`, DEC-177) are one-entry
-        // balance blocks, within the small limit; #100 repeats their snapshot.
-        let lowest = balance_block(98, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
-        let below = balance_block(99, lowest.view().hash(), &[(3, 0, 0, 0x33)], 3);
-        for block in [&lowest, &below] {
+        let mut bc = new_unconfigured_w6_chain();
+        // The three blocks below the window (`W + H`, DEC-177) are
+        // [`w6_below`]'s; #100 is a one-entry balance block seeding node #3,
+        // within the small limit. The UTXO blocks sit off the clean slots #101
+        // and #104 (Story 6.7 D8), which hold node #3's transfers of nothing.
+        let below = w6_below();
+        for block in &below {
             let (outcome, _) = bc.receive_block(block.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
-        let base = balance_block(100, below.view().hash(), &[(3, 0, 0, 0x33)], 3);
-        let one = utxo_tx(101, &[], None, &[Ok(5)]);
-        let b101 = complex_tx_block(101, base.view().hash(), 3, 0, &[&one]);
-        let three = utxo_tx(102, &[], None, &[Ok(5), Ok(6), Ok(7)]);
-        let b102 = complex_tx_block(102, b101.view().hash(), 3, 0, &[&three]);
+        let clean = |seq: u32, prev: [u8; 32]| {
+            let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+            let nt = NodeTransfer::new_signed(0, seq - 1, 3, 3, 0, 0, 0, &signer);
+            headed(seq, prev, 3, 1, 0, 3, 0, |b| {
+                b.add_node_transfer(&nt).ok().expect("add transfer");
+            })
+        };
+        // `max_node_id = 9`: the pre-window actors of #97..=#99 (nodes 7 and
+        // 9) lie inside the derived node-id range.
+        let base = balance_block(100, below[2].view().hash(), &[(3, 0, 0, 0x33)], 9);
+        let s101 = clean(101, base.view().hash());
+        let one = utxo_tx(102, &[], None, &[Ok(5)]);
+        let b102 = complex_tx_block(102, s101.view().hash(), 3, 0, &[&one]);
+        let three = utxo_tx(103, &[], None, &[Ok(5), Ok(6), Ok(7)]);
+        let b103 = complex_tx_block(103, b102.view().hash(), 3, 0, &[&three]);
+        let s104 = clean(104, b103.view().hash());
         let cfg =
-            chain_config_block_from(103, b102.view().hash(), &mut small_limit_config_builder(W4));
-        for small in [&lowest, &below, &base, &b101, &cfg] {
+            chain_config_block_from(105, s104.view().hash(), &mut small_limit_config_builder(W6));
+        for small in below.iter().chain([&base, &s101, &b102, &s104, &cfg]) {
             assert!(small.len() <= SMALL_BLOCK_SIZE_LIMIT as usize);
         }
-        assert!(b102.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
-        for block in [&base, &b101, &b102, &cfg] {
+        assert!(b103.len() > SMALL_BLOCK_SIZE_LIMIT as usize);
+        for block in [&base, &s101, &b102, &b103, &s104, &cfg] {
             let (outcome, _) = bc.receive_block(block.view(), 0);
             assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         }
@@ -15611,12 +16565,12 @@ mod tests {
             "the re-evaluation at the lock refuses the candidate"
         );
         assert!(
-            bc.blocks.find(102, &b102.view().hash()).is_none(),
+            bc.blocks.find(103, &b103.view().hash()).is_none(),
             "offender deleted"
         );
         let survivor = bc
             .blocks
-            .find(101, &b101.view().hash())
+            .find(102, &b102.view().hash())
             .expect("the offender's ancestor survives");
         assert_eq!(
             bc.blocks.has_available_utxo(survivor),
@@ -15644,6 +16598,30 @@ mod tests {
         let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
         let genesis = bc
             .process_genesis(CURRENCY, window_config_builder(w).content())
+            .ok()
+            .expect("genesis succeeds");
+        (bc, genesis.block_zero, genesis.block_one)
+    }
+
+    /// [`ready_genesis`] on `W = 6` over the W6 harness's fourteen-slot
+    /// storage ([`W6Storage`]): a full window and a branch as long as it fit.
+    fn ready_genesis_w6() -> (Chain16<W6Storage>, Block, Block) {
+        let (crypto, _, chain_config) = test_backends();
+        let node_zero = *crypto.public_key().serialize();
+        let mut slot = core::mem::MaybeUninit::<Chain16<W6Storage>>::uninit();
+        Blockchain::init(
+            &mut slot,
+            crypto,
+            w6_storage(),
+            chain_config,
+            0,
+            node_zero,
+            0,
+        );
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        let mut bc = unsafe { slot.assume_init() };
+        let genesis = bc
+            .process_genesis(CURRENCY, window_config_builder(W6).content())
             .ok()
             .expect("genesis succeeds");
         (bc, genesis.block_zero, genesis.block_one)
@@ -16192,20 +17170,23 @@ mod tests {
 
     // --- AC10.7: the window path --------------------------------------------
 
-    /// A genesis node on `W = 4` with #2 and #3 added: the window is full
-    /// (`0..=3`), and its tail #0 is node #0's seed source (its registration).
-    fn full_w4_genesis() -> (TestChain, Block) {
-        let (mut bc, _, b1) = ready_genesis(4);
-        let b2 = transfer(2, b1.view().hash(), 0, 7);
-        let b3 = transfer(3, b2.view().hash(), 0, 8);
-        for block in [&b2, &b3] {
+    /// A genesis node on `W = 6` ([`ready_genesis_w6`]) with #2..=#5 added
+    /// (transfers, clean on the slots #2 and #5, Story 6.7 D8): the window is
+    /// full (`0..=5`), and its tail #0 is node #0's seed source (its
+    /// registration).
+    fn full_w6_genesis() -> (Chain16<W6Storage>, Block) {
+        let (mut bc, _, b1) = ready_genesis_w6();
+        let mut prev = b1;
+        for seq in 2..=5 {
+            let block = transfer(seq, prev.view().hash(), 0, 5 + u64::from(seq));
             assert_eq!(
-                receive(&mut bc, block),
+                receive(&mut bc, &block),
                 ReceiveBlockOutcome::AcceptedSilently
             );
+            prev = block;
         }
-        assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
-        (bc, b3)
+        assert_eq!(bc.active_snake_chain_window(), Ok((0, 5)));
+        (bc, prev)
     }
 
     fn snapshot_block<S: StorageTrait>(bc: &Chain16<S>, seq: u32, prev: [u8; 32]) -> Block {
@@ -16220,20 +17201,20 @@ mod tests {
     #[test]
     fn window_extension_past_w_advances_and_binds() {
         // Binding `Invalid` at intake: dropping #0 needs a balance block (FR50).
-        let (mut bc, b3) = full_w4_genesis();
-        let (twin, _) = full_w4_genesis();
-        let plain = transfer(4, b3.view().hash(), 0, 9);
+        let (mut bc, b5) = full_w6_genesis();
+        let (twin, _) = full_w6_genesis();
+        let plain = transfer(6, b5.view().hash(), 0, 9);
         assert_eq!(
             receive(&mut bc, &plain),
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
         );
         assert_same_state(&bc, &twin, "binding refusal stores nothing");
 
-        // A stored child failing its binding is deleted. The snapshot at #4
-        // advances the tail to #1 (chain-config), so a transfer at #5 cannot
+        // A stored child failing its binding is deleted. The snapshot at #6
+        // advances the tail to #1 (chain-config), so a transfer at #7 cannot
         // drop it (FR49) — admitted first as an orphan, judged by continuation.
-        let replay = snapshot_block(&bc, 4, b3.view().hash());
-        let child = transfer(5, replay.view().hash(), 0, 9);
+        let replay = snapshot_block(&bc, 6, b5.view().hash());
+        let child = transfer(7, replay.view().hash(), 0, 9);
         assert_eq!(
             receive(&mut bc, &child),
             ReceiveBlockOutcome::AcceptedSilently
@@ -16242,17 +17223,17 @@ mod tests {
             receive(&mut bc, &replay),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        assert_eq!(head_of(&bc), (4, replay.view().hash()));
+        assert_eq!(head_of(&bc), (6, replay.view().hash()));
         assert_eq!(
             bc.active_snake_chain_window(),
-            Ok((1, 4)),
+            Ok((1, 6)),
             "the extension past W advanced the tail in the same step"
         );
         let genesis_idx = bc.blocks.find(0, &bc_genesis_hash());
         assert!(genesis_idx.is_some(), "#0 entered the horizon (Story 6.14)");
         assert_eq!(genesis_idx, Some(bc.horizon_root()));
         assert!(
-            bc.blocks.find(5, &child.view().hash()).is_none(),
+            bc.blocks.find(7, &child.view().hash()).is_none(),
             "child deleted"
         );
         let replay_idx = bc.active_chain_head_idx;
@@ -16276,10 +17257,10 @@ mod tests {
     /// window asserts the same invariant in debug builds.
     #[test]
     fn window_classification_failure_changes_nothing() {
-        let (mut bc, b3) = full_w4_genesis();
-        let (twin, _) = full_w4_genesis();
+        let (mut bc, b5) = full_w6_genesis();
+        let (twin, _) = full_w6_genesis();
         let real_tail = bc.snake_chain_tail_idx;
-        let replay = snapshot_block(&bc, 4, b3.view().hash());
+        let replay = snapshot_block(&bc, 6, b5.view().hash());
         let view = replay.view();
         let idx = bc.blocks.next_free_index().expect("free");
         let head = bc.active_chain_head_idx;
@@ -16299,7 +17280,7 @@ mod tests {
             receive(&mut bc, &replay),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        assert_eq!(head_of(&bc), (4, replay.view().hash()));
+        assert_eq!(head_of(&bc), (6, replay.view().hash()));
     }
 
     // --- AC10.8: genesis-node equivalence (AC8) -----------------------------
@@ -17052,35 +18033,37 @@ mod tests {
             .map(|entry| entry.status())
     }
 
-    /// The window-anchored W4 segment `100..=103` with the values 2 (the
-    /// chain-config anchor), 3, 5, 7, Ready through FR3, above `H = 2` plain
-    /// blocks (the horizon). Returns the node and the four blocks.
-    fn valued_w4() -> (W4Chain, [Block; 4]) {
-        valued_w4_h(test_horizon(W4))
-    }
-
-    /// [`valued_w4`] on the horizon `h`: the `h` plain blocks
-    /// `100 − h ..= 99` below the window.
-    fn valued_w4_h(h: u32) -> (W4Chain, [Block; 4]) {
-        let mut bc = new_w4_chain_h(h);
-        let mut prev = [0xAB; 32];
-        for seq in (100 - h)..100 {
-            let below = linked_transfer_block(seq, prev);
-            prev = below.view().hash();
-            bc.tier1_admit(&below.view(), &prev, 0)
+    /// The window-anchored W6 segment `100..=105` with the values 2 (the
+    /// chain-config anchor), 3, 5, 7, 11, 13, Ready through FR3, above the
+    /// `H = 3` plain blocks of [`w6_below`] (the horizon). Returns the node
+    /// and the six window blocks.
+    fn valued_w6() -> (W6Chain, [Block; 6]) {
+        let mut bc = new_w6_chain();
+        for below in w6_below() {
+            bc.tier1_admit(&below.view(), &below.view().hash(), 0)
                 .expect("a block below the window admitted");
         }
-        let anchor = revalue(&w4_config_anchor_block_h(100, prev, h), 2);
-        let b101 = revalue(&linked_transfer_block(101, anchor.view().hash()), 3);
-        let b102 = revalue(&linked_transfer_block(102, b101.view().hash()), 5);
-        let b103 = revalue(&linked_transfer_block(103, b102.view().hash()), 7);
-        for blk in [&anchor, &b101, &b102, &b103] {
+        let anchor = revalue(
+            &w6_config_anchor_block(100, w6_horizon_block().view().hash()),
+            2,
+        );
+        let mut prev = anchor.view().hash();
+        let rest: [Block; 5] = core::array::from_fn(|i| {
+            let blk = revalue(
+                &linked_transfer_block(101 + i as u32, prev),
+                [3, 5, 7, 11, 13][i],
+            );
+            prev = blk.view().hash();
+            blk
+        });
+        let [b101, b102, b103, b104, b105] = rest;
+        for blk in [&anchor, &b101, &b102, &b103, &b104, &b105] {
             bc.tier1_admit(&blk.view(), &blk.view().hash(), 0)
                 .expect("admitted");
         }
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready(), "precondition: the segment validated");
-        (bc, [anchor, b101, b102, b103])
+        (bc, [anchor, b101, b102, b103, b104, b105])
     }
 
     /// AC10.1 / AC3 — seeding at every Ready entry: the genesis node holds 0
@@ -17120,25 +18103,30 @@ mod tests {
             mesh.active_branch_value,
             brute_value(&mesh, mesh.active_chain_head_idx)
         );
-        let (w4, _) = valued_w4();
-        assert_eq!(w4.active_branch_value, 3 + 5 + 7, "the anchor is S_tail");
+        let (w6, _) = valued_w6();
         assert_eq!(
-            w4.active_branch_value,
-            brute_value(&w4, w4.active_chain_head_idx)
+            w6.active_branch_value,
+            3 + 5 + 7 + 11 + 13,
+            "the anchor is S_tail"
+        );
+        assert_eq!(
+            w6.active_branch_value,
+            brute_value(&w6, w6.active_chain_head_idx)
         );
     }
 
     /// AC10.3 / AC5 / AC9; Story 6.14 — a tail advance subtracts the block
     /// that becomes `S_tail`, from the active value and from a side head forked
-    /// above it (with `H = 2` a fork at #102 stays inside FR58's bound after the
+    /// above it (with `H = 3` a fork at #103 stays inside FR58's bound after the
     /// advance); a fresh node reaching Ready through FR3 over the same blocks
     /// holds the same values. The horizon below the tail is never summed.
     #[test]
     fn tail_advance_subtracts_the_new_tail_everywhere() {
-        let (mut a, [anchor, b101, b102, b103]) = valued_w4_h(2);
-        // A fork at #102, judged before its write (D4) and valued by the walk;
-        // worth less than the active branch, so no switch is attempted.
-        let side = revalue(&salted_linked_block(103, b102.view().hash(), 6), 1);
+        let (mut a, [anchor, b101, b102, b103, b104, b105]) = valued_w6();
+        // A fork at #103, judged before its write (D4) and valued by the walk;
+        // worth less than the active branch, so no switch is attempted. #104
+        // is a clean slot (Story 6.7 D8): the side block is a transfer.
+        let side = revalue(&salted_linked_block(104, b103.view().hash(), 6), 1);
         assert_eq!(
             a.receive_block(side.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
@@ -17148,50 +18136,46 @@ mod tests {
             a.blocks.get(si).map(|e| e.status()),
             Some(BlockStatus::Connected)
         );
-        assert_eq!(a.chain_heads.branch_value_of(si), Some(3 + 5 + 1));
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(3 + 5 + 7 + 1));
         assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
 
         // Dropping the chain-config anchor needs a chain-config extension.
-        let b104 = real_on(
-            &a,
-            &w4_config_anchor_block_h(104, b103.view().hash(), 2),
-            0,
-            1,
-        );
-        extend_active_head(&mut a, &b104, 0);
-        assert_eq!(a.active_snake_chain_window(), Ok((101, 104)));
+        let b106 = real_on(&a, &w6_config_anchor_block(106, b105.view().hash()), 0, 1);
+        extend_active_head(&mut a, &b106, 0);
+        assert_eq!(a.active_snake_chain_window(), Ok((101, 106)));
         assert_eq!(
             a.active_branch_value,
-            5 + 7 + v(&b104),
+            5 + 7 + 11 + 13 + v(&b106),
             "#101 left the sum, #100 never was in it"
         );
         assert_eq!(
             a.active_branch_value,
             brute_value(&a, a.active_chain_head_idx)
         );
-        assert_eq!(a.chain_heads.branch_value_of(si), Some(5 + 1));
+        assert_eq!(a.chain_heads.branch_value_of(si), Some(5 + 7 + 1));
         assert_eq!(a.chain_heads.branch_value_of(si), Some(brute_value(&a, si)));
 
         // A fresh node, orphans first, reaches the same values through FR3 on
-        // `99..=104` — `W + H` long, so #98 is not needed.
-        let b98 = linked_transfer_block(98, [0xAB; 32]);
-        let b99 = linked_transfer_block(99, b98.view().hash());
-        let mut b = new_w4_chain_h(2);
-        for blk in [&side, &b104, &b103, &b102, &b101, &anchor, &b99] {
+        // `98..=106` — `W + H` long, so #97 is not needed.
+        let [_, b98, b99] = w6_below();
+        let mut b = new_w6_chain();
+        for blk in [
+            &side, &b106, &b105, &b104, &b103, &b102, &b101, &anchor, &b99, &b98,
+        ] {
             assert_eq!(
                 b.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
         assert!(b.is_ready());
-        assert_eq!(b.active_snake_chain_window(), Ok((101, 104)));
+        assert_eq!(b.active_snake_chain_window(), Ok((101, 106)));
         assert_eq!(b.active_branch_value, a.active_branch_value);
         let bs = slot(&b, &side);
         assert_eq!(
             b.blocks.get(bs).map(|e| e.status()),
             Some(BlockStatus::Connected)
         );
-        assert_eq!(b.chain_heads.branch_value_of(bs), Some(5 + 1));
+        assert_eq!(b.chain_heads.branch_value_of(bs), Some(5 + 7 + 1));
         // Story 6.4 AC9 3c: built at a window-anchored ready entry.
         assert_active_set_matches(&b, "window-anchored entry");
     }
@@ -17222,23 +18206,40 @@ mod tests {
     /// failed read is a local failure, and the next admission extends.
     #[test]
     fn failed_new_tail_read_is_a_local_failure() {
-        let (mut bc, b1) = faulty_genesis(4);
-        let b2 = alt(2, b1.view().hash(), 0, 0, 2, 7, true);
-        let b3 = alt(3, b2.view().hash(), 1, 2, 0, 8, false);
-        for blk in [&b2, &b3] {
+        // `W = 6`: the window fills at #5. The clean slots #2 and #5 (Story
+        // 6.7 D8) hold node #0's transfers; node #1 registers at #3 and
+        // creates #4.
+        let (mut bc, b1) = faulty_genesis(W6);
+        let b2 = real_on(
+            &bc,
+            &tx_block(2, b1.view().hash(), 0, votes_for(2, 0, 1, 6)),
+            0,
+            1,
+        );
+        assert_eq!(receive(&mut bc, &b2), ReceiveBlockOutcome::AcceptedSilently);
+        let b3 = alt(3, b2.view().hash(), 0, 0, 2, 7, true);
+        let b4 = alt(4, b3.view().hash(), 1, 2, 0, 8, false);
+        for blk in [&b3, &b4] {
             assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
         }
+        let b5 = real_on(
+            &bc,
+            &tx_block(5, b4.view().hash(), 0, votes_for(5, 0, 1, 9)),
+            0,
+            1,
+        );
+        assert_eq!(receive(&mut bc, &b5), ReceiveBlockOutcome::AcceptedSilently);
         let before = bc.active_branch_value;
-        let snapshot = snapshot_block(&bc, 4, b3.view().hash());
+        let snapshot = snapshot_block(&bc, 6, b5.view().hash());
         bc.storage.failing_read_slot = 1; // #1 becomes the tail
         assert_eq!(
             receive(&mut bc, &snapshot),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        assert_eq!(head_of(&bc), (3, b3.view().hash()), "not extended");
+        assert_eq!(head_of(&bc), (5, b5.view().hash()), "not extended");
         assert_eq!(status_of(&bc, &snapshot), Some(BlockStatus::Stored));
         assert_eq!(bc.active_branch_value, before);
-        assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
+        assert_eq!(bc.active_snake_chain_window(), Ok((0, 5)));
 
         bc.storage.failing_read_slot = NONE_REF;
         let unrelated = node_transfer_block(3, 3, 2, 7);
@@ -17248,12 +18249,15 @@ mod tests {
         );
         assert_eq!(
             head_of(&bc),
-            (4, snapshot.view().hash()),
+            (6, snapshot.view().hash()),
             "the retry extended"
         );
-        assert_eq!(bc.active_snake_chain_window(), Ok((1, 4)));
-        assert_eq!(v(&b3), 2010);
-        assert_eq!(bc.active_branch_value, v(&b2) + v(&b3) + v(&snapshot));
+        assert_eq!(bc.active_snake_chain_window(), Ok((1, 6)));
+        assert_eq!(v(&b4), 2010);
+        assert_eq!(
+            bc.active_branch_value,
+            v(&b2) + v(&b3) + v(&b4) + v(&b5) + v(&snapshot)
+        );
         assert_eq!(
             bc.active_branch_value,
             brute_value(&bc, bc.active_chain_head_idx)
@@ -17589,24 +18593,25 @@ mod tests {
             }
         }
 
-        // A reference more than `W` back, on the W4 window. The side branch
+        // A reference more than `W` back, on the W6 window. The side branch
         // forks inside FR58's bound (`A = S_head − H`, DEC-208) and is worth
-        // less than the active branch, so no switch is attempted.
-        let (mut bc, [_, _, b102, _]) = valued_w4();
-        let p103 = revalue(&salted_linked_block(103, b102.view().hash(), 6), 1);
-        let tx = utxo_tx(104, &[(97, 0, 50)], None, &[Ok(50)]);
-        let far = complex_tx_block(104, p103.view().hash(), 0, 0, &[&tx]);
-        for blk in [&far, &p103] {
+        // less than the active branch, so no switch is attempted. `far` sits
+        // off the clean slots (Story 6.7 D8), its parent `p104` on one.
+        let (mut bc, [_, _, _, b103, _, _]) = valued_w6();
+        let p104 = revalue(&salted_linked_block(104, b103.view().hash(), 6), 1);
+        let tx = utxo_tx(105, &[(98, 0, 50)], None, &[Ok(50)]);
+        let far = complex_tx_block(105, p104.view().hash(), 0, 0, &[&tx]);
+        for blk in [&far, &p104] {
             assert_eq!(
                 bc.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
         assert!(
-            bc.blocks.find(104, &far.view().hash()).is_none(),
+            bc.blocks.find(105, &far.view().hash()).is_none(),
             "deleted by the driver"
         );
-        let pi = slot(&bc, &p103);
+        let pi = slot(&bc, &p104);
         assert_eq!(
             bc.blocks.get(pi).map(|e| e.status()),
             Some(BlockStatus::Connected)
@@ -17640,7 +18645,7 @@ mod tests {
     /// not hold is evidence. More than `W` back it is evidence too.
     #[test]
     fn side_reference_into_the_horizon_is_resolved() {
-        let (mut bc, [_, _, b102, _]) = valued_w4();
+        let (mut bc, [_, _, b102, _, _, _]) = valued_w6();
         let tx = utxo_tx(103, &[(99, 0, 50)], None, &[Ok(50)]);
         let missing = complex_tx_block(103, b102.view().hash(), 0, 0, &[&tx]);
         assert_eq!(
@@ -17649,7 +18654,7 @@ mod tests {
             "#99 is retained and holds no output 0"
         );
 
-        let tx = utxo_tx(103, &[(98, 0, 50)], None, &[Ok(50)]);
+        let tx = utxo_tx(103, &[(96, 0, 50)], None, &[Ok(50)]);
         let too_far = complex_tx_block(103, b102.view().hash(), 0, 0, &[&tx]);
         assert_eq!(
             bc.receive_block(too_far.view(), 0).0,
@@ -18003,79 +19008,87 @@ mod tests {
         }
     }
 
-    /// AC10.6 / AC3 / D3; Story 6.14 D4 / D6 — on the matured W4 window
-    /// `[100, 103]` with `H = 2` below it, a heavier side branch shorter than
+    /// AC10.6 / AC3 / D3; Story 6.14 D4 / D6 — on the matured W6 window
+    /// `[100, 105]` with `H = 3` below it, a heavier side branch shorter than
     /// the window is not admissible: the horizon is not counted (DEC-209).
     /// Extended to cover the window it is, and the switch now runs — there is
     /// no completeness horizon (DEC-211) — so the replay refuses its forged
     /// value and deletes the branch; the active chain stays. The late case:
     /// once the head has moved on, a branch at the old head sequence waits for
-    /// its own extension.
+    /// its own extension. Side blocks are transfers, clean on the slots #104
+    /// and #107 (Story 6.7 D8).
     #[test]
-    fn fr22_admissibility_follows_the_w4_window() {
-        let (mut bc, [_, b101, _, b103]) = valued_w4_h(2);
-        let s102 = valued(102, b101.view().hash(), 999, 6);
-        assert_eq!(
-            bc.receive_block(s102.view(), 0).0,
-            ReceiveBlockOutcome::AcceptedSilently
-        );
-        let si = slot(&bc, &s102);
-        assert!(bc.chain_heads.branch_value_of(si) > Some(bc.active_branch_value));
-        assert_eq!(
-            bc.switch_target([Some(si), None]),
-            None,
-            "segment [100, 102] < W; the horizon below it is not counted"
-        );
-        let s103 = valued(103, s102.view().hash(), 1, 7);
+    fn fr22_admissibility_follows_the_w6_window() {
+        let (mut bc, [_, _, b102, _, _, b105]) = valued_w6();
+        let s103 = valued(103, b102.view().hash(), 999, 6);
         assert_eq!(
             bc.receive_block(s103.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
         );
+        let si = slot(&bc, &s103);
+        assert!(bc.chain_heads.branch_value_of(si) > Some(bc.active_branch_value));
+        assert_eq!(
+            bc.switch_target([Some(si), None]),
+            None,
+            "segment [100, 103] < W; the horizon below it is not counted"
+        );
+        let s104 = valued(104, s103.view().hash(), 1, 7);
+        assert_eq!(
+            bc.receive_block(s104.view(), 0).0,
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            bc.switch_target([Some(slot(&bc, &s104)), None]),
+            None,
+            "segment [100, 104] < W"
+        );
+        let s105 = valued(105, s104.view().hash(), 1, 10);
+        assert_eq!(
+            bc.receive_block(s105.view(), 0).0,
+            ReceiveBlockOutcome::AcceptedSilently
+        );
         assert!(
-            bc.blocks.find(102, &s102.view().hash()).is_none()
-                && bc.blocks.find(103, &s103.view().hash()).is_none(),
+            [&s103, &s104, &s105].iter().all(|blk| bc
+                .blocks
+                .find(blk.view().sequence(), &blk.view().hash())
+                .is_none()),
             "attempted, refused by the replay (I-09) and deleted"
         );
         assert_eq!(
             bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
-            Some(b103.view().hash()),
+            Some(b105.view().hash()),
             "the active chain stays"
         );
 
-        // The late case (D3; AC10.10): the head moved on to #104, so a branch
-        // at #103 is one short until it reaches #104.
-        let (mut bc, [_, _, b102, b103]) = valued_w4_h(2);
-        let b104 = real_on(
-            &bc,
-            &w4_config_anchor_block_h(104, b103.view().hash(), 2),
-            0,
-            1,
-        );
-        extend_active_head(&mut bc, &b104, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
-        let n103 = valued(103, b102.view().hash(), 500, 8);
+        // The late case (D3; AC10.10): the head moved on to #106, so a branch
+        // at #105 is one short until it reaches #106.
+        let (mut bc, [_, _, _, _, b104, b105]) = valued_w6();
+        let b106 = real_on(&bc, &w6_config_anchor_block(106, b105.view().hash()), 0, 1);
+        extend_active_head(&mut bc, &b106, 0);
+        assert_eq!(bc.active_snake_chain_window(), Ok((101, 106)));
+        let n105 = valued(105, b104.view().hash(), 500, 8);
         assert_eq!(
-            bc.receive_block(n103.view(), 0).0,
+            bc.receive_block(n105.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
         );
-        let n3 = slot(&bc, &n103);
+        let n5 = slot(&bc, &n105);
         assert_eq!(
-            bc.switch_target([Some(n3), None]),
+            bc.switch_target([Some(n5), None]),
             None,
             "not admissible yet"
         );
-        let n104 = valued(104, n103.view().hash(), 0, 9);
+        let n106 = valued(106, n105.view().hash(), 0, 9);
         assert_eq!(
-            bc.receive_block(n104.view(), 0).0,
+            bc.receive_block(n106.view(), 0).0,
             ReceiveBlockOutcome::AcceptedSilently
         );
         assert!(
-            bc.blocks.find(103, &n103.view().hash()).is_none(),
-            "admissible at #104: attempted and deleted"
+            bc.blocks.find(105, &n105.view().hash()).is_none(),
+            "admissible at #106: attempted and deleted"
         );
         assert_eq!(
             bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
-            Some(b104.view().hash())
+            Some(b106.view().hash())
         );
     }
 
@@ -19386,46 +20399,49 @@ mod tests {
         }
     }
 
-    /// AC11.7 / D3 — on W4 (`#0, #1, b2, b3`, tail not advanced) the new
+    /// AC11.7 / D3 — on W6 (`#0, #1, b2..=b5`, tail not advanced) the new
     /// branch from `b2` crosses `W`: its replay advances a virtual tail past
-    /// #0, #1 and finally `b2`, the common ancestor. The failing case: `n5`
+    /// #0, #1 and finally `b2`, the common ancestor. The failing case: `n7`
     /// skips the chain-config replay #1 needs (exact evidence) after the
     /// virtual tail passed #0, and the original branch is restored exactly,
-    /// #0 still retained. The success case: the commit releases #0, #1 and
-    /// `b2`, the common ancestor, and with it the abandoned branch — the
-    /// release a failure after it could not have undone. (The test backend's
-    /// eight slots leave no room for a failure after the ancestor's own
-    /// virtual release.)
+    /// #0 still retained. The success case: the commit moves #0, #1 and `b2`,
+    /// the common ancestor, out of the window, and with it releases the
+    /// abandoned branch — the release a failure after it could not have
+    /// undone. The branch is `W` blocks long, so it runs on the fourteen-slot
+    /// storage ([`full_w6_genesis`]).
     #[test]
     fn fr23_tail_advances_wait_for_the_commit() {
-        // Every block is node #0's and worth 0; `n6` drops `b2`, which holds
-        // no obligation, and makes the tip larger than `b3`.
-        let branch = |bc: &TestChain, b2: &Block, last_is_replay: bool| {
+        // Every block is node #0's and worth 0; `n6` replays #0 (node #0's
+        // seed source), `n8` drops `b2`, which holds no obligation, and makes
+        // the tip larger than `b5`. #5 and #8 are clean slots.
+        let branch = |bc: &Chain16<W6Storage>, b2: &Block, last_is_replay: bool| {
             let n3 = transfer(3, b2.view().hash(), 0, 51);
-            let n4 = snapshot_block(bc, 4, n3.view().hash());
-            let n5 = if last_is_replay {
-                w4_config_anchor_block(5, n4.view().hash())
+            let n4 = transfer(4, n3.view().hash(), 0, 54);
+            let n5 = transfer(5, n4.view().hash(), 0, 55);
+            let n6 = snapshot_block(bc, 6, n5.view().hash());
+            let n7 = if last_is_replay {
+                w6_config_anchor_block(7, n6.view().hash())
             } else {
-                tx_block(5, n4.view().hash(), 0, votes_for(5, 0, 3, 52))
+                tx_block(7, n6.view().hash(), 0, votes_for(7, 0, 3, 52))
             };
-            let n6 = tx_block(6, n5.view().hash(), 0, votes_for(6, 0, 3, 53));
-            [n3, n4, n5, n6]
+            let n8 = tx_block(8, n7.view().hash(), 0, votes_for(8, 0, 3, 53));
+            [n3, n4, n5, n6, n7, n8]
         };
-        let (_, _, b1) = ready_genesis(4);
+        let (_, _, b1) = ready_genesis_w6();
         let b2 = transfer(2, b1.view().hash(), 0, 7);
         for last_is_replay in [false, true] {
-            let (mut bc, b3) = full_w4_genesis();
-            let (twin, _) = full_w4_genesis();
+            let (mut bc, b5) = full_w6_genesis();
+            let (twin, _) = full_w6_genesis();
             let blocks = branch(&bc, &b2, last_is_replay);
-            assert!(blocks[3].view().len() > b3.view().len());
-            for blk in [&blocks[3], &blocks[2], &blocks[1], &blocks[0]] {
+            assert!(blocks[5].view().len() > b5.view().len());
+            for blk in blocks.iter().rev() {
                 assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
             }
             if last_is_replay {
-                assert_eq!(head_of(&bc), (6, blocks[3].view().hash()));
-                assert_eq!(bc.active_snake_chain_window(), Ok((3, 6)));
-                assert_eq!(status_of(&bc, &b3), None, "released with b2's forks");
-                let (mut fresh, _, _) = ready_genesis(4);
+                assert_eq!(head_of(&bc), (8, blocks[5].view().hash()));
+                assert_eq!(bc.active_snake_chain_window(), Ok((3, 8)));
+                assert_eq!(status_of(&bc, &b5), None, "released with b2's forks");
+                let (mut fresh, _, _) = ready_genesis_w6();
                 assert_eq!(
                     receive(&mut fresh, &b2),
                     ReceiveBlockOutcome::AcceptedSilently
@@ -19440,11 +20456,11 @@ mod tests {
                 // Story 6.4 AC9 3c: the deferred advances' decrements.
                 assert_active_set_matches(&bc, "committed with advances");
             } else {
-                assert_eq!(head_of(&bc), (3, b3.view().hash()), "restored");
-                assert_eq!(bc.active_snake_chain_window(), Ok((0, 3)));
-                assert_eq!(status_of(&bc, &blocks[2]), None, "skipped replay: deleted");
-                assert_eq!(status_of(&bc, &blocks[3]), None, "with its descendant");
-                assert_eq!(status_of(&bc, &blocks[1]), Some(BlockStatus::Connected));
+                assert_eq!(head_of(&bc), (5, b5.view().hash()), "restored");
+                assert_eq!(bc.active_snake_chain_window(), Ok((0, 5)));
+                assert_eq!(status_of(&bc, &blocks[4]), None, "skipped replay: deleted");
+                assert_eq!(status_of(&bc, &blocks[5]), None, "with its descendant");
+                assert_eq!(status_of(&bc, &blocks[3]), Some(BlockStatus::Connected));
                 assert_same_projection(&bc, &twin, "restored after the advances");
                 // Story 6.4 AC9 3c: the unwound virtual advances.
                 assert_active_set_matches(&bc, "restored after the advances");
@@ -19454,27 +20470,27 @@ mod tests {
 
     /// AC11.8 / DEC-204; Story 6.14 AC4 — once the tail has advanced, a heavier
     /// admissible fork inside `H` is switched toward in place: its replayed
-    /// block at #4 is bound against the dropped block the horizon retained
+    /// block at #6 is bound against the dropped block the horizon retained
     /// (#0, node #0's seed source), and skipping that replay is exact
     /// evidence. The fork is deleted and the original chain restored.
     #[test]
     fn fr23_replay_binds_against_the_horizon() {
-        let (mut bc, b3) = full_w4_genesis();
-        let (mut twin, _) = full_w4_genesis();
-        let r4 = snapshot_block(&bc, 4, b3.view().hash());
+        let (mut bc, b5) = full_w6_genesis();
+        let (mut twin, _) = full_w6_genesis();
+        let r6 = snapshot_block(&bc, 6, b5.view().hash());
         for node in [&mut bc, &mut twin] {
-            assert_eq!(receive(node, &r4), ReceiveBlockOutcome::AcceptedSilently);
+            assert_eq!(receive(node, &r6), ReceiveBlockOutcome::AcceptedSilently);
         }
-        assert_eq!(bc.active_snake_chain_window(), Ok((1, 4)));
+        assert_eq!(bc.active_snake_chain_window(), Ok((1, 6)));
         assert_eq!(
             bc.blocks.get(bc.horizon_root()).map(|e| e.sequence()),
             Some(0),
             "#0 is retained below the tail"
         );
-        let s4 = tx_block(4, b3.view().hash(), 0, votes_for(4, 0, 3, 60));
-        assert_eq!(receive(&mut bc, &s4), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(status_of(&bc, &s4), None, "the skipped replay deleted it");
-        assert_eq!(head_of(&bc), (4, r4.view().hash()));
+        let s6 = tx_block(6, b5.view().hash(), 0, votes_for(6, 0, 3, 60));
+        assert_eq!(receive(&mut bc, &s6), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(status_of(&bc, &s6), None, "the skipped replay deleted it");
+        assert_eq!(head_of(&bc), (6, r6.view().hash()));
         assert_same_projection(&bc, &twin, "restored");
     }
 
@@ -19658,9 +20674,9 @@ mod tests {
     // Story 6.14 — verification horizon, FR58 bound, W + H, FR3 binding
     // ===================================================================
 
-    /// Admits `blocks` on a Collecting W4 node through Tier 1 only, without the
+    /// Admits `blocks` on a Collecting W6 node through Tier 1 only, without the
     /// FR2 hook, so a test can run the pass on a tip of its choice.
-    fn admit_all(bc: &mut W4Chain, blocks: &[&Block]) {
+    fn admit_all(bc: &mut W6Chain, blocks: &[&Block]) {
         for blk in blocks {
             let view = blk.view();
             bc.tier1_admit(&view, &view.hash(), 0).expect("admitted");
@@ -19669,22 +20685,37 @@ mod tests {
 
     /// AC9 / AC12.8 — the FR3 pass evaluates the FR48 binding of every block
     /// whose dropped block lies in the segment, and a skipped replay is exact
-    /// evidence (DEC-204). Genesis-anchored: #5 drops the chain-config block
-    /// #1. Window-anchored with `a = 99`: #104 drops #100 (`s ≥ a + W`); #103
-    /// drops #99, which carries nothing, and #101, #102 drop blocks below the
-    /// segment (pre-window trust).
+    /// evidence (DEC-204). Genesis-anchored (a founder's FR54 genesis, built by
+    /// the founder): #6 replays node #0's seed source #0, and #7 drops the
+    /// chain-config block #1; the clean slots #2 and #5 (Story 6.7 D8) hold
+    /// node-#0 transfers, as does the skip. Window-anchored with `a = 97`:
+    /// #106 drops #100 (`s ≥ a + W`); #103..=#105 drop #97..=#99, which carry
+    /// nothing, and #101, #102 drop blocks below the segment (pre-window
+    /// trust).
     #[test]
     fn fr3_pass_evaluates_the_binding_inside_the_segment() {
-        let mut bc = new_w4_chain();
-        let g = node_transfer_block(0, 3, 0, 7);
-        let c1 = w4_config_anchor_block(1, g.view().hash());
-        let c2 = w4_config_anchor_block(2, c1.view().hash());
-        let c3 = w4_config_anchor_block(3, c2.view().hash());
-        let c4 = w4_config_anchor_block(4, c3.view().hash());
-        let skip = linked_transfer_block(5, c4.view().hash());
-        let replay = w4_config_anchor_block(5, c4.view().hash());
-        admit_all(&mut bc, &[&g, &c1, &c2, &c3, &c4, &skip, &replay]);
-        let si = bc.blocks.find(5, &skip.view().hash()).expect("stored");
+        let (mut founder, g, c1) = w6_founder();
+        let mut prev = c1.view().hash();
+        let mut chain = std::vec![g, c1];
+        for seq in 2..=6 {
+            let blk = match seq {
+                6 => w6_balance_block(Some(&founder), seq, prev),
+                _ if seq % 3 == 2 => w6_clean_block(seq, prev),
+                _ => w6_config_anchor_block(seq, prev),
+            };
+            assert_eq!(
+                founder.receive_block(blk.view(), 0).0,
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+            prev = blk.view().hash();
+            chain.push(blk);
+        }
+        let skip = w6_clean_block(7, prev);
+        let replay = w6_config_anchor_block(7, prev);
+        let mut bc = new_w6_chain();
+        let refs: std::vec::Vec<&Block> = chain.iter().chain([&skip, &replay]).collect();
+        admit_all(&mut bc, &refs);
+        let si = bc.blocks.find(7, &skip.view().hash()).expect("stored");
         assert!(matches!(
             bc.run_processing_pass(si),
             Err(ProcessingError::Invalid {
@@ -19692,40 +20723,48 @@ mod tests {
                 reason: ValidationReason::TailDropUnpreserved,
             }) if block_idx == si
         ));
-        let ri = bc.blocks.find(5, &replay.view().hash()).expect("stored");
+        let ri = bc.blocks.find(7, &replay.view().hash()).expect("stored");
         assert!(
             bc.run_processing_pass(ri).is_ok(),
             "the chain-config replay preserves #1"
         );
         // Through the acquisition: FR5 deletes only the offender, and the node
         // enters Ready on the prefix.
-        let mut bc = new_w4_chain();
-        admit_all(&mut bc, &[&g, &c1, &c2, &c3, &c4, &skip]);
+        let mut bc = new_w6_chain();
+        let refs: std::vec::Vec<&Block> = chain.iter().chain([&skip]).collect();
+        admit_all(&mut bc, &refs);
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready());
         assert!(
-            bc.blocks.find(5, &skip.view().hash()).is_none(),
+            bc.blocks.find(7, &skip.view().hash()).is_none(),
             "offender deleted"
         );
         assert_eq!(
             bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
-            Some(c4.view().hash())
+            Some(prev)
         );
         assert_eq!(
             bc.block_tree_len(),
-            5,
-            "#0 in the horizon, #1..#4 the window"
+            7,
+            "#0 in the horizon, #1..#6 the window"
         );
 
-        let mut bc = new_w4_chain();
-        let below = w4_horizon_block();
-        let c100 = w4_config_anchor_block(100, below.view().hash());
+        let mut bc = new_w6_chain();
+        let [b97, b98, below] = w6_below();
+        let c100 = w6_config_anchor_block(100, below.view().hash());
         let b101 = linked_transfer_block(101, c100.view().hash());
         let b102 = linked_transfer_block(102, b101.view().hash());
         let b103 = linked_transfer_block(103, b102.view().hash());
-        let skip = linked_transfer_block(104, b103.view().hash());
-        admit_all(&mut bc, &[&below, &c100, &b101, &b102, &b103, &skip]);
-        let si = bc.blocks.find(104, &skip.view().hash()).expect("stored");
+        let b104 = linked_transfer_block(104, b103.view().hash());
+        let b105 = linked_transfer_block(105, b104.view().hash());
+        let skip = linked_transfer_block(106, b105.view().hash());
+        admit_all(
+            &mut bc,
+            &[
+                &b97, &b98, &below, &c100, &b101, &b102, &b103, &b104, &b105, &skip,
+            ],
+        );
+        let si = bc.blocks.find(106, &skip.view().hash()).expect("stored");
         assert!(matches!(
             bc.run_processing_pass(si),
             Err(ProcessingError::Invalid {
@@ -19733,20 +20772,20 @@ mod tests {
                 reason: ValidationReason::TailDropUnpreserved,
             }) if block_idx == si
         ));
-        let ti = bc.blocks.find(103, &b103.view().hash()).expect("stored");
+        let ti = bc.blocks.find(105, &b105.view().hash()).expect("stored");
         assert!(bc.run_processing_pass(ti).is_ok());
     }
 
     /// AC8 / AC12.9 (DEC-177) — on a window-anchored candidate with `a = 99`
-    /// and `H = 2`, node #3's vote is seeded by its first entry at or after
-    /// #101 (the entry at #102): before it, its forged header at #101 is auto-accepted and the
-    /// D9 vote compare is skipped; after it, its forged header at #103 is
-    /// judged and refused.
+    /// and `H = 3`, node #3's vote is seeded by its first entry at or after
+    /// #102 (the entry at #102): before it, its forged header at #101 is
+    /// auto-accepted and the D9 vote compare is skipped; after it, its forged
+    /// header at #103 is judged and refused.
     #[test]
     fn fr3_pass_seeds_a_window_anchored_vote_at_a_plus_h() {
-        let mut bc = new_w4_chain();
+        let mut bc = new_w6_chain();
         let floor = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
-        let cfg = w4_config_anchor_block(100, floor.view().hash());
+        let cfg = w6_config_anchor_block(100, floor.view().hash());
         let early = headed(
             101,
             cfg.view().hash(),
@@ -19793,10 +20832,10 @@ mod tests {
     /// block is already known; a fork inside the bound is admitted.
     #[test]
     fn ready_intake_refuses_blocks_outside_the_switch_bound() {
-        let (mut bc, h) = w4_ready_on_segment(103);
+        let (mut bc, h) = w6_ready_on_segment(105);
         let len = bc.block_tree_len();
-        let late = salted_linked_block(101, h[0], 9);
-        let below = w4_horizon_block();
+        let late = salted_linked_block(102, h[1], 9);
+        let below = w6_horizon_block();
         let under = salted_linked_block(100, below.view().hash(), 9);
         for blk in [&late, &under] {
             assert_eq!(
@@ -19809,7 +20848,7 @@ mod tests {
             bc.receive_block(below.view(), 0).0,
             ReceiveBlockOutcome::DuplicateKnown
         );
-        let fork = salted_linked_block(102, h[1], 9);
+        let fork = salted_linked_block(103, h[2], 9);
         admit_fork(&mut bc, &fork, 0);
         assert_eq!(bc.block_tree_len(), len + 1);
     }
@@ -19817,7 +20856,7 @@ mod tests {
     /// Every block below `S_tail` is a flagged, Active block of the active
     /// path, `H` of them, and the root's only child is its successor (D1,
     /// DEC-206) — after advances and reclamation, and after a restart.
-    fn assert_horizon_is_the_active_path(bc: &W4Chain, h: u32) {
+    fn assert_horizon_is_the_active_path(bc: &W6Chain, h: u32) {
         let (s_tail, _) = bc.active_snake_chain_window().expect("Ready");
         let mut below = 0;
         for idx in 0..16u32 {
@@ -19841,24 +20880,24 @@ mod tests {
     #[test]
     fn the_horizon_holds_only_the_active_path() {
         let (_, bc, _) = drive_past_w(1_000);
-        assert_horizon_is_the_active_path(&bc, 2);
+        assert_horizon_is_the_active_path(&bc, 3);
 
         let storage = bc.storage;
         let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
-        let chain_config = empty_chain_config(W4Chain::BUILD_LIMITS);
+        let chain_config = empty_chain_config(W6Chain::BUILD_LIMITS);
         let node_zero = *crypto.public_key().serialize();
         let mut slot = core::mem::MaybeUninit::uninit();
-        W4Chain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
+        W6Chain::init(&mut slot, crypto, storage, chain_config, 5, node_zero, 0);
         // SAFETY: `init` returned, so every field of `slot` is initialized.
         let mut restarted = unsafe { slot.assume_init() };
         restarted.initialize_from_storage(500);
         assert!(restarted.is_ready());
-        assert_eq!(restarted.active_snake_chain_window(), Ok((102, 105)));
-        assert_horizon_is_the_active_path(&restarted, 2);
+        assert_eq!(restarted.active_snake_chain_window(), Ok((102, 107)));
+        assert_horizon_is_the_active_path(&restarted, 3);
 
         // AC12.6 — the restarted node's projections equal a fresh node's fed
         // the same retained blocks.
-        let mut fresh = new_w4_chain();
+        let mut fresh = new_w6_chain();
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         for idx in 0..16u32 {
             // The exact stored length, as the node itself reads it back.
@@ -19871,7 +20910,7 @@ mod tests {
             fresh.active_snake_chain_window(),
             restarted.active_snake_chain_window()
         );
-        let hash_at = |bc: &W4Chain, idx: u32| bc.blocks.get(idx).map(|e| *e.hash());
+        let hash_at = |bc: &W6Chain, idx: u32| bc.blocks.get(idx).map(|e| *e.hash());
         assert_eq!(
             hash_at(&fresh, fresh.active_chain_head_idx),
             hash_at(&restarted, restarted.active_chain_head_idx)
@@ -19880,19 +20919,23 @@ mod tests {
             hash_at(&fresh, fresh.horizon_root()),
             hash_at(&restarted, restarted.horizon_root())
         );
-        assert!(fresh.node_info == restarted.node_info);
+        // Node #0's seed source is #102, held at different slots by the two
+        // nodes (they admitted the blocks in different orders), so the node
+        // projections are compared through the blocks the pointers name.
+        assert_same_nodes(&fresh, &restarted);
         assert!(fresh.vote_engine == restarted.vote_engine);
         assert_eq!(fresh.active_branch_value, restarted.active_branch_value);
     }
 
-    /// Compares two W4 nodes node by node (`0..=4`) and block by block: the
+    /// Compares two W6 nodes node by node (all 16) and block by block: the
     /// derived state a chain switch must leave exactly as a fresh pass does.
-    fn assert_same_nodes(a: &W4Chain, b: &W4Chain) {
-        let source = |bc: &W4Chain, node: u32| match bc.node_info.seed_source_of(node) {
+    /// Seed sources are compared by the block they name, not by slot.
+    fn assert_same_nodes(a: &W6Chain, b: &W6Chain) {
+        let source = |bc: &W6Chain, node: u32| match bc.node_info.seed_source_of(node) {
             Some(SEED_SOURCE_RELEASED) | None => None,
             Some(slot) => bc.blocks.get(slot).map(|e| *e.hash()),
         };
-        for node in 0..=4 {
+        for node in 0..16 {
             assert_eq!(a.node_info.balance_of(node), b.node_info.balance_of(node));
             assert_eq!(
                 a.vote_engine.accumulated_vote_of(node),
@@ -19925,41 +20968,30 @@ mod tests {
 
     /// AC4 / AC12.4 / AC5 (DEC-211, DEC-208) — a switch on a window-anchored
     /// node may undo the balance block that seeded nodes in its FR3 pass: the
-    /// head #102 floor-seeds node #4 and vote-seeds node #3 (`a = 97`, `H = 2`,
-    /// #3 floor-seeded at #97). The undo is identity on the values, so the
-    /// switched node ends where a node that joined the new chain directly ends
-    /// — the ground truth, since a fresh pass on honest blocks is (Story 6.0's
-    /// FR3 equivalence). A forged twin of the winner is refused by the replay
-    /// and leaves the node exactly as it was; the winner arrives as a
-    /// three-block branch, and the commit's sweep deletes the demoted head.
+    /// head #102 floor-seeds node #4 and vote-seeds node #3 (`a = 94`, `H = 3`,
+    /// #3 floor-seeded at #96; [`vote_seed_prefix`]). The undo is identity on
+    /// the values, so the switched node ends where a node that joined the new
+    /// chain directly ends — the ground truth, since a fresh pass on honest
+    /// blocks is (Story 6.0's FR3 equivalence). A forged twin of the winner is
+    /// refused by the replay and leaves the node exactly as it was; the winner
+    /// arrives as a four-block branch, and the commit's sweep deletes the
+    /// demoted head.
     #[test]
     fn a_switch_undoes_seed_points_as_identity() {
-        let lowest = balance_block(97, [0xAB; 32], &[(3, 0, 0, 0x33)], 4);
-        let floor = balance_block(98, lowest.view().hash(), &[(3, 0, 0, 0x33)], 4);
-        let cfg = w4_config_anchor_block(99, floor.view().hash());
-        let early = headed(
-            100,
-            cfg.view().hash(),
-            3,
-            1,
-            777,
-            3,
-            0,
-            votes_for(100, 3, 1, 40),
-        );
-        let b101 = tx_block(101, early.view().hash(), 0, votes_for(101, 3, 1, 41));
+        let prefix = vote_seed_prefix(4);
+        let b101 = &prefix[7];
         let entries = [(3, 1, 1000, 0x33), (4, 70, 500, 0x34)];
         let seed = balance_block(102, b101.view().hash(), &entries, 4);
         let joiner = || {
-            let mut bc = new_w4_chain();
-            for blk in [&lowest, &floor, &cfg, &early, &b101, &seed] {
+            let mut bc = new_w6_chain();
+            for blk in prefix.iter().chain([&seed]) {
                 assert_eq!(
                     bc.receive_block(blk.view(), 0).0,
                     ReceiveBlockOutcome::AcceptedSilently
                 );
             }
             assert!(bc.is_ready());
-            assert_eq!(bc.active_snake_chain_window(), Ok((99, 102)));
+            assert_eq!(bc.active_snake_chain_window(), Ok((97, 102)));
             bc
         };
         let (mut j, twin) = (joiner(), joiner());
@@ -19984,32 +21016,46 @@ mod tests {
         assert_eq!(j.active_branch_value, twin.active_branch_value);
 
         // The ground truth: a node that joins the new chain directly.
-        let mut direct = new_w4_chain();
-        for blk in [&lowest, &floor, &cfg, &early, &b101, &f102] {
+        let mut direct = new_w6_chain();
+        for blk in prefix.iter().chain([&f102]) {
             assert_eq!(
                 direct.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
         assert!(direct.is_ready());
+        // #103 replays the chain-config block #97 it drops; #104 is a clean
+        // slot (Story 6.7 D8): node #4, seeded by #102 with 70, transfers
+        // nothing to itself; #105 is any block.
         let f103 = real_on(
             &direct,
-            &w4_config_anchor_block(103, f102.view().hash()),
+            &w6_config_anchor_block(103, f102.view().hash()),
             0,
             1,
         );
         extend_active_head(&mut direct, &f103, 0);
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let idle = NodeTransfer::new_signed(0, 103, 4, 4, 0, 0, 0, &signer);
         let f104 = real_on(
             &direct,
-            &w4_config_anchor_block(104, f103.view().hash()),
+            &tx_block(104, f103.view().hash(), 0, |b| {
+                b.add_node_transfer(&idle).ok().expect("add transfer");
+            }),
             0,
             1,
         );
         extend_active_head(&mut direct, &f104, 0);
+        let f105 = real_on(
+            &direct,
+            &w6_config_anchor_block(105, f104.view().hash()),
+            0,
+            1,
+        );
+        extend_active_head(&mut direct, &f105, 0);
 
-        // The three-block branch, orphan first: the switch goes to #104
+        // The four-block branch, orphan first: the switch goes to #105
         // across both seed points.
-        for blk in [&f104, &f103, &f102] {
+        for blk in [&f105, &f104, &f103, &f102] {
             assert_eq!(
                 j.receive_block(blk.view(), 0).0,
                 ReceiveBlockOutcome::AcceptedSilently
@@ -20017,7 +21063,7 @@ mod tests {
         }
         assert_eq!(
             j.blocks.get(j.active_chain_head_idx).map(|e| *e.hash()),
-            Some(f104.view().hash()),
+            Some(f105.view().hash()),
             "switched across the seed points"
         );
         assert!(
@@ -20031,52 +21077,49 @@ mod tests {
     /// they leave with its slot when it leaves the horizon.
     #[test]
     fn a_horizon_block_keeps_its_available_utxo_bits() {
-        let (mut bc, h) = w4_ready_on_segment(103);
+        let (mut bc, h) = w6_ready_on_segment(105);
         let slot_100 = slot_of(&bc, 100, &h[0]).expect("#100");
         assert!(bc.blocks.set_utxo_available(slot_100, 0, true));
-        let b104 = w4_config_anchor_block(104, h[3]);
-        extend_active_head(&mut bc, &b104, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((101, 104)));
-        assert_eq!(
-            bc.blocks.utxo_available(slot_100, 0),
-            Some(true),
-            "kept in the horizon"
-        );
-        let b105 = w4_config_anchor_block(105, b104.view().hash());
-        extend_active_head(&mut bc, &b105, 0);
-        assert_eq!(bc.active_snake_chain_window(), Ok((102, 105)));
-        assert_eq!(
-            bc.blocks.utxo_available(slot_100, 0),
-            Some(true),
-            "still in the horizon (H = 2)"
-        );
-        let b106 = w4_config_anchor_block(106, b105.view().hash());
-        extend_active_head(&mut bc, &b106, 0);
+        let mut prev = h[5];
+        for seq in 106..=108 {
+            let blk = w6_extension(&bc, seq, prev);
+            extend_active_head(&mut bc, &blk, 0);
+            prev = blk.view().hash();
+            assert_eq!(bc.active_snake_chain_window(), Ok((seq - 5, seq)));
+            assert_eq!(
+                bc.blocks.utxo_available(slot_100, 0),
+                Some(true),
+                "kept in the horizon (H = 3)"
+            );
+        }
+        let b109 = w6_extension(&bc, 109, prev);
+        extend_active_head(&mut bc, &b109, 0);
         assert!(slot_of(&bc, 100, &h[0]).is_none(), "#100 left the horizon");
         assert_ne!(bc.blocks.utxo_available(slot_100, 0), Some(true));
     }
 
     /// AC12.2 — the configured `H` reaches the bound: the same late block is
-    /// refused at `H = 2` and admitted at `H = 3`. `W = 4` admits only
-    /// `H = 2` (configuration §6 check 21: `H ≥ 2` divides `W`), and 6 is the
-    /// smallest window with two legal horizons, so the pair runs on a genesis
-    /// chain of `TestChain`, whose capacity holds it: the head is #5 and the
-    /// late block a child of #2, at `S_new = S_head − 2`.
+    /// refused at `H = 3` and admitted at `H = 4`. The W6 harness admits only
+    /// `H = 3` (configuration §6 check 21: `H ≥ 3` divides `W`), and 12 is the
+    /// smallest window with two adjacent legal horizons, so the pair runs on a
+    /// genesis chain of `TestChain`, whose capacity holds it: the head is #6
+    /// and the late block a child of #2, at `S_new = S_head − 3`. Every block
+    /// is a plain transfer, clean on either horizon's slots (Story 6.7 D8).
     #[test]
     fn the_configured_horizon_reaches_the_bound() {
         for (h, expected) in [
-            (2, ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)),
-            (3, ReceiveBlockOutcome::AcceptedSilently),
+            (3, ReceiveBlockOutcome::Rejected(RejectReason::OutOfWindow)),
+            (4, ReceiveBlockOutcome::AcceptedSilently),
         ] {
             let (crypto, storage, chain_config) = test_backends();
             let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
             let genesis = bc
-                .process_genesis(CURRENCY, window_horizon_config_builder(6, h).content())
+                .process_genesis(CURRENCY, window_horizon_config_builder(12, h).content())
                 .ok()
                 .expect("genesis succeeds");
             let mut prev = genesis.block_one.view().hash();
             let mut at_two = prev;
-            for seq in 2..=5 {
+            for seq in 2..=6 {
                 let blk = transfer(seq, prev, 0, 7);
                 assert_eq!(
                     receive(&mut bc, &blk),
@@ -20087,7 +21130,7 @@ mod tests {
                     at_two = prev;
                 }
             }
-            assert_eq!(head_of(&bc), (5, prev));
+            assert_eq!(head_of(&bc), (6, prev));
             let late = transfer(3, at_two, 0, 8);
             assert_eq!(receive(&mut bc, &late), expected, "H = {h}");
         }
@@ -20097,29 +21140,32 @@ mod tests {
     /// that was retained while collecting.
     #[test]
     fn ready_entry_reclaims_a_deep_fork() {
-        let mut bc = new_w4_chain();
-        let lowest = w4_horizon_base();
-        let below = w4_horizon_block();
-        let anchor = w4_config_anchor_block(100, below.view().hash());
+        let mut bc = new_w6_chain();
+        let [b97, b98, below] = w6_below();
+        let anchor = w6_config_anchor_block(100, below.view().hash());
         let b101 = linked_transfer_block(101, anchor.view().hash());
         let b102 = linked_transfer_block(102, b101.view().hash());
         let b103 = linked_transfer_block(103, b102.view().hash());
-        let deep = salted_linked_block(101, anchor.view().hash(), 5);
+        let b104 = linked_transfer_block(104, b103.view().hash());
+        let b105 = linked_transfer_block(105, b104.view().hash());
+        let deep = salted_linked_block(102, b101.view().hash(), 5);
         admit_all(
             &mut bc,
-            &[&lowest, &below, &anchor, &b101, &deep, &b102, &b103],
+            &[
+                &b97, &b98, &below, &anchor, &b101, &deep, &b102, &b103, &b104, &b105,
+            ],
         );
         bc.drive_dominant_chain_acquisition();
         assert!(bc.is_ready());
         assert_eq!(
             bc.blocks.get(bc.active_chain_head_idx).map(|e| *e.hash()),
-            Some(b103.view().hash())
+            Some(b105.view().hash())
         );
         assert!(
-            bc.blocks.find(101, &deep.view().hash()).is_none(),
-            "forked at #100 ≤ S_head − H − 1"
+            bc.blocks.find(102, &deep.view().hash()).is_none(),
+            "forked at #101 ≤ S_head − H − 1"
         );
-        assert_eq!(bc.block_tree_len(), 6);
+        assert_eq!(bc.block_tree_len(), 9);
         assert_eq!(bc.chain_heads.count(), 1);
     }
 
@@ -20145,16 +21191,25 @@ mod tests {
         assert!(!bc.chain_heads.has_stored_head());
     }
 
-    /// The D6 scenario's admissions at wall clock `now`, then one extension
-    /// past the switch (a horizon release): the joiner's head, window, root,
-    /// tree size, values and the two nodes' derived state.
-    fn switch_across_a_vote_seed(now: u64) -> (W4Chain, [u8; 32]) {
-        let lowest = balance_block(97, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
-        let floor = balance_block(98, lowest.view().hash(), &[(3, 0, 0, 0x33)], 3);
-        let cfg = w4_config_anchor_block(99, floor.view().hash());
+    /// The window-anchored W6 prefix `#94..=#101` below a vote seed at #102:
+    /// node-#0 self-transfers voting for node #0 at #94, #95, #98 and #99
+    /// (clean, so #95 and #98 may be slots, Story 6.7 D8), the floor #96 (a
+    /// balance block floor-seeding node #3, `max_node_id` given, whose drop
+    /// the #102 balance block replays), the chain-config block #97 (the window
+    /// tail at #102), node #3's forged-vote header `early` at #100, and #101
+    /// (votes for #3, a slot). A join on #94..=#102 is `W + H = 9` blocks,
+    /// `a = 94`, so node #3's vote is seeded at its first entry at or after
+    /// `a + H = 97`.
+    fn vote_seed_prefix(max_node_id: u32) -> [Block; 8] {
+        let p94 = tx_block(94, [0xAB; 32], 0, votes_for(94, 0, 1, 50));
+        let p95 = tx_block(95, p94.view().hash(), 0, votes_for(95, 0, 1, 51));
+        let floor = balance_block(96, p95.view().hash(), &[(3, 0, 0, 0x33)], max_node_id);
+        let cfg = w6_config_anchor_block(97, floor.view().hash());
+        let p98 = tx_block(98, cfg.view().hash(), 0, votes_for(98, 0, 1, 52));
+        let p99 = tx_block(99, p98.view().hash(), 0, votes_for(99, 0, 1, 53));
         let early = headed(
             100,
-            cfg.view().hash(),
+            p99.view().hash(),
             3,
             1,
             777,
@@ -20163,17 +21218,26 @@ mod tests {
             votes_for(100, 3, 1, 40),
         );
         let b101 = tx_block(101, early.view().hash(), 0, votes_for(101, 3, 1, 41));
+        [p94, p95, floor, cfg, p98, p99, early, b101]
+    }
+
+    /// The D6 scenario's admissions at wall clock `now`, then one extension
+    /// past the switch (a horizon release): the joiner's head, window, root,
+    /// tree size, values and the two nodes' derived state.
+    fn switch_across_a_vote_seed(now: u64) -> (W6Chain, [u8; 32]) {
+        let prefix = vote_seed_prefix(3);
+        let b101 = &prefix[7];
         let seed = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
         let replay = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
         let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
-        let mut bc = new_w4_chain();
-        for blk in [&lowest, &floor, &cfg, &early, &b101, &seed, &f102] {
+        let mut bc = new_w6_chain();
+        for blk in prefix.iter().chain([&seed, &f102]) {
             assert_eq!(
                 bc.receive_block(blk.view(), now).0,
                 ReceiveBlockOutcome::AcceptedSilently
             );
         }
-        let cfg103 = real_on(&bc, &w4_config_anchor_block(103, f102.view().hash()), 0, 1);
+        let cfg103 = real_on(&bc, &w6_config_anchor_block(103, f102.view().hash()), 0, 1);
         extend_active_head(&mut bc, &cfg103, now);
         (bc, f102.view().hash())
     }
@@ -20186,7 +21250,7 @@ mod tests {
         let (a, fa) = switch_across_a_vote_seed(1_000);
         let (b, fb) = switch_across_a_vote_seed(9_999_999);
         assert_eq!(fa, fb);
-        assert_eq!(a.active_snake_chain_window(), Ok((100, 103)));
+        assert_eq!(a.active_snake_chain_window(), Ok((98, 103)));
         assert_eq!(a.active_snake_chain_window(), b.active_snake_chain_window());
         assert_eq!(a.active_chain_head_idx, b.active_chain_head_idx);
         assert_eq!(a.snake_chain_tail_idx, b.snake_chain_tail_idx);
@@ -20195,15 +21259,14 @@ mod tests {
         assert_eq!(a.active_branch_value, b.active_branch_value);
         assert!(a.node_info == b.node_info);
         assert!(a.vote_engine == b.vote_engine);
-        let lowest = balance_block(97, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
+        let prefix = vote_seed_prefix(3);
         assert!(
-            a.blocks.find(97, &lowest.view().hash()).is_none(),
-            "#97 left the horizon"
+            a.blocks.find(94, &prefix[0].view().hash()).is_none(),
+            "#94 left the horizon"
         );
-        let floor = balance_block(98, lowest.view().hash(), &[(3, 0, 0, 0x33)], 3);
         assert!(
-            a.blocks.find(98, &floor.view().hash()).is_some(),
-            "#98 is still in the horizon (H = 2)"
+            a.blocks.find(95, &prefix[1].view().hash()).is_some(),
+            "#95 is still in the horizon (H = 3)"
         );
     }
 
@@ -20944,22 +22007,29 @@ mod tests {
         set_grace_admits(false);
     }
 
-    /// AC9 test 3 — a block above `p` by another creator (shape (b) fails).
+    /// AC9 test 3 — converted by Story 6.7 D4 (it pinned that a block above
+    /// `p` by another creator fails shape (b) for a sibling's support): inside
+    /// `d`'s open run only `d`'s creator may extend it (FR27 rule 1,
+    /// `RunCreator`), so the supporter refuses that block at intake and its
+    /// head stays `d`. A head above `d` is `d`'s creator's or `d`'s evidence,
+    /// so shape (b)'s foreign-creator stop is unreachable.
     #[test]
     fn no_support_with_another_creator_above_p() {
         set_grace_admits(true);
         let (mut g, mut l, blocks) = support_chain(3);
         let d = deviation_after(&g, &blocks[5], 5, 1);
-        // `x` is built at #5, so its header names the top at `p − 1`.
-        let x = deviation_after(&g, &blocks[5], 2, 3);
         let _ = receive(&mut g, &d);
         assert!(support_for(&mut l, &d).is_some());
         let above = normal_after(&g, &d, 3, 2);
         assert_eq!(
-            receive(&mut l, &above),
-            ReceiveBlockOutcome::AcceptedSilently
+            step_reason(&mut l, &above),
+            Some(ValidationReason::RunCreator)
         );
-        assert_eq!(support_for(&mut l, &x), None);
+        assert_eq!(
+            receive(&mut l, &above),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(head_of(&l), (6, d.view().hash()));
         set_grace_admits(false);
     }
 
@@ -21019,23 +22089,31 @@ mod tests {
     /// AC9 — `p + H ≤ S_head` after the head advanced in the same call: `x`
     /// arrives after its eight descendants (`H = 8` on these `W = 16`
     /// chains), which the drive promotes behind it, so `x` is out of the
-    /// switch bound by the time it is evaluated.
+    /// switch bound by the time it is evaluated. Its run admits only its
+    /// creator's replays up to `p + H − 1` (Story 6.7 D4), so the eighth
+    /// descendant, at `p + H`, is `x`'s evidence: proposer #4 (`pl`) completes
+    /// its package and builds it.
     #[test]
     fn no_support_after_the_head_advanced_past_the_horizon() {
         set_grace_admits(true);
-        let (mut g, mut l, blocks) = support_chain(3);
-        let x = deviation_after(&g, &blocks[5], 4, 1);
+        let (mut g, mut pl, _, x, x_idx) = proposer_chain(4);
+        accumulate(&mut pl, &x, x_idx, 2);
+        let (_, mut l, _) = support_chain(3);
         let _ = receive(&mut g, &x);
         let mut descendants = core::array::from_fn::<Option<Block>, 8, _>(|_| None);
         let mut prev_hash = x.view().hash();
         for (i, slot) in descendants.iter_mut().enumerate() {
             let seq = 7 + i as u32;
-            let template = tx_block(seq, prev_hash, 0, votes_for(seq, 0, 1, 500 + seq as u64));
-            let block = real_on(&g, &template, 4, key_of(4));
-            assert_eq!(
-                receive(&mut g, &block),
-                ReceiveBlockOutcome::AcceptedSilently
-            );
+            let block = if seq == 14 {
+                pl.build_evidence_block(pl.active_chain_head_idx, 0)
+                    .expect("complete")
+            } else {
+                let template = tx_block(seq, prev_hash, 0, votes_for(seq, 0, 1, 500 + seq as u64));
+                real_on(&g, &template, 4, key_of(4))
+            };
+            for node in [&mut g, &mut pl] {
+                assert_eq!(receive(node, &block), ReceiveBlockOutcome::AcceptedSilently);
+            }
             prev_hash = block.view().hash();
             *slot = Some(block);
         }
@@ -21206,7 +22284,7 @@ mod tests {
         set_grace_admits(false);
     }
 
-    /// The Story 6.4 chain on `W = 8` (`H = 2`) carried past genesis, so its
+    /// The Story 6.4 chain on `W = 8` (`H = 4`) carried past genesis, so its
     /// tail has advanced: [`support_chain_on`]'s `b0..=a5`, then `a6` (node 2,
     /// one credit for node 3), `a7` (node 5, one for node 2), `r8` (node #0's
     /// balance replay of node #0, dropping #0), `r9` (node 3's chain-config
@@ -21658,29 +22736,43 @@ mod tests {
         );
     }
 
-    /// AC7 test 3 — at `p + H ≤ S_head` (W = 8, H = 2, `d` at 12, its
-    /// creator's block at 13, the top's at 14) the subgroup half is deferred,
-    /// while the watermark and the evidence half still run.
+    /// AC7 test 3 — converted by Story 6.7 D4 (it pinned that at
+    /// `p + H ≤ S_head` the subgroup half is deferred). `d`'s run admits only
+    /// its creator's replays up to `p + H − 1` (W = 8, H = 4, `d` at 12, its
+    /// creator's blocks at 13..=15): a fourth replay, at `p + H`, is refused
+    /// (`RunBound`), and a head at `p + H` is `d`'s evidence, which (iv-a)
+    /// answers first, so the deferral is unreachable. At the last head before
+    /// the bound the subgroup half runs (`u` is refused), and the watermark
+    /// and the evidence half run as before.
     #[test]
     fn a_deep_deviation_defers_only_the_subgroup_half() {
         let (mut g, mut r, blocks) = long_support_chain(2);
         let d = deviation_after(&g, &blocks[5], 4, 1);
         assert_eq!(receive(&mut r, &d), ReceiveBlockOutcome::AcceptedSilently);
         let _ = receive(&mut g, &d);
+        let both = |g: &mut SupportChain, r: &mut SupportChain, block: &Block| {
+            for node in [g, r] {
+                assert_eq!(receive(node, block), ReceiveBlockOutcome::AcceptedSilently);
+            }
+        };
         let y = normal_after(&g, &d, 4, 2);
-        assert_eq!(receive(&mut r, &y), ReceiveBlockOutcome::AcceptedSilently);
-        let _ = receive(&mut g, &y);
-        // `H = 2` (Story 6.7 D8): one more block, by the top at 13, puts
-        // `p + H` at the head.
-        let top = g.vote_engine.top_creator().expect("a top creator");
-        let z = normal_after(&g, &y, top, 3);
-        assert_eq!(receive(&mut r, &z), ReceiveBlockOutcome::AcceptedSilently);
-        assert_eq!(head_of(&r).0, 14);
+        both(&mut g, &mut r, &y);
+        let y14 = normal_after(&g, &y, 4, 3);
+        both(&mut g, &mut r, &y14);
+        let y15 = normal_after(&g, &y14, 4, 4);
+        both(&mut g, &mut r, &y15);
+        assert_eq!(head_of(&r).0, 15, "p + H − 1");
+        let over = normal_after(&g, &y15, 4, 5);
+        assert_eq!(step_reason(&mut r, &over), Some(ValidationReason::RunBound));
+        assert_eq!(
+            receive(&mut r, &over),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
         let h = d.view().hash();
-        // `u` (node 1) is outside `A'`: accepted only because (iv-b) defers.
+        // `u` (node 1) is outside `A'`: the subgroup half runs and refuses it.
         assert_eq!(
             intake(&mut r, &support_by(1, 4, 12, h)),
-            ReceiveSupportOutcome::Accepted
+            ReceiveSupportOutcome::Rejected
         );
         for unknown in [9, 20] {
             assert_eq!(
@@ -21697,21 +22789,28 @@ mod tests {
         );
     }
 
-    /// AC7 test 3 — another creator above `d` (an FR27 violation) defers the
-    /// subgroup half: the idle node 2 is then accepted.
+    /// AC7 test 3 — converted by Story 6.7 D4 (it pinned that another
+    /// creator above `d`, an FR27 violation, defers the subgroup half): the
+    /// violation is now refused at intake (rule 1, `RunCreator`), so the head
+    /// stays `x` and the subgroup half runs: the idle node 2, outside `A'`,
+    /// is rejected.
     #[test]
     fn a_foreign_creator_above_the_deviation_defers_the_subgroup_half() {
         let (mut g, mut r, _, x) = on_chain_receiver();
         let _ = receive(&mut g, &x);
         let above = normal_after(&g, &x, 3, 2);
         assert_eq!(
-            receive(&mut r, &above),
-            ReceiveBlockOutcome::AcceptedSilently
+            step_reason(&mut r, &above),
+            Some(ValidationReason::RunCreator)
         );
-        assert_eq!(head_of(&r).0, 7);
+        assert_eq!(
+            receive(&mut r, &above),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(head_of(&r), (6, x.view().hash()));
         assert_eq!(
             intake(&mut r, &support_by(2, 4, 6, x.view().hash())),
-            ReceiveSupportOutcome::Accepted
+            ReceiveSupportOutcome::Rejected
         );
     }
 
@@ -22264,6 +23363,18 @@ mod tests {
         assert_eq!(usize::from(held(bc)), n);
     }
 
+    /// [`plant`], flagged on the active chain: the evidence scans' stand-in
+    /// for an active evidence block (Story 6.7 D3: only those stop).
+    fn plant_on_chain<S: StorageTrait>(bc: &mut Chain16<S>, block: &Block, stored: bool) {
+        plant(bc, block, true, stored);
+        let view = block.view();
+        let idx = bc
+            .blocks
+            .find(view.sequence(), &view.hash())
+            .expect("planted");
+        assert!(bc.blocks.set_on_active_chain(idx, true));
+    }
+
     /// Puts `block` into `bc`'s table and storage as a retained entry with no
     /// parent: a planted block (verified or not) for the evidence scans.
     /// `stored == false` leaves its slot unwritten, so its read fails.
@@ -22355,30 +23466,36 @@ mod tests {
         assert_refused(&mut l, d_idx, "no valid active set");
     }
 
+    /// Converted by Story 6.7 D4 (it pinned that the open refuses with
+    /// another creator above `p − 1`): that block is refused at intake (rule
+    /// 1, `RunCreator`), so the proposer's head stays `d` and the open holds.
     #[test]
     fn open_refuses_another_creator_above_the_parent() {
         let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
         assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
         let foreign_above = normal_after(&g, &d, 3, 2);
         assert_eq!(
-            receive(&mut l, &foreign_above),
-            ReceiveBlockOutcome::AcceptedSilently
+            step_reason(&mut l, &foreign_above),
+            Some(ValidationReason::RunCreator)
         );
-        assert_refused(&mut l, d_idx, "another creator above p − 1");
+        assert_eq!(
+            receive(&mut l, &foreign_above),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert_eq!(head_of(&l), (6, d.view().hash()));
+        assert!(l.open_approval(d_idx), "nothing foreign above p − 1");
     }
 
     #[test]
     fn open_refuses_past_the_horizon() {
+        // The head reaches `p + H` only through `d`'s own evidence, which
+        // closes its run (Story 6.7 D4: replays end by `p + H − 1`), so the
+        // package is completed first and the evidence is the block at #14.
         let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
+        accumulate(&mut l, &d, d_idx, 2);
         assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
         let mut prev = d;
-        for salt in 0..8 {
-            if salt == 7 {
-                // Head 13: `p + H = 14 > 13`, the last head that opens.
-                assert_eq!(head_of(&l).0, 13);
-                assert!(l.open_approval(d_idx), "the boundary control");
-                l.approval.clear();
-            }
+        for salt in 0..7 {
             let next = normal_after(&g, &prev, 5, 10 + salt);
             assert_eq!(
                 receive(&mut g, &next),
@@ -22390,27 +23507,49 @@ mod tests {
             );
             prev = next;
         }
+        let evidence = l
+            .build_evidence_block(l.active_chain_head_idx, 0)
+            .expect("complete");
+        // Head 13: `p + H = 14 > 13`, the last head that opens.
+        assert_eq!(head_of(&l).0, 13);
+        l.approval.clear();
+        assert!(l.open_approval(d_idx), "the boundary control");
+        l.approval.clear();
+        assert_eq!(
+            receive(&mut l, &evidence),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
         assert_eq!(head_of(&l).0, 14);
         // `F` followed `S_head − H` to 6: reset it, so only the bound refuses.
         l.non_conflict = NonConflictRing::new();
         assert_refused(&mut l, d_idx, "p + H ≤ S_head");
     }
 
-    /// AC9 test 1 — a second open (the proposer's next deviation, at 7 on
-    /// its own `d`) replaces the first; a refused one keeps it.
+    /// AC9 test 1 — a second open (the proposer's next deviation, at 8 on
+    /// its own `d`'s evidence) replaces the first; a refused one keeps it.
+    /// The second deviation follows the evidence: inside `d`'s open run only
+    /// override-form blocks by its creator may follow it (Story 6.7 D4).
     #[test]
     fn a_second_open_replaces_the_first() {
         let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
-        accumulate(&mut l, &d, d_idx, 1);
+        accumulate(&mut l, &d, d_idx, 2);
+        let evidence = l.build_evidence_block(d_idx, 0).expect("complete");
+        assert_eq!(evidence.view().sequence(), 7);
         assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
-        let second = deviation_after(&g, &d, 5, 2);
+        for node in [&mut g, &mut l] {
+            assert_eq!(
+                receive(node, &evidence),
+                ReceiveBlockOutcome::AcceptedSilently
+            );
+        }
+        let second = deviation_after(&g, &evidence, 5, 2);
         assert_eq!(
             receive(&mut l, &second),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        let second_idx = l.blocks.find(7, &second.view().hash()).expect("held");
+        let second_idx = l.blocks.find(8, &second.view().hash()).expect("held");
         assert!(l.open_approval(second_idx));
-        assert_eq!(l.approval.deviation(), Some((7, &second.view().hash())));
+        assert_eq!(l.approval.deviation(), Some((8, &second.view().hash())));
         assert_eq!(
             l.approval.counts().2,
             0,
@@ -22420,7 +23559,7 @@ mod tests {
         assert!(!l.open_approval(d_idx));
         assert_eq!(
             l.approval.deviation(),
-            Some((7, &second.view().hash())),
+            Some((8, &second.view().hash())),
             "kept"
         );
     }
@@ -22581,23 +23720,43 @@ mod tests {
         assert_eq!(verified(&l, &u), Some(true));
         assert!(!l.approval_live(), "a validated u-block");
 
-        let evidence = node_four_evidence();
-        let (_, mut l, _, _, d_idx) = proposer_chain(5);
-        assert!(l.open_approval(d_idx));
-        plant(&mut l, &evidence, false, true);
-        assert!(l.approval_live(), "an unverified evidence does not stop");
-        let (_, mut l, _, _, d_idx) = proposer_chain(5);
-        assert!(l.open_approval(d_idx));
-        plant(&mut l, &evidence, true, true);
-        assert!(!l.approval_live(), "a validated evidence at p");
-        let (_, mut l, _, _, d_idx) = proposer_chain(5);
-        assert!(l.open_approval(d_idx));
-        plant(&mut l, &evidence, true, false);
-        assert!(l.approval_live(), "a failed read never discards");
-
         let (_, mut l, _, _, d_idx, _) = sibling_proposer();
         assert!(l.open_approval(d_idx));
         assert!(l.approval_live(), "the heavier sibling keeps it");
+    }
+
+    /// AC9 test 3, Story 6.7 D3 (AR-025 closed): only an active evidence at
+    /// `p` stops the proposer — a planted side evidence does not, unverified or
+    /// signature-verified — and a failed read of an active one never discards.
+    /// One planted case per test (the test-thread stack, 6.6).
+    #[test]
+    fn only_an_active_evidence_stops_the_accumulator() {
+        for (on_chain, verified, stored, live, why) in [
+            (false, false, true, true, "an unverified side evidence"),
+            (
+                false,
+                true,
+                true,
+                true,
+                "a signature-verified side evidence",
+            ),
+            (true, true, true, false, "an active evidence at p"),
+            (true, true, false, true, "a failed read never discards"),
+        ] {
+            evidence_stop_case(on_chain, verified, stored, live, why);
+        }
+    }
+
+    fn evidence_stop_case(on_chain: bool, verified: bool, stored: bool, live: bool, why: &str) {
+        let evidence = node_four_evidence();
+        let (_, mut l, _, _, d_idx) = proposer_chain(5);
+        assert!(l.open_approval(d_idx));
+        if on_chain {
+            plant_on_chain(&mut l, &evidence, stored);
+        } else {
+            plant(&mut l, &evidence, verified, stored);
+        }
+        assert_eq!(l.approval_live(), live, "{why}");
     }
 
     /// AC9 test 3 — an unverified `u`-block (the 6.5 fixture: node 5's
@@ -22635,25 +23794,31 @@ mod tests {
         );
     }
 
-    /// AC9 test 4 — 6.4's emission gains the evidence half: a validated
-    /// evidence at `p` stops it, an unverified one does not, a failed evidence
-    /// read stops it (the conservative side).
+    /// AC9 test 4 — 6.4's emission gains the evidence half: an active
+    /// evidence at `p` stops it, a side one does not, verified or not (Story
+    /// 6.7 D3, AR-025 closed), and a failed read of an active one stops it (the
+    /// conservative side).
     #[test]
     fn the_evidence_half_stops_emission() {
         set_grace_admits(true);
         let evidence = node_four_evidence();
-        for (verified, stored, endorsed) in [
-            (true, true, false),
-            (false, true, true),
-            (true, false, false),
+        for (on_chain, verified, stored, endorsed) in [
+            (true, true, true, false),
+            (false, true, true, true),
+            (false, false, true, true),
+            (true, true, false, false),
         ] {
             let (g, mut l, blocks) = support_chain(3);
-            plant(&mut l, &evidence, verified, stored);
+            if on_chain {
+                plant_on_chain(&mut l, &evidence, stored);
+            } else {
+                plant(&mut l, &evidence, verified, stored);
+            }
             let x = deviation_after(&g, &blocks[5], 4, 1);
             assert_eq!(
                 support_for(&mut l, &x).is_some(),
                 endorsed,
-                "verified {verified}, stored {stored}"
+                "on chain {on_chain}, verified {verified}, stored {stored}"
             );
         }
         set_grace_admits(false);
@@ -22966,16 +24131,23 @@ mod tests {
             ApprovalStep::Hold,
             "an unreadable tail is never taken as no obligation"
         );
+        // Story 6.7 D1 (DEC-258): the cap holds complete or not — a replay at
+        // 14 would leave the evidence no position by `p + H = 14`.
+        assert_eq!(l.approval_step(12, seed, 0, delay), ApprovalStep::Replay);
         assert_eq!(
             l.approval_step(13, seed, 0, delay),
-            ApprovalStep::Replay,
-            "cap lifted"
+            ApprovalStep::Hold,
+            "no lift for a complete package"
         );
     }
 
-    /// AC9 test 7 — a complete package stays live past the bound while its
-    /// own blocks carry it (D6), an incomplete one does not, and the evidence
-    /// is still built over the longer rewind.
+    /// AC9 test 7 — converted by Story 6.7 D4 (DEC-258; it pinned DEC-240's
+    /// D6 lift: a complete package outliving the bound on its own replays).
+    /// A deviation's run ends by `p + H`: the proposer's replays fill
+    /// `p + 1 ..= p + H − 1`, and one more at `p + H` is refused (rule 4,
+    /// `RunBound`) whether its package is complete or not. A complete package
+    /// builds its evidence over that rewind, and the evidence fits at
+    /// `p + H`, closing the run.
     #[test]
     fn a_complete_package_outlives_the_bound() {
         for complete in [true, false] {
@@ -22983,7 +24155,7 @@ mod tests {
             accumulate(&mut l, &d, d_idx, if complete { 2 } else { 1 });
             assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
             let mut prev = d;
-            for salt in 0..8 {
+            for salt in 0..7 {
                 let next = normal_after(&g, &prev, 5, 10 + salt);
                 assert_eq!(
                     receive(&mut g, &next),
@@ -22995,11 +24167,29 @@ mod tests {
                 );
                 prev = next;
             }
-            assert_eq!(head_of(&l).0, 14);
-            assert!(l.non_conflict.floor() >= 6, "F passed p");
-            assert_eq!(l.approval_live(), complete);
+            assert_eq!(head_of(&l).0, 13, "p + H − 1");
+            let over = normal_after(&g, &prev, 5, 17);
+            assert_eq!(
+                run_rules(&over.view(), Some((6, 5)), l.verification_horizon()),
+                Err(ValidationReason::RunBound)
+            );
+            for node in [&mut g, &mut l] {
+                assert_eq!(
+                    receive(node, &over),
+                    ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+                    "a replay at p + H"
+                );
+            }
+            assert_eq!(head_of(&l).0, 13);
+            assert!(l.approval_live(), "still inside the bound");
             let tip = l.active_chain_head_idx;
-            assert_eq!(l.build_evidence_block(tip, 0).is_some(), complete);
+            let evidence = l.build_evidence_block(tip, 0);
+            assert_eq!(evidence.is_some(), complete);
+            if let Some(e) = evidence {
+                assert_eq!(e.view().sequence(), 14, "p + H");
+                assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
+                assert_eq!(head_of(&g), (14, e.view().hash()), "the run closes");
+            }
         }
     }
 
@@ -23437,7 +24627,7 @@ mod tests {
         let evidence = node_four_evidence();
         let (_, mut l, _, d, d_idx, _) = sibling_proposer();
         assert!(l.open_approval(d_idx));
-        plant(&mut l, &evidence, true, true);
+        plant_on_chain(&mut l, &evidence, true);
         let member = *l
             .approval
             .members()
@@ -23464,10 +24654,10 @@ mod tests {
             l.approval_live(),
             "d unreadable: only the evidence half runs"
         );
-        plant(&mut l, &evidence, true, true);
+        plant_on_chain(&mut l, &evidence, true);
         assert!(
             !l.approval_live(),
-            "which still stops at a validated evidence"
+            "which still stops at an active evidence"
         );
 
         let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
@@ -23489,13 +24679,14 @@ mod tests {
         let seven = evidence_naming_seven();
         let (_, mut l, _, _, d_idx) = proposer_chain(5);
         assert!(l.open_approval(d_idx));
-        plant(&mut l, &seven, true, true);
+        plant_on_chain(&mut l, &seven, true);
         assert!(l.approval_live(), "evidence for the deviation at 7, not 6");
     }
 
     /// AC7 — the builder refuses: a validated `u`-block at `p` although the
-    /// package is complete; a tip off `d`'s branch; a foreign creator above
-    /// `d` (the engine is restored).
+    /// package is complete; a tip off `d`'s branch. A foreign creator above
+    /// `d` no longer reaches the builder: it is refused at intake (Story 6.7
+    /// D4, rule 1), and the builder then builds on `d` (converted).
     #[test]
     fn the_builder_refuses_a_resolved_or_foreign_branch() {
         let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
@@ -23517,14 +24708,19 @@ mod tests {
         assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
         let foreign = normal_after(&g, &d, 3, 2);
         assert_eq!(
+            step_reason(&mut l, &foreign),
+            Some(ValidationReason::RunCreator)
+        );
+        assert_eq!(
             receive(&mut l, &foreign),
-            ReceiveBlockOutcome::AcceptedSilently
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
         );
         let before = engine_votes(&l);
         let head = l.active_chain_head_idx;
+        assert_eq!(head, d_idx, "the head stays d");
         assert!(
-            l.build_evidence_block(head, 0).is_none(),
-            "not the proposer's branch"
+            l.build_evidence_block(head, 0).is_some(),
+            "the proposer's own branch"
         );
         assert_eq!(engine_votes(&l), before);
         assert!(l.is_ready());

@@ -19,16 +19,34 @@
 //! value is the new head's entry value, and the old active head's entry (if
 //! one exists) receives the old `active_branch_value`.
 
-use moonblokz_chain_types::BlockView;
+use moonblokz_chain_types::{ApprovalView, BlockView, PAYLOAD_TYPE_APPROVAL};
+use moonblokz_crypto::MAX_AGGREGATED_SIGNATURES;
 
-/// The FR21 per-block value: the header `consumed_votes`. A replay block
-/// between a deviation and its evidence block contributes 0 through its FR27
-/// header override. A sum of at most `MAX_BLOCKS` such values cannot overflow
-/// a `u64` (asserted at compile time in `Blockchain::walk_side_branch`).
-/// The approval-evidence `supporter_vote_sum` arm is Story
-/// 6.7's, added together with its validation (D2): until then an evidence
-/// block contributes its header `consumed_votes`, which FR27 fixes at 0.
-pub(crate) fn block_value(view: &BlockView<'_>) -> u64 {
+/// The largest FR21 value an evidence block can count (Story 6.7 D7, DEC-264),
+/// a build constant: `MAX_AGGREGATED_SIGNATURES · MAX_NODES · (u32::MAX +
+/// u16::MAX)`. No honest value reaches it — `supporter_vote_sum = B_k − cv(d)`
+/// with `B_k = h · Σ_{j=0..k}(s_j + vs)`, `h ≤ MAX_AGGREGATED_SIGNATURES`, `k + 1
+/// ≤ max_node_count ≤ MAX_NODES` (configuration §6 check 18), `s_j ≤ u32::MAX`
+/// and `vs ≤ u16::MAX` — so the clamp only bounds a junk claim.
+pub(crate) const fn value_cap<const MAX_NODES: usize>() -> u64 {
+    (MAX_AGGREGATED_SIGNATURES as u64) * (MAX_NODES as u64) * (u32::MAX as u64 + u16::MAX as u64)
+}
+
+/// The FR21 per-block value. An approval evidence block (`payload_type == 4`)
+/// counts its `supporter_vote_sum` (DEC-216), claimed until its Tier 3 runs
+/// (Story 6.7 D2, DEC-259) and clamped at [`value_cap`] (D7, DEC-264); every
+/// other block counts its header `consumed_votes`, so a replay block between a
+/// deviation and its evidence contributes 0 through its FR27 header override.
+/// The clamped value is a pure function of the bytes, so the incremental `+=` /
+/// `−=` of FR21 stays exact. A sum of at most `MAX_BLOCKS` values cannot
+/// overflow a `u64` (asserted at compile time in `Blockchain::walk_side_branch`).
+/// An evidence payload that does not frame cannot pass Tier 1; it counts 0.
+pub(crate) fn block_value<const MAX_NODES: usize>(view: &BlockView<'_>) -> u64 {
+    if view.payload_type() == PAYLOAD_TYPE_APPROVAL {
+        return ApprovalView::from_payload(view.payload()).map_or(0, |evidence| {
+            evidence.supporter_vote_sum().min(value_cap::<MAX_NODES>())
+        });
+    }
     u64::from(view.consumed_votes())
 }
 

@@ -250,8 +250,9 @@ mod tests {
     >;
 
     /// The verification horizon the configurations declare beside `W`
-    /// (configuration §6 check 15, `H < W`).
-    const H: u32 = 2;
+    /// (configuration §6 check 15, `H < W`): the least `H ≥ 3` dividing `W`
+    /// (check 21, Story 6.7 D8).
+    const H: u32 = 4;
 
     /// `W + 2·H` (configuration §6 check 16); the test backend stores eight
     /// blocks, so the size only has to pass the check.
