@@ -269,7 +269,7 @@ fn fr17_discards_mismatching_config_block_only_once_durably_locked() {
 #[test]
 fn fr8_candidate_without_config_block_is_refused() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 3, 0, 7);
+    let genesis = genesis_zero_block(1_037);
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
@@ -349,7 +349,7 @@ fn fr2_segment_naming_no_configuration_is_not_a_candidate() {
 #[test]
 fn fr8_ready_locks_durably_and_deletes_disagreeing_config_subtrees() {
     let mut bc = new_unconfigured_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     // Main branch: #0 → cfg A (#1) → cfg A (#2) → cfg A (#3), tip sequence 3.
     // Three blocks carrying *identical* content, which AC3 permits and in
     // fact requires: every in-scope config block must be byte-identical to
@@ -427,7 +427,7 @@ fn fr8_ready_locks_durably_and_deletes_disagreeing_config_subtrees() {
 #[test]
 fn fr8_second_durable_commit_is_refused() {
     let mut bc = new_unconfigured_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let cfg = chain_config_anchor_block(1, genesis.view().hash());
     bc.receive_block(cfg.view(), 0);
     bc.receive_block(genesis.view(), 0);
@@ -473,7 +473,7 @@ fn fr8_mismatch_adopts_candidate_content_and_reruns_in_one_call() {
         "the stray block supplied the tentative configuration"
     );
 
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let cfg = chain_config_anchor_block(1, genesis.view().hash());
     bc.receive_block(cfg.view(), 0);
     let (outcome, _) = bc.receive_block(genesis.view(), 0);
@@ -507,7 +507,7 @@ fn fr8_mismatch_adopts_candidate_content_and_reruns_in_one_call() {
 #[test]
 fn fr8_two_differing_config_contents_take_the_hard_rollback() {
     let mut bc = new_unconfigured_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let cfg_a = chain_config_anchor_block(1, genesis.view().hash());
     let cfg_b = chain_config_block_from(2, cfg_a.view().hash(), &mut alt_config_builder());
 
@@ -646,7 +646,7 @@ fn fr8_recovery_never_unloads_a_durable_configuration() {
 fn fr8_commitment_ignores_now() {
     fn run(now: u64) -> ([bool; 16], bool, bool, usize) {
         let mut bc = new_unconfigured_test_chain();
-        let genesis = node_transfer_block(0, 0, 0, 0);
+        let genesis = genesis_zero_block(1_000);
         let cfg_a = chain_config_anchor_block(1, genesis.view().hash());
         let cfg_b = chain_config_block_from(1, genesis.view().hash(), &mut alt_config_builder());
         let side = linked_transfer_block(2, cfg_b.view().hash());
@@ -693,7 +693,7 @@ fn fr8_commitment_ignores_now() {
 fn fr8_lock_is_arrival_order_independent() {
     fn run(config_a_first: bool) -> (bool, usize, [u8; 2]) {
         let mut bc = new_unconfigured_test_chain();
-        let genesis = node_transfer_block(0, 0, 0, 0);
+        let genesis = genesis_zero_block(1_000);
         let cfg_a = chain_config_anchor_block(1, genesis.view().hash());
         let cfg_b = chain_config_block_from(1, genesis.view().hash(), &mut alt_config_builder());
         let side = linked_transfer_block(2, cfg_b.view().hash());
@@ -846,7 +846,7 @@ fn fr3_preload_prevents_a_stale_tentative_from_condemning_a_valid_block() {
 #[test]
 fn fr5_retry_stops_when_recovery_unloads_the_configuration() {
     let mut bc = new_unconfigured_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     // Out-of-sequence registration (new_node_id 5, expected 1) — invalid.
     let bad = registration_block(1, genesis.view().hash(), 1, 5, 0x45);
     let cfg = chain_config_anchor_block(2, bad.view().hash());

@@ -19,7 +19,7 @@ use super::*;
 /// the durable evidence the restart later reads back.
 fn node_ready_from_the_mesh() -> (TestChain, Block, Block) {
     let mut bc = new_unconfigured_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let cfg = chain_config_anchor_block(1, genesis.view().hash());
     for block in [&cfg, &genesis] {
         let (outcome, _) = bc.receive_block(block.view(), 0);
@@ -40,7 +40,7 @@ fn node_ready_from_the_mesh() -> (TestChain, Block, Block) {
 #[test]
 fn fr59_a_short_block_survives_the_storage_round_trip() {
     let (_, mut storage, _) = test_backends();
-    let block = node_transfer_block(0, 7, 0, 7);
+    let block = genesis_zero_block(1_007);
     let exact = block.serialized_bytes();
     assert!(
         exact.len() < MAX_BLOCK_SIZE,
@@ -179,7 +179,7 @@ fn fr59_restart_is_equivalent_to_a_fresh_node_fed_the_same_blocks() {
 #[test]
 fn fr59_restart_scan_does_not_stop_at_the_first_empty_slot() {
     let (_, mut storage, _) = test_backends();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let cfg = chain_config_anchor_block(1, genesis.view().hash());
     // Deliberately leaving slot 0 empty and scattering the blocks.
     storage.save_block(1, &genesis).ok().expect("save");
@@ -211,7 +211,7 @@ fn fr59_restart_scan_does_not_stop_at_the_first_empty_slot() {
 #[test]
 fn fr59_restart_links_parents_stored_after_their_children() {
     let (_, mut storage, _) = test_backends();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let child = chain_config_anchor_block(1, genesis.view().hash());
     // Child first, parent second — the order a one-pass rebuild would break on.
     storage.save_block(0, &child).ok().expect("save");
@@ -356,7 +356,7 @@ fn payload_late_count(raw: &mut [u8], fixed: usize, late_count: u16) {
 #[test]
 fn fr59_restart_skips_a_slot_whose_length_cannot_be_recovered() {
     let (_, mut storage, _) = test_backends();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     storage.save_block(0, &genesis).ok().expect("save");
 
     const FIXED: usize = moonblokz_chain_types::approval_fixed_size(1, 1);
@@ -413,7 +413,7 @@ fn fr59_restart_rejects_a_populated_store_with_an_unreadable_control_plane() {
     // Never `init`ed, so `load_control_data` fails - but `save_block` still
     // writes into the slot region, so blocks are readable.
     let mut storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     storage.save_block(0, &genesis).ok().expect("save");
 
     let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
@@ -574,8 +574,8 @@ fn fr59_restart_preserves_the_missing_parent_hash_of_a_stored_head() {
 #[test]
 fn fr59_restart_admits_at_most_one_genesis() {
     let (_, mut storage, _) = test_backends();
-    let genesis_a = node_transfer_block(0, 0, 0, 0);
-    let genesis_b = node_transfer_block(0, 7, 0, 7);
+    let genesis_a = genesis_zero_block(1_000);
+    let genesis_b = genesis_zero_block(1_007);
     assert_ne!(
         genesis_a.view().hash(),
         genesis_b.view().hash(),
@@ -692,7 +692,7 @@ fn fr59_a_control_plane_config_failing_fr7_is_refused() {
         .set_chain_configuration(&forged)
         .ok()
         .expect("control plane accepts it - storage does not verify signatures");
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     storage.save_block(0, &genesis).ok().expect("save");
 
     let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
@@ -775,7 +775,7 @@ fn a_refused_restart_stops_accepting_blocks_instead_of_overwriting_the_chain() {
         .set_chain_configuration(&tampered)
         .ok()
         .expect("the control plane does not verify signatures");
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let durable_hash = genesis.view().hash();
     storage.save_block(0, &genesis).ok().expect("save");
 
@@ -843,7 +843,7 @@ fn a_no_usable_tree_refusal_also_stops_accepting_blocks() {
         InitOutcome::Rejected(RestartRejectReason::NoUsableTree)
     );
 
-    let incoming = node_transfer_block(0, 0, 0, 0);
+    let incoming = genesis_zero_block(1_000);
     let (admitted, _) = bc.receive_block(incoming.view(), 600);
     assert_eq!(
         admitted,

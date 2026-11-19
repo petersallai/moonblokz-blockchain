@@ -50,8 +50,8 @@ fn receive_block_genesis_anchors_active_head() {
     // admission completes an FR2 candidate and the whole lifecycle runs
     // inside this same call.
     let mut bc = new_unconfigured_test_chain();
-    // Block-zero waives the self-vote / anchor Tier 1 checks.
-    let genesis = node_transfer_block(0, 7, 0, 7);
+    // A block #0 of the fixed FR54 shape (DEC-269), signed by the anchor.
+    let genesis = genesis_zero_block(1_007);
     let (outcome, _) = bc.receive_block(genesis.view(), 100);
     assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(
@@ -354,16 +354,18 @@ fn single_genesis_guard_rejects_second_seq0() {
     let mut bc = new_unconfigured_test_chain();
 
     // First genesis (seq 0) anchors the active chain at slot 0.
-    let g1 = node_transfer_block(0, 7, 0, 7);
+    let g1 = genesis_zero_block(1_007);
     let (o1, _) = bc.receive_block(g1.view(), 100);
     assert_eq!(o1, ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(bc.active_chain_head_idx, 0);
     assert_eq!(bc.current_active_head(), Some(0));
     assert_eq!(bc.blocks.len(), 1);
 
-    // A second, distinct seq-0 block (different vote/initializer → different
-    // hash) is rejected and leaves the chain untouched.
-    let g2 = node_transfer_block(0, 3, 0, 3);
+    // A second, distinct seq-0 block (another amount → another hash) is
+    // rejected and leaves the chain untouched — before any signature
+    // verification (DEC-270: the guard runs first).
+    let verified_before = counted(&BLOCK_SIGNATURE_VERIFICATIONS);
+    let g2 = genesis_zero_block(1_033);
     assert_ne!(
         g1.view().hash(),
         g2.view().hash(),
@@ -380,6 +382,67 @@ fn single_genesis_guard_rejects_second_seq0() {
     );
     assert_eq!(bc.blocks.len(), 1, "second genesis must not be stored");
     assert_eq!(bc.chain_heads.count(), 1, "no spurious Stored head created");
+    assert_eq!(
+        counted(&BLOCK_SIGNATURE_VERIFICATIONS),
+        verified_before,
+        "a block #0 refused by the guard costs no verification"
+    );
+}
+
+/// Story 6.10 AC1 / AC6 (DEC-269): a received sequence-0 block with a
+/// non-zero `previous_hash` is not block #0 — exact evidence, not stored, and
+/// it anchors nothing.
+#[test]
+fn a_sequence_zero_block_with_a_non_zero_previous_hash_is_refused() {
+    let mut bc = new_unconfigured_test_chain();
+    let (anchor, registration, transfer) = genesis_zero_transactions(1_000);
+    let block = block_zero_from(&registration, &transfer, [0xAB; 32], &anchor);
+    let (outcome, _) = bc.receive_block(block.view(), 100);
+    assert_eq!(
+        outcome,
+        ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+    );
+    assert_eq!(bc.blocks.len(), 0, "nothing is stored");
+    assert_eq!(bc.current_active_head(), None, "nothing is anchored");
+    assert_eq!(
+        bc.tier1_admit(&block.view(), &block.view().hash(), 100),
+        Err(AdmitError::Rejected(Tier1Failure::GenesisShape))
+    );
+}
+
+/// Story 6.10 AC3 / AC6 (DEC-270): a forged block #0 — the anchor's own
+/// registration copied, its own transfer, signed by another key — is refused
+/// at intake before it can take the single anchor slot, so the real genesis
+/// that follows is admitted.
+#[test]
+fn a_forged_block_zero_cannot_take_the_anchor() {
+    let mut bc = new_unconfigured_test_chain();
+    let (_, registration, _) = genesis_zero_transactions(1_000);
+    let forger = Crypto::new([9u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("forger key");
+    let transfer = NodeTransfer::new_signed(0, 0, 0, 0, u64::MAX, 0, 0, &forger);
+    let forged = block_zero_from(&registration, &transfer, [0u8; 32], &forger);
+    assert_eq!(
+        bc.tier1_admit(&forged.view(), &forged.view().hash(), 100),
+        Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid))
+    );
+    assert_eq!(bc.blocks.len(), 0, "the forgery is not stored");
+
+    let genesis = genesis_zero_block(1_000);
+    let (outcome, _) = bc.receive_block(genesis.view(), 200);
+    assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+    assert_eq!(
+        bc.current_active_head(),
+        Some(0),
+        "the real genesis anchors"
+    );
+    assert!(
+        bc.blocks
+            .get(0)
+            .is_some_and(|entry| entry.is_signature_verified()),
+        "its intake verification is marked, so the pass does not repeat it"
+    );
 }
 
 /// AC8 (FR63/NFR5) — the lifecycle/gating surface is deterministic and
@@ -395,9 +458,9 @@ fn lifecycle_surface_is_now_independent() {
         assert_eq!(init_outcome, InitOutcome::StartedCollecting);
         // Anchor a genesis, then a rejected second genesis — with now derived
         // from now_base so the two runs use different timestamps.
-        let g1 = node_transfer_block(0, 7, 0, 7);
+        let g1 = genesis_zero_block(1_007);
         let o1 = bc.receive_block(g1.view(), now_base + 10).0;
-        let g2 = node_transfer_block(0, 3, 0, 3);
+        let g2 = genesis_zero_block(1_033);
         let o2 = bc.receive_block(g2.view(), now_base + 20).0;
         (
             o1 == ReceiveBlockOutcome::AcceptedSilently,

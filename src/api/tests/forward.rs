@@ -792,7 +792,7 @@ fn ready_has_no_trust_zone() {
 #[test]
 fn missing_block_repairs_the_index_and_deletes_nothing() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
     let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);

@@ -131,7 +131,7 @@ fn fr2_without_a_configuration_no_segment_qualifies() {
         "six blocks fill the capacity of 6, but no window is known"
     );
 
-    let genesis = node_transfer_block(0, 7, 0, 7);
+    let genesis = genesis_zero_block(1_007);
     bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("the genesis is admitted");
     assert!(
@@ -197,7 +197,7 @@ fn fr8_window_is_bounded_by_this_builds_capacity() {
 #[test]
 fn fr2_genesis_anchored_triggers_processing() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 7, 0, 7);
+    let genesis = genesis_zero_block(1_007);
     // FR8 (Story 5.9, AC3): the candidate must name a configuration, so
     // block #1 carries the chain-config as the FR54 bootstrap emits it.
     // Admitted first, while it is still an orphan (no FR2 trigger), so the
@@ -231,7 +231,7 @@ fn fr2_genesis_anchored_triggers_processing() {
 fn fr2_stays_collecting_without_configuration() {
     let (crypto, storage, chain_config) = test_backends();
     let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
-    let genesis = node_transfer_block(0, 7, 0, 7);
+    let genesis = genesis_zero_block(1_007);
 
     let (outcome, _) = bc.receive_block(genesis.view(), 100);
 
@@ -255,7 +255,7 @@ fn fr2_stays_collecting_without_configuration() {
 fn processing_pass_refuses_without_configuration() {
     let (crypto, storage, chain_config) = test_backends();
     let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
-    let genesis = node_transfer_block(0, 7, 0, 7);
+    let genesis = genesis_zero_block(1_007);
     let (outcome, _) = bc.receive_block(genesis.view(), 100);
     assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
 
@@ -315,7 +315,7 @@ fn fr2_active_length_triggers_at_w() {
 #[test]
 fn fr2_selection_highest_sequence_then_lowest_hash() {
     let mut bc = new_test_chain();
-    let g = node_transfer_block(0, 7, 0, 7);
+    let g = genesis_zero_block(1_007);
     bc.tier1_admit(&g.view(), &g.view().hash(), 0)
         .expect("genesis admitted");
     // Block #1 names the configuration both branches inherit (Story 5.13).
@@ -360,7 +360,7 @@ fn fr2_selection_highest_sequence_then_lowest_hash() {
 fn fr2_selection_is_order_independent() {
     fn winner_hash(order: &[u32; 2], now: u64) -> [u8; 32] {
         let mut bc = new_test_chain();
-        let g = node_transfer_block(0, 7, 0, 7);
+        let g = genesis_zero_block(1_007);
         bc.tier1_admit(&g.view(), &g.view().hash(), now)
             .expect("genesis");
         let cfg = chain_config_anchor_block(1, g.view().hash());
@@ -396,7 +396,7 @@ fn fr2_selection_is_order_independent() {
 fn fr2_anchored_genesis_does_not_preempt_higher_branch() {
     let mut bc = new_w6_chain();
     // Anchored genesis (a short genesis-anchored candidate).
-    let g = node_transfer_block(0, 7, 0, 7);
+    let g = genesis_zero_block(1_007);
     bc.tier1_admit(&g.view(), &g.view().hash(), 0)
         .expect("genesis admitted");
     assert_eq!(
@@ -442,7 +442,7 @@ fn fr2_anchored_genesis_does_not_preempt_higher_branch() {
 #[test]
 fn fr2_genesis_anchored_multiblock_below_w_qualifies() {
     let mut bc = new_test_chain(); // W = 16
-    let g = node_transfer_block(0, 7, 0, 7);
+    let g = genesis_zero_block(1_007);
     bc.tier1_admit(&g.view(), &g.view().hash(), 0)
         .expect("genesis admitted");
     // Block #1, carrying the configuration (Story 5.13) → a 2-block
@@ -591,7 +591,7 @@ fn fr3_preseed_zone_auto_accepts() {
 #[test]
 fn fr3_genesis_anchored_watermark_zero() {
     let mut bc = new_test_chain();
-    let g = node_transfer_block(0, 3, 0, 7);
+    let g = genesis_zero_block(1_037);
     bc.tier1_admit(&g.view(), &g.view().hash(), 0)
         .expect("genesis admitted");
     // FR8 (Story 5.9, AC3): block #1 carries the chain-config. It contributes
@@ -717,7 +717,7 @@ fn fr3_projection_is_clock_independent_and_reproducible() {
 #[test]
 fn fr4_seam_reaches_ready_and_promotes_active() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 3, 0, 7);
+    let genesis = genesis_zero_block(1_037);
     // FR8 (Story 5.9, AC3): block #1 carries the chain-config, admitted first
     // as an orphan so the genesis admission completes the candidate.
     let cfg = chain_config_anchor_block(1, genesis.view().hash());
@@ -758,7 +758,7 @@ fn fr4_seam_reaches_ready_and_promotes_active() {
 #[test]
 fn fr5_seam_recovers_and_retries_invalid_candidate_in_one_call() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let cfg = chain_config_anchor_block(1, genesis.view().hash());
     // Out-of-sequence registration child (new_node_id 5, expected 1).
     let child = registration_block(2, cfg.view().hash(), 1, 5, 0x45);
@@ -832,7 +832,7 @@ fn fr5_seam_recovers_and_retries_invalid_candidate_in_one_call() {
 #[test]
 fn fr5_deletes_offender_subtree_and_spares_sibling() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
@@ -895,7 +895,7 @@ fn fr5_deletes_offender_subtree_and_spares_sibling() {
 fn fr5_non_invalid_error_deletes_only_the_candidate_head() {
     fn run(err: ProcessingError) -> (usize, bool, bool) {
         let mut bc = new_test_chain();
-        let genesis = node_transfer_block(0, 0, 0, 0);
+        let genesis = genesis_zero_block(1_000);
         bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
             .expect("genesis admitted");
         let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
@@ -1072,7 +1072,7 @@ fn fr5_working_set_is_clean_after_recovery() {
 #[test]
 fn fr5_clears_active_head_when_its_block_is_deleted() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
@@ -1117,7 +1117,7 @@ fn fr5_clears_active_head_when_its_block_is_deleted() {
 #[test]
 fn fr5_restores_active_chain_marking_and_keeps_the_genesis_bootstrap() {
     let mut bc = new_test_chain();
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    let genesis = genesis_zero_block(1_000);
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
@@ -1207,7 +1207,7 @@ fn fr5_recovery_ignores_now() {
     }
     fn run(now: u64) -> Snapshot {
         let mut bc = new_test_chain();
-        let genesis = node_transfer_block(0, 0, 0, 0);
+        let genesis = genesis_zero_block(1_000);
         // Block #1 is the chain-config the FR8 final check requires below the
         // offender (Story 5.9, AC3) — see
         // `fr5_seam_recovers_and_retries_invalid_candidate_in_one_call`.
@@ -1567,22 +1567,31 @@ fn fr6_window_anchored_registration_before_first_balance_is_trusted() {
 #[test]
 fn fr6_rejects_wrong_block_creator_signature() {
     let mut bc = new_test_chain();
-    // A genesis (#0) block, creator = node #0, but signed by the WRONG key
-    // ([9u8] ≠ the trust anchor pubkey([1u8])).
+    // A received block #0 is signature-checked at intake (DEC-270), so the
+    // pass-side check is exercised on a later block: #2, creator node #0,
+    // signed by the WRONG key ([9u8] ≠ the trust anchor pubkey([1u8])).
+    // Outside Ready, intake does not judge it; the FR3 pass does.
+    let genesis = genesis_zero_block(1_000);
+    bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
+        .expect("genesis admitted");
+    // FR8 (Story 5.9, AC3): the candidate must name a configuration.
+    let cfg = chain_config_anchor_block(1, genesis.view().hash());
+    bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
+        .expect("chain-config block admitted");
     let wrong = Crypto::new([9u8; PRIVATE_KEY_SIZE])
         .ok()
         .expect("wrong test key");
-    let nt = NodeTransfer::new_signed(0, 0, 0, 9, 100, 1, 0, &wrong);
+    let nt = NodeTransfer::new_signed(0, 1, 0, 9, 100, 1, 0, &wrong);
     let header = BlockHeader {
         version: 1,
-        sequence: 0,
+        sequence: 2,
         creator: 0,
         mined_amount: 0,
         payload_type: PAYLOAD_TYPE_TRANSACTION,
         consumed_votes: 0,
         first_voted_node: 0,
         consumed_votes_from_first_voted_node: 0,
-        previous_hash: [0u8; 32],
+        previous_hash: cfg.view().hash(),
         signature: [0u8; SIGNATURE_SIZE],
     };
     let mut builder = BlockBuilder::new().header(header);
@@ -1590,18 +1599,9 @@ fn fr6_rejects_wrong_block_creator_signature() {
     let block = builder.build_signed(&wrong).ok().expect("build signed");
     let idx = bc
         .tier1_admit(&block.view(), &block.view().hash(), 0)
-        .expect("admitted (creator signature is not a Tier 1 gate)");
-    // FR8 (Story 5.9, AC3): the candidate must name a configuration, and the
-    // existence check runs before the forward traversal (PRD FR3) — so
-    // without block #1 the pass would report the whole-candidate verdict
-    // instead of the per-block one under test. The config block sits *above*
-    // the offender, so the walk still reaches #0 first.
-    let cfg = chain_config_anchor_block(1, block.view().hash());
-    let tip = bc
-        .tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
-        .expect("chain-config block admitted");
+        .expect("admitted (outside Ready the creator signature is not a Tier 1 gate)");
     assert_eq!(
-        bc.run_processing_pass(tip),
+        bc.run_processing_pass(idx),
         Err(ProcessingError::Invalid {
             block_idx: idx,
             reason: ValidationReason::CreatorSignatureInvalid,
@@ -1722,8 +1722,8 @@ fn fr6_rejects_duplicate_public_key() {
 #[test]
 fn fr6_rejects_unseeded_actor_on_genesis_anchored_candidate() {
     let mut bc = new_test_chain();
-    // Genesis block #0 seeds no node (a bare transfer, not a node-#0 registration).
-    let genesis = node_transfer_block(0, 0, 0, 0);
+    // Genesis block #0 seeds node #0 only (FR54); node 1 never registers.
+    let genesis = genesis_zero_block(1_000);
     bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
     // FR8 (Story 5.9, AC3): block #1 carries the chain-config the candidate
@@ -1745,4 +1745,122 @@ fn fr6_rejects_unseeded_actor_on_genesis_anchored_candidate() {
         }),
         "genesis-anchored: an unseeded initializer is invalid (no pre-seed trust)"
     );
+}
+
+// ---- Story 6.10: received genesis blocks in the FR3 pass ----
+
+/// Admits `blocks` in order and returns the last one's index.
+fn admit_all(bc: &mut TestChain, blocks: &[&Block]) -> u32 {
+    let mut last = NONE_REF;
+    for block in blocks {
+        last = bc
+            .tier1_admit(&block.view(), &block.view().hash(), 0)
+            .expect("admitted");
+    }
+    last
+}
+
+/// Story 6.10 AC5 / AC6 (DEC-269, D4): the FR36 genesis exception at
+/// sequence 1 needs the chain-config content too. A transaction block at
+/// sequence 1 is an ordinary block: its creator, node #0, is credited its
+/// `mined_amount` (before 6.10 the sequence alone exempted it).
+#[test]
+fn a_sequence_one_transaction_block_gets_the_ordinary_fr36_credit() {
+    let mut bc = new_test_chain();
+    let genesis = genesis_zero_block(1_000);
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    let nt = NodeTransfer::new_signed(0, 0, 0, 0, 0, 0, 0, &signer);
+    let header = BlockHeader {
+        version: 1,
+        sequence: 1,
+        creator: 0,
+        mined_amount: 5,
+        payload_type: PAYLOAD_TYPE_TRANSACTION,
+        consumed_votes: 0,
+        first_voted_node: 0,
+        consumed_votes_from_first_voted_node: 0,
+        previous_hash: genesis.view().hash(),
+        signature: [0u8; SIGNATURE_SIZE],
+    };
+    let mut builder = BlockBuilder::new().header(header);
+    builder.add_node_transfer(&nt).ok().expect("add transfer");
+    let one = builder.build_signed(&signer).ok().expect("build signed");
+    let cfg = chain_config_anchor_block(2, one.view().hash());
+    let tip = admit_all(&mut bc, &[&genesis, &one, &cfg]);
+    assert!(bc.run_processing_pass(tip).is_ok());
+    assert_eq!(
+        bc.node_info.balance_of(0),
+        1_005,
+        "the minted 1 000 plus block #1's mined_amount"
+    );
+}
+
+/// Story 6.10 AC5 / AC6: a chain-config block at sequence 1 whose content is
+/// not the held configuration is condemned by the per-block step — the
+/// content half of block #1's genesis exception.
+#[test]
+fn a_sequence_one_config_block_of_other_content_is_condemned() {
+    let mut bc = new_test_chain();
+    let genesis = genesis_zero_block(1_000);
+    let mut other = alt_config_builder();
+    let one = chain_config_block_from(1, genesis.view().hash(), &mut other);
+    let tip = admit_all(&mut bc, &[&genesis, &one]);
+    assert_eq!(
+        bc.run_processing_pass(tip),
+        Err(ProcessingError::Invalid {
+            block_idx: tip,
+            reason: ValidationReason::ChainConfigMismatch,
+        })
+    );
+}
+
+/// Story 6.10 AC4 / AC6 (DEC-271): block #0's transaction signatures are
+/// verified against the trust anchor like any transaction's. Each block #0
+/// below has the fixed shape, a valid creator signature and a valid proof of
+/// possession, so intake admits it; one transaction signature is not the
+/// anchor's.
+#[test]
+fn block_zero_transaction_signatures_are_verified() {
+    let wrong = Crypto::new([9u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("wrong key");
+    let (anchor, registration, transfer) = genesis_zero_transactions(1_000);
+    // The self-transfer signed by another key.
+    let bad_transfer = NodeTransfer::new_signed(0, 0, 0, 0, 1_000, 0, 0, &wrong);
+    // The registration with the anchor's proof of possession but another
+    // key's transaction signature.
+    let reg_view = TransactionView::from_bytes(registration.as_bytes())
+        .and_then(|tx| tx.as_registration())
+        .expect("a registration");
+    let pop: [u8; SIGNATURE_SIZE] = reg_view
+        .new_key_signature()
+        .try_into()
+        .expect("signature size");
+    let bad_registration = Registration::new(
+        0,
+        0,
+        0,
+        0,
+        0,
+        anchor.public_key().serialize(),
+        &pop,
+        wrong.sign(b"not this transaction").serialize(),
+    );
+    for (reg, nt) in [
+        (&registration, &bad_transfer),
+        (&bad_registration, &transfer),
+    ] {
+        let mut bc = new_test_chain();
+        let genesis = block_zero_from(reg, nt, [0u8; 32], &anchor);
+        let cfg = chain_config_anchor_block(1, genesis.view().hash());
+        let idx = admit_all(&mut bc, &[&genesis]);
+        let tip = admit_all(&mut bc, &[&cfg]);
+        assert_eq!(
+            bc.run_processing_pass(tip),
+            Err(ProcessingError::Invalid {
+                block_idx: idx,
+                reason: ValidationReason::TransactionSignatureInvalid,
+            })
+        );
+    }
 }

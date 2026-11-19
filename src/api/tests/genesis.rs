@@ -573,3 +573,23 @@ fn walking_skeleton_query_carries_no_next_call() {
     let node_id: u32 = bc.local_node_id();
     assert_eq!(node_id, 0);
 }
+
+/// Story 6.10 AC1 (DEC-269): the block #0 that `process_genesis` builds is
+/// exactly the fixed FR54 description that Tier 1 requires of a received one,
+/// so a joining node admits it.
+#[test]
+fn process_genesis_block_zero_has_the_tier1_genesis_shape() {
+    let (bc, block_zero, block_one) = ready_genesis(TEST_W);
+    for block in [&block_zero, &block_one] {
+        assert_eq!(
+            tier1_gate(
+                &block.view(),
+                &bc.node_zero_public_key,
+                bc.enforceable_block_size_limit(),
+                bc.enforceable_max_utxo_outputs(),
+                &bc.crypto,
+            ),
+            Ok(())
+        );
+    }
+}
