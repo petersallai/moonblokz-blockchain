@@ -2609,13 +2609,23 @@ impl<
                 None => false,
             };
 
-        // Story 6.7 AC4 (D4): outside Ready, a block whose parent is held is
-        // judged against the FR27 run rules now, before the write — they read
-        // only the block and its ancestry. Rules 4 and 5 read the
-        // configuration, so they wait for the lock (a tentative one may not be
-        // the chain's; the FR3 pass judges them). In Ready the direct
-        // extension's step and a side block's Tier 2 check judge them.
-        if self.lifecycle_phase != LifecyclePhase::Ready
+        // Story 6.7 AC4 (D4): a block whose parent is held is judged against
+        // the FR27 run rules now, before the write — they read only the block
+        // and its ancestry. In Ready the direct extension's step and a side
+        // block's Tier 2 check (a Connected or Active parent) judge them later
+        // in this call; every other held parent (a Stored one in Ready, any
+        // outside Ready) is judged here by the header walk. Rules 4 and 5 read
+        // the configuration, so they wait for the lock (a tentative one may not
+        // be the chain's; the FR3 pass judges them).
+        let judged_later = self.lifecycle_phase == LifecyclePhase::Ready
+            && parent.is_some_and(|q| {
+                q == self.active_chain_head_idx
+                    || self
+                        .blocks
+                        .get(q)
+                        .is_some_and(|entry| entry.status() != BlockStatus::Stored)
+            });
+        if !judged_later
             && let Some(q) = parent
             && let Ok(run) = self.deviation_run_at(q)
         {
@@ -2941,7 +2951,7 @@ impl<
         {
             self.drive_dominant_chain_acquisition();
         }
-        if outcome == ReceiveBlockOutcome::AcceptedSilently && was_ready {
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && was_ready && !self.reentry_due {
             self.drive_forward_extension();
         }
         // Story 6.1 AC6: after the continuation, whose promotion turns a
@@ -2949,7 +2959,8 @@ impl<
         // the FR8 lock-time cleanups (a cleanup retarget onto a Connected block
         // must not keep a value the driver computed before it).
         let mut driver_best = None;
-        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() && !self.reentry_due
+        {
             driver_best = self.connect_side_branches();
         }
         // Story 6.2 D1 (DEC-152): FR22 — one comparison at the end of the
@@ -2957,7 +2968,8 @@ impl<
         // branch and the higher-ranked admissible of the block judged at intake
         // and the driver's best. Never inside the loops: a switch (6.3) rewrites
         // `chain_heads` and the active chain under them.
-        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() {
+        if outcome == ReceiveBlockOutcome::AcceptedSilently && self.is_ready() && !self.reentry_due
+        {
             self.compare_and_switch([admitted, driver_best], now);
         }
         // Story 6.7 AC8: an evidence check whose vote projection could not
@@ -7044,6 +7056,11 @@ impl<
     /// rank), and one read of the new tail when the window advances.
     fn drive_forward_extension(&mut self) {
         for _ in 0..MAX_BLOCKS {
+            // Story 6.7 AC8: after a failed restore the engine is not the
+            // head's; no further step runs before the root re-enters.
+            if self.reentry_due {
+                return;
+            }
             let Some(child) = self.best_stored_child() else {
                 return;
             };
@@ -7261,6 +7278,8 @@ impl<
         // Story 6.6 AC4: the accumulator is Ready-state work.
         self.approval.clear();
         self.active_open_run = NO_OPEN_RUN;
+        // Story 6.7 AC8: this re-entry is the one a failed restore asked for.
+        self.reentry_due = false;
         self.node_info.reset();
         self.reset_vote_engine();
         for idx in 0..MAX_BLOCKS as u32 {
@@ -25507,6 +25526,23 @@ mod tests {
             );
         }
         assert_eq!(head_of(&l), (7, e.view().hash()));
+    }
+
+    /// AC4 (D4) — in Ready, a block whose held parent is only Stored (neither
+    /// the head nor Connected) is judged at intake too, by the header walk: a
+    /// foreign block above a stored deviation is refused before its write.
+    #[test]
+    fn a_block_on_a_stored_deviation_is_judged_at_intake() {
+        let (mut g, mut l, blocks) = support_chain(3);
+        let d = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        plant(&mut l, &d, false, true);
+        let foreign = normal_after(&g, &d, 3, 71);
+        assert_eq!(
+            receive(&mut l, &foreign),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
+        );
+        assert!(entry_of(&l, &foreign).is_none(), "not stored");
     }
 
     /// AC4 — a failed read of `d`'s header in the per-block step gives no
