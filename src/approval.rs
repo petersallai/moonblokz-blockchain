@@ -793,6 +793,12 @@ pub(crate) mod test_seams {
         /// late list truncated without a block-size limit too small for the
         /// fixture chain's own blocks).
         pub(crate) static PAYLOAD_ROOM: Cell<usize> = const { Cell::new(usize::MAX) };
+        /// Aggregate verifications of approval evidence on this test thread
+        /// (Story 6.7 AC6: no evidence is verified twice).
+        pub(crate) static AGGREGATE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
+        /// Transaction-signature verifications on this test thread (Story 6.7
+        /// AC6: a restore verifies no transaction signature again).
+        pub(crate) static TX_SIGNATURE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
     }
 
     /// The evidence payload room under this thread's cap.
