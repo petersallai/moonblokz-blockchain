@@ -9474,8 +9474,11 @@ mod tests {
     /// window: the least divisor of `w` from 3 up (check 21; `H < W`, check 15).
     /// The W6 harness then declares 3 and joins on `W + H = 9` blocks, keeping
     /// five of its backend's fourteen slots for forks ([`W6Storage`]). A window
-    /// with no such divisor (4 or a prime) has no legal horizon and is refused
-    /// at compile time.
+    /// with no such divisor (4 or a prime) has no legal horizon: it panics, at
+    /// compile time in a `const` item and otherwise when the test builds its
+    /// configuration. A window above `TEST_W` also declares `TEST_H`, legal
+    /// or not: only the FR8 capacity tests build one, and the capacity bound
+    /// refuses it first.
     const fn test_horizon(w: u32) -> u32 {
         if w >= TEST_W {
             return TEST_H;
@@ -11173,8 +11176,8 @@ mod tests {
     /// Story 5.11 — FR2 measures a window-anchored segment against the
     /// configured `W`, not the allocated capacity: on a build with capacity 16
     /// configured with `W = 6` (`H = 3`), nine blocks qualify and eight do
-    /// not. The build is `TestChain`'s over [`W6Storage`], whose twelve slots
-    /// hold the nine-block join.
+    /// not. The build is `TestChain`'s over [`W6Storage`], whose fourteen
+    /// slots hold the nine-block join.
     #[test]
     fn fr2_active_length_is_the_configured_w_not_the_capacity() {
         let (crypto, _, mut chain_config) = test_backends();
@@ -19119,8 +19122,8 @@ mod tests {
     /// no completeness horizon (DEC-211) — so the replay refuses its forged
     /// value and deletes the branch; the active chain stays. The late case:
     /// once the head has moved on, a branch at the old head sequence waits for
-    /// its own extension. Side blocks are transfers, clean on the slots #104
-    /// and #107 (Story 6.7 D8).
+    /// its own extension. Side blocks are transfers, clean on the slot #104
+    /// (Story 6.7 D8).
     #[test]
     fn fr22_admissibility_follows_the_w6_window() {
         let (mut bc, [_, _, b102, _, _, b105]) = valued_w6();
@@ -22186,7 +22189,7 @@ mod tests {
     /// head stays `d`. A head above `d` is `d`'s creator's or `d`'s evidence,
     /// so shape (b)'s foreign-creator stop is unreachable.
     #[test]
-    fn no_support_with_another_creator_above_p() {
+    fn a_supporter_refuses_another_creator_above_p() {
         set_grace_admits(true);
         let (mut g, mut l, blocks) = support_chain(3);
         let d = deviation_after(&g, &blocks[5], 5, 1);
@@ -22917,7 +22920,7 @@ mod tests {
     /// the bound the subgroup half runs (`u` is refused), and the watermark
     /// and the evidence half run as before.
     #[test]
-    fn a_deep_deviation_defers_only_the_subgroup_half() {
+    fn a_run_ends_before_the_subgroup_half_defers() {
         let (mut g, mut r, blocks) = long_support_chain(2);
         let d = deviation_after(&g, &blocks[5], 4, 1);
         assert_eq!(receive(&mut r, &d), ReceiveBlockOutcome::AcceptedSilently);
@@ -22967,7 +22970,7 @@ mod tests {
     /// stays `x` and the subgroup half runs: the idle node 2, outside `A'`,
     /// is rejected.
     #[test]
-    fn a_foreign_creator_above_the_deviation_defers_the_subgroup_half() {
+    fn a_refused_foreign_creator_leaves_the_subgroup_half_running() {
         let (mut g, mut r, _, x) = on_chain_receiver();
         let _ = receive(&mut g, &x);
         let above = normal_after(&g, &x, 3, 2);
@@ -23642,7 +23645,7 @@ mod tests {
     /// another creator above `p − 1`): that block is refused at intake (rule
     /// 1, `RunCreator`), so the proposer's head stays `d` and the open holds.
     #[test]
-    fn open_refuses_another_creator_above_the_parent() {
+    fn a_refused_foreign_creator_leaves_the_open_possible() {
         let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
         assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
         let foreign_above = normal_after(&g, &d, 3, 2);
@@ -23900,7 +23903,9 @@ mod tests {
     /// AC9 test 3, Story 6.7 D3 (AR-025 closed): only an active evidence at
     /// `p` stops the proposer — a planted side evidence does not, unverified or
     /// signature-verified — and a failed read of an active one never discards.
-    /// One planted case per test (the test-thread stack, 6.6).
+    /// Each case builds its chain in its own helper frame (the test-thread
+    /// stack, 6.6); an active evidence is always planted verified (it passed
+    /// Tier 3), so `verified` varies only the side cases.
     #[test]
     fn only_an_active_evidence_stops_the_accumulator() {
         for (on_chain, verified, stored, live, why) in [
@@ -23969,7 +23974,7 @@ mod tests {
     /// AC9 test 4 — 6.4's emission gains the evidence half: an active
     /// evidence at `p` stops it, a side one does not, verified or not (Story
     /// 6.7 D3, AR-025 closed), and a failed read of an active one stops it (the
-    /// conservative side).
+    /// conservative side). An active evidence is always planted verified.
     #[test]
     fn the_evidence_half_stops_emission() {
         set_grace_admits(true);
@@ -24321,7 +24326,7 @@ mod tests {
     /// builds its evidence over that rewind, and the evidence fits at
     /// `p + H`, closing the run.
     #[test]
-    fn a_complete_package_outlives_the_bound() {
+    fn a_run_ends_by_the_bound_complete_or_not() {
         for complete in [true, false] {
             let (mut g, mut l, _, d, d_idx) = proposer_chain(5);
             accumulate(&mut l, &d, d_idx, if complete { 2 } else { 1 });
@@ -24453,7 +24458,7 @@ mod tests {
         );
         assert!(l.is_ready());
         assert!(l.approval.deviation().is_some());
-        l.storage.failing_slot = u32::MAX;
+        l.storage.failing_slot = NONE_REF;
         let before = engine_votes(&l);
         assert!(
             l.build_evidence_block(tip, 0).is_some(),
@@ -24860,7 +24865,7 @@ mod tests {
     /// `d` no longer reaches the builder: it is refused at intake (Story 6.7
     /// D4, rule 1), and the builder then builds on `d` (converted).
     #[test]
-    fn the_builder_refuses_a_resolved_or_foreign_branch() {
+    fn the_builder_refuses_a_resolved_or_off_branch_tip() {
         let (_, mut l, blocks, d, d_idx) = proposer_chain(5);
         accumulate(&mut l, &d, d_idx, 2);
         let u = u_block(&blocks, &[&d]);
@@ -25197,18 +25202,23 @@ mod tests {
 
     // -- AC4: the FR27 run rules and the FR48 clean slot --
 
-    /// Three blocks that may not extend `d`'s open run (`g` at `d`, by 4):
-    /// a foreign creator, the proposer in deviation form, the proposer with
-    /// `consumed_votes ≠ 0`.
-    fn run_violations(g: &SupportChain, d: &Block) -> [(Block, ValidationReason); 3] {
+    /// Four blocks that may not extend `d`'s open run (`g` at `d`, by 4):
+    /// a foreign creator, the proposer in deviation form, the proposer voting
+    /// for another node with `consumed_votes = 0` (only `first_voted ≠
+    /// creator` breaks the override form), the proposer with `consumed_votes ≠
+    /// 0` (only `cv ≠ 0` breaks it).
+    fn run_violations(g: &SupportChain, d: &Block) -> [(Block, ValidationReason); 4] {
         let foreign = normal_after(g, d, 3, 71);
         let deviation = deviation_after(g, d, 4, 72);
         assert_ne!(deviation.view().first_voted_node(), 4, "deviation form");
+        let other_vote = reheader(&normal_after(g, d, 4, 74), 4, 0, 3, 0, key_of(4));
+        assert_eq!(other_vote.view().consumed_votes(), 0);
         let consuming = reheader(&normal_after(g, d, 4, 73), 4, 7, 4, 0, key_of(4));
         assert_eq!(d.view().creator(), 4);
         [
             (foreign, ValidationReason::RunCreator),
             (deviation, ValidationReason::RunHeader),
+            (other_vote, ValidationReason::RunHeader),
             (consuming, ValidationReason::RunHeader),
         ]
     }
@@ -25379,11 +25389,18 @@ mod tests {
         let (_, e, _) = evidence_by(4);
         let ev = evidence_of(&e, 2);
         let h = TEST_H;
-        let blocks = |seq: u32| -> [(Block, bool); 7] {
+        let blocks = |seq: u32| -> [(Block, bool); 9] {
             let prev = [0x5A; 32];
             let utxo = utxo_tx(seq, &[], Some((1, 100)), &[Ok(60)]);
             let balance_only = utxo_tx(seq, &[], Some((1, 100)), &[Err((2, 100))]);
+            let mixed = utxo_tx(seq, &[], Some((1, 100)), &[Err((2, 40)), Ok(60)]);
             [
+                // Every transaction and every output counts (review).
+                (
+                    complex_tx_block(seq, prev, 3, 0, &[&balance_only, &utxo]),
+                    false,
+                ),
+                (complex_tx_block(seq, prev, 3, 0, &[&mixed]), false),
                 (transfer(seq, prev, 1, 1), true),
                 (evidence_block(seq, prev, 4, &ev), true),
                 (complex_tx_block(seq, prev, 3, 0, &[&balance_only]), true),
@@ -25416,8 +25433,8 @@ mod tests {
     }
 
     /// AC4 rule 5 end to end: on Story 6.4's chain (`H = 8`) the slot #7
-    /// refuses a registration at intake and admits a transfer; the same
-    /// registration passes at #6.
+    /// refuses a registration at intake and admits a transfer; a registration
+    /// at #6, off the slot, passes the step.
     #[test]
     fn a_ready_node_refuses_unclean_content_at_a_slot() {
         let (mut g, _, blocks) = support_chain(3);
@@ -25483,19 +25500,18 @@ mod tests {
 
     /// AC4 (D4): a window-anchored pass trusts rules 1–4 while the run state
     /// is unknown — a foreign block over an open run passes — and a
-    /// deviation-form block settles it; the slot rule applies throughout.
+    /// deviation-form block or an evidence block settles it (taken as no run,
+    /// the evidence would be misplaced); the slot rule applies throughout.
     #[test]
     fn an_unknown_run_state_trusts_rules_one_to_four() {
-        let (mut g, _, _, d, _) = proposer_chain(4);
-        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        let (mut g, d, e) = evidence_observer(4);
         let foreign = normal_after(&g, &d, 3, 71);
         let judge = |g: &mut SupportChain, block: &Block, projection: &mut Projection| {
             let view = block.view();
             let idx = g.blocks.next_free_index().expect("a free slot");
-            g.blocks.insert_at(
-                idx,
-                BlockEntry::new(view.hash(), g.active_chain_head_idx, view.sequence()),
-            );
+            let mut entry = BlockEntry::new(view.hash(), g.active_chain_head_idx, view.sequence());
+            entry.set_payload_type(view.payload_type());
+            g.blocks.insert_at(idx, entry);
             let verdict = g.check_run_rules(&view, idx, projection);
             g.blocks.delete(idx);
             run_rule_reason(verdict)
@@ -25520,6 +25536,15 @@ mod tests {
             Err(ValidationReason::SlotNotClean),
             "the slot rule still applies"
         );
+        let mut settled_by_evidence = Projection {
+            run_unknown_below: 100,
+            ..Projection::COMPLETE
+        };
+        assert_eq!(judge(&mut g, &e, &mut settled_by_evidence), Ok(()));
+        assert_eq!(
+            settled_by_evidence.run_unknown_below, 0,
+            "an evidence settles it"
+        );
         let deviation = deviation_after(&g, &d, 3, 72);
         assert_eq!(judge(&mut g, &deviation, &mut unknown), Ok(()));
         assert_eq!(unknown.run_unknown_below, 0, "a deviation settles it");
@@ -25538,10 +25563,9 @@ mod tests {
     ) -> (Result<(), ValidationReason>, u32) {
         let view = block.view();
         let idx = bc.blocks.next_free_index().expect("a free slot");
-        bc.blocks.insert_at(
-            idx,
-            BlockEntry::new(view.hash(), bc.active_chain_head_idx, view.sequence()),
-        );
+        let mut entry = BlockEntry::new(view.hash(), bc.active_chain_head_idx, view.sequence());
+        entry.set_payload_type(view.payload_type());
+        bc.blocks.insert_at(idx, entry);
         let mut projection = Projection::COMPLETE;
         let reads = bc.storage.reads.get();
         let verdict = bc.check_run_rules(&view, idx, &mut projection);
@@ -25730,12 +25754,14 @@ mod tests {
             ReceiveBlockOutcome::AcceptedSilently,
             "no verdict"
         );
-        assert!(entry_of(&l, &clean).is_some(), "held");
+        let (status, on_chain, accepted, _) = entry_of(&l, &clean).expect("held");
+        assert!(status == BlockStatus::Stored && !on_chain && !accepted);
     }
 
     /// Review (AC10, D3) — only the local node's own evidence above `d`
     /// releases its accumulator: another creator's evidence held above `d`
-    /// unjudged (a walk fault at intake) does not.
+    /// (it can be held unjudged after a walk fault at intake; planted here)
+    /// does not.
     #[test]
     fn a_foreign_evidence_above_d_does_not_release() {
         let (_, e, _) = evidence_by(4);
@@ -25761,32 +25787,69 @@ mod tests {
         assert_eq!(judge_on(&mut g, &e, &ready), Err(None));
     }
 
-    /// Review (AC8) — a failed restore inside the FR3 pass is the pass's own
-    /// local failure: it does not also mark the root's re-entry due (a
-    /// second, spurious re-entry). Every read budget of `r` is tried; at least
-    /// one hits the restore (the engine is left changed).
+    /// Review (AC5 step 1) — the pass builds its own counter over the window
+    /// at `p − 1`; a read fault there leaves it invalid: a local fault, no
+    /// verdict and nothing verified. The control: the same pass without the
+    /// fault accepts.
     #[test]
-    fn a_failed_restore_in_the_pass_marks_no_reentry() {
+    fn a_window_read_fault_in_the_pass_is_local() {
         let (d, r, e, _) = replay_evidence();
-        let pass = Projection {
+        let pass = || Projection {
             counter_tail: u32::MAX,
             ..Projection::COMPLETE
         };
-        let mut restore_failures = 0;
-        for reads in 0..4 {
-            let mut l = failing_observer(&d, &r);
-            let before = engine_votes(&l);
-            l.storage.failing_slot = l.active_chain_head_idx;
-            l.storage.reads_left.set(reads);
-            l.storage.failures_left.set(1);
-            let verdict = judge_on(&mut l, &e, &pass);
-            if engine_votes(&l) != before {
-                restore_failures += 1;
-                assert_eq!(verdict, Err(None), "reads {reads}");
+        let mut l = failing_observer(&d, &r);
+        assert_eq!(judge_on(&mut l, &e, &pass()), Ok(()), "the control");
+        let mut l = failing_observer(&d, &r);
+        l.storage.failing_slot = l
+            .ancestor_at(l.active_chain_head_idx, 3)
+            .ok()
+            .flatten()
+            .expect("#3 in the window");
+        let verified = counted(&AGGREGATE_VERIFICATIONS);
+        assert_eq!(judge_on(&mut l, &e, &pass()), Err(None));
+        assert!(l.storage.attempts.get() > 0, "the window read was hit");
+        assert_eq!(counted(&AGGREGATE_VERIFICATIONS), verified);
+    }
+
+    /// Review (AC8) — a failed restore inside the FR3 pass is the pass's own
+    /// local failure: it does not also mark the root's re-entry due (a
+    /// second, spurious re-entry). Every read budget of `r` is tried; at least
+    /// one hits the restore (the engine is left changed). The control: the
+    /// same fault under Ready's projection marks it.
+    #[test]
+    fn a_failed_restore_in_the_pass_marks_no_reentry() {
+        let (d, r, e, _) = replay_evidence();
+        for in_pass in [true, false] {
+            let mut restore_failures = 0;
+            for reads in 0..4 {
+                let mut l = failing_observer(&d, &r);
+                let projection = if in_pass {
+                    Projection {
+                        counter_tail: u32::MAX,
+                        ..Projection::COMPLETE
+                    }
+                } else {
+                    ready_projection(&l)
+                };
+                let before = engine_votes(&l);
+                l.storage.failing_slot = l.active_chain_head_idx;
+                l.storage.reads_left.set(reads);
+                l.storage.failures_left.set(1);
+                let verdict = judge_on(&mut l, &e, &projection);
+                let restore_failed = engine_votes(&l) != before;
+                if restore_failed {
+                    restore_failures += 1;
+                    assert_eq!(verdict, Err(None), "reads {reads}");
+                }
+                assert_eq!(
+                    l.reentry_due,
+                    restore_failed && !in_pass,
+                    "in the pass {in_pass}, reads {reads}"
+                );
             }
-            assert!(!l.reentry_due, "reads {reads}");
+            assert!(restore_failures > 0, "a restore failed (pass {in_pass})");
         }
-        assert!(restore_failures > 0, "a restore failed");
     }
 
     // -- AC5 / AC6: the Tier-3 evidence check and the accepted mark --
@@ -25895,11 +25958,29 @@ mod tests {
         refused_evidence_case(2, late, |ev| ev.late.push((4, 0)));
         refused_evidence_case(2, late, |ev| ev.late.swap(0, 1));
         refused_evidence_case(2, late, |ev| ev.late[0].1 += 1);
+        // Review: the right count, one listed id wrong — beyond the roster
+        // (99), or a registered node that is not late at `p − 1`.
+        for id in [99, 1, 2, 4] {
+            refused_evidence_case(2, late, |ev| ev.late[1].0 = id);
+        }
+        // `u` heads the order, so in front of node 0, with its true value at
+        // the tip, it keeps the order, the count of late nodes above the last
+        // entry and the values: only "late" refuses it.
+        let (g, d, _) = evidence_observer(2);
+        let u = d.view().first_voted_node();
+        let at_tip = g
+            .vote_engine
+            .grown(g.vote_engine.accumulated_vote_of(u))
+            .expect("grown");
+        refused_evidence_case(2, late, |ev| ev.late[0] = (u, at_tip));
     }
 
     /// AC5 step 5: a corrupted aggregate byte (the framing kept) is
     /// `EvidenceAggregate`. Under BLS a `count` other than the population
-    /// also ends there; under Schnorr the framing refuses it at Tier 1.
+    /// also ends there; under Schnorr the framing refuses it at Tier 1, before
+    /// any verification. AC13.4: under Schnorr the keys enter in rank order,
+    /// so an aggregate over the signers in swapped order does not verify (a
+    /// BLS aggregate is order-free).
     #[test]
     fn a_wrong_aggregate_is_refused() {
         refused_evidence_case(4, ValidationReason::EvidenceAggregate, |ev| {
@@ -25908,17 +25989,28 @@ mod tests {
         });
         #[cfg(not(feature = "schnorr"))]
         refused_evidence_case(4, ValidationReason::EvidenceAggregate, |ev| {
-            ev.aggregate[1] += 1
+            ev.aggregate[1] = ev.aggregate[1].wrapping_add(1)
         });
         #[cfg(feature = "schnorr")]
         {
             let (mut g, _, e) = evidence_observer(4);
-            let bad = evidence_with(&e, 2, |ev| ev.aggregate[1] += 1);
+            let bad = evidence_with(&e, 2, |ev| {
+                ev.aggregate[1] = ev.aggregate[1].wrapping_add(1)
+            });
+            let verified = counted(&AGGREGATE_VERIFICATIONS);
             assert_eq!(
                 receive(&mut g, &bad),
                 ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
             );
+            assert_eq!(counted(&AGGREGATE_VERIFICATIONS), verified, "Tier 1");
             assert_eq!(head_of(&g).0, 6);
+
+            let (d, e, members) = evidence_by(4);
+            assert_eq!(evidence_of(&e, 2).bitmap, [0b011], "ranks 0 and 1");
+            let hash = d.view().hash();
+            refused_evidence_case(4, ValidationReason::EvidenceAggregate, |ev| {
+                ev.aggregate = aggregate_by(&[members[1], members[0]], 4, 6, &hash)
+            });
         }
     }
 
@@ -26093,10 +26185,10 @@ mod tests {
         junk_switch_case(5, 4, false);
     }
 
-    /// AC6: a local fault in the check (`d`'s header unreadable) leaves the
-    /// direct extension Stored, unmarked and off the chain; once the read
-    /// works, a later admission's continuation judges it as a stored child of
-    /// the head and accepts it.
+    /// AC6: a local fault in the step (`d`'s header unreadable from its first
+    /// read, the run rules') leaves the direct extension Stored, unmarked and
+    /// off the chain; once the read works, a later admission's continuation
+    /// judges it as a stored child of the head and accepts it.
     #[test]
     fn a_local_fault_leaves_the_evidence_unjudged() {
         let (_, e, _) = evidence_by(4);
@@ -26111,7 +26203,7 @@ mod tests {
         assert_eq!(status, BlockStatus::Stored);
         assert!(!accepted, "never marked on a local fault");
         assert_eq!(head_of(&l), (6, d.view().hash()));
-        l.storage.failing_slot = u32::MAX;
+        l.storage.failing_slot = NONE_REF;
         let verified = counted(&AGGREGATE_VERIFICATIONS);
         let sibling = normal_after(&g, &blocks[5], 2, 91);
         assert_eq!(
@@ -26121,6 +26213,31 @@ mod tests {
         assert_eq!(head_of(&l), (7, e.view().hash()), "the stored child");
         assert_eq!(counted(&AGGREGATE_VERIFICATIONS) - verified, 1);
         assert!(entry_of(&l, &e).expect("held").2);
+    }
+
+    /// AC5 step 1 / AC6 (review): the evidence check's own read of `d`'s
+    /// header fails — the run rules' read before it succeeds — so the check
+    /// gives no verdict: the evidence is held Stored, unmarked, off the chain,
+    /// and nothing is verified.
+    #[test]
+    fn an_unreadable_deviation_header_in_the_evidence_check_is_local() {
+        let (_, e, _) = evidence_by(4);
+        let (mut g, mut l, blocks) = support_chain_on(3, failing_storage(3), 16, |_| {});
+        let d = deviation_after(&g, &blocks[5], 4, 1);
+        assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(receive(&mut g, &d), ReceiveBlockOutcome::AcceptedSilently);
+        l.storage.failing_slot = l.active_chain_head_idx;
+        l.storage.reads_left.set(1);
+        let verified = counted(&AGGREGATE_VERIFICATIONS);
+        assert_eq!(receive(&mut l, &e), ReceiveBlockOutcome::AcceptedSilently);
+        assert!(
+            l.storage.attempts.get() >= 2,
+            "the run rules read d, then the check"
+        );
+        let (status, on_chain, accepted, _) = entry_of(&l, &e).expect("held");
+        assert!(status == BlockStatus::Stored && !on_chain && !accepted);
+        assert_eq!(counted(&AGGREGATE_VERIFICATIONS), verified);
+        assert_eq!(head_of(&l), (6, d.view().hash()));
     }
 
     /// AC6: after a restart (FR59) the genesis-anchored pass judges the
@@ -26235,37 +26352,61 @@ mod tests {
         );
     }
 
-    /// AC7 (D5) — the exact zone of a window-anchored pass: with `p − W = a`
-    /// the evidence is checked exactly (the real one verifies, a junk claim is
-    /// refused); trusted when each condition fails alone: `p − W = a − 1`,
-    /// the roster unknown, one registered node (#0, its seed source #0 below
-    /// `vote_seed_from`) not vote-seeded, and node 2, whose latest seed source
-    /// is `d` itself (its balance lists node 2), so its vote at `p − 1` is not
-    /// known to be exact.
+    /// AC7 (D5) — the exact zone of a window-anchored pass. Nodes from #2 on
+    /// count as registered inside the segment; #0 (seed source #0) and #1
+    /// (seed source #2) are vote-seeded through their sources, below `p`. With
+    /// `p − W = a` the evidence is then checked exactly (the real one
+    /// verifies, a junk claim is refused); trusted when each condition fails
+    /// alone: `p − W = a − 1`, the roster unknown, node #0's source below
+    /// `vote_seed_from`, and node 2 judged by its source, which is `d` itself
+    /// (its balance lists node 2): seeded at `p` only, so its vote at `p − 1`
+    /// is not known to be exact.
     #[test]
     fn a_window_anchored_pass_checks_its_exact_zone() {
         let (mut g, e) = w8_evidence();
         let junk = evidence_with(&e, 3, |ev| ev.supporter_vote_sum += 1);
-        let exact = window_anchored(0);
+        let base = || Projection {
+            first_segment_registration: 2,
+            ..window_anchored(0)
+        };
+        let exact = base();
         let verified = counted(&AGGREGATE_VERIFICATIONS);
         assert_eq!(judge_on(&mut g, &e, &exact), Ok(()));
         assert_eq!(counted(&AGGREGATE_VERIFICATIONS) - verified, 1, "exact");
         assert_eq!(
             judge_on(&mut g, &junk, &exact),
-            Err(Some(ValidationReason::EvidenceVoteSum))
+            Err(Some(ValidationReason::EvidenceVoteSum)),
+            "every node seeded below p: exact"
         );
-        let mut seeded_from_one = window_anchored(0);
-        seeded_from_one.first_segment_registration = u32::MAX;
-        seeded_from_one.vote_seed_from = 1;
-        let mut seeded_from_zero = window_anchored(0);
-        seeded_from_zero.first_segment_registration = u32::MAX;
-        let mut unknown_roster = window_anchored(0);
-        unknown_roster.roster_bounded = false;
         for (projection, why) in [
-            (window_anchored(1), "p − W = a − 1"),
-            (unknown_roster, "the roster unknown"),
-            (seeded_from_one, "node #0 not vote-seeded"),
-            (seeded_from_zero, "node 2 seeded at `p` only"),
+            (
+                Projection {
+                    anchor: 1,
+                    ..base()
+                },
+                "p − W = a − 1",
+            ),
+            (
+                Projection {
+                    roster_bounded: false,
+                    ..base()
+                },
+                "the roster unknown",
+            ),
+            (
+                Projection {
+                    vote_seed_from: 1,
+                    ..base()
+                },
+                "node #0 not vote-seeded",
+            ),
+            (
+                Projection {
+                    first_segment_registration: 3,
+                    ..base()
+                },
+                "node 2 seeded at `p` only",
+            ),
         ] {
             assert_eq!(judge_on(&mut g, &junk, &projection), Ok(()), "{why}");
         }
@@ -26317,7 +26458,8 @@ mod tests {
     }
 
     /// AC10 (D3): an evidence at `p` on another fork (its `p − 1` is not the
-    /// proposer's) stops nothing.
+    /// proposer's) stops nothing, even the proposer's own (review: the
+    /// ancestry condition of the release, not the creator's).
     #[test]
     fn an_evidence_on_another_fork_stops_nothing() {
         let (_, e, _) = evidence_by(4);
@@ -26333,7 +26475,7 @@ mod tests {
             );
         }
         let x6_idx = l.blocks.find(6, &x6.view().hash()).expect("held");
-        let other = evidence_block(7, x6.view().hash(), 4, &ev);
+        let other = evidence_block(7, x6.view().hash(), 5, &ev);
         assert_eq!(evidence_of(&other, 2).deviation_sequence, 6);
         plant_child(&mut l, &other, x6_idx, true, true);
         assert!(l.approval_live(), "another p − 1");
@@ -26342,8 +26484,7 @@ mod tests {
     // -- AC13.3: AR16 replay --
 
     /// AR16: one block stream — a deviation, an evidence with a wrong vote
-    /// sum, another with a wrong late value, the valid one, a competing
-    /// deviation and its junk claim — on two fresh modules gives identical
+    /// sum, the valid one, a competing deviation and its junk claim — on two fresh modules gives identical
     /// verdicts, heads, open runs and branch values.
     #[test]
     fn evidence_verdicts_are_replay_deterministic() {
@@ -26425,7 +26566,7 @@ mod tests {
         );
         assert_eq!(head_of(&l), (7, r.view().hash()));
         assert!(l.is_ready());
-        l.storage.failing_slot = u32::MAX;
+        l.storage.failing_slot = NONE_REF;
         let verified = counted(&AGGREGATE_VERIFICATIONS);
         assert_eq!(
             receive(&mut l, &sibling),
@@ -26439,8 +26580,8 @@ mod tests {
     /// N23 (AC8) — a failed restore inside the evidence check escalates at the
     /// root: `r`'s first read (the rewind's undo) succeeds and its second (the
     /// restore's re-apply) fails once. The check returns a local fault and
-    /// marks the re-entry due; the continuation's retry of the stored evidence
-    /// in the same call is refused (the engine is not at `r`), and
+    /// marks the re-entry due; the root skips the continuation, the driver and
+    /// the comparison while it is due (the engine is not at `r`), and
     /// `receive_block` then re-enters collecting, whose spine re-derives the
     /// tree and reaches Ready again at the evidence. Nothing is deleted, the
     /// flag is consumed, and the engine equals a node that judged the evidence
