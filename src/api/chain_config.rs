@@ -3,22 +3,6 @@
 
 use super::*;
 
-/// The blockchain's chain-info source: values read once, at bind time, from the
-/// FR34 projections. A thin read: no field, no cache, no maintenance of its own.
-pub(super) struct ChainInfoAtHead {
-    /// Node ids are contiguous, so the count is the node-id watermark plus one.
-    registered_node_count: Option<u64>,
-}
-
-impl ChainInfoSource for ChainInfoAtHead {
-    fn read(&self, id: u8, args: &[u64]) -> Option<u64> {
-        match (id, args) {
-            (chain_info::REGISTERED_NODE_COUNT, []) => self.registered_node_count,
-            _ => None,
-        }
-    }
-}
-
 impl<
     Crypto: CryptoTrait,
     Storage: StorageTrait,
@@ -586,6 +570,22 @@ impl<
             registered_node_count: self
                 .is_ready()
                 .then(|| u64::from(self.node_info.max_known_node_id()) + 1),
+        }
+    }
+}
+
+/// The blockchain's chain-info source: values read once, at bind time, from the
+/// FR34 projections. A thin read: no field, no cache, no maintenance of its own.
+pub(super) struct ChainInfoAtHead {
+    /// Node ids are contiguous, so the count is the node-id watermark plus one.
+    registered_node_count: Option<u64>,
+}
+
+impl ChainInfoSource for ChainInfoAtHead {
+    fn read(&self, id: u8, args: &[u64]) -> Option<u64> {
+        match (id, args) {
+            (chain_info::REGISTERED_NODE_COUNT, []) => self.registered_node_count,
+            _ => None,
         }
     }
 }
