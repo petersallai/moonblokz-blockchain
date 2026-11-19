@@ -8,7 +8,7 @@
 //! forward**: no Connected/Active promotion is executed anywhere in Epic 4.
 //! Tier 2 ancestry/lookup completion is realized by the FR3 processing pass
 //! (Epic 5), the Ready head extension (Story 6.0), the Ready side-block Tier 2
-//! (Story 6.1, `Blockchain::tier2_check` in `api.rs` — it reads storage, so it
+//! (Story 6.1, `Blockchain::tier2_check` in `api/forward.rs` — it reads storage, so it
 //! is not one of this module's stateless checks) and FR23 chain-switch (6.3);
 //! Tier 3 derived-state replay by the same paths plus transaction/balance/UTXO
 //! validation (Epic 7).
@@ -62,7 +62,7 @@ pub(crate) enum BlockStatus {
     /// A Stored block whose ancestry reaches the active chain and which passed
     /// Tier 2 — a side block in Ready, set by the Story 6.1 side-branch
     /// driver or at intake when its parent is Connected or Active
-    /// (`Blockchain::tier2_check`, `api.rs`).
+    /// (`Blockchain::tier2_check`, `api/forward.rs`).
     Connected,
     /// A block on the selected active chain, Tier 3-verified: promoted by the
     /// FR3 pass or a Ready head extension (from Stored), or by an FR23 chain
@@ -271,7 +271,7 @@ fn verify_possession_bytes<C: CryptoTrait>(
 /// admissible at `Stored`), or the first exact-evidence [`Tier1Failure`].
 ///
 /// Stateless over passed-in references — no argument is mutated.
-#[allow(dead_code)] // consumed by `Blockchain::tier1_admit` (api.rs).
+#[allow(dead_code)] // consumed by `Blockchain::tier1_admit` (api/admission.rs).
 pub(crate) fn tier1_gate<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],

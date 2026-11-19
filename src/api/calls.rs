@@ -238,7 +238,7 @@ impl<
 
     /// Number of blocks currently retained in the block-tree. Test-only
     /// accessor for the `intake.rs` tests (a separate module cannot reach the
-    /// private `blocks` field); `api.rs`'s own tests read `self.blocks.len()`.
+    /// private `blocks` field); `api`'s own tests read `self.blocks.len()`.
     #[cfg(test)]
     pub(crate) fn block_tree_len(&self) -> usize {
         self.blocks.len()

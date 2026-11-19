@@ -776,7 +776,7 @@ impl<
     /// check against the watermark**, not a per-node `is_seeded` lookup, and that
     /// distinction is what keeps a **window-anchored** candidate correct: the
     /// watermark is set to the full node count (including pre-window nodes) by the
-    /// window's first balance block (`max_node_id`, api.rs `saw_balance_block`
+    /// window's first balance block (`max_node_id`, the `saw_balance_block`
     /// branch), whereas a *specific* pre-window node's in-window balance-block
     /// coverage (`is_seeded`) can fall later in the window than a transaction that
     /// legitimately votes for it (FR50 seed-source replays are emitted head-ward),

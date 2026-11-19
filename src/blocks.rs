@@ -380,7 +380,7 @@ pub(crate) struct BlockTable<const MAX_BLOCKS: usize> {
 }
 
 // `find`/`insert`/`get`/`walks_to_active_chain` are consumed starting with
-// Story 4.2/4.3/4.4; `init` is already called from `api.rs`.
+// Story 4.2/4.3/4.4; `init` is already called from `api/genesis.rs`.
 // Story 4.1's tests exercise every method directly.
 #[allow(dead_code)]
 impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {

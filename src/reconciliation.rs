@@ -1,8 +1,8 @@
 //! `reconciliation.rs` — FR23, FR58.
 //!
-//! The reversible chain-switch reconciliation walk lives in `api.rs` as
-//! private `Blockchain` methods (Story 6.3 D6, DEC-171), because the state it
-//! rewrites is private to that module: `switch_toward` (the entry point
+//! The reversible chain-switch reconciliation walk lives in `api/switch.rs` as
+//! `Blockchain` methods (Story 6.3 D6, DEC-171; Story 6.18), because the state
+//! it rewrites is private to the `api` module: `switch_toward` (the entry point
 //! FR22's comparison calls), `undo_active_head` / `undo_committed_block` (the
 //! backward walk's exact per-block inverse), the forward replay through the
 //! shared per-block step against a virtual tail, `commit_switch` and
