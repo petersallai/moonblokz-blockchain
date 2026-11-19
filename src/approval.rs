@@ -101,6 +101,13 @@ pub(crate) fn subgroup_size(required_support: u8, eligible: u32) -> Option<u32> 
     (m > 0).then_some(m)
 }
 
+/// ADR-015 — the signers an evidence over a subgroup of `m` needs,
+/// `r_eff = ⌊m/2⌋ + 1`: shared by the accumulator (6.6) and the evidence
+/// check (6.7 AC8).
+pub(crate) fn required_signers(m: usize) -> usize {
+    m / 2 + 1
+}
+
 /// Whether `local` is among the `m` members of `A'` with the smallest
 /// [`node_value`], by rank counting — one pass, no `m`-sized array.
 /// `members` yields `A'` (it may include `local`, which never counts against
@@ -685,8 +692,7 @@ impl ApprovalAccumulator {
         self.p = p;
         self.hash = *hash;
         self.m = m as u8;
-        // ADR-015: `h = ⌊m/2⌋ + 1 = r_eff`.
-        self.r_eff = (m / 2 + 1) as u8;
+        self.r_eff = required_signers(m) as u8;
         self.held = 0;
         self.members[..m].copy_from_slice(members);
         true
@@ -793,6 +799,12 @@ pub(crate) mod test_seams {
         /// late list truncated without a block-size limit too small for the
         /// fixture chain's own blocks).
         pub(crate) static PAYLOAD_ROOM: Cell<usize> = const { Cell::new(usize::MAX) };
+        /// Aggregate verifications of approval evidence on this test thread
+        /// (Story 6.7 AC6: no evidence is verified twice).
+        pub(crate) static AGGREGATE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
+        /// Transaction-signature verifications on this test thread (Story 6.7
+        /// AC6: a restore verifies no transaction signature again).
+        pub(crate) static TX_SIGNATURE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
     }
 
     /// The evidence payload room under this thread's cap.

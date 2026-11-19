@@ -78,7 +78,8 @@ pub(crate) const AVAILABLE_UTXO_BYTES: usize = 32;
 /// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
 /// bits 3-4 carry the block's `payload_type` (Story 5.4 review, see
 /// [`FLAG_PAYLOAD_TYPE_MASK`]); bit 5 marks a verified creator signature
-/// ([`FLAG_SIGNATURE_VERIFIED`]); bits 6-7 are unused.
+/// ([`FLAG_SIGNATURE_VERIFIED`]); bit 6 marks the block's Tier-3 signature
+/// checks final ([`FLAG_SIGNATURES_ACCEPTED`]); bit 7 is unused.
 const FLAG_ON_ACTIVE_CHAIN: u8 = 0b0000_0001;
 
 /// FR9 status bits (bits 1-2 of `flags`). Story 4.1 reserved these; Story 4.2
@@ -112,6 +113,20 @@ const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
 /// for the block's lifetime. RAM-only: a new entry starts with `flags == 0`,
 /// and nothing persists it.
 const FLAG_SIGNATURE_VERIFIED: u8 = 0b0010_0000;
+
+/// Bit 6 of `flags` (Story 6.7 D2): the block's Tier-3 signature checks are
+/// final for this node — every transaction signature and the approval
+/// evidence check (whose cost is its aggregate signature); Epic 7's UTXO input
+/// signatures join it. Set at the block's commit after a successful per-block
+/// step, including checks the FR3 pass accepted on trust, so a chain-switch
+/// restore or a later walk never judges them again. It implies bit 5: the one
+/// marker, [`BlockTable::mark_signatures_accepted`], sets both. Bit 5 stays
+/// separate because Tier 1 and the switch prepass verify a creator signature
+/// before any Tier-3 check is possible. The verdicts rest on the block's own
+/// ancestry, which never changes. RAM-only; every FR3 pass clears it first, so
+/// a pass judges each block itself (a block trusted by one pass's anchor may be
+/// exact under the next one's).
+const FLAG_SIGNATURES_ACCEPTED: u8 = 0b0100_0000;
 
 /// Per-block ancestry and status metadata (FR18).
 ///
@@ -213,6 +228,11 @@ impl BlockEntry {
     /// See [`FLAG_SIGNATURE_VERIFIED`].
     pub(crate) fn is_signature_verified(&self) -> bool {
         self.flags & FLAG_SIGNATURE_VERIFIED != 0
+    }
+
+    /// See [`FLAG_SIGNATURES_ACCEPTED`].
+    pub(crate) fn is_signatures_accepted(&self) -> bool {
+        self.flags & FLAG_SIGNATURES_ACCEPTED != 0
     }
 
     /// Marks a not-yet-inserted entry's creator signature verified (the
@@ -477,8 +497,8 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     }
 
     /// Test-only: overwrites the cached payload type of the entry at `idx`
-    /// (Story 6.5: an approval block on the active chain, which no admission
-    /// path can produce before Stories 6.6 and 6.7).
+    /// (Story 6.5: an approval entry on the active chain without building a
+    /// valid evidence block).
     #[cfg(test)]
     pub(crate) fn stamp_payload_type(&mut self, idx: u32, payload_type: u8) {
         let entry = &mut self.blocks[idx as usize];
@@ -693,6 +713,28 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Marks the block at `idx` with its Tier-3 signature checks final, which
+    /// includes its creator signature: bits 6 and 5 together (Story 6.7 D2).
+    /// Set at the block's commit. Returns `false` for an empty/out-of-bounds
+    /// slot. See [`FLAG_SIGNATURES_ACCEPTED`].
+    pub(crate) fn mark_signatures_accepted(&mut self, idx: u32) -> bool {
+        match self.blocks.get_mut(idx as usize) {
+            Some(entry) if !entry.is_empty_slot() => {
+                entry.flags |= FLAG_SIGNATURES_ACCEPTED | FLAG_SIGNATURE_VERIFIED;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Clears bit 6 on every entry, at the start of an FR3 pass, so the pass
+    /// judges each block's signatures itself (see [`FLAG_SIGNATURES_ACCEPTED`]).
+    pub(crate) fn clear_signatures_accepted(&mut self) {
+        for entry in self.blocks.iter_mut() {
+            entry.flags &= !FLAG_SIGNATURES_ACCEPTED;
         }
     }
 

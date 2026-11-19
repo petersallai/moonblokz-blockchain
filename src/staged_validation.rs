@@ -32,7 +32,7 @@
 //! locally resolvable.
 
 use moonblokz_chain_types::{
-    BlockView, ComplexTransactionView, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
+    ApprovalView, BlockView, ComplexTransactionView, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
     PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
 };
 use moonblokz_crypto::{
@@ -201,6 +201,14 @@ pub(crate) enum Tier1Failure {
     /// not yet Tier-1-verified (FR69, later epic), so a forged first-arriving
     /// seq-0 would anchor until that check lands.
     DuplicateGenesis,
+    /// FR16 / FR27 (Story 6.7 AC4, D4): a block whose parent is held — outside
+    /// Ready, or a Stored parent in Ready — breaks a rule of the open deviation
+    /// run below it (another creator, a non-override header, a misplaced
+    /// evidence block, the run bound) or the FR48 clean slot once the
+    /// configuration is locked (the slot rule also when the ancestry cannot be
+    /// read). Produced in `tier1_admit` from the block and its ancestry, before
+    /// the write.
+    DeviationRun,
 }
 
 // ---------------------------------------------------------------------------
@@ -319,10 +327,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
         }
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
         PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
-        PAYLOAD_TYPE_APPROVAL => {
-            // Recognized schema; its DEC-195 field checks are Story 6.7's.
-            // The exact framing below already applies to it.
-        }
+        PAYLOAD_TYPE_APPROVAL => tier1_approval_block(block)?,
         _ => return Err(Tier1Failure::UnknownPayloadType),
     }
 
@@ -337,6 +342,26 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
     }
 
     Ok(())
+}
+
+/// FR27 Tier 1 for approval evidence (DEC-195, Story 6.7 AC3): no signer bit
+/// at a rank `≥ m`. The rest of FR27's Tier-1 structure is the framing that
+/// [`tier1_gate`] applies to every type (`content_length() == Some(len())`):
+/// the lengths, `m ≤ 2·MAX_AGGREGATED_SIGNATURES − 1`, `1 ≤ n ≤
+/// MAX_AGGREGATED_SIGNATURES`, a Schnorr aggregate's `count == n`, the
+/// `late_count` against the remaining length, and no trailing byte. A payload
+/// that does not frame is left to that check. The bit rule lives here, not in
+/// the framing, so FR59's restart (which does not re-run Tier 1) stays
+/// padding-tolerant (D52).
+fn tier1_approval_block(block: &BlockView) -> Result<(), Tier1Failure> {
+    let Some(view) = ApprovalView::from_payload(block.payload()) else {
+        return Ok(());
+    };
+    let used = usize::from(view.m()) % 8;
+    match view.bitmap().last() {
+        Some(last) if used != 0 && last >> used != 0 => Err(Tier1Failure::MalformedPayload),
+        _ => Ok(()),
+    }
 }
 
 fn tier1_transaction_block<C: CryptoTrait>(
@@ -581,8 +606,9 @@ fn check_no_self_vote(
 mod tests {
     use super::*;
     use moonblokz_chain_types::{
-        Block, BlockBuilder, BlockHeader, ComplexTransaction, HEADER_SIZE, MAX_PAYLOAD_SIZE,
-        NodeInfo, NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_TRANSACTION, Registration,
+        Block, BlockBuilder, BlockHeader, ComplexTransaction, HEADER_SIZE, MAX_BLOCK_SIZE,
+        MAX_PAYLOAD_SIZE, NodeInfo, NodeTransfer, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_TRANSACTION,
+        Registration,
     };
     use moonblokz_crypto::{Crypto, PRIVATE_KEY_SIZE, SIGNATURE_SIZE};
 
@@ -710,6 +736,133 @@ mod tests {
             ),
             Err(Tier1Failure::BlockTooLarge)
         );
+    }
+
+    // --- Story 6.7 AC3: the approval evidence's FR27 Tier-1 structure ------
+
+    /// A real evidence block: subgroup `m`, signers at `ranks` (a real
+    /// aggregate in the order given), `late` late entries. Returned as wire
+    /// bytes so a test can mutate one field; Tier 1 does not verify the creator
+    /// signature, so a mutated copy still reaches the field checks.
+    fn evidence_bytes(m: u8, ranks: &[usize], late: u16) -> ([u8; MAX_BLOCK_SIZE], usize) {
+        use moonblokz_chain_types::{
+            APPROVAL_LATE_ENTRY_SIZE, APPROVAL_PREFIX_SIZE, approval_fixed_size,
+        };
+        use moonblokz_crypto::{
+            AggregatedSignatureTrait, MAX_AGGREGATED_SIGNATURES, MultiSignature,
+        };
+        let message = b"evidence-tier1";
+        let signers: [Crypto; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| crypto(i as u8 + 1));
+        let sigs: [MultiSignature; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| signers[i].multi_sign(message));
+        let keys: [[u8; PUBLIC_KEY_SIZE]; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| pubkey_bytes(&signers[i]));
+        let sig_refs: [&MultiSignature; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| &sigs[i]);
+        let key_refs: [&[u8; PUBLIC_KEY_SIZE]; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| &keys[i]);
+        let n = ranks.len();
+        let aggregate = crypto(1)
+            .aggregate_signatures(&sig_refs[..n], &key_refs[..n], message)
+            .ok()
+            .expect("aggregates");
+        let mut builder = BlockBuilder::new().header(header(9, 0));
+        let fixed = approval_fixed_size(usize::from(m), n);
+        let len = fixed + APPROVAL_LATE_ENTRY_SIZE * usize::from(late);
+        let out = builder.approval_payload_mut(len).ok().expect("type 0");
+        out.fill(0);
+        out[8..12].copy_from_slice(&7u32.to_le_bytes());
+        out[12] = m;
+        for rank in ranks {
+            out[APPROVAL_PREFIX_SIZE + rank / 8] |= 1 << (rank % 8);
+        }
+        let at = APPROVAL_PREFIX_SIZE + usize::from(m).div_ceil(8);
+        aggregate
+            .serialize(&mut out[at..])
+            .ok()
+            .expect("serializes");
+        out[fixed - 2..fixed].copy_from_slice(&late.to_le_bytes());
+        let block = builder.build_signed(&crypto(1)).ok().expect("signs");
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[..block.len()].copy_from_slice(block.serialized_bytes());
+        (bytes, block.len())
+    }
+
+    fn tier1_of(bytes: &[u8]) -> Result<(), Tier1Failure> {
+        let block = BlockView::from_bytes(bytes).ok().expect("parses");
+        let c = crypto(1);
+        tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c)
+    }
+
+    #[test]
+    fn tier1_admits_a_well_formed_evidence() {
+        let (bytes, len) = evidence_bytes(9, &[0, 3, 8], 2);
+        assert_eq!(tier1_of(&bytes[..len]), Ok(()));
+    }
+
+    /// A signer bit at a rank `≥ m` is exact evidence. The fixture keeps the
+    /// aggregate's `count` equal to the bitmap's population, so the framing
+    /// holds and only the bit rule refuses it.
+    #[test]
+    fn tier1_refuses_a_signer_bit_beyond_m() {
+        let (bytes, len) = evidence_bytes(5, &[0, 2, 6], 0);
+        assert_eq!(tier1_of(&bytes[..len]), Err(Tier1Failure::MalformedPayload));
+        // The highest legal rank, `m − 1`, passes.
+        let (bytes, len) = evidence_bytes(5, &[0, 2, 4], 0);
+        assert_eq!(tier1_of(&bytes[..len]), Ok(()));
+        // A full byte (`m = 8`) has no bit beyond `m`.
+        let (bytes, len) = evidence_bytes(8, &[0, 7], 0);
+        assert_eq!(tier1_of(&bytes[..len]), Ok(()));
+    }
+
+    /// The rest of FR27's Tier-1 list is the shared framing; each case mutates
+    /// one field of a passing evidence block.
+    #[test]
+    fn tier1_refuses_each_evidence_framing_fault() {
+        use moonblokz_chain_types::{
+            APPROVAL_M_OFFSET, APPROVAL_MAX_SUBGROUP, approval_fixed_size,
+        };
+        let (good, len) = evidence_bytes(9, &[0, 3, 8], 2);
+        let p = HEADER_SIZE;
+        let fixed = approval_fixed_size(9, 3);
+        let mutate = |f: &dyn Fn(&mut [u8]), len: usize| {
+            let mut bytes = good;
+            f(&mut bytes);
+            tier1_of(&bytes[..len])
+        };
+        let malformed = Err(Tier1Failure::MalformedPayload);
+        // `m` above `2·MAX_AGGREGATED_SIGNATURES − 1`.
+        assert_eq!(
+            mutate(
+                &|b| b[p + APPROVAL_M_OFFSET] = APPROVAL_MAX_SUBGROUP as u8 + 1,
+                len
+            ),
+            malformed
+        );
+        // No signer at all.
+        assert_eq!(mutate(&|b| b[p + 13..p + 15].fill(0), len), malformed);
+        // `late_count` one above and one below the entries present.
+        assert_eq!(mutate(&|b| b[p + fixed - 2] = 3, len), malformed);
+        assert_eq!(mutate(&|b| b[p + fixed - 2] = 1, len), malformed);
+        // A byte after the framed payload.
+        assert_eq!(mutate(&|_| {}, len + 1), malformed);
+    }
+
+    /// The aggregate's `count` against the bitmap: framing checks it under
+    /// Schnorr (a Tier-1 fault); under BLS Tier 1 passes it and Tier 3's
+    /// verification refuses it (`count ≠ keys`).
+    #[test]
+    fn the_aggregate_count_is_tier1_under_schnorr_only() {
+        let (good, len) = evidence_bytes(9, &[0, 3, 8], 0);
+        let mut bytes = good;
+        // Add a signer bit without touching the aggregate.
+        bytes[HEADER_SIZE + 13] |= 1 << 1;
+        let verdict = tier1_of(&bytes[..len]);
+        #[cfg(feature = "schnorr")]
+        assert_eq!(verdict, Err(Tier1Failure::MalformedPayload));
+        #[cfg(not(feature = "schnorr"))]
+        assert_eq!(verdict, Ok(()));
     }
 
     // --- AC1 (FR7 / FR69 (iii)): chain-config content signature -------------
