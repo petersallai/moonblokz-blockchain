@@ -1161,13 +1161,13 @@ fn fr23_switch_matches_a_fresh_node_on_the_new_chain() {
 
 /// AC2 — the committed-block undo is the exact inverse of the per-block
 /// step, for every block kind: applied as a head extension and undone,
-/// the node equals a twin that never saw the block; genesis #1 undone and
+/// the node equals a replica that never saw the block; genesis #1 undone and
 /// re-applied equals itself.
 #[test]
 fn fr23_undo_inverts_every_block_kind() {
     fn check<S: StorageTrait, T: StorageTrait>(
         mut bc: Chain16<S>,
-        twin: &Chain16<T>,
+        replica: &Chain16<T>,
         block: &Block,
         what: &str,
     ) {
@@ -1183,14 +1183,14 @@ fn fr23_undo_inverts_every_block_kind() {
             bc.blocks.get(idx).map(|e| e.status()),
             Some(BlockStatus::Connected)
         );
-        assert_same_projection(&bc, twin, what);
+        assert_same_projection(&bc, replica, what);
     }
     // A registration (node #0's `a2`).
     let (bc, _, b1) = ready_genesis(16);
-    let (twin, _, _) = ready_genesis(16);
+    let (replica, _, _) = ready_genesis(16);
     check(
         bc,
-        &twin,
+        &replica,
         &alt(2, b1.view().hash(), 0, 0, 1, 7, true),
         "registration",
     );
@@ -1201,25 +1201,25 @@ fn fr23_undo_inverts_every_block_kind() {
         assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
         (bc, (), a2, ())
     };
-    let twin = {
-        let (mut twin, _, _) = ready_genesis(16);
+    let replica = {
+        let (mut replica, _, _) = ready_genesis(16);
         assert_eq!(
-            receive(&mut twin, &a2),
+            receive(&mut replica, &a2),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        twin
+        replica
     };
     check(
         bc,
-        &twin,
+        &replica,
         &alt(3, a2.view().hash(), 1, 1, 2, 8, false),
         "creator credit",
     );
     // A balance block: node #0's seed source moves back to #0.
     let (bc, _, b1) = ready_genesis(16);
-    let (twin, _, _) = ready_genesis(16);
+    let (replica, _, _) = ready_genesis(16);
     let snapshot = snapshot_block(&bc, 2, b1.view().hash());
-    check(bc, &twin, &snapshot, "balance");
+    check(bc, &replica, &snapshot, "balance");
     // A deviation (node #0 on node #1's top rank, fr28's `d`).
     let setup = || {
         let (mut bc, _, b1) = ready_genesis(16);
@@ -1227,7 +1227,7 @@ fn fr23_undo_inverts_every_block_kind() {
         assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
         (bc, a2)
     };
-    let ((bc, a2), (twin, _)) = (setup(), setup());
+    let ((bc, a2), (replica, _)) = (setup(), setup());
     let d = headed(
         3,
         a2.view().hash(),
@@ -1238,31 +1238,31 @@ fn fr23_undo_inverts_every_block_kind() {
         3015,
         votes_for(3, 1, 2, 60),
     );
-    check(bc, &twin, &d, "deviation");
+    check(bc, &replica, &d, "deviation");
     // A complex block spending a UTXO into two outputs.
     let (bc, mint) = faulty_utxo_genesis();
-    let (twin, _) = faulty_utxo_genesis();
+    let (replica, _) = faulty_utxo_genesis();
     let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(30), Ok(30)]);
     check(
         bc,
-        &twin,
+        &replica,
         &complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]),
         "utxo",
     );
     // A complex block paying its creator a fee (60 in, 50 out).
     let (bc, mint) = faulty_utxo_genesis();
-    let (twin, _) = faulty_utxo_genesis();
+    let (replica, _) = faulty_utxo_genesis();
     let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(50)]);
     check(
         bc,
-        &twin,
+        &replica,
         &complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]),
         "utxo fee",
     );
 
     // Genesis #1: undone, then re-applied by the same step.
     let (mut bc, _, b1) = ready_genesis(16);
-    let (twin, _, _) = ready_genesis(16);
+    let (replica, _, _) = ready_genesis(16);
     let idx = slot(&bc, &b1);
     assert_eq!(bc.undo_active_head(), Ok(()));
     let tail = bc.snake_chain_tail_idx;
@@ -1274,7 +1274,7 @@ fn fr23_undo_inverts_every_block_kind() {
         } => bc.promote_replayed(idx, value, creator),
         _ => panic!("genesis #1 re-applies"),
     }
-    assert_same_projection(&bc, &twin, "genesis #1");
+    assert_same_projection(&bc, &replica, "genesis #1");
 }
 
 /// AC11.3 / FR39 — the replay resolves UTXO references against the chain
@@ -1324,7 +1324,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
     // fork (FR70) that outranks only with `x5` (node #1's, credited by the
     // mint and `x4`).
     let (mut bc, mint) = faulty_utxo_genesis();
-    let (mut twin, _) = faulty_utxo_genesis();
+    let (mut replica, _) = faulty_utxo_genesis();
     let o4 = resign(
         &spend(&[Ok(60)])(&mint),
         1,
@@ -1333,7 +1333,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
     );
     assert_eq!(receive(&mut bc, &o4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(
-        receive(&mut twin, &o4),
+        receive(&mut replica, &o4),
         ReceiveBlockOutcome::AcceptedSilently
     );
     let x4 = resign(
@@ -1359,7 +1359,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
         bc.chain_heads.branch_value_of(slot(&bc, &x4)),
         Some(brute_value(&bc, slot(&bc, &x4)))
     );
-    assert_same_projection(&bc, &twin, "restored after a bad reference");
+    assert_same_projection(&bc, &replica, "restored after a bad reference");
 }
 
 /// AC11.4 / D4 — switching back over a balance block restores each
@@ -1446,7 +1446,7 @@ fn fr23_seed_sources_are_restored_by_the_backward_scan() {
 #[test]
 fn fr23_replay_checks_key_uniqueness_on_the_new_branch() {
     let (mut bc, _, a2, a3) = zero_tip_chain();
-    let (twin, _, _, _) = zero_tip_chain();
+    let (replica, _, _, _) = zero_tip_chain();
     let dup = resign(
         &tx_block(3, a2.view().hash(), 0, |b| {
             b.add_registration(&registration_tx(0, 2, NODE_ONE_KEY))
@@ -1467,7 +1467,7 @@ fn fr23_replay_checks_key_uniqueness_on_the_new_branch() {
         None,
         "a duplicate key on its own branch"
     );
-    assert_same_projection(&bc, &twin, "duplicate key");
+    assert_same_projection(&bc, &replica, "duplicate key");
 
     // The abandoned branch's node #0 block `k3` registers node #2 with a
     // key; node #1's sibling `n3` registers it with the same key.
@@ -1513,7 +1513,7 @@ fn fr23_replay_checks_key_uniqueness_on_the_new_branch() {
 fn fr23_evidence_restores_and_deletes_the_offender() {
     for bad in 0..3 {
         let (mut bc, _, a2, a3) = zero_tip_chain();
-        let (twin, _, _, _) = zero_tip_chain();
+        let (replica, _, _, _) = zero_tip_chain();
         let forge = |i: usize, block: Block, creator: u32, key: u8| {
             if i == bad {
                 resign(&block, creator, block.view().consumed_votes() + 7, key)
@@ -1555,7 +1555,7 @@ fn fr23_evidence_restores_and_deletes_the_offender() {
                 bad + 3
             );
         }
-        assert_same_projection(&bc, &twin, "after evidence");
+        assert_same_projection(&bc, &replica, "after evidence");
     }
 }
 
@@ -1779,7 +1779,7 @@ fn fr23_tail_advances_wait_for_the_commit() {
     };
     for last_is_replay in [false, true] {
         let (mut bc, _, b5) = full_w6_genesis_with_node_one();
-        let (twin, _, _) = full_w6_genesis_with_node_one();
+        let (replica, _, _) = full_w6_genesis_with_node_one();
         let blocks = branch(last_is_replay);
         assert!(blocks[5].view().len() > b5.view().len());
         for blk in blocks.iter().rev() {
@@ -1805,7 +1805,7 @@ fn fr23_tail_advances_wait_for_the_commit() {
             assert_eq!(status_of(&bc, &blocks[3]), None, "skipped replay: deleted");
             assert_eq!(status_of(&bc, &blocks[4]), None, "with its descendant");
             assert_eq!(status_of(&bc, &blocks[2]), Some(BlockStatus::Connected));
-            assert_same_projection(&bc, &twin, "restored after the advances");
+            assert_same_projection(&bc, &replica, "restored after the advances");
             // Story 6.4 AC9 3c: the unwound virtual advances.
             assert_active_set_matches(&bc, "restored after the advances");
         }
@@ -1822,9 +1822,9 @@ fn fr23_tail_advances_wait_for_the_commit() {
 #[test]
 fn fr23_replay_binds_against_the_horizon() {
     let (mut bc, _, b5) = full_w6_genesis_with_node_one();
-    let (mut twin, _, _) = full_w6_genesis_with_node_one();
+    let (mut replica, _, _) = full_w6_genesis_with_node_one();
     let r6 = snapshot_block(&bc, 6, b5.view().hash());
-    for node in [&mut bc, &mut twin] {
+    for node in [&mut bc, &mut replica] {
         assert_eq!(receive(node, &r6), ReceiveBlockOutcome::AcceptedSilently);
     }
     assert_eq!(bc.active_snake_chain_window(), Ok((1, 6)));
@@ -1843,7 +1843,7 @@ fn fr23_replay_binds_against_the_horizon() {
     assert_eq!(receive(&mut bc, &s6), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(status_of(&bc, &s6), None, "the skipped replay deleted it");
     assert_eq!(head_of(&bc), (6, r6.view().hash()));
-    assert_same_projection(&bc, &twin, "restored");
+    assert_same_projection(&bc, &replica, "restored");
 }
 
 /// AC11.9 / D5 — the pre-pass: a bad signature by a creator registered at
@@ -1897,7 +1897,7 @@ fn fr23_signature_prepass() {
     // `k3` (node #0's) registers node #2 above the common ancestor `a2`;
     // node #2's `n4` carries a bad signature.
     let (mut bc, _, a2, a3) = two_creator_chain();
-    let (twin, _, _, _) = two_creator_chain();
+    let (replica, _, _, _) = two_creator_chain();
     let k3 = resign(
         &tx_block(3, a2.view().hash(), 0, |b| {
             b.add_registration(&registration_tx(0, 2, key_of(2)))
@@ -1925,7 +1925,7 @@ fn fr23_signature_prepass() {
             .get(k3i)
             .is_some_and(|e| e.is_signature_verified())
     );
-    assert_same_projection(&bc, &twin, "after the replay's refusal");
+    assert_same_projection(&bc, &replica, "after the replay's refusal");
 }
 
 /// AC10 — the same block set in three admission orders ends on the same
@@ -1974,23 +1974,23 @@ fn fr23_restore_failure_on_the_new_branch_reenters_collecting() {
         let x4 = resign(&alt(4, x3.view().hash(), 0, 1, 0, 71, false), 0, 9, 1);
         (x3, x4)
     };
-    // Count `x3`'s reads on a twin, then fail its last one: the
+    // Count `x3`'s reads on a replica, then fail its last one: the
     // restore's undo.
     let reads = {
-        let (mut twin, _, a2, _) = failing_zero_tip_chain();
+        let (mut replica, _, a2, _) = failing_zero_tip_chain();
         let (x3, x4) = blocks(&a2);
         assert_eq!(
-            receive(&mut twin, &x4),
+            receive(&mut replica, &x4),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        twin.storage.failing_slot = twin.blocks.next_free_index().expect("a free slot");
-        twin.storage.reads_left.set(1000);
+        replica.storage.failing_slot = replica.blocks.next_free_index().expect("a free slot");
+        replica.storage.reads_left.set(1000);
         assert_eq!(
-            receive(&mut twin, &x3),
+            receive(&mut replica, &x3),
             ReceiveBlockOutcome::AcceptedSilently
         );
-        assert_eq!(head_of(&twin).0, 3, "the twin restored fully");
-        twin.storage.attempts.get()
+        assert_eq!(head_of(&replica).0, 3, "the replica restored fully");
+        replica.storage.attempts.get()
     };
     let (mut bc, _, a2, a3) = failing_zero_tip_chain();
     let (x3, x4) = blocks(&a2);

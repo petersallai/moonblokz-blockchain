@@ -59,9 +59,9 @@ fn utxo_genesis() -> (TestChain, Block) {
 fn step_inverses_restore_the_derived_state_exactly() {
     // Node transfer, registration, and a complex transaction with a UTXO
     // spend, a balance input and a balance output — each applied by the
-    // step and inverted, on a node that has a twin.
+    // step and inverted, on a node that has a replica.
     let (mut bc, mint) = utxo_genesis();
-    let (twin, _) = utxo_genesis();
+    let (replica, _) = utxo_genesis();
     let (seq, prev) = (4, mint.view().hash());
     let nt = transfer_tx(seq, 1, 500);
     let reg = registration_tx(0, 2, 0x32);
@@ -77,7 +77,7 @@ fn step_inverses_restore_the_derived_state_exactly() {
     ];
     for block in &blocks {
         assert_eq!(step_reason(&mut bc, block), None, "the block is valid");
-        assert_same_state(&bc, &twin, "after apply and invert");
+        assert_same_state(&bc, &replica, "after apply and invert");
     }
 }
 
@@ -179,22 +179,22 @@ fn forward_extension_takes_the_lowest_hash_sibling_on_an_equal_rank() {
 // --- AC10.4: invalid direct extension (AC3, AC2) ------------------------
 
 /// Feeds `bad` to a node and asserts the AC3 refusal: `InvalidEvidence`,
-/// nothing stored, and every piece of derived state identical to a twin
-/// that never saw it (AC2). `reason` pins why, against a third twin.
+/// nothing stored, and every piece of derived state identical to a replica
+/// that never saw it (AC2). `reason` pins why, against a third replica.
 fn assert_refused_at_intake(build: impl Fn() -> TestChain, bad: &Block, reason: ValidationReason) {
     let mut bc = build();
-    let twin = build();
+    let replica = build();
     let mut probe = build();
     assert_eq!(step_reason(&mut probe, bad), Some(reason));
-    assert_same_state(&probe, &twin, "the probe left nothing behind");
+    assert_same_state(&probe, &replica, "the probe left nothing behind");
     let free = bc.blocks.next_free_index().expect("a free slot");
     assert_eq!(
         receive(&mut bc, bad),
         ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
     );
-    assert_same_state(&bc, &twin, "refused extension");
+    assert_same_state(&bc, &replica, "refused extension");
     assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
-    assert!(same_slot(&bc, &twin, free), "storage unchanged");
+    assert!(same_slot(&bc, &replica, free), "storage unchanged");
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn invalid_direct_extension_is_not_stored_and_leaves_no_trace() {
 #[test]
 fn invalid_stored_child_is_deleted_with_its_descendants() {
     let (mut bc, _, b1) = ready_genesis(16);
-    let (mut twin, _, _) = ready_genesis(16);
+    let (mut replica, _, _) = ready_genesis(16);
     let a = transfer(2, b1.view().hash(), 0, 7);
     let bad = transfer(3, a.view().hash(), 0, CURRENCY);
     let below = transfer(4, bad.view().hash(), 0, 8);
@@ -248,7 +248,7 @@ fn invalid_stored_child_is_deleted_with_its_descendants() {
 
     assert_eq!(receive(&mut bc, &a), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(
-        receive(&mut twin, &a),
+        receive(&mut replica, &a),
         ReceiveBlockOutcome::AcceptedSilently
     );
     assert_eq!(head_of(&bc), (2, a.view().hash()), "A stays the head");
@@ -262,8 +262,8 @@ fn invalid_stored_child_is_deleted_with_its_descendants() {
     );
     assert!(bc.is_ready(), "no FR5 recovery in Ready");
     // Nothing of the failed child reached the derived state.
-    assert!(bc.node_info == twin.node_info);
-    assert!(bc.vote_engine == twin.vote_engine);
+    assert!(bc.node_info == replica.node_info);
+    assert!(bc.vote_engine == replica.vote_engine);
 }
 
 // --- AC10.6: local failures (AC6) ---------------------------------------
@@ -271,7 +271,7 @@ fn invalid_stored_child_is_deleted_with_its_descendants() {
 #[test]
 fn read_failure_at_intake_stores_the_extension_and_retries_it() {
     let (mut bc, mint) = faulty_utxo_genesis();
-    let (twin, _) = faulty_utxo_genesis();
+    let (replica, _) = faulty_utxo_genesis();
     let mint_idx = bc.active_chain_head_idx;
     let tx = utxo_tx(4, &[(3, 1, 40)], None, &[Err((1, 40))]);
     let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
@@ -290,8 +290,8 @@ fn read_failure_at_intake_stores_the_extension_and_retries_it() {
         Some(BlockStatus::Stored)
     );
     assert_eq!(bc.active_chain_head_idx, mint_idx, "head unchanged");
-    assert!(bc.node_info == twin.node_info, "derived state unchanged");
-    assert!(bc.vote_engine == twin.vote_engine);
+    assert!(bc.node_info == replica.node_info, "derived state unchanged");
+    assert!(bc.vote_engine == replica.vote_engine);
     assert_eq!(
         bc.blocks.utxo_available(mint_idx, 1),
         Some(true),
@@ -313,7 +313,7 @@ fn read_failure_at_intake_stores_the_extension_and_retries_it() {
 #[test]
 fn save_failure_inverts_the_extension_and_is_unstorable() {
     let (mut bc, mint) = faulty_utxo_genesis();
-    let (twin, _) = faulty_utxo_genesis();
+    let (replica, _) = faulty_utxo_genesis();
     let tx = utxo_tx(4, &[(3, 1, 40)], Some((0, 5)), &[Err((1, 44))]);
     let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
     bc.storage.fail_saves = true;
@@ -321,7 +321,7 @@ fn save_failure_inverts_the_extension_and_is_unstorable() {
         receive(&mut bc, &spend),
         ReceiveBlockOutcome::Rejected(RejectReason::Unstorable)
     );
-    assert_same_state(&bc, &twin, "save failure");
+    assert_same_state(&bc, &replica, "save failure");
 }
 
 // --- AC10.7: the window path --------------------------------------------
@@ -330,13 +330,13 @@ fn save_failure_inverts_the_extension_and_is_unstorable() {
 fn window_extension_past_w_advances_and_binds() {
     // Binding `Invalid` at intake: dropping #0 needs a balance block (FR50).
     let (mut bc, b5) = full_w6_genesis();
-    let (twin, _) = full_w6_genesis();
+    let (replica, _) = full_w6_genesis();
     let plain = transfer(6, b5.view().hash(), 0, 9);
     assert_eq!(
         receive(&mut bc, &plain),
         ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
     );
-    assert_same_state(&bc, &twin, "binding refusal stores nothing");
+    assert_same_state(&bc, &replica, "binding refusal stores nothing");
 
     // A stored child failing its binding is deleted. The snapshot at #6
     // advances the tail to #1 (chain-config), so a transfer at #7 cannot
@@ -386,7 +386,7 @@ fn bc_genesis_hash() -> [u8; 32] {
 #[test]
 fn window_classification_failure_changes_nothing() {
     let (mut bc, b5) = full_w6_genesis();
-    let (twin, _) = full_w6_genesis();
+    let (replica, _) = full_w6_genesis();
     let real_tail = bc.snake_chain_tail_idx;
     let replay = snapshot_block(&bc, 6, b5.view().hash());
     let view = replay.view();
@@ -401,7 +401,7 @@ fn window_classification_failure_changes_nothing() {
     ));
     bc.snake_chain_tail_idx = real_tail;
     bc.blocks.delete(idx);
-    assert_same_state(&bc, &twin, "classification failure");
+    assert_same_state(&bc, &replica, "classification failure");
 
     // With the tail readable again, the same block extends the head.
     assert_eq!(
@@ -672,19 +672,19 @@ fn balance_block_repeats_the_pre_state_in_ready() {
     );
 
     // A mismatch as a stored child is deleted, derived state untouched.
-    let (mut twin, _) = build();
+    let (mut replica, _) = build();
     let mut bad_child_chain = build().0;
     let filler = transfer(4, prev, 0, 7);
     let bad = mined_balance_block(5, filler.view().hash(), &[(owner, 0, votes, 0)], 1, 3);
     receive(&mut bad_child_chain, &bad);
     receive(&mut bad_child_chain, &filler);
-    receive(&mut twin, &filler);
+    receive(&mut replica, &filler);
     assert!(
         bad_child_chain.blocks.find(5, &bad.view().hash()).is_none(),
         "deleted"
     );
-    assert!(bad_child_chain.node_info == twin.node_info);
-    assert!(bad_child_chain.vote_engine == twin.vote_engine);
+    assert!(bad_child_chain.node_info == replica.node_info);
+    assert!(bad_child_chain.vote_engine == replica.vote_engine);
 
     // The matching snapshot is accepted: the entries leave balances and
     // votes as they were; only the block-level effects apply.
@@ -870,7 +870,7 @@ fn registration_fee_reaches_the_creator_when_the_initializer_is_unseeded() {
 #[test]
 fn partially_applied_complex_transaction_is_inverted_exactly() {
     let (mut bc, mint) = utxo_genesis();
-    let (twin, _) = utxo_genesis();
+    let (replica, _) = utxo_genesis();
     // Node 9 does not exist: the second output fails its range check.
     let cx = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 5)), Err((9, 5))]);
     let block = complex_tx_block(4, mint.view().hash(), 0, 0, &[&cx]);
@@ -878,7 +878,7 @@ fn partially_applied_complex_transaction_is_inverted_exactly() {
         step_reason(&mut bc, &block),
         Some(ValidationReason::NodeIdOutOfRange)
     );
-    assert_same_state(&bc, &twin, "partial complex inversion");
+    assert_same_state(&bc, &replica, "partial complex inversion");
 }
 
 /// Review patch — a credit that would overflow the creator's balance is
@@ -895,7 +895,7 @@ fn creator_credit_overflow_is_invalid() {
         (bc, genesis.block_one)
     };
     let (mut bc, b1) = build();
-    let (twin, _) = build();
+    let (replica, _) = build();
     // A self-transfer pays its fee of 1 back to node #0, the creator,
     // whose balance is then `u64::MAX - 1`; `mined_amount = 2` overflows.
     let nt = transfer_tx(2, 0, 1);
@@ -906,7 +906,7 @@ fn creator_credit_overflow_is_invalid() {
         step_reason(&mut bc, &block),
         Some(ValidationReason::BalanceOverflow)
     );
-    assert_same_state(&bc, &twin, "overflow refusal");
+    assert_same_state(&bc, &replica, "overflow refusal");
 }
 
 /// DEC-138 — the vote apply runs before `chain_heads` learns of a direct
@@ -915,7 +915,7 @@ fn creator_credit_overflow_is_invalid() {
 #[test]
 fn local_vote_refusal_after_the_write_keeps_the_extension_stored() {
     let (mut bc, _, b1) = ready_genesis(16);
-    let (twin, _, _) = ready_genesis(16);
+    let (replica, _, _) = ready_genesis(16);
     // An engine that holds no FR37 parameters (the test oracle's state).
     bc.vote_engine = VoteEngine::new();
     let a = transfer(2, b1.view().hash(), 0, 7);
@@ -931,7 +931,7 @@ fn local_vote_refusal_after_the_write_keeps_the_extension_stored() {
         "tracked as a head"
     );
     assert!(
-        bc.node_info == twin.node_info,
+        bc.node_info == replica.node_info,
         "the derivation was inverted"
     );
 }
@@ -1320,16 +1320,16 @@ fn side_blocks_are_judged_before_their_write_and_valued() {
 fn side_block_failing_tier2_at_intake_is_not_stored() {
     for (index, amount) in [(0, 61), (5, 60)] {
         let (mut bc, mint, _) = utxo_side_fixture();
-        let (twin, _, _) = utxo_side_fixture();
+        let (replica, _, _) = utxo_side_fixture();
         let bad = side_spend(4, mint.view().hash(), index, amount);
         let free = bc.blocks.next_free_index().expect("a free slot");
         assert_eq!(
             receive(&mut bc, &bad),
             ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
         );
-        assert_same_state(&bc, &twin, "refused side block");
+        assert_same_state(&bc, &replica, "refused side block");
         assert_eq!(bc.blocks.next_free_index(), Some(free), "no slot used");
-        assert!(same_slot(&bc, &twin, free), "storage unchanged");
+        assert!(same_slot(&bc, &replica, free), "storage unchanged");
     }
 
     // A fork from an interior Connected block is refused the same way.
@@ -1401,7 +1401,7 @@ fn tier2_read_failure_at_intake_is_retried_by_the_driver() {
 fn driver_deletes_a_failing_side_block_and_values_the_retarget() {
     for (index, amount) in [(0, 61), (5, 60)] {
         let (mut bc, mint, _) = utxo_side_fixture();
-        let (twin, _, _) = utxo_side_fixture();
+        let (replica, _, _) = utxo_side_fixture();
         let p4 = valued(4, mint.view().hash(), 4, 30);
         let bad5 = revalue(&side_spend(5, p4.view().hash(), index, amount), 5);
         let c6 = valued(6, bad5.view().hash(), 6, 31);
@@ -1417,13 +1417,13 @@ fn driver_deletes_a_failing_side_block_and_values_the_retarget() {
             Some(brute_value(&bc, pi))
         );
         assert!(bc.is_ready());
-        assert!(bc.node_info == twin.node_info);
-        assert!(bc.vote_engine == twin.vote_engine);
-        assert_eq!(bc.active_branch_value, twin.active_branch_value);
+        assert!(bc.node_info == replica.node_info);
+        assert!(bc.vote_engine == replica.vote_engine);
+        assert_eq!(bc.active_branch_value, replica.active_branch_value);
         for bit in 0..2 {
             assert_eq!(
                 bc.blocks.utxo_available(slot(&bc, &mint), bit),
-                twin.blocks.utxo_available(slot(&twin, &mint), bit),
+                replica.blocks.utxo_available(slot(&replica, &mint), bit),
                 "active available-UTXO bits untouched"
             );
         }
