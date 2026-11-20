@@ -821,15 +821,15 @@ impl<
         }
     }
 
-    /// Verifies the FR6 block-creator signature (AC2b) over the canonical signing
-    /// preimage (the full block bytes with the header signature field
-    /// zero-filled — exactly what `BlockBuilder::build_signed` signs; the
-    /// signature is the last `SIGNATURE_SIZE` bytes of the `HEADER_SIZE` header). Returns
-    /// `Some(valid)`, or `None` when the creator's public key is not yet derivable
-    /// (pre-seed zone → the block is trusted, not re-proved). Node #0 resolves to
-    /// the FR69 trust anchor (`node_zero_public_key`), available from construction.
-    // Its own frame (stack budget, DEC-136): the 2 KB preimage is live only
-    // here, never alongside the UTXO resolver's read buffer.
+    /// Verifies the FR6 block-creator signature (AC2b) over the FR70 preimage,
+    /// `BlockView::signing_preimage` (the header before the signature field
+    /// followed by `H(payload)`, 90 B — exactly what `BlockBuilder::build_signed`
+    /// signs; DEC-272). Returns `Some(valid)`, or `None` when the creator's public
+    /// key is not yet derivable (pre-seed zone → the block is trusted, not
+    /// re-proved). Node #0 resolves to the FR69 trust anchor
+    /// (`node_zero_public_key`), available from construction.
+    // Its own frame (stack budget, DEC-136): the payload hash and the crypto
+    // call are live only here, never alongside a read buffer.
     #[inline(never)]
     pub(super) fn verify_block_creator_signature(&self, view: &BlockView) -> Option<bool> {
         #[cfg(test)]
@@ -842,17 +842,9 @@ impl<
         } else {
             *self.node_info.public_key_of(creator)?
         };
-        let sig_off = HEADER_SIZE - SIGNATURE_SIZE;
-        let bytes = view.serialized_bytes();
-        let len = bytes.len();
-        let mut preimage = [0u8; MAX_BLOCK_SIZE];
-        preimage[..len].copy_from_slice(bytes);
-        for b in preimage[sig_off..HEADER_SIZE].iter_mut() {
-            *b = 0;
-        }
         Some(verify_signature_bytes(
             &self.crypto,
-            &preimage[..len],
+            &view.signing_preimage(),
             view.signature(),
             &key,
         ))
