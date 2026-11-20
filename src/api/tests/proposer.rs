@@ -1029,8 +1029,9 @@ fn the_evidence_is_replay_deterministic() {
 }
 
 /// Story 6.6 (the investigation that found it, 2026-11-17): a valid block
-/// with bytes after its last transaction, signed over all its wire bytes,
-/// was accepted live and lost at restart (the restart trims it to its
+/// with bytes after its last transaction, signed over all its wire bytes
+/// (since Story 6.12, the FR70 preimage of all of them: the trailing bytes are
+/// in `H(payload)`), was accepted live and lost at restart (the restart trims it to its
 /// framed length, which no longer verifies, and cut the chain below it).
 /// Tier 1 now refuses it as exact evidence; the clean block survives a
 /// restart.
@@ -1041,14 +1042,35 @@ fn a_block_with_bytes_after_its_payload_is_refused() {
     let mut raw = std::vec::Vec::from(clean.serialized_bytes());
     raw.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
     let signature_at = HEADER_SIZE - SIGNATURE_SIZE;
-    raw[signature_at..HEADER_SIZE].fill(0);
     let signer = Crypto::new([key_of(1); PRIVATE_KEY_SIZE])
         .ok()
         .expect("key");
-    let signature = signer.sign(&raw);
+    let preimage = BlockView::from_bytes(&raw)
+        .ok()
+        .expect("parses")
+        .signing_preimage();
+    let signature = signer.sign(&preimage);
     raw[signature_at..HEADER_SIZE].copy_from_slice(signature.serialize());
     let trailing = Block::from_bytes(&raw).ok().expect("parses");
+    // The signature is valid: the refusal below is the framing's, not the
+    // signature's (Story 6.12).
+    assert!(signer.verify_signature(
+        &trailing.view().signing_preimage(),
+        &signature,
+        signer.public_key()
+    ));
     assert_eq!(trailing.content_length(), Some(clean.len()));
+    assert_eq!(
+        tier1_gate(
+            &trailing.view(),
+            &l.node_zero_public_key,
+            MAX_BLOCK_SIZE as u32,
+            UTXO_BITFIELD_WIDTH,
+            &l.crypto,
+        ),
+        Err(Tier1Failure::MalformedPayload),
+        "refused for its framing"
+    );
     assert_eq!(
         receive(&mut l, &trailing),
         ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)

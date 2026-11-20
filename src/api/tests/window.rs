@@ -1098,7 +1098,7 @@ fn assert_same_nodes(a: &W6Chain, b: &W6Chain) {
 /// #3 floor-seeded at #96; [`vote_seed_prefix`]). The undo is identity on
 /// the values, so the switched node ends where a node that joined the new
 /// chain directly ends — the ground truth, since a fresh pass on honest
-/// blocks is (Story 6.0's FR3 equivalence). A forged twin of the winner is
+/// blocks is (Story 6.0's FR3 equivalence). A forged sibling of the winner is
 /// refused by the replay and leaves the node exactly as it was; the winner
 /// arrives as a four-block branch, and the commit's sweep deletes the
 /// demoted head.
@@ -1120,14 +1120,14 @@ fn a_switch_undoes_seed_points_as_identity() {
         assert_eq!(bc.active_snake_chain_window(), Ok((97, 102)));
         bc
     };
-    let (mut j, twin) = (joiner(), joiner());
+    let (mut j, replica) = (joiner(), joiner());
 
     // The winner: the same replay by #3, worth its real vote at #101.
     let replay = balance_block(102, b101.view().hash(), &entries, 4);
     let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
     assert!(v(&f102) > v(&seed), "the replay by #3 outranks the head");
 
-    // A forged twin: attempted, refused by the replay (I-09), restored.
+    // A forged sibling: attempted, refused by the replay (I-09), restored.
     let forged = resign(&replay, 3, vote_snapshot(1000) + 1, 1);
     assert_eq!(
         j.receive_block(forged.view(), 0).0,
@@ -1137,9 +1137,9 @@ fn a_switch_undoes_seed_points_as_identity() {
         j.blocks.find(102, &forged.view().hash()).is_none(),
         "deleted"
     );
-    assert!(j.node_info == twin.node_info);
-    assert!(j.vote_engine == twin.vote_engine);
-    assert_eq!(j.active_branch_value, twin.active_branch_value);
+    assert!(j.node_info == replica.node_info);
+    assert!(j.vote_engine == replica.vote_engine);
+    assert_eq!(j.active_branch_value, replica.active_branch_value);
 
     // The ground truth: a node that joins the new chain directly.
     let mut direct = new_w6_chain();

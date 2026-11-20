@@ -8,6 +8,24 @@ use super::*;
 /// seed-source scan (Story 6.3 AC2).
 const MAX_BALANCE_ENTRIES: usize = MAX_PAYLOAD_SIZE / NODE_INFO_SIZE;
 
+/// What an FR70 twin check found (Story 6.12 AC2, DEC-273).
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(super) enum Twin {
+    /// Another creator: an honest fork.
+    No,
+    /// The candidate block claims the active block's creator but its creator
+    /// signature is invalid under that creator's key, which every branch
+    /// through the parent shares: exact evidence against it.
+    Forged,
+    /// A twin; `verified_now` when this check verified the candidate block's
+    /// signature, for a caller that may mark it (DEC-157).
+    Yes { verified_now: bool },
+    /// A read failed, or the key was not derivable (only under pre-seed
+    /// trust, DEC-157): not evidence either way. A same-creator candidate is
+    /// never switched to in any case, so the caller holds.
+    Unknown,
+}
+
 impl<
     Crypto: CryptoTrait,
     Storage: StorageTrait,
@@ -97,6 +115,115 @@ impl<
         rank.outranks(&self.active_rank()?).then_some(head)
     }
 
+    /// FR70 (Story 6.12 AC2, DEC-273): whether `x` is a twin of the active
+    /// block `y`, two children of one retained parent. Two entries at one
+    /// sequence never share a hash (FR11), so they are twins when they have one
+    /// creator and `x`'s creator signature is valid (`y` is committed). `y`'s
+    /// creator is seeded on the prefix both blocks share, so the key the check
+    /// uses is the one every branch through the parent uses. The signature is
+    /// verified only when the creators match and bit 5 is unset; `&self`, so a
+    /// read-only query can use it (Story 10.1) and the caller marks the bit.
+    /// No state is kept: the check reads both blocks each time, one after the
+    /// other into its one read buffer (DEC-136).
+    #[inline(never)]
+    pub(super) fn twin_of(&self, x: u32, y: u32) -> Twin {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let Some(creator) = self.view_retained(y, &mut buf).map(|view| view.creator()) else {
+            return Twin::Unknown;
+        };
+        let Some(verified) = self
+            .blocks
+            .get(x)
+            .map(|entry| entry.is_signature_verified())
+        else {
+            return Twin::Unknown;
+        };
+        let Some(view) = self.view_retained(x, &mut buf) else {
+            return Twin::Unknown;
+        };
+        if view.creator() != creator {
+            return Twin::No;
+        }
+        if verified {
+            return Twin::Yes {
+                verified_now: false,
+            };
+        }
+        match self.verify_block_creator_signature(&view) {
+            Some(true) => Twin::Yes { verified_now: true },
+            Some(false) => Twin::Forged,
+            None => Twin::Unknown,
+        }
+    }
+
+    /// FR70's hold (Story 6.12 AC3, D3, DEC-273): whether the switch toward
+    /// `head` would cross a same-parent twin of the active block. The RAM
+    /// checks come first: a candidate the FR58 bound refuses is not held here
+    /// (`switch_toward` refuses it, reading nothing), and one without an active
+    /// block above the common ancestor crosses no twin. A check that could not
+    /// complete (a read, the block index, an underivable key) holds, deleting
+    /// nothing. A forged candidate block is deleted with its descendants as
+    /// exact evidence (FR16), as the switch's pre-pass would, and the candidate
+    /// drops out without a second verification or a walk. Story 6.13 lifts
+    /// the hold for a candidate carrying a verdict for its twin.
+    pub(super) fn twin_held(&mut self, head: u32) -> bool {
+        let Some(ancestor) = self.common_ancestor(head) else {
+            return false;
+        };
+        if !self.in_place_switch_allowed(ancestor) {
+            return false;
+        }
+        let Some(first) = self.blocks.get(ancestor).map(|entry| entry.sequence() + 1) else {
+            return false;
+        };
+        let (x, y) = match (
+            self.ancestor_at(head, first),
+            self.ancestor_at(self.active_chain_head_idx, first),
+        ) {
+            (Ok(Some(x)), Ok(Some(y))) => (x, y),
+            // A local index fault: no evidence, so hold.
+            (Err(_), _) | (_, Err(_)) => return true,
+            // No active block above the ancestor: no twin to cross.
+            _ => return false,
+        };
+        match self.twin_of(x, y) {
+            Twin::No => false,
+            Twin::Unknown => true,
+            Twin::Forged => {
+                // FR64 (Epic 11 `LogSink`): the deletion event, as for the
+                // pre-pass. Deferred — see deferred-work.md.
+                self.delete_offender(x, None);
+                true
+            }
+            Twin::Yes { verified_now } => {
+                if verified_now {
+                    self.blocks.mark_signature_verified(x);
+                }
+                true
+            }
+        }
+    }
+
+    /// FR22 with the FR70 hold (Story 6.12 AC3, D3, DEC-273): the head
+    /// [`Self::switch_target`] names, unless FR70 holds it; a held head drops
+    /// out of `candidates` and the next-ranked one is compared. Each round
+    /// removes a candidate, so there are at most two.
+    fn unheld_switch_target(&mut self, candidates: &mut [Option<u32>; 2]) -> Option<u32> {
+        while let Some(head) = self.switch_target(*candidates) {
+            if !self.twin_held(head) {
+                return Some(head);
+            }
+            // FR64 (Epic 11 `LogSink`): the FR70 hold, with the candidate head
+            // and the twin's `(c, s, P)`. Deferred — see deferred-work.md.
+            for candidate in candidates.iter_mut() {
+                if *candidate == Some(head) {
+                    *candidate = None;
+                }
+            }
+        }
+        None
+    }
+
     /// FR22's one comparison and the FR23 switch it may run. A switch whose
     /// restore failed leaves a chain shorter than the window and horizon that
     /// every ready-state rule assumes, so the node re-enters collecting
@@ -106,7 +233,7 @@ impl<
     pub(super) fn compare_and_switch(&mut self, candidates: [Option<u32>; 2], now: u64) {
         let mut candidates = candidates;
         for comparisons_left in [true, false] {
-            let Some(head) = self.switch_target(candidates) else {
+            let Some(head) = self.unheld_switch_target(&mut candidates) else {
                 return;
             };
             // Story 6.7 AC8: an evidence check on the walk whose projection

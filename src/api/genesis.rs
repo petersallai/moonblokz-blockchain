@@ -631,8 +631,8 @@ pub(super) fn genesis_block_zero<C: CryptoTrait>(
         consumed_votes_from_first_voted_node: 0,
         previous_hash: [0u8; 32],
         // Ignored by `BlockBuilder::build_signed`; the builder signs the
-        // full canonical block bytes with this field zero-filled, then
-        // stores the generated signature here.
+        // FR70 preimage (the header before this field, then `H(payload)`),
+        // then stores the generated signature here.
         signature: [0u8; SIGNATURE_SIZE],
     };
 
