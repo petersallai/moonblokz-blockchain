@@ -1872,3 +1872,70 @@ pub(super) fn plant_child<S: StorageTrait>(
         bc.storage.save_block(idx, block).ok().expect("save");
     }
 }
+
+// -- Story 6.12: honest (different-creator) forks ----------------------------
+
+/// Story 6.12 (FR70): `template` as `creator`'s block (signed with `[key;
+/// 32]`), worth its real FR21 value on the chain a `W = 16` genesis node
+/// reaches by receiving `path` (I-09). The node a sibling of the same creator
+/// would be a twin of has another creator here, so a fork built from it is
+/// honest and FR22 may switch to it.
+pub(super) fn real_after(path: &[&Block], template: &Block, creator: u32, key: u8) -> Block {
+    let (mut fresh, _, _) = ready_genesis(16);
+    for blk in path {
+        assert_eq!(
+            receive(&mut fresh, blk),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    real_on(&fresh, template, creator, key)
+}
+
+/// Story 6.12 (FR70): [`valued`] by `creator` (signed with `[key; 32]`): a
+/// one-transfer block with a forged value, so an honest-fork winner the
+/// replay refuses (I-09) when `creator` is seeded on its branch.
+pub(super) fn valued_by(
+    seq: u32,
+    prev: [u8; 32],
+    value: u32,
+    amount: u64,
+    creator: u32,
+    key: u8,
+) -> Block {
+    resign(&transfer(seq, prev, 0, amount), creator, value, key)
+}
+
+/// A genesis node on `W = w` over a [`FailingReadStorage`], unarmed.
+pub(super) fn failing_genesis(w: u32) -> (Chain16<FailingReadStorage>, Block) {
+    let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+    let node_zero = *crypto.public_key().serialize();
+    let storage = FailingReadStorage {
+        inner: initialized_storage([1u8; PRIVATE_KEY_SIZE]),
+        failing_slot: NONE_REF,
+        reads_left: core::cell::Cell::new(0),
+        failures_left: core::cell::Cell::new(u32::MAX),
+        attempts: core::cell::Cell::new(0),
+        reads: core::cell::Cell::new(0),
+    };
+    let mut slot = core::mem::MaybeUninit::<Chain16<FailingReadStorage>>::uninit();
+    Chain16::<FailingReadStorage>::init(&mut slot, crypto, storage, chain_config, 0, node_zero, 0);
+    // SAFETY: `init` returned, so every field of `slot` is initialized.
+    let mut bc = unsafe { slot.assume_init() };
+    let genesis = bc
+        .process_genesis(CURRENCY, window_config_builder(w).content())
+        .ok()
+        .expect("genesis");
+    (bc, genesis.block_one)
+}
+
+/// [`two_creator_chain`] on a [`FailingReadStorage`] node, unarmed.
+pub(super) fn failing_two_creator_chain() -> (Chain16<FailingReadStorage>, Block, Block, Block) {
+    let (mut bc, b1) = failing_genesis(16);
+    let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+    let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+    for blk in [&a2, &a3] {
+        assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+    }
+    (bc, b1, a2, a3)
+}

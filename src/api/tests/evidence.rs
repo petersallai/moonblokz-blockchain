@@ -1032,7 +1032,8 @@ fn alternative_evidence(d: &Block, e: &Block, members: &[u32]) -> Block {
     })
 }
 
-/// A block by node 1 on `e_alt`, which a node holding `d`, `e_alt` builds.
+/// A block by node 1 on `e_alt`, which a node holding `d`, `e_alt` builds
+/// (any deviation and its evidence).
 fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     let (mut g, _, _) = support_chain(2);
     for block in [d, e_alt] {
@@ -1045,13 +1046,17 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     normal_after(&g, e_alt, 1, 81)
 }
 
-/// AC5 / AC6 / AC9 / AC4 — a switch over evidence on both branches: the
-/// active `d, e` and the heavier `d, e', x8` (another valid evidence of
-/// the same deviation, one block above it). The walk undoes `e` (the run
-/// reopens at `d`: the exact inverse), applies `e'` (verified once, the
-/// FR23 cross-check holds), and every value is exact.
+/// Story 6.12 (FR70, DEC-273) — a second valid evidence of one deviation
+/// is a twin: `e` and `e'` are the proposer's two children of `d` (FR16
+/// admits only its blocks above `d`). FR21 ranks the twin branch above the
+/// active one at `e'` or at `x8` (which, depends on the scheme's hashes and
+/// sizes; the pre-6.12 test switched under every scheme); it is held both
+/// times, the node stays on the evidence it adopted first, `e'` is never
+/// judged (no aggregate verification), and the values are exact. An honest proposer
+/// never builds it (`holds_own_evidence`); Story 6.13's verdict lifts the
+/// hold.
 #[test]
-fn a_switch_judges_the_evidence_of_the_new_branch() {
+fn a_second_evidence_of_one_deviation_is_a_held_twin() {
     let (d, e, members) = evidence_by(2);
     let e_alt = alternative_evidence(&d, &e, &members);
     let x8 = child_of_alternative(&d, &e_alt);
@@ -1059,21 +1064,63 @@ fn a_switch_judges_the_evidence_of_the_new_branch() {
     assert_eq!(built.serialized_bytes(), e.serialized_bytes());
     assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
     let verified = counted(&AGGREGATE_VERIFICATIONS);
-    for block in [&e_alt, &x8] {
+    assert_eq!(
+        receive(&mut g, &e_alt),
+        ReceiveBlockOutcome::AcceptedSilently
+    );
+    let alt_i = g.blocks.find(7, &e_alt.view().hash()).expect("held");
+    let ranked_alt = g.switch_target([Some(alt_i), None]).is_some();
+    assert_eq!(head_of(&g), (7, e.view().hash()), "held");
+    assert_eq!(receive(&mut g, &x8), ReceiveBlockOutcome::AcceptedSilently);
+    let x8i = g.blocks.find(8, &x8.view().hash()).expect("held");
+    let ranked_x8 = g.switch_target([Some(x8i), None]).is_some();
+    assert!(
+        ranked_alt || ranked_x8,
+        "FR21 ranks the twin branch first at one admission"
+    );
+    assert_eq!(head_of(&g), (7, e.view().hash()), "still held");
+    assert!(entry_of(&g, &e).expect("held").1);
+    assert_eq!(
+        entry_of(&g, &e_alt).map(|entry| (entry.0, entry.1)),
+        Some((BlockStatus::Connected, false))
+    );
+    assert_eq!(
+        counted(&AGGREGATE_VERIFICATIONS) - verified,
+        0,
+        "e' is never judged"
+    );
+    assert_eq!(g.active_branch_value, window_value(&g));
+}
+
+/// AC5 / AC6 / AC9 / AC4 — a switch over evidence on both branches, an
+/// honest fork (Story 6.12): the active `d2, e2` (proposer 2) and the
+/// heavier `d4, e4, x8` (proposer 4's deviation at the same #6, another
+/// creator). The walk undoes `e2` and `d2` (exact inverses), applies `e4`
+/// (verified once, the FR23 cross-check holds), and every value is exact.
+#[test]
+fn a_switch_judges_the_evidence_of_the_new_branch() {
+    let (d4, e4, _) = evidence_by(4);
+    let x8 = child_of_alternative(&d4, &e4);
+    let (mut g, d2, e2) = evidence_observer(2);
+    assert_eq!(receive(&mut g, &e2), ReceiveBlockOutcome::AcceptedSilently);
+    assert_eq!(head_of(&g), (7, e2.view().hash()));
+    let verified = counted(&AGGREGATE_VERIFICATIONS);
+    for block in [&d4, &e4, &x8] {
         assert_eq!(
             receive(&mut g, block),
             ReceiveBlockOutcome::AcceptedSilently
         );
     }
     assert_eq!(head_of(&g), (8, x8.view().hash()), "switched");
-    assert!(entry_of(&g, &e_alt).expect("held").1);
-    assert!(!entry_of(&g, &e).expect("held").1);
+    assert!(entry_of(&g, &e4).expect("held").1);
+    assert!(!entry_of(&g, &e2).expect("held").1);
+    assert!(!entry_of(&g, &d2).expect("held").1);
     assert_eq!(
         counted(&AGGREGATE_VERIFICATIONS) - verified,
         1,
-        "e' once, on the walk"
+        "e4 once, on the walk"
     );
-    assert!(entry_of(&g, &e_alt).expect("held").2);
+    assert!(entry_of(&g, &e4).expect("held").2);
     assert_eq!(g.active_open_run, NO_OPEN_RUN);
     assert_eq!(g.active_branch_value, window_value(&g));
 }
