@@ -828,8 +828,9 @@ impl<
     /// key is not yet derivable (pre-seed zone → the block is trusted, not
     /// re-proved). Node #0 resolves to the FR69 trust anchor
     /// (`node_zero_public_key`), available from construction.
-    // Its own frame (stack budget, DEC-136): the payload hash and the crypto
-    // call are live only here, never alongside a read buffer.
+    // Its own frame (stack budget, DEC-136): it holds the payload hash and the
+    // 90-byte preimage, no block copy; the caller's read buffer, which the
+    // view borrows, stays live in the caller's frame.
     #[inline(never)]
     pub(super) fn verify_block_creator_signature(&self, view: &BlockView) -> Option<bool> {
         #[cfg(test)]
