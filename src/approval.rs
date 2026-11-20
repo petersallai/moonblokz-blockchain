@@ -805,6 +805,9 @@ pub(crate) mod test_seams {
         /// Transaction-signature verifications on this test thread (Story 6.7
         /// AC6: a restore verifies no transaction signature again).
         pub(crate) static TX_SIGNATURE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
+        /// Block-creator signature verifications on this test thread (Story
+        /// 6.10: a block #0 refused by the single-genesis guard costs none).
+        pub(crate) static BLOCK_SIGNATURE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
     }
 
     /// The evidence payload room under this thread's cap.

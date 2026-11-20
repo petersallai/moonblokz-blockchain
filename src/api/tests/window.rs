@@ -526,7 +526,7 @@ fn snake_drive_past_w() {
 #[test]
 fn snake_ready_entry_reclaims_a_genesis_island() {
     let mut bc = new_w6_chain();
-    let genesis = node_transfer_block(0, 3, 0, 7);
+    let genesis = genesis_zero_block(1_037);
     let (outcome, _) = bc.receive_block(genesis.view(), 0);
     assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
     let gi = slot_of(&bc, 0, &genesis.view().hash()).expect("genesis stored");
@@ -662,7 +662,7 @@ fn snake_reset_sites_clear_the_tail() {
     // Tier-1 genesis anchor (Collecting).
     let mut bc = new_test_chain();
     bc.snake_chain_tail_idx = 3;
-    let genesis = node_transfer_block(0, 3, 0, 7);
+    let genesis = genesis_zero_block(1_037);
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");

@@ -196,11 +196,15 @@ pub(crate) enum Tier1Failure {
     /// — admitting it would either reseat the anchor (the Story-4.4 defect) or
     /// create a perpetual-recovery `sequence == 0` Stored orphan. Produced in
     /// `Blockchain::tier1_admit` (it needs `active_chain_head_idx`, so it cannot
-    /// live in the state-free `tier1_gate`). NOTE: this enforces single-*anchor*
-    /// structurally, not *authenticity* — the genesis block-creator signature is
-    /// not yet Tier-1-verified (FR69, later epic), so a forged first-arriving
-    /// seq-0 would anchor until that check lands.
+    /// live in the state-free `tier1_gate`). Authenticity is the next check in
+    /// `tier1_admit`: the first block #0's creator signature against the trust
+    /// anchor (DEC-270, Story 6.10).
     DuplicateGenesis,
+    /// FR54 / DEC-269 (Story 6.10): a `sequence == 0` block that is not exactly
+    /// the fixed block #0 description ([`is_genesis_zero_shape`]), or a
+    /// registration of `new_node_id == 0` in a block at any other sequence —
+    /// node #0 is registered only by block #0. Exact evidence in every phase.
+    GenesisShape,
     /// FR16 / FR27 (Story 6.7 AC4, D4): a block whose parent is held — outside
     /// Ready, or a Stored parent in Ready — breaks a rule of the open deviation
     /// run below it (another creator, a non-override header, a misplaced
@@ -300,20 +304,18 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
         return Err(Tier1Failure::VoteHeaderForm);
     }
 
-    // FR54 exception (i)+(c): block #0 waives the no-self-vote and the
-    // `sequence > anchor_sequence` rules (the genesis self-transfer legitimately
-    // has anchor_sequence == 0 and votes for node #0). Story 4.2 implements only
-    // the two waivers needed so a legitimately-received genesis block is not
-    // falsely rejected here.
-    //
-    // **Still deferred after Story 5.9:** the *full* FR54 bootstrap exception
-    // set is gated on a sequence-AND-content-match conjunction (block #1 must be
-    // the chain-config block whose content the chain committed to), and this gate
-    // is only sequence-gated. Story 5.9 deliberately does not close it: the
-    // conjunction's content half is a *candidate*-relative fact, while Tier 1 is
-    // state-free, so the check belongs where the candidate is known (FR6, the
-    // processing pass) rather than here. Recorded in `deferred-work.md`.
+    // FR54 (DEC-269): the bootstrap exceptions need sequence **and** content.
+    // Block #0's content is fixed and readable from its bytes plus the trust
+    // anchor, so a sequence-0 block that is not exactly that description is
+    // refused here, in every phase, before anything is written. Every block in
+    // the tree therefore satisfies `sequence == 0 ⇒ genesis shape`, and the
+    // waivers below and the per-block step's genesis branches stay keyed on the
+    // sequence alone. Block #1's content half (the configuration the chain
+    // commits to) is candidate-relative and is judged by the per-block step.
     let is_genesis_block_zero = block.sequence() == 0;
+    if is_genesis_block_zero && !is_genesis_zero_shape(block) {
+        return Err(Tier1Failure::GenesisShape);
+    }
 
     match block.payload_type() {
         PAYLOAD_TYPE_TRANSACTION => {
@@ -391,6 +393,11 @@ fn tier1_transaction_block<C: CryptoTrait>(
             check_no_self_vote(nt.initializer(), vote, is_genesis_block_zero)?;
         } else if let Some(reg) = tx.as_registration() {
             has_registration = true;
+            // DEC-269: node #0 is registered only by block #0 (FR54 (h), and
+            // FR6's `watermark + 1` makes id 0 unreachable afterwards).
+            if reg.new_node_id() == NODE_ZERO_ID && !is_genesis_block_zero {
+                return Err(Tier1Failure::GenesisShape);
+            }
             check_no_self_vote(reg.initializer(), vote, is_genesis_block_zero)?;
             // FR69 (i): node-#0 registration must carry the trust-anchor key.
             if reg.new_node_id() == NODE_ZERO_ID
@@ -576,6 +583,49 @@ pub(crate) fn tier1_chain_config_block<C: CryptoTrait>(
         return Err(Tier1Failure::ChainConfigContentSignatureInvalid);
     }
     Ok(())
+}
+
+/// FR54's fixed block #0 description (DEC-269), from the block bytes alone:
+/// all-zeros `previous_hash`, creator 0, zero `mined_amount` and vote-header
+/// fields, a transaction payload of exactly the node #0 registration (vote,
+/// initializer, `new_node_id`, price and fee 0) then the node #0 self-transfer
+/// (vote, anchor, initializer, receiver, fee and comment 0, any amount). The
+/// registration's key is the trust anchor and its proof of possession holds —
+/// both checked by [`tier1_transaction_block`] (FR69 (i), DEC-248). This is the
+/// layout `api::genesis::genesis_block_zero` builds. Called after the header
+/// vote form, which already forces `consumed_votes_from_first_voted_node` to 0
+/// once `first_voted_node == creator`; a transaction count that disagrees with
+/// the two transactions read here is `MalformedPayload` in the same gate.
+fn is_genesis_zero_shape(block: &BlockView) -> bool {
+    let header_holds = block.previous_hash().iter().all(|byte| *byte == 0)
+        && block.creator() == NODE_ZERO_ID
+        && block.mined_amount() == 0
+        && block.first_voted_node() == NODE_ZERO_ID
+        && block.consumed_votes() == 0
+        && block.payload_type() == PAYLOAD_TYPE_TRANSACTION;
+    let Some(payload) = block.transactions().filter(|_| header_holds) else {
+        return false;
+    };
+    let mut txs = payload.iter();
+    let (Some(first), Some(second), None) = (txs.next(), txs.next(), txs.next()) else {
+        return false;
+    };
+    let registration_holds = first.vote() == NODE_ZERO_ID
+        && first.as_registration().is_some_and(|reg| {
+            reg.initializer() == NODE_ZERO_ID
+                && reg.new_node_id() == NODE_ZERO_ID
+                && reg.registration_price() == 0
+                && reg.fee() == 0
+        });
+    let transfer_holds = second.vote() == NODE_ZERO_ID
+        && second.as_node_transfer().is_some_and(|nt| {
+            nt.anchor_sequence() == 0
+                && nt.initializer() == NODE_ZERO_ID
+                && nt.receiver() == NODE_ZERO_ID
+                && nt.fee() == 0
+                && nt.comment() == 0
+        });
+    registration_holds && transfer_holds
 }
 
 /// FR6 no-self-vote (exact semantics): a transaction's `initializer` must not
@@ -1079,18 +1129,216 @@ mod tests {
 
     #[test]
     fn tier1_block_zero_waives_self_vote_and_anchor() {
-        // FR54 exception (i)+(c): block #0 waives no-self-vote and the anchor
-        // monotonicity rule (genesis self-transfer: initializer==vote, anchor==0==seq).
+        // FR54 exception (i)+(c): block #0 waives the anchor monotonicity rule
+        // (its self-transfer has anchor_sequence 0 == sequence 0) and the
+        // no-self-vote rule — for the fixed block #0 only (DEC-269).
         let c = crypto(1);
-        let block = node_transfer_block(0, 7, 0, 7, &c);
+        let block = mutated_genesis_zero_block(&c, 1_000, GenesisMutation::None);
         assert_eq!(
             tier1_gate(
                 &block.view(),
-                &pubkey_bytes(&crypto(2)),
+                &pubkey_bytes(&c),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
                 &c
             ),
+            Ok(())
+        );
+        // The same waivers do not follow from the sequence alone: a sequence-0
+        // block that is not the fixed description is exact evidence.
+        let forged = node_transfer_block(0, 7, 0, 7, &c);
+        assert_eq!(
+            tier1_gate(
+                &forged.view(),
+                &pubkey_bytes(&c),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
+            Err(Tier1Failure::GenesisShape)
+        );
+    }
+
+    /// One field of the canonical block #0 changed, for the DEC-269 shape tests.
+    #[derive(Clone, Copy, Debug)]
+    enum GenesisMutation {
+        None,
+        PreviousHash,
+        Creator,
+        MinedAmount,
+        FirstVotedNode,
+        ConsumedVotes,
+        RegistrationOnly,
+        ExtraTransfer,
+        Swapped,
+        RegInitializer,
+        RegNodeId,
+        RegVote,
+        RegPrice,
+        RegFee,
+        TransferInitializer,
+        TransferReceiver,
+        TransferVote,
+        TransferAnchor,
+        TransferFee,
+        TransferComment,
+    }
+
+    /// The fixed block #0 (`api::genesis::genesis_block_zero`'s layout),
+    /// signed by `signer`, whose key is also the registered one, with `m`
+    /// applied. Re-signed after the change, so a refusal is the shape's.
+    fn mutated_genesis_zero_block(signer: &Crypto, amount: u64, m: GenesisMutation) -> Block {
+        use GenesisMutation as M;
+        let pk = pubkey_bytes(signer);
+        let pick = |hit: bool, value: u32| if hit { value } else { 0 };
+        let reg = Registration::new_signed(
+            pick(matches!(m, M::RegVote), 3),
+            pick(matches!(m, M::RegInitializer), 1),
+            pick(matches!(m, M::RegNodeId), 1),
+            u64::from(pick(matches!(m, M::RegPrice), 5)),
+            u64::from(pick(matches!(m, M::RegFee), 1)),
+            &pk,
+            signer,
+        );
+        let transfer = NodeTransfer::new_signed(
+            pick(matches!(m, M::TransferVote), 3),
+            pick(matches!(m, M::TransferAnchor), 1),
+            pick(matches!(m, M::TransferInitializer), 1),
+            pick(matches!(m, M::TransferReceiver), 1),
+            amount,
+            pick(matches!(m, M::TransferFee), 1),
+            u64::from(pick(matches!(m, M::TransferComment), 1)),
+            signer,
+        );
+        let mut h = header(0, PAYLOAD_TYPE_TRANSACTION);
+        h.previous_hash[31] = u8::from(matches!(m, M::PreviousHash));
+        h.creator = pick(matches!(m, M::Creator), 1);
+        h.mined_amount = pick(matches!(m, M::MinedAmount), 1);
+        h.first_voted_node = pick(matches!(m, M::FirstVotedNode), 1);
+        // With `first_voted_node == creator` the Tier 1 vote form (DEC-157)
+        // leaves `consumed_votes` free, so this field changes alone.
+        h.consumed_votes = pick(matches!(m, M::ConsumedVotes), 1);
+        let mut b = BlockBuilder::new().header(h);
+        let add_reg = |b: &mut BlockBuilder| {
+            b.add_registration(&reg).ok().expect("add registration");
+        };
+        let add_transfer = |b: &mut BlockBuilder| {
+            b.add_node_transfer(&transfer).ok().expect("add transfer");
+        };
+        match m {
+            M::Swapped => {
+                add_transfer(&mut b);
+                add_reg(&mut b);
+            }
+            M::RegistrationOnly => add_reg(&mut b),
+            M::ExtraTransfer => {
+                add_reg(&mut b);
+                add_transfer(&mut b);
+                add_transfer(&mut b);
+            }
+            _ => {
+                add_reg(&mut b);
+                add_transfer(&mut b);
+            }
+        }
+        b.build_signed(signer).ok().expect("build signed")
+    }
+
+    #[test]
+    fn tier1_genesis_zero_shape_accepts_any_amount() {
+        // DEC-269: the amount defines the chain's initial currency; it is not
+        // compared with anything.
+        let c = crypto(1);
+        for amount in [0, 1, u64::MAX] {
+            let block = mutated_genesis_zero_block(&c, amount, GenesisMutation::None);
+            assert_eq!(
+                tier1_gate(
+                    &block.view(),
+                    &pubkey_bytes(&c),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &c
+                ),
+                Ok(()),
+                "amount {amount}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_rejects_every_genesis_zero_shape_deviation() {
+        // DEC-269: each field of the fixed description, changed alone.
+        use GenesisMutation as M;
+        let c = crypto(1);
+        for m in [
+            M::PreviousHash,
+            M::Creator,
+            M::MinedAmount,
+            M::FirstVotedNode,
+            M::ConsumedVotes,
+            M::RegistrationOnly,
+            M::ExtraTransfer,
+            M::Swapped,
+            M::RegInitializer,
+            M::RegNodeId,
+            M::RegVote,
+            M::RegPrice,
+            M::RegFee,
+            M::TransferInitializer,
+            M::TransferReceiver,
+            M::TransferVote,
+            M::TransferAnchor,
+            M::TransferFee,
+            M::TransferComment,
+        ] {
+            let block = mutated_genesis_zero_block(&c, 1_000, m);
+            assert_eq!(
+                tier1_gate(
+                    &block.view(),
+                    &pubkey_bytes(&c),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &c
+                ),
+                Err(Tier1Failure::GenesisShape),
+                "{m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_rejects_a_sequence_zero_block_of_another_payload_type() {
+        // DEC-269: block #0 is a transaction block; a node-#0-signed chain-config
+        // block at sequence 0 is not the fixed description.
+        let c = crypto(1);
+        let block = chain_config_block(0, &[1, 2, 3], &c);
+        assert_eq!(
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&c),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
+            Err(Tier1Failure::GenesisShape)
+        );
+    }
+
+    #[test]
+    fn tier1_rejects_a_node_zero_registration_outside_block_zero() {
+        // DEC-269 converse binding: node #0 is registered only by block #0, so
+        // the anchor-keyed registration of id 0 at sequence 5 is exact evidence;
+        // the same registration of id 1 is not.
+        let a = crypto(1);
+        let pk_a = pubkey_bytes(&a);
+        let block = registration_block(5, 0, &pk_a, &a);
+        assert_eq!(
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            Err(Tier1Failure::GenesisShape)
+        );
+        let block = registration_block(5, 1, &pk_a, &a);
+        assert_eq!(
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
             Ok(())
         );
     }
@@ -1172,8 +1420,8 @@ mod tests {
     fn tier1_accepts_valid_registration() {
         let a = crypto(1);
         let pk_a = pubkey_bytes(&a);
-        // new_node_id == 0 → FR69 (i) requires new_public_key == node_zero. Pass pk_a as both.
-        let block = registration_block(5, 0, &pk_a, &a);
+        // A registration of node 6 with a key whose proof of possession holds.
+        let block = registration_block(5, 6, &pk_a, &a);
         assert_eq!(
             tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
             Ok(())
@@ -1183,9 +1431,11 @@ mod tests {
     #[test]
     fn tier1_rejects_node_zero_registration_key_mismatch() {
         // FR69 (i): new_node_id == 0 but new_public_key != node_zero_public_key.
+        // Node #0 registers only in block #0 (DEC-269), so the check is reached
+        // in a block #0 of the fixed shape that registers another key.
         let a = crypto(1);
         let b = crypto(2);
-        let block = registration_block(5, 0, &pubkey_bytes(&a), &a);
+        let block = mutated_genesis_zero_block(&a, 1_000, GenesisMutation::None);
         assert_eq!(
             tier1_gate(
                 &block.view(),

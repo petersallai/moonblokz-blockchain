@@ -382,60 +382,13 @@ impl<
             .load_tentative(chain_config_payload)
             .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
 
-        // Assemble signed Block #0: registration of node #0 + a self-transfer
-        // of the initial total network currency.
-        let registration = Registration::new_signed(
-            0, // vote
-            0, // initializer (node #0)
-            0, // new_node_id (node #0)
-            0, // registration_price
-            0, // fee
+        // Block #0: the FR54 fixed description (DEC-269), from the one builder
+        // whose output the Tier 1 genesis-shape check is pinned against.
+        let block_0 = genesis_block_zero(
+            &self.crypto,
             &node_zero_public_key,
-            &self.crypto,
-        );
-        let self_transfer = NodeTransfer::new_signed(
-            0, // vote
-            0, // anchor_sequence
-            0, // initializer (node #0)
-            0, // receiver (self)
             initial_total_network_currency,
-            0, // fee
-            0, // comment
-            &self.crypto,
         );
-
-        let block_0_header = BlockHeader {
-            version: 1,
-            sequence: 0,
-            creator: 0,
-            mined_amount: 0,
-            payload_type: PAYLOAD_TYPE_TRANSACTION,
-            consumed_votes: 0,
-            first_voted_node: 0,
-            consumed_votes_from_first_voted_node: 0,
-            previous_hash: [0u8; 32],
-            // Ignored by `BlockBuilder::build_signed`; the builder signs the
-            // full canonical block bytes with this field zero-filled, then
-            // stores the generated signature here.
-            signature: [0u8; SIGNATURE_SIZE],
-        };
-
-        // The chain-types builder errors only on payload-type mismatch or
-        // capacity overflow — neither applies to these fixed-size bootstrap
-        // payloads. The walking-skeleton uses `unreachable!` to make the
-        // invariant explicit; Story 5.6+ may surface BlockError through a
-        // new GenesisRejectReason variant when the assembly grows.
-        let mut builder = BlockBuilder::new().header(block_0_header);
-        if builder.add_registration(&registration).is_err() {
-            unreachable!("Block #0 registration is fixed-size and cannot overflow payload");
-        }
-        if builder.add_node_transfer(&self_transfer).is_err() {
-            unreachable!("Block #0 self-transfer is fixed-size and cannot overflow payload");
-        }
-        let block_0 = match builder.build_signed(&self.crypto) {
-            Ok(b) => b,
-            Err(_) => unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
-        };
 
         // Assemble signed Block #1: the chain-config block, chained to Block #0.
         let block_1_header = BlockHeader {
@@ -631,5 +584,72 @@ impl<
     /// not-ready indication.
     pub(crate) fn is_ready(&self) -> bool {
         self.lifecycle_phase == LifecyclePhase::Ready
+    }
+}
+
+/// Block #0 exactly as FR54 fixes it (DEC-269): node #0's registration
+/// (`new_node_id` 0, key `node_zero_public_key`), then node #0's self-transfer
+/// of `initial_total_network_currency`; creator 0, every other header and
+/// transaction field 0, all-zeros `previous_hash`. `process_genesis` builds its
+/// block #0 here, and the Tier 1 genesis-shape check
+/// (`staged_validation::is_genesis_zero_shape`) accepts exactly this layout with
+/// any amount. The order is load-bearing: the registration seeds node #0, so
+/// the self-transfer then credits it the amount.
+pub(super) fn genesis_block_zero<C: CryptoTrait>(
+    crypto: &C,
+    node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
+    initial_total_network_currency: u64,
+) -> Block {
+    let registration = Registration::new_signed(
+        0, // vote
+        0, // initializer (node #0)
+        0, // new_node_id (node #0)
+        0, // registration_price
+        0, // fee
+        node_zero_public_key,
+        crypto,
+    );
+    let self_transfer = NodeTransfer::new_signed(
+        0, // vote
+        0, // anchor_sequence
+        0, // initializer (node #0)
+        0, // receiver (self)
+        initial_total_network_currency,
+        0, // fee
+        0, // comment
+        crypto,
+    );
+
+    let block_0_header = BlockHeader {
+        version: 1,
+        sequence: 0,
+        creator: 0,
+        mined_amount: 0,
+        payload_type: PAYLOAD_TYPE_TRANSACTION,
+        consumed_votes: 0,
+        first_voted_node: 0,
+        consumed_votes_from_first_voted_node: 0,
+        previous_hash: [0u8; 32],
+        // Ignored by `BlockBuilder::build_signed`; the builder signs the
+        // full canonical block bytes with this field zero-filled, then
+        // stores the generated signature here.
+        signature: [0u8; SIGNATURE_SIZE],
+    };
+
+    // The chain-types builder errors only on payload-type mismatch or
+    // capacity overflow — neither applies to these fixed-size bootstrap
+    // payloads. The walking-skeleton uses `unreachable!` to make the
+    // invariant explicit; Story 5.6+ may surface BlockError through a
+    // new GenesisRejectReason variant when the assembly grows.
+    let mut builder = BlockBuilder::new().header(block_0_header);
+    if builder.add_registration(&registration).is_err() {
+        unreachable!("Block #0 registration is fixed-size and cannot overflow payload");
+    }
+    if builder.add_node_transfer(&self_transfer).is_err() {
+        unreachable!("Block #0 self-transfer is fixed-size and cannot overflow payload");
+    }
+    match builder.build_signed(crypto) {
+        Ok(b) => b,
+        Err(_) => unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
     }
 }

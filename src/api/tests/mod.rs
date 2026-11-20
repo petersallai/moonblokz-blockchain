@@ -19,7 +19,9 @@ use crate::snake_chain::{TailBinding, TailObligation, tail_drop_binding};
 use crate::approval::node_value;
 use crate::approval::test_seams::set_grace_admits;
 
-use crate::approval::test_seams::{SUBGROUP_EVALS, VERIFICATIONS, counted};
+use crate::approval::test_seams::{
+    BLOCK_SIGNATURE_VERIFICATIONS, SUBGROUP_EVALS, VERIFICATIONS, counted,
+};
 use moonblokz_crypto::{AGGREGATED_SIGNATURE_CONSTANT_SIZE, AGGREGATED_SIGNATURE_VARIABLE_SIZE};
 
 use crate::approval::test_seams::{AGGREGATE_VERIFICATIONS, TX_SIGNATURE_VERIFICATIONS};

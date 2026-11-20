@@ -116,10 +116,10 @@ impl<
     ) -> Result<BlockDerivation, ProcessingError> {
         let seq = view.sequence();
         // FR54 genesis exceptions: block #0 waives no-self-vote / anchor /
-        // watermark-`+1` and mints currency (FR54(d)); blocks #0/#1 are
-        // FR36-exempt.
-        let is_genesis_zero = seq == 0;
-        let is_genesis = is_genesis_zero || seq == 1;
+        // watermark-`+1` and mints currency (FR54(d)); the genesis blocks are
+        // FR36-exempt. Block #0's are keyed on the sequence: every block #0 in
+        // the tree has the fixed shape (`tier1_gate`, DEC-269).
+        let is_genesis = is_fr36_exempt(view);
         let invalid = |reason| ProcessingError::Invalid {
             block_idx: idx,
             reason,
@@ -147,8 +147,9 @@ impl<
         self.check_run_rules(view, idx, projection)?;
         // (c) block-creator signature. Skipped when the creator's key is not
         //     yet derivable (pre-seed zone → trusted); node #0 always resolves
-        //     to the FR69 trust anchor. In a complete projection a non-derivable
-        //     creator past block #0 is exact evidence of invalidity (D3).
+        //     to the FR69 trust anchor, and block #0's creator is node #0 (its
+        //     Tier 1 shape). In a complete projection a non-derivable creator is
+        //     exact evidence of invalidity (D3).
         //     A block whose signature already verified against its own
         //     ancestry key is not verified again (Story 6.2 D6, DEC-157).
         if !self
@@ -161,7 +162,7 @@ impl<
                 Some(true) => {
                     self.blocks.mark_signature_verified(idx);
                 }
-                None if projection.complete && !is_genesis_zero => {
+                None if projection.complete => {
                     return Err(invalid(ValidationReason::UnseededActor));
                 }
                 None => {}
@@ -378,8 +379,7 @@ impl<
             self.invert_transactions(view, idx, usize::MAX);
             return Err(ProcessingError::Vote(e));
         }
-        let seq = view.sequence();
-        if seq > 1 && self.node_info.is_seeded(view.creator()) {
+        if !is_fr36_exempt(view) && self.node_info.is_seeded(view.creator()) {
             self.node_info.credit(
                 view.creator(),
                 view.mined_amount() as u64 + derivation.total_fees,
@@ -436,9 +436,13 @@ impl<
             }
             // State-dependent FR6 checks apply once the initializer is
             // derivable. The intrinsic invariants (no-self-vote,
-            // anchor-before-block) are owned by the Tier-1 gate.
-            if !is_genesis_zero && self.node_info.is_seeded(init) {
-                self.check_vote_target(vote).map_err(&invalid)?;
+            // anchor-before-block) are owned by the Tier-1 gate. Block #0's
+            // self-transfer is signature-checked too (DEC-271): its
+            // registration has just seeded node #0 with the anchor key.
+            if self.node_info.is_seeded(init) {
+                if !is_genesis_zero {
+                    self.check_vote_target(vote).map_err(&invalid)?;
+                }
                 if !self.signatures_accepted(idx) && !self.verify_tx_signature(tx.as_bytes(), init)
                 {
                     return Err(invalid(ValidationReason::TransactionSignatureInvalid));
@@ -515,15 +519,19 @@ impl<
                 }
                 if debits {
                     self.check_vote_target(vote).map_err(&invalid)?;
-                    if !self.signatures_accepted(idx)
-                        && !self.verify_tx_signature(tx.as_bytes(), init)
-                    {
-                        return Err(invalid(ValidationReason::TransactionSignatureInvalid));
-                    }
-                    if self.node_info.balance_of(init) < debit {
-                        return Err(invalid(ValidationReason::InsufficientBalance));
-                    }
                 }
+            }
+            // The initializer's signature, once its key is derivable — or, for
+            // block #0's registration, node #0's key, the trust anchor, before
+            // that registration seeds it (DEC-271).
+            if (debits || is_genesis_zero)
+                && !self.signatures_accepted(idx)
+                && !self.verify_tx_signature(tx.as_bytes(), init)
+            {
+                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+            }
+            if debits && self.node_info.balance_of(init) < debit {
+                return Err(invalid(ValidationReason::InsufficientBalance));
             }
             // [E] FR6 registration uniqueness, against the seeded roster —
             // earlier registrations of this block included.
@@ -824,6 +832,10 @@ impl<
     // here, never alongside the UTXO resolver's read buffer.
     #[inline(never)]
     pub(super) fn verify_block_creator_signature(&self, view: &BlockView) -> Option<bool> {
+        #[cfg(test)]
+        crate::approval::test_seams::count(
+            &crate::approval::test_seams::BLOCK_SIGNATURE_VERIFICATIONS,
+        );
         let creator = view.creator();
         let key: [u8; PUBLIC_KEY_SIZE] = if creator == 0 {
             self.node_zero_public_key
@@ -893,10 +905,16 @@ impl<
         crate::approval::test_seams::count(
             &crate::approval::test_seams::TX_SIGNATURE_VERIFICATIONS,
         );
-        let Some(key) = self.node_info.public_key_of(signer_node_id) else {
-            return false;
+        // Node #0's key is the FR69 trust anchor, also before block #0's
+        // registration has seeded it (DEC-271).
+        let key = if signer_node_id == 0 {
+            self.node_zero_public_key
+        } else {
+            let Some(key) = self.node_info.public_key_of(signer_node_id) else {
+                return false;
+            };
+            *key
         };
-        let key = *key;
         let len = tx_bytes.len();
         if !(SIGNATURE_SIZE..=REGISTRATION_SIZE).contains(&len) {
             return false;
@@ -1020,4 +1038,14 @@ impl<
             .ok_or(UtxoSpendError::StorageRead)?;
         Ok(utxo_output_at(&view, output_index))
     }
+}
+
+/// FR36's genesis exception (FR54 (e)): block #0, and block #1 when it is the
+/// chain-config block (DEC-269: sequence **and** content; the configuration
+/// content itself is judged by the per-block step for every chain-config
+/// block). No creator credit, no credit-overflow check. Shared by the forward
+/// step and the chain-switch inverse so the two cannot drift.
+pub(super) fn is_fr36_exempt(view: &BlockView) -> bool {
+    view.sequence() == 0
+        || (view.sequence() == 1 && view.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG)
 }

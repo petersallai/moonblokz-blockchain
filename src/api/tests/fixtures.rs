@@ -51,6 +51,62 @@ pub(super) fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer:
     builder.build_signed(&signer).ok().expect("build signed")
 }
 
+/// Block #0 of the fixed FR54 shape (DEC-269), built by the same builder as
+/// `process_genesis` and signed by the universal test key — the test chains'
+/// trust anchor — carrying `amount`. Distinct amounts give distinct blocks #0.
+pub(super) fn genesis_zero_block(amount: u64) -> Block {
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    let anchor = *signer.public_key().serialize();
+    crate::api::genesis::genesis_block_zero(&signer, &anchor, amount)
+}
+
+/// A block #0 assembled from its parts, for the Story 6.10 intake and pass
+/// tests that need one field changed: the two transactions in the fixed
+/// order, under a canonical header with `previous_hash` = `prev`, signed by
+/// `block_signer`.
+pub(super) fn block_zero_from(
+    registration: &Registration,
+    transfer: &NodeTransfer,
+    prev: [u8; 32],
+    block_signer: &Crypto,
+) -> Block {
+    let header = BlockHeader {
+        version: 1,
+        sequence: 0,
+        creator: 0,
+        mined_amount: 0,
+        payload_type: PAYLOAD_TYPE_TRANSACTION,
+        consumed_votes: 0,
+        first_voted_node: 0,
+        consumed_votes_from_first_voted_node: 0,
+        previous_hash: prev,
+        signature: [0u8; SIGNATURE_SIZE],
+    };
+    let mut builder = BlockBuilder::new().header(header);
+    builder
+        .add_registration(registration)
+        .ok()
+        .expect("add registration");
+    builder
+        .add_node_transfer(transfer)
+        .ok()
+        .expect("add transfer");
+    builder
+        .build_signed(block_signer)
+        .ok()
+        .expect("build signed")
+}
+
+/// The test anchor's own block #0 transactions: node #0's registration and a
+/// self-transfer of `amount`, both signed by the universal test key.
+pub(super) fn genesis_zero_transactions(amount: u64) -> (Crypto, Registration, NodeTransfer) {
+    let anchor = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    let anchor_pk = *anchor.public_key().serialize();
+    let registration = Registration::new_signed(0, 0, 0, 0, 0, &anchor_pk, &anchor);
+    let transfer = NodeTransfer::new_signed(0, 0, 0, 0, amount, 0, 0, &anchor);
+    (anchor, registration, transfer)
+}
+
 /// A transfer block whose `previous_hash` is set to `prev` (so it can extend
 /// a specific parent). `node_transfer_block` zero-fills `previous_hash`, which
 /// makes an orphan (Stored head); this helper links a child to its parent.
