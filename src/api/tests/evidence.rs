@@ -1050,8 +1050,8 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
 /// is a twin: `e` and `e'` are the proposer's two children of `d` (FR16
 /// admits only its blocks above `d`). FR21 ranks the twin branch above the
 /// active one at `e'` or at `x8` (which, depends on the scheme's hashes and
-/// sizes; the pre-6.12 test switched under every scheme); it is held both
-/// times, the node stays on the evidence it adopted first, `e'` is never
+/// sizes; the pre-6.12 test switched under every scheme); it is held
+/// wherever it is compared, the node stays on the evidence it adopted first, `e'` is never
 /// judged (no aggregate verification), and the values are exact. An honest proposer
 /// never builds it (`holds_own_evidence`); Story 6.13's verdict lifts the
 /// hold.

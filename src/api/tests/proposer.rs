@@ -1061,6 +1061,17 @@ fn a_block_with_bytes_after_its_payload_is_refused() {
     ));
     assert_eq!(trailing.content_length(), Some(clean.len()));
     assert_eq!(
+        tier1_gate(
+            &trailing.view(),
+            &l.node_zero_public_key,
+            MAX_BLOCK_SIZE as u32,
+            UTXO_BITFIELD_WIDTH,
+            &l.crypto,
+        ),
+        Err(Tier1Failure::MalformedPayload),
+        "refused for its framing"
+    );
+    assert_eq!(
         receive(&mut l, &trailing),
         ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence)
     );

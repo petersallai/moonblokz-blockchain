@@ -49,6 +49,12 @@ fn a_twin_of_the_active_block_is_held() {
     // is still the twin.
     let x4 = alt(4, x.view().hash(), 0, 3, 0, 21, false);
     assert_eq!(receive(&mut bc, &x4), ReceiveBlockOutcome::AcceptedSilently);
+    let x4i = slot(&bc, &x4);
+    assert_eq!(
+        bc.switch_target([Some(x4i), None]),
+        Some(x4i),
+        "it outranks"
+    );
     assert_eq!(head_of(&bc), (3, a3.view().hash()), "still held");
     assert_eq!(status_of(&bc, &x4), Some(BlockStatus::Connected));
 
@@ -56,6 +62,18 @@ fn a_twin_of_the_active_block_is_held() {
     let a4 = alt(4, a3.view().hash(), 0, 0, 1, 9, false);
     assert_eq!(receive(&mut bc, &a4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (4, a4.view().hash()));
+
+    // Beside a deeper active block: with the head at #4, the twin `a3` lies
+    // below it; the twin branch extended again outranks, and is held.
+    let x5 = alt(5, x4.view().hash(), 1, 1, 0, 22, false);
+    assert_eq!(receive(&mut bc, &x5), ReceiveBlockOutcome::AcceptedSilently);
+    let x5i = slot(&bc, &x5);
+    assert_eq!(
+        bc.switch_target([Some(x5i), None]),
+        Some(x5i),
+        "it outranks"
+    );
+    assert_eq!(head_of(&bc), (4, a4.view().hash()), "held at depth");
 }
 
 /// AC3 positive control — an honest fork, a different creator at the
@@ -123,7 +141,8 @@ fn a_held_twin_yields_to_the_next_ranked_candidate() {
 }
 
 /// FR70: blocks of one creator at one sequence on different parents are no
-/// twins. Node #0's `h4` sits on node #0's `h3`, an honest fork of `a3`, and
+/// twins. A regression guard against a check that matches any same-creator
+/// block at the sequence: the comparison sees only the first divergent pair. Node #0's `h4` sits on node #0's `h3`, an honest fork of `a3`, and
 /// shares creator and sequence with the active `a4`: the comparison is not
 /// held, so the forged branch is attempted and the replay deletes it.
 #[test]
@@ -142,7 +161,7 @@ fn same_creator_blocks_on_different_parents_are_not_held() {
 /// AC2 — the check itself. An honest pair costs no verification (the
 /// creators differ); an unverified twin is verified once, and the caller's
 /// mark spares the next check; a forged sibling of the same claimed creator
-/// is no twin. Exact counter deltas.
+/// is no twin but evidence (`Forged`). Exact counter deltas.
 #[test]
 fn the_twin_check_verifies_once_and_only_a_same_creator_sibling() {
     let (mut bc, _, a2, a3) = two_creator_chain();
@@ -178,13 +197,15 @@ fn the_twin_check_verifies_once_and_only_a_same_creator_sibling() {
     });
     plant_child(&mut bc, &forged, a2i, false, true);
     let before = count();
-    assert_eq!(bc.twin_of(slot(&bc, &forged), a3i), Twin::No);
+    assert_eq!(bc.twin_of(slot(&bc, &forged), a3i), Twin::Forged);
     assert_eq!(count() - before, 1);
 }
 
 /// AC2 — a read that fails is no evidence: the twin is held and nothing is
 /// deleted. `a3` is read once to value the fork, then the twin check's read
-/// fails; the switch is never attempted (its undo would read `a3` again).
+/// fails; the switch is never attempted: the admission reads 4 blocks in
+/// all, where an attempted switch would add the pre-pass's read of `x`
+/// before its undo fails on `a3`.
 #[test]
 fn a_failed_read_holds_and_deletes_nothing() {
     let (mut bc, _, a2, a3) = failing_two_creator_chain();
@@ -192,6 +213,7 @@ fn a_failed_read_holds_and_deletes_nothing() {
     bc.storage.reads_left.set(1);
     bc.storage.attempts.set(0);
     let x = twin_of_a3(&a2, 40);
+    let reads = bc.storage.reads.get();
     assert_eq!(receive(&mut bc, &x), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (3, a3.view().hash()));
     assert_eq!(status_of(&bc, &x), Some(BlockStatus::Connected));
@@ -201,6 +223,27 @@ fn a_failed_read_holds_and_deletes_nothing() {
         2,
         "valued, then the twin check failed"
     );
+    assert_eq!(
+        bc.storage.reads.get() - reads,
+        4,
+        "no pre-pass, no undo: the switch was never attempted"
+    );
+}
+
+/// AC2 — either read failing makes the check `Unknown` (held by the caller).
+#[test]
+fn the_twin_check_is_unknown_when_a_read_fails() {
+    let (mut bc, _, a2, a3) = failing_two_creator_chain();
+    let x = twin_of_a3(&a2, 40);
+    let a2i = slot(&bc, &a2);
+    plant_child(&mut bc, &x, a2i, false, true);
+    let (xi, a3i) = (slot(&bc, &x), slot(&bc, &a3));
+    assert_eq!(bc.twin_of(xi, a3i), Twin::Yes { verified_now: true });
+    for failing in [a3i, xi] {
+        bc.storage.failing_slot = failing;
+        bc.storage.reads_left.set(0);
+        assert_eq!(bc.twin_of(xi, a3i), Twin::Unknown);
+    }
 }
 
 /// AC3 / D3 — bound first: a candidate whose divergence lies outside the
@@ -231,8 +274,74 @@ fn a_candidate_outside_the_switch_bound_costs_no_read() {
     assert_eq!(bc.storage.reads.get() - reads, 0, "nothing read");
 }
 
+/// AC2 (code review P2) — a local index fault is no evidence: when the walk
+/// to the active branch's first divergent block meets a missing entry (here
+/// `a4`, between the head `a5` and `a3`, removed from the table), the
+/// candidate is held, not passed on to the switch.
+#[test]
+fn an_index_fault_holds() {
+    let (mut bc, _, a2, a3) = two_creator_chain();
+    let a4 = alt(4, a3.view().hash(), 0, 0, 1, 9, false);
+    let a5 = alt(5, a4.view().hash(), 1, 1, 0, 10, false);
+    for blk in [&a4, &a5] {
+        assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+    }
+    assert_eq!(head_of(&bc), (5, a5.view().hash()));
+    let x = twin_of_a3(&a2, 40);
+    let a2i = slot(&bc, &a2);
+    plant_child(&mut bc, &x, a2i, false, true);
+    let (xi, a4i) = (slot(&bc, &x), slot(&bc, &a4));
+    bc.blocks.delete(a4i);
+    assert!(bc.twin_held(xi));
+}
+
+/// AC2 / P1 (code review) — a forged sibling of the active block's creator
+/// (node #0's header, another key) stored unverified while collecting: at
+/// the Ready entry the driver's best is that forgery; the twin check
+/// verifies it once, finds it invalid under the shared-prefix key, and
+/// deletes it as exact evidence (FR16). No switch, no walk, no second
+/// verification.
+#[test]
+fn a_forged_sibling_is_deleted_by_the_twin_check() {
+    let (_, b0, b1) = ready_genesis(16);
+    let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+    let (d3, forged) = (100..2000)
+        .find_map(|salt| {
+            let d3 = node_zero_on_a2(&a2, salt);
+            let forged = headed(3, a2.view().hash(), 0, 0x42, 5000, 0, 0, |b| {
+                votes_for(3, 1, 1, salt + 5000)(b)
+            });
+            (d3.view().hash() < forged.view().hash()).then_some((d3, forged))
+        })
+        .expect("a d3 with the lower tip hash");
+    let count = || BLOCK_SIGNATURE_VERIFICATIONS.with(|c| c.get());
+    // The Ready entry's verifications on the same chain without the forgery.
+    let control = {
+        let mut bc = new_unconfigured_test_chain();
+        for blk in [&d3, &a2, &b1] {
+            assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let before = count();
+        assert_eq!(receive(&mut bc, &b0), ReceiveBlockOutcome::AcceptedSilently);
+        count() - before
+    };
+    let mut bc = new_unconfigured_test_chain();
+    for blk in [&forged, &d3, &a2, &b1] {
+        assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+    }
+    let before = count();
+    assert_eq!(receive(&mut bc, &b0), ReceiveBlockOutcome::AcceptedSilently);
+    assert!(bc.is_ready());
+    assert_eq!(head_of(&bc), (3, d3.view().hash()));
+    assert!(attempted(&bc, &forged), "deleted");
+    assert_eq!(count() - before, control + 1, "the forgery verified once");
+}
+
 /// AC3 — the restart comparison holds too: FR2 resumes on `a3` (the lower
 /// tip hash) and the driver's best, the larger twin, is not switched to.
+/// Which twin a restart resumes on is FR2's choice (the lowest tip hash at
+/// the highest sequence), not the first-adopted one: the operating model's
+/// "until a restart" (§7.9).
 #[test]
 fn the_restart_comparison_holds_a_twin() {
     let (mut bc, _, a2, a3) = two_creator_chain();
@@ -242,8 +351,8 @@ fn the_restart_comparison_holds_a_twin() {
         .expect("a twin with a higher hash");
     assert_eq!(receive(&mut bc, &x), ReceiveBlockOutcome::AcceptedSilently);
     let mut restarted = restart(bc);
-    let _ = restarted.initialize_from_storage(0);
-    assert!(restarted.is_ready());
+    let (outcome, _) = restarted.initialize_from_storage(0);
+    assert_eq!(outcome, InitOutcome::ResumedReady);
     assert_eq!(head_of(&restarted), (3, a3.view().hash()));
     assert_eq!(status_of(&restarted, &x), Some(BlockStatus::Connected));
 }

@@ -56,7 +56,9 @@ fn fr22_side_extension_and_fork_that_outrank_switch() {
     );
     assert_eq!(bc.switch_target([None, None]), None);
     // FORK from an older active block (#2) with a forged value: node #1's
-    // `f3` beside node #0's `g3` (an honest fork, FR70). The comparison
+    // `f3` beside node #0's active `g3` (an honest fork against the active
+    // branch, FR70; against the side `a3`, by the same node #1, it is a twin,
+    // which the hold ignores: only a twin of an active block is held). The comparison
     // picks it, the replay refuses it (I-09), and the active chain stays.
     let f3 = valued_by(3, a2.view().hash(), 5000, 22, 1, NODE_ONE_KEY);
     assert_eq!(receive(&mut bc, &f3), ReceiveBlockOutcome::AcceptedSilently);
@@ -312,41 +314,52 @@ fn fr22_admissibility_follows_the_w6_window() {
 /// pre-pass; Story 6.3 AC6: kept, nothing deleted) stays a side head that
 /// would be attempted if compared — its forged value would be refused and
 /// deleted. Active extensions, direct and by continuation, leave it
-/// alone; a zero-valued side block compares only itself.
+/// alone; a zero-valued side block compares only itself. The fork is
+/// honest (Story 6.12, FR70): node #0's `f3` beside node #1's `a3`, so the
+/// twin check reads `f3` once and passes it on to the switch, whose pre-pass
+/// then fails to read it.
 #[test]
 fn fr22_non_triggers_compare_nothing() {
-    let (mut bc, b1) = faulty_genesis(16);
+    let (mut bc, b1) = failing_genesis(16);
     let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
-    assert_eq!(receive(&mut bc, &a2), ReceiveBlockOutcome::AcceptedSilently);
-    let f2 = valued(2, b1.view().hash(), 5000, 20);
-    // `f2` is valued from the view in hand; the switch's pre-pass must
-    // read it back.
-    bc.storage.failing_read_slot = bc.blocks.next_free_index().expect("a free slot");
-    assert_eq!(receive(&mut bc, &f2), ReceiveBlockOutcome::AcceptedSilently);
-    bc.storage.failing_read_slot = NONE_REF;
-    assert_eq!(status_of(&bc, &f2), Some(BlockStatus::Connected), "kept");
-    assert_eq!(head_of(&bc), (2, a2.view().hash()));
     let a3 = alt(3, a2.view().hash(), 1, 1, 1, 8, false);
-    assert_eq!(receive(&mut bc, &a3), ReceiveBlockOutcome::AcceptedSilently);
+    for blk in [&a2, &a3] {
+        assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
+    }
+    let f3 = valued(3, a2.view().hash(), 5000, 20);
+    // `f3` is valued from the view in hand; the twin check reads it once,
+    // then the switch's pre-pass must read it back.
+    bc.storage.failing_slot = bc.blocks.next_free_index().expect("a free slot");
+    bc.storage.reads_left.set(1);
+    bc.storage.attempts.set(0);
+    assert_eq!(receive(&mut bc, &f3), ReceiveBlockOutcome::AcceptedSilently);
+    bc.storage.failing_slot = NONE_REF;
+    assert_eq!(
+        bc.storage.attempts.get(),
+        2,
+        "the twin check, then the pre-pass failed"
+    );
+    assert_eq!(status_of(&bc, &f3), Some(BlockStatus::Connected), "kept");
+    assert_eq!(head_of(&bc), (3, a3.view().hash()));
     let a4 = alt(4, a3.view().hash(), 0, 1, 1, 9, false);
     let a5 = alt(5, a4.view().hash(), 1, 1, 0, 10, false);
     for blk in [&a5, &a4] {
         assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
     }
     assert_eq!(head_of(&bc), (5, a5.view().hash()));
-    let fi = slot(&bc, &f2);
+    let fi = slot(&bc, &f3);
     let fv = bc.chain_heads.branch_value_of(fi).expect("valued");
     assert!(fv > bc.active_branch_value, "it would still win");
-    assert!(!attempted(&bc, &f2), "active extensions compare nothing");
+    assert!(!attempted(&bc, &f3), "active extensions compare nothing");
     // A side block worth 0 (a replay-like value, FR22 (b)) is an ordinary
-    // trigger (i): it cannot win, and it does not compare `f2`.
-    let zero = valued(3, a2.view().hash(), 0, 23);
+    // trigger (i): it cannot win, and it does not compare `f3`.
+    let zero = valued(4, a3.view().hash(), 0, 23);
     assert_eq!(
         receive(&mut bc, &zero),
         ReceiveBlockOutcome::AcceptedSilently
     );
     assert!(!attempted(&bc, &zero), "a zero-valued side block");
-    assert!(!attempted(&bc, &f2));
+    assert!(!attempted(&bc, &f3));
 }
 
 /// AC10.8 / D4 — the comparison reads nothing: a value-and-size tie is
@@ -354,23 +367,27 @@ fn fr22_non_triggers_compare_nothing() {
 /// tying block extends a Connected side head, which is valued with no
 /// read either (Story 6.1 D4). The switch the comparison then calls must
 /// read that tip to undo it: a local failure, kept with nothing deleted
-/// (Story 6.3 AC6).
+/// (Story 6.3 AC6). The fork is honest (Story 6.12, FR70): node #0's `g3`
+/// beside node #1's `a3`, below the failing tip `a4`, so the twin check
+/// (which reads `a3` and `g3`) passes it on to the switch.
 #[test]
 fn fr22_comparison_reads_nothing() {
     let (mut bc, b1) = faulty_genesis(16);
     let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
-    let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
-    let g2 = valued(2, b1.view().hash(), 5, 20);
-    for blk in [&a2, &a3, &g2] {
+    let a3 = alt(3, a2.view().hash(), 1, 1, 1, 8, false);
+    let a4 = alt(4, a3.view().hash(), 0, 1, 0, 9, false);
+    let g3 = valued(3, a2.view().hash(), 5, 20);
+    for blk in [&a2, &a3, &a4, &g3] {
         assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
     }
-    assert!(!attempted(&bc, &g2));
-    let tip = a3.view();
+    assert!(!attempted(&bc, &g3));
+    let tip = a4.view();
+    let tie = u32::try_from(bc.active_branch_value - v(&g3)).expect("small");
     let side = (100..100_000)
-        .map(|amount| valued(3, g2.view().hash(), 1000, amount))
+        .map(|amount| valued(4, g3.view().hash(), tie, amount))
         .find(|blk| blk.view().len() == tip.len() && blk.view().hash() < tip.hash())
         .expect("a same-size extension with a lower hash");
-    bc.storage.failing_read_slot = slot(&bc, &a3);
+    bc.storage.failing_read_slot = slot(&bc, &a4);
     assert_eq!(
         receive(&mut bc, &side),
         ReceiveBlockOutcome::AcceptedSilently
@@ -386,7 +403,7 @@ fn fr22_comparison_reads_nothing() {
         "decided without a read"
     );
     assert_eq!(status_of(&bc, &side), Some(BlockStatus::Connected), "kept");
-    assert_eq!(head_of(&bc), (3, a3.view().hash()));
+    assert_eq!(head_of(&bc), (4, a4.view().hash()));
 }
 
 /// AC10.13 (first negative check) — the comparison runs after the
@@ -1804,6 +1821,7 @@ fn fr23_tail_advances_wait_for_the_commit() {
             assert_eq!(bc.active_snake_chain_window(), Ok((0, 5)));
             assert_eq!(status_of(&bc, &blocks[3]), None, "skipped replay: deleted");
             assert_eq!(status_of(&bc, &blocks[4]), None, "with its descendant");
+            assert_eq!(status_of(&bc, &blocks[5]), None, "and the last one");
             assert_eq!(status_of(&bc, &blocks[2]), Some(BlockStatus::Connected));
             assert_same_projection(&bc, &replica, "restored after the advances");
             // Story 6.4 AC9 3c: the unwound virtual advances.
@@ -1848,7 +1866,8 @@ fn fr23_replay_binds_against_the_horizon() {
 
 /// AC11.9 / D5 — the pre-pass: a bad signature by a creator registered at
 /// or below the common ancestor is deleted before anything is touched (no
-/// read of the old head); one by a creator
+/// undo, no restore; since Story 6.12 the FR22 twin check has read the old
+/// head's first divergent block once, see below); one by a creator
 /// registered above it is refused by the replay instead, which restores
 /// and deletes it.
 ///
