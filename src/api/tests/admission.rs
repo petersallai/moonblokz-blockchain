@@ -353,10 +353,17 @@ fn single_genesis_guard_rejects_second_seq0() {
     // lifecycle rather than the guard.
     let mut bc = new_unconfigured_test_chain();
 
-    // First genesis (seq 0) anchors the active chain at slot 0.
+    // First genesis (seq 0) anchors the active chain at slot 0, after one
+    // creator-signature verification against the anchor (DEC-270).
     let g1 = genesis_zero_block(1_007);
+    let first_before = counted(&BLOCK_SIGNATURE_VERIFICATIONS);
     let (o1, _) = bc.receive_block(g1.view(), 100);
     assert_eq!(o1, ReceiveBlockOutcome::AcceptedSilently);
+    assert_eq!(
+        counted(&BLOCK_SIGNATURE_VERIFICATIONS),
+        first_before + 1,
+        "the first block #0 is verified once at intake"
+    );
     assert_eq!(bc.active_chain_head_idx, 0);
     assert_eq!(bc.current_active_head(), Some(0));
     assert_eq!(bc.blocks.len(), 1);
@@ -386,6 +393,14 @@ fn single_genesis_guard_rejects_second_seq0() {
         counted(&BLOCK_SIGNATURE_VERIFICATIONS),
         verified_before,
         "a block #0 refused by the guard costs no verification"
+    );
+    // The guard runs before the Tier 1 gate (DEC-270): a sequence-0 block
+    // that would also fail Tier 1 is refused as a duplicate genesis, without
+    // the gate's checks (the proof of possession among them) running at all.
+    let bare = node_transfer_block(0, 7, 0, 7);
+    assert_eq!(
+        bc.tier1_admit(&bare.view(), &bare.view().hash(), 300),
+        Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis))
     );
 }
 
@@ -442,6 +457,18 @@ fn a_forged_block_zero_cannot_take_the_anchor() {
             .get(0)
             .is_some_and(|entry| entry.is_signature_verified()),
         "its intake verification is marked, so the pass does not repeat it"
+    );
+    // Block #1 completes the candidate and the FR3 pass runs: it verifies
+    // block #1's creator signature, and not block #0's again.
+    let verified_before = counted(&BLOCK_SIGNATURE_VERIFICATIONS);
+    let cfg = chain_config_anchor_block(1, genesis.view().hash());
+    let (outcome, _) = bc.receive_block(cfg.view(), 300);
+    assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+    assert!(bc.is_ready());
+    assert_eq!(
+        counted(&BLOCK_SIGNATURE_VERIFICATIONS),
+        verified_before + 1,
+        "only block #1 is verified in the pass"
     );
 }
 

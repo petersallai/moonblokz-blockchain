@@ -592,14 +592,16 @@ pub(crate) fn tier1_chain_config_block<C: CryptoTrait>(
 /// (vote, anchor, initializer, receiver, fee and comment 0, any amount). The
 /// registration's key is the trust anchor and its proof of possession holds —
 /// both checked by [`tier1_transaction_block`] (FR69 (i), DEC-248). This is the
-/// layout `api::genesis::genesis_block_zero` builds.
+/// layout `api::genesis::genesis_block_zero` builds. Called after the header
+/// vote form, which already forces `consumed_votes_from_first_voted_node` to 0
+/// once `first_voted_node == creator`; a transaction count that disagrees with
+/// the two transactions read here is `MalformedPayload` in the same gate.
 fn is_genesis_zero_shape(block: &BlockView) -> bool {
     let header_holds = block.previous_hash().iter().all(|byte| *byte == 0)
         && block.creator() == NODE_ZERO_ID
         && block.mined_amount() == 0
         && block.first_voted_node() == NODE_ZERO_ID
         && block.consumed_votes() == 0
-        && block.consumed_votes_from_first_voted_node() == 0
         && block.payload_type() == PAYLOAD_TYPE_TRANSACTION;
     let Some(payload) = block.transactions().filter(|_| header_holds) else {
         return false;
@@ -623,7 +625,7 @@ fn is_genesis_zero_shape(block: &BlockView) -> bool {
                 && nt.fee() == 0
                 && nt.comment() == 0
         });
-    payload.count() == 2 && registration_holds && transfer_holds
+    registration_holds && transfer_holds
 }
 
 /// FR6 no-self-vote (exact semantics): a transaction's `initializer` must not
@@ -1131,7 +1133,7 @@ mod tests {
         // (its self-transfer has anchor_sequence 0 == sequence 0) and the
         // no-self-vote rule — for the fixed block #0 only (DEC-269).
         let c = crypto(1);
-        let block = genesis_zero_block(&c, 1_000, GenesisMutation::None);
+        let block = mutated_genesis_zero_block(&c, 1_000, GenesisMutation::None);
         assert_eq!(
             tier1_gate(
                 &block.view(),
@@ -1166,7 +1168,6 @@ mod tests {
         MinedAmount,
         FirstVotedNode,
         ConsumedVotes,
-        ConsumedVotesFromFirst,
         RegistrationOnly,
         ExtraTransfer,
         Swapped,
@@ -1186,7 +1187,7 @@ mod tests {
     /// The fixed block #0 (`api::genesis::genesis_block_zero`'s layout),
     /// signed by `signer`, whose key is also the registered one, with `m`
     /// applied. Re-signed after the change, so a refusal is the shape's.
-    fn genesis_zero_block(signer: &Crypto, amount: u64, m: GenesisMutation) -> Block {
+    fn mutated_genesis_zero_block(signer: &Crypto, amount: u64, m: GenesisMutation) -> Block {
         use GenesisMutation as M;
         let pk = pubkey_bytes(signer);
         let pick = |hit: bool, value: u32| if hit { value } else { 0 };
@@ -1214,13 +1215,9 @@ mod tests {
         h.creator = pick(matches!(m, M::Creator), 1);
         h.mined_amount = pick(matches!(m, M::MinedAmount), 1);
         h.first_voted_node = pick(matches!(m, M::FirstVotedNode), 1);
-        // A deviation-form header keeps the Tier 1 vote form (DEC-157) valid.
+        // With `first_voted_node == creator` the Tier 1 vote form (DEC-157)
+        // leaves `consumed_votes` free, so this field changes alone.
         h.consumed_votes = pick(matches!(m, M::ConsumedVotes), 1);
-        h.consumed_votes_from_first_voted_node =
-            pick(matches!(m, M::ConsumedVotesFromFirst | M::ConsumedVotes), 1);
-        if matches!(m, M::ConsumedVotesFromFirst | M::ConsumedVotes) {
-            h.first_voted_node = 1;
-        }
         let mut b = BlockBuilder::new().header(h);
         let add_reg = |b: &mut BlockBuilder| {
             b.add_registration(&reg).ok().expect("add registration");
@@ -1253,7 +1250,7 @@ mod tests {
         // compared with anything.
         let c = crypto(1);
         for amount in [0, 1, u64::MAX] {
-            let block = genesis_zero_block(&c, amount, GenesisMutation::None);
+            let block = mutated_genesis_zero_block(&c, amount, GenesisMutation::None);
             assert_eq!(
                 tier1_gate(
                     &block.view(),
@@ -1279,7 +1276,6 @@ mod tests {
             M::MinedAmount,
             M::FirstVotedNode,
             M::ConsumedVotes,
-            M::ConsumedVotesFromFirst,
             M::RegistrationOnly,
             M::ExtraTransfer,
             M::Swapped,
@@ -1295,7 +1291,7 @@ mod tests {
             M::TransferFee,
             M::TransferComment,
         ] {
-            let block = genesis_zero_block(&c, 1_000, m);
+            let block = mutated_genesis_zero_block(&c, 1_000, m);
             assert_eq!(
                 tier1_gate(
                     &block.view(),
@@ -1439,7 +1435,7 @@ mod tests {
         // in a block #0 of the fixed shape that registers another key.
         let a = crypto(1);
         let b = crypto(2);
-        let block = genesis_zero_block(&a, 1_000, GenesisMutation::None);
+        let block = mutated_genesis_zero_block(&a, 1_000, GenesisMutation::None);
         assert_eq!(
             tier1_gate(
                 &block.view(),

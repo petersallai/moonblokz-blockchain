@@ -70,6 +70,23 @@ impl<
         hash: &[u8; 32],
         now: u64,
     ) -> Result<u32, AdmitError> {
+        // Single-genesis guard (Story 5.1, deferred from the Story-4.4 review).
+        // There is structurally exactly one genesis anchor. A distinct `sequence
+        // == 0` block (FR11 dedup already filtered an identical one upstream) that
+        // arrives once the active chain is anchored is rejected as exact evidence
+        // (FR16) — BEFORE any storage write — rather than admitted. Admitting it
+        // would either reseat the anchor (the Story-4.4 defect this guard closes)
+        // or, as a `parent.is_none()` orphan, create a `sequence == 0` Stored head
+        // that emits a perpetual bogus parent-recovery request for a nonexistent
+        // seq-0 parent (violating the `chain_heads` "tail-point never has sequence
+        // 0" invariant). It needs no Tier 1 verdict, so it runs first: a block #0
+        // arriving once an anchor is held costs no verification at all (DEC-270),
+        // not even the proof of possession its registration carries.
+        let is_block_zero = block.sequence() == 0;
+        if is_block_zero && self.active_chain_head_idx != NONE_REF {
+            return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
+        }
+
         // FR9: enforceable, not merely declared — a tentative must not reject.
         let block_size_limit = self.enforceable_block_size_limit();
         tier1_gate(
@@ -81,29 +98,13 @@ impl<
         )
         .map_err(AdmitError::Rejected)?;
 
-        // Single-genesis guard (Story 5.1, deferred from the Story-4.4 review).
-        // There is structurally exactly one genesis anchor. A distinct `sequence
-        // == 0` block (FR11 dedup already filtered an identical one upstream) that
-        // arrives once the active chain is anchored is rejected as exact evidence
-        // (FR16) — BEFORE any storage write — rather than admitted. Admitting it
-        // would either reseat the anchor (the Story-4.4 defect this guard closes)
-        // or, as a `parent.is_none()` orphan, create a `sequence == 0` Stored head
-        // that emits a perpetual bogus parent-recovery request for a nonexistent
-        // seq-0 parent (violating the `chain_heads` "tail-point never has sequence
-        // 0" invariant). This guard enforces single-*anchor*; authenticity is
-        // the check right below it.
-        if block.sequence() == 0 && self.active_chain_head_idx != NONE_REF {
-            return Err(AdmitError::Rejected(Tier1Failure::DuplicateGenesis));
-        }
-        // DEC-270 (Story 6.10): the first block #0 — `tier1_gate` already
-        // pinned its FR54 shape, so its creator is node #0 — must carry the trust
-        // anchor's signature before it takes the single anchor slot, in every
-        // phase; a forged one would otherwise lock the real genesis out with
-        // `DuplicateGenesis` until the FR3 pass condemned it. After the guard,
-        // so a block #0 arriving once an anchor is held costs no verification.
-        // The pass is marked below and does not verify it again (DEC-157).
-        let genesis_signature_verified = block.sequence() == 0;
-        if genesis_signature_verified && self.verify_block_creator_signature(block) != Some(true) {
+        // DEC-270 (Story 6.10): the first block #0 — `tier1_gate` has pinned its
+        // FR54 shape, so its creator is node #0 — must carry the trust anchor's
+        // signature before it takes the single anchor slot, in every phase; a
+        // forged one would otherwise lock the real genesis out with
+        // `DuplicateGenesis` until the FR3 pass condemned it. A pass is marked
+        // below, so the per-block step does not verify it again (DEC-157).
+        if is_block_zero && self.verify_block_creator_signature(block) != Some(true) {
             return Err(AdmitError::Rejected(Tier1Failure::CreatorSignatureInvalid));
         }
 
@@ -127,7 +128,7 @@ impl<
         // only ever verifies more. FR12 needs it: a deviating sibling must be
         // signature-verified to be endorsed, and a bad signature is exact
         // evidence here, before the write.
-        let signature_verified = genesis_signature_verified
+        let signature_verified = is_block_zero
             || (self.lifecycle_phase == LifecyclePhase::Ready
                 && self
                     .blocks

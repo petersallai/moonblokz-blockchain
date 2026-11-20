@@ -592,4 +592,15 @@ fn process_genesis_block_zero_has_the_tier1_genesis_shape() {
             Ok(())
         );
     }
+    // A fresh joiner admits both through the whole intake gate, block #0's
+    // creator signature included (DEC-270).
+    let mut joiner = new_unconfigured_test_chain();
+    for block in [&block_zero, &block_one] {
+        assert!(
+            joiner
+                .tier1_admit(&block.view(), &block.view().hash(), 0)
+                .is_ok()
+        );
+    }
+    assert_eq!(joiner.current_active_head(), Some(0));
 }

@@ -506,14 +506,6 @@ impl<
             if !is_genesis_zero && node_id >= self.max_node_count() {
                 return Err(invalid(ValidationReason::NodeCountExceeded));
             }
-            // Block #0's registration is signed by node #0, not yet seeded:
-            // its signature is checked against the trust anchor (DEC-271).
-            if is_genesis_zero
-                && !self.signatures_accepted(idx)
-                && !self.verify_tx_signature(tx.as_bytes(), init)
-            {
-                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
-            }
             if !is_genesis_zero {
                 // FR6 registration monotonicity: `new_node_id == running
                 // watermark + 1`, authoritative once the watermark is
@@ -527,15 +519,19 @@ impl<
                 }
                 if debits {
                     self.check_vote_target(vote).map_err(&invalid)?;
-                    if !self.signatures_accepted(idx)
-                        && !self.verify_tx_signature(tx.as_bytes(), init)
-                    {
-                        return Err(invalid(ValidationReason::TransactionSignatureInvalid));
-                    }
-                    if self.node_info.balance_of(init) < debit {
-                        return Err(invalid(ValidationReason::InsufficientBalance));
-                    }
                 }
+            }
+            // The initializer's signature, once its key is derivable — or, for
+            // block #0's registration, node #0's key, the trust anchor, before
+            // that registration seeds it (DEC-271).
+            if (debits || is_genesis_zero)
+                && !self.signatures_accepted(idx)
+                && !self.verify_tx_signature(tx.as_bytes(), init)
+            {
+                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+            }
+            if debits && self.node_info.balance_of(init) < debit {
+                return Err(invalid(ValidationReason::InsufficientBalance));
             }
             // [E] FR6 registration uniqueness, against the seeded roster —
             // earlier registrations of this block included.

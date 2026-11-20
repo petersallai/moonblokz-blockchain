@@ -1786,12 +1786,26 @@ fn a_sequence_one_transaction_block_gets_the_ordinary_fr36_credit() {
     builder.add_node_transfer(&nt).ok().expect("add transfer");
     let one = builder.build_signed(&signer).ok().expect("build signed");
     let cfg = chain_config_anchor_block(2, one.view().hash());
-    let tip = admit_all(&mut bc, &[&genesis, &one, &cfg]);
-    assert!(bc.run_processing_pass(tip).is_ok());
+    // #2 and #1 first, as orphans, so block #0's arrival completes the
+    // genesis-anchored candidate and the node goes Ready on it (FR2–FR4).
+    for block in [&cfg, &one, &genesis] {
+        let (outcome, _) = bc.receive_block(block.view(), 0);
+        assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+    }
+    assert!(bc.is_ready());
     assert_eq!(
         bc.node_info.balance_of(0),
         1_005,
         "the minted 1 000 plus block #1's mined_amount"
+    );
+    // The chain-switch inverse uses the same predicate: undoing #2 and then
+    // #1 takes the credit back (`api/switch.rs` `undo_committed_block`).
+    assert_eq!(bc.undo_active_head(), Ok(()), "#2 undone");
+    assert_eq!(bc.undo_active_head(), Ok(()), "#1 undone");
+    assert_eq!(
+        bc.node_info.balance_of(0),
+        1_000,
+        "block #1's credit is undone"
     );
 }
 
