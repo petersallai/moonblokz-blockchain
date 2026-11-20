@@ -157,7 +157,7 @@ impl<
     /// block above the common ancestor crosses no twin. A check that could not
     /// read holds, deleting nothing. Story 6.13 lifts the hold for a candidate
     /// carrying a verdict for its twin.
-    fn twin_held(&mut self, head: u32) -> bool {
+    pub(super) fn twin_held(&mut self, head: u32) -> bool {
         let Some(ancestor) = self.common_ancestor(head) else {
             return false;
         };

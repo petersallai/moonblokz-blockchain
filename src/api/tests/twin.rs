@@ -106,6 +106,11 @@ fn a_held_twin_yields_to_the_next_ranked_candidate() {
         "x held at the Ready entry"
     );
     assert_eq!(status_of(&bc, &x), Some(BlockStatus::Connected));
+    assert_eq!(
+        verified(&bc, &x),
+        Some(true),
+        "stored unverified while collecting, verified and marked by the hold's check"
+    );
     let (xi, a3i) = (slot(&bc, &x), slot(&bc, &a3));
     assert_eq!(
         bc.switch_target([Some(xi), Some(a3i)]),
@@ -196,6 +201,34 @@ fn a_failed_read_holds_and_deletes_nothing() {
         2,
         "valued, then the twin check failed"
     );
+}
+
+/// AC3 / D3 — bound first: a candidate whose divergence lies outside the
+/// FR58 switch bound is not checked, so it costs no read (`switch_toward`
+/// refuses it). On `W = 6`, `H = 3` the head moves to #5 (the window full,
+/// as in [`full_w6_genesis`]); `x`, node #0's block on #1 beside the active
+/// #2, is planted afterwards (`#1 + H < 5`; intake would discard it,
+/// reclamation would release it).
+#[test]
+fn a_candidate_outside_the_switch_bound_costs_no_read() {
+    let (mut bc, b1) = failing_genesis(6);
+    let mut prev = b1.view().hash();
+    for seq in 2..=5 {
+        let next = transfer(seq, prev, 0, 5 + u64::from(seq));
+        assert_eq!(
+            receive(&mut bc, &next),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        prev = next.view().hash();
+    }
+    assert_eq!(head_of(&bc).0, 5);
+    let x = transfer(2, b1.view().hash(), 0, 99);
+    let b1i = slot(&bc, &b1);
+    plant_child(&mut bc, &x, b1i, false, true);
+    let xi = slot(&bc, &x);
+    let reads = bc.storage.reads.get();
+    assert!(!bc.twin_held(xi));
+    assert_eq!(bc.storage.reads.get() - reads, 0, "nothing read");
 }
 
 /// AC3 — the restart comparison holds too: FR2 resumes on `a3` (the lower
