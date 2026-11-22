@@ -301,10 +301,11 @@ impl<
                 }
             }
             _ => {
-                // Approval evidence (payload_type 4): its Tier 3 (Story 6.7
-                // AC5) runs after this step at the two Tier-3 drivers
-                // (`judge_evidence_step`), off genesis' static path (D6). The
-                // shared tail applies its FR37 vote effects.
+                // Approval evidence (payload_type 4) and the twin fact block
+                // (5): their Tier 3 (Story 6.7 AC5, Story 6.13 AC3) runs after
+                // this step at the two Tier-3 drivers (`judge_evidence_step`),
+                // off genesis' static path (D6). The shared tail applies their
+                // FR37 vote effects (the fact block's twin reset in the engine).
             }
         }
 
@@ -373,8 +374,16 @@ impl<
         idx: u32,
         derivation: BlockDerivation,
     ) -> Result<(), ProcessingError> {
+        // FR72: the credit drop at this block (Story 6.13 AC6).
+        let parent = self
+            .blocks
+            .get(idx)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
+        let (blocks, h) = (&self.blocks, self.verification_horizon());
         if let Ok(v) = BlockView::from_bytes(view.serialized_bytes())
-            && let Err(e) = self.vote_engine.apply_block(v)
+            && let Err(e) = self
+                .vote_engine
+                .apply_block(v, |node| fact::credit_excluded(blocks, parent, h, node))
         {
             self.invert_transactions(view, idx, usize::MAX);
             return Err(ProcessingError::Vote(e));

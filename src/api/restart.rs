@@ -367,7 +367,7 @@ impl<
             let mut entry = BlockEntry::new(hash, NONE_REF, sequence);
             entry.set_status(BlockStatus::Stored);
             entry.set_len(view.len() as u32);
-            entry.set_payload_type(view.payload_type());
+            entry.set_payload(&view);
             self.blocks.insert_at(idx, entry);
             admitted += 1;
         }

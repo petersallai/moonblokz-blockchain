@@ -23,8 +23,8 @@ use moonblokz_chain_types::{
     APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, APPROVAL_SUPPORTER_VOTE_SUM_OFFSET, ApprovalView,
     Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE,
     MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL,
-    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE,
-    Registration, TransactionView,
+    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
+    PAYLOAD_TYPE_TWIN_FACT, REGISTRATION_SIZE, Registration, TransactionView, TwinFactView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
@@ -71,6 +71,7 @@ mod admission;
 mod calls;
 mod chain_config;
 mod evidence;
+mod fact;
 mod forward;
 mod genesis;
 mod outcomes;
@@ -344,6 +345,22 @@ pub(crate) enum ValidationReason {
     /// FR6 / FR27 (AC5, D6): the aggregated signature does not verify over the
     /// support content against the signers' keys in rank order.
     EvidenceAggregate,
+    /// FR71 I-43 rules 1–3 (Story 6.13 AC3): the branch's block at the proof's
+    /// sequence is not by its creator on its parent, the proof is that block,
+    /// or the proof's signature does not verify.
+    TwinFactProof,
+    /// FR71 I-43 rule 4: the proof's sequence is below the window tail, or a
+    /// fact block for the same creator and sequence is already in the window.
+    TwinFactWindow,
+    /// FR71 I-43 rule 5 (DEC-277): a round-opening block above `s + H − 1`, or
+    /// a penalty-only one at or below it.
+    TwinFactKind,
+    /// FR71 I-43 rule 6 (DEC-277, DEC-278): the carried subgroup is not the
+    /// twin round's.
+    TwinFactSubgroup,
+    /// FR72 I-43 rule 7 (DEC-279): the snapshot is not the equivocator's vote
+    /// after the block's interest step.
+    TwinFactSnapshot,
 }
 
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass

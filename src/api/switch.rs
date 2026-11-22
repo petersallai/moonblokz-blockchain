@@ -720,7 +720,15 @@ impl<
         // The vote engine refuses atomically; its errors are the node's own
         // state, never evidence against the block (AC2 step 2).
         if let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
-            self.vote_engine.undo_block(v).map_err(|_| ())?;
+            // FR72: the credit drop the apply made (Story 6.13 AC6).
+            let parent = self
+                .blocks
+                .get(idx)
+                .map_or(NONE_REF, |entry| entry.parent_ref());
+            let (blocks, h) = (&self.blocks, self.verification_horizon());
+            self.vote_engine
+                .undo_block(v, |node| fact::credit_excluded(blocks, parent, h, node))
+                .map_err(|_| ())?;
         }
         // Undone top-down: every descendant spend of this block's outputs is
         // undone already and side branches never touch bits, so its bits are

@@ -2,14 +2,24 @@
 
 use super::*;
 
-/// Story 6.7 D4: the open deviation run after `block` is applied on top of a
-/// head whose run state is `run` (a deviation's `p`, or [`NO_OPEN_RUN`]). A
-/// deviation-form block (`creator ≠ first_voted_node`) opens a run at its own
-/// sequence; an evidence block (`payload_type == 4`) closes it; any other block
-/// leaves it as it was (the run rules have already refused every block that
-/// may not extend an open run).
+/// Whether `block` opens a run (Story 6.7 D4; Story 6.13 T2, DEC-276): a
+/// deviation-form block (`creator ≠ first_voted_node`), or a round-opening twin
+/// fact block (`payload_type == 5` naming a subgroup, `m ≥ 1`). Tier 3 binds
+/// `m ≥ 1` to the position `q ≤ s + H − 1`.
+pub(super) fn opens_run(block: &BlockView<'_>) -> bool {
+    block.creator() != block.first_voted_node()
+        || (block.payload_type() == PAYLOAD_TYPE_TWIN_FACT
+            && TwinFactView::from_payload(block.payload()).is_some_and(|proof| proof.m() > 0))
+}
+
+/// Story 6.7 D4: the open run after `block` is applied on top of a head whose
+/// run state is `run` (the run-opening block's `p`, or [`NO_OPEN_RUN`]). A
+/// run-opening block ([`opens_run`]) opens a run at its own sequence; an
+/// evidence block (`payload_type == 4`) closes it; any other block leaves it as
+/// it was (the run rules have already refused every block that may not extend
+/// an open run).
 pub(super) fn run_after(run: u32, block: &BlockView<'_>) -> u32 {
-    if block.creator() != block.first_voted_node() {
+    if opens_run(block) {
         block.sequence()
     } else if block.payload_type() == PAYLOAD_TYPE_APPROVAL {
         NO_OPEN_RUN
@@ -19,10 +29,10 @@ pub(super) fn run_after(run: u32, block: &BlockView<'_>) -> u32 {
 }
 
 /// The exact inverse of [`run_after`] for the committed `block` being undone:
-/// no deviation starts inside an open run, so undoing one leaves no run; an
-/// evidence block names the run it closed, which undoing it reopens.
+/// no run starts inside an open run, so undoing a run-opening block leaves no
+/// run; an evidence block names the run it closed, which undoing it reopens.
 pub(super) fn run_before(run: u32, block: &BlockView<'_>) -> u32 {
-    if block.creator() != block.first_voted_node() {
+    if opens_run(block) {
         NO_OPEN_RUN
     } else if block.payload_type() == PAYLOAD_TYPE_APPROVAL {
         ApprovalView::from_payload(block.payload())
@@ -101,6 +111,11 @@ pub(super) fn run_rules(
         None if is_evidence => return Err(ValidationReason::EvidencePlacement),
         None => {}
         Some((p, creator_d)) => {
+            // D8 (Story 6.13, DEC-281): a run's positions are its proposer's
+            // replays and its evidence; no twin fact block inside another run.
+            if block.payload_type() == PAYLOAD_TYPE_TWIN_FACT {
+                return Err(ValidationReason::EvidencePlacement);
+            }
             if block.creator() != creator_d {
                 return Err(ValidationReason::RunCreator);
             }
@@ -140,7 +155,8 @@ pub(super) fn slot_rule(block: &BlockView<'_>, h: Option<u32>) -> Result<(), Val
         return Ok(());
     }
     let clean = match block.payload_type() {
-        PAYLOAD_TYPE_APPROVAL => true,
+        // A twin fact block's drop carries no obligation either (FR71, D8).
+        PAYLOAD_TYPE_APPROVAL | PAYLOAD_TYPE_TWIN_FACT => true,
         PAYLOAD_TYPE_TRANSACTION => block.transactions().is_some_and(|txs| {
             txs.iter().all(|tx| {
                 tx.as_registration().is_none()
@@ -541,7 +557,9 @@ impl<
             if creator.is_some_and(|run_creator| run_creator != c) {
                 return Ok(None);
             }
-            if c != first_voted {
+            if c != first_voted
+                || (entry.payload_type() == PAYLOAD_TYPE_TWIN_FACT && self.opens_round_at(cur)?)
+            {
                 return Ok(Some((sequence, c)));
             }
             if consumed != 0 {
@@ -576,9 +594,7 @@ impl<
         };
         let h = self.verification_horizon();
         if view.sequence() < projection.run_unknown_below {
-            if view.creator() != view.first_voted_node()
-                || view.payload_type() == PAYLOAD_TYPE_APPROVAL
-            {
+            if opens_run(view) || view.payload_type() == PAYLOAD_TYPE_APPROVAL {
                 projection.run_unknown_below = 0;
             }
             return slot_rule(view, h).map_err(invalid);
@@ -611,17 +627,22 @@ impl<
     /// Genesis never reaches it (no static path from `process_genesis` to the
     /// aggregate verification, D6's stack). Skipped once the block's signature
     /// checks are final (bit 6, D2). An evidence block carries no transaction,
-    /// so a refusal leaves nothing of the step to invert.
+    /// so a refusal leaves nothing of the step to invert. A twin fact block's
+    /// check (Story 6.13 AC3, I-43) runs at the same sites under the same
+    /// gate; it carries no transaction either.
     pub(super) fn judge_evidence_step(
         &mut self,
         view: &BlockView<'_>,
         idx: u32,
         projection: &Projection,
     ) -> Result<(), ProcessingError> {
-        if view.payload_type() == PAYLOAD_TYPE_APPROVAL && !self.signatures_accepted(idx) {
-            self.judge_evidence(view, idx, projection)
-        } else {
-            Ok(())
+        if self.signatures_accepted(idx) {
+            return Ok(());
+        }
+        match view.payload_type() {
+            PAYLOAD_TYPE_APPROVAL => self.judge_evidence(view, idx, projection),
+            PAYLOAD_TYPE_TWIN_FACT => self.judge_twin_fact(view, idx, projection),
+            _ => Ok(()),
         }
     }
 }

@@ -176,6 +176,11 @@ impl<
         // `ChainHeadsTable::init`'s own const assert: invisible to `cargo check`
         // while it passes.
         const { assert!(limits_are_expressible(Self::BUILD_LIMITS)) };
+        // Story 6.13 D6 (DEC-280): a block entry caches a twin fact block's
+        // equivocator in 16 bits, which is the whole id only while node ids,
+        // contiguous below `MAX_NODES`, fit them. A wider build needs another
+        // cache first (the confirm-read form, deferred until such a profile).
+        const { assert!(MAX_NODES <= 1 << 16) };
 
         let p = slot.as_mut_ptr();
         // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it
@@ -475,7 +480,7 @@ impl<
         entry_0.set_status(BlockStatus::Active);
         entry_0.set_on_active_chain(true);
         entry_0.set_len(block_0.len() as u32);
-        entry_0.set_payload_type(block_0.payload_type());
+        entry_0.set_payload(&block_0.view());
         self.blocks.insert_at(0, entry_0);
         self.active_chain_head_idx = 0;
         let active_head = self.active_chain_head_idx;
@@ -506,7 +511,7 @@ impl<
         entry_1.set_status(BlockStatus::Active);
         entry_1.set_on_active_chain(true);
         entry_1.set_len(block_1.len() as u32);
-        entry_1.set_payload_type(block_1.payload_type());
+        entry_1.set_payload(&block_1.view());
         self.blocks.insert_at(1, entry_1);
         self.active_chain_head_idx = 1;
         let active_head = self.active_chain_head_idx;
