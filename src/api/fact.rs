@@ -228,7 +228,7 @@ impl<
     /// (`W` entries). A RAM walk over the cached equivocator; one read per
     /// fact block naming `c`, for its proof's sequence. `Err` on a failed read.
     #[inline(never)]
-    fn fact_unique(&self, tip: u32, w: u32, c: u32, s: u32) -> Result<bool, ()> {
+    pub(super) fn fact_unique(&self, tip: u32, w: u32, c: u32, s: u32) -> Result<bool, ()> {
         let mut cur = tip;
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         for _ in 0..w {
