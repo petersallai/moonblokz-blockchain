@@ -109,7 +109,17 @@ impl<
                     .active_snake_chain_window()
                     .is_ok_and(|(tail, head)| tail <= p && p <= head)
         });
-        if let Some(d_idx) = on_chain {
+        let twin = on_chain
+            .and_then(|idx| self.blocks.get(idx))
+            .is_some_and(|entry| entry.payload_type() == PAYLOAD_TYPE_TWIN_FACT);
+        if let Some(e_idx) = on_chain.filter(|_| twin) {
+            // Story 6.13 AC5: a twin round's support — membership in the
+            // block's carried subgroup; the deviation's (iii) and (iv-c) do not
+            // apply.
+            if !self.on_chain_twin_support_holds(e_idx, p, supporter, proposer) {
+                return None;
+            }
+        } else if let Some(d_idx) = on_chain {
             // The accumulator's rank lookup replaces (iv-b) only while it is
             // live: a dead one is cleared at the hook and the support is a
             // plain relay, which (iv-b) still classifies.
@@ -291,7 +301,7 @@ impl<
     /// when its read header is not type 4 or its payload does not frame;
     /// `None` on a failed read. Its own read buffer.
     #[inline(never)]
-    fn evidence_deviation(&self, idx: u32) -> Option<Option<u32>> {
+    pub(super) fn evidence_deviation(&self, idx: u32) -> Option<Option<u32>> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
         Some(
@@ -524,6 +534,10 @@ impl<
         self.non_conflict.raise_floor(s_head.saturating_sub(h));
         if !self.is_ready() || !self.active_set.is_valid() {
             return None;
+        }
+        // Story 6.13 AC5: a twin fact block's round has its own arm.
+        if self.blocks.get(x_idx)?.payload_type() == PAYLOAD_TYPE_TWIN_FACT {
+            return self.evaluate_twin_support(x_idx, x_creator, x_first_voted);
         }
         let w = self.active_chain_length()?;
         let required_support = self.chain_config.active_configuration()?.required_support();
@@ -853,7 +867,10 @@ impl<
     /// key, in its own frame: the backend's signature value and the signer's
     /// working set never overlap a read buffer.
     #[inline(never)]
-    fn sign_support(&self, bytes: &[u8; SUPPORT_MESSAGE_SIZE]) -> [u8; MULTI_SIGNATURE_SIZE] {
+    pub(super) fn sign_support(
+        &self,
+        bytes: &[u8; SUPPORT_MESSAGE_SIZE],
+    ) -> [u8; MULTI_SIGNATURE_SIZE] {
         *self.crypto.multi_sign(bytes).serialize()
     }
 }

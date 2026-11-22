@@ -168,6 +168,10 @@ pub(crate) fn support_message_bytes(
 /// The `kind` of a ring entry that records an FR12 support. `1` is reserved
 /// for Story 6.13's FR71 twin vote, which shares the ring (DEC-198).
 pub(crate) const RING_KIND_SUPPORT: u8 = 0;
+/// The `kind` byte of a twin-round support (Story 6.13 T4 (c), DEC-277): the
+/// entry is `(c, s, round key)`, the round key the first 4 bytes of the
+/// carried subgroup's digest, so a node supports one side per round.
+pub(crate) const RING_KIND_TWIN: u8 = 1;
 /// The `kind` byte of a never-used slot.
 const RING_KIND_EMPTY: u8 = 0xFF;
 /// Ring capacity (DEC-198).
@@ -270,6 +274,15 @@ impl NonConflictRing {
             }
         }
         RingCheck::Free
+    }
+
+    /// Whether a live entry is exactly `(kind, proposer, sequence, key)`: a twin
+    /// round's identity is all four fields, so two rounds of one conflict do
+    /// not conflict ([`Self::check`]'s rule is the deviation's).
+    pub(crate) fn holds(&self, kind: u8, proposer: u32, sequence: u32, key: u32) -> bool {
+        self.entries.iter().any(|entry| {
+            !self.is_free(entry) && Self::decode(entry) == (kind, proposer, sequence, key)
+        })
     }
 
     /// Records a support. Takes a free slot first; with every slot live, a live

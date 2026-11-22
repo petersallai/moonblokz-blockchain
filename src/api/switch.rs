@@ -199,7 +199,11 @@ impl<
                 if verified_now {
                     self.blocks.mark_signature_verified(x);
                 }
-                true
+                // Story 6.13 AC7 (FR70, FR71; DEC-276): an approved twin round
+                // on the candidate's segment, against the active twin `y`,
+                // lifts the hold; FR21 then decides. The claim is verified on
+                // the switch's replay (DEC-259).
+                !self.approved_against(head, first, y)
             }
         }
     }

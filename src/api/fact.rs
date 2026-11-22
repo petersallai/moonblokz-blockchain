@@ -2,8 +2,16 @@
 //! step reads, and the block's Tier-3 check (I-43).
 
 use super::*;
-use crate::approval::twin_seed;
+use crate::approval::{RING_KIND_TWIN, twin_seed};
 use moonblokz_chain_types::calculate_hash;
+
+/// A twin round as its round-opening fact block names it (Story 6.13 AC5).
+struct TwinRound {
+    c: u32,
+    s: u32,
+    key: u32,
+    local_member: bool,
+}
 
 /// What a check that may reach below a window-anchored pass's segment found.
 enum Reach {
@@ -307,6 +315,227 @@ impl<
     fn creator_at(&self, tip: u32, sequence: u32) -> Result<u32, ()> {
         let idx = self.ancestor_at(tip, sequence).ok().flatten().ok_or(())?;
         self.header_at(idx).map(|(creator, _)| creator).ok_or(())
+    }
+
+    /// Story 6.13 AC5 (FR12, DEC-277) — the twin round's support for the
+    /// admitted block `x`, a twin fact block. Only a validated one on the
+    /// active chain (its parent on the node's chain, so a late twin's side,
+    /// which no majority stands on, gathers nothing), a round-opening one,
+    /// above the support floor, whose carried subgroup holds the local node.
+    /// A retry (a deviation-form fact block) needs grace admission, as any
+    /// deviation. One support per round: the ring entry `(c, s, round key)`.
+    /// No support once an approval for a twin round of `(c, s)` is held. The
+    /// signed content is the deviation's, with `x`'s creator as proposer.
+    pub(super) fn evaluate_twin_support(
+        &mut self,
+        x_idx: u32,
+        x_creator: u32,
+        x_first_voted: u32,
+    ) -> Option<SupportMessage> {
+        let x = self.blocks.get(x_idx)?;
+        if !x.is_on_active_chain() || !x.is_signature_verified() {
+            return None;
+        }
+        let (q, x_hash) = (x.sequence(), *x.hash());
+        if x_creator != x_first_voted && !self.grace_admits(x_creator) {
+            return None;
+        }
+        let round = self.twin_round_of(x_idx)?;
+        if round.s <= self.non_conflict.floor()
+            || !round.local_member
+            || self
+                .non_conflict
+                .holds(RING_KIND_TWIN, round.c, round.s, round.key)
+            || self.holds_twin_approval(round.c, round.s) != Some(false)
+            || !self
+                .non_conflict
+                .insert(RING_KIND_TWIN, round.c, round.s, round.key)
+        {
+            return None;
+        }
+        let bytes = support_message_bytes(x_creator, q, &x_hash);
+        let support_signature = self.sign_support(&bytes);
+        let local = self.local_node_id;
+        let dedupe_key = self.support_dedupe.key(&support_body_tail(
+            local,
+            x_creator,
+            &x_hash,
+            &support_signature,
+        ));
+        if !self.support_dedupe.contains(q, dedupe_key, local) {
+            self.support_dedupe.insert(q, dedupe_key, local);
+        }
+        Some(SupportMessage {
+            supporter_node_id: local,
+            proposer_node_id: x_creator,
+            deviation_sequence: q,
+            deviation_block_hash: x_hash,
+            support_signature,
+        })
+    }
+
+    /// The round a round-opening twin fact block at `idx` opens: its `c` and
+    /// `s`, the round key (the first 4 bytes of the digest of its carried
+    /// members, the same on both sides of a split in one round) and whether
+    /// the local node is a member. `None` for a penalty-only block or a failed
+    /// read. Its own frame.
+    #[inline(never)]
+    fn twin_round_of(&self, idx: u32) -> Option<TwinRound> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        let proof = TwinFactView::from_payload(view.payload())?;
+        let m = usize::from(proof.m());
+        if m == 0 {
+            return None;
+        }
+        let mut members = [0u8; 4 * MAX_SUBGROUP];
+        let mut local_member = false;
+        for i in 0..m {
+            let member = proof.member(i)?;
+            local_member |= member == self.local_node_id;
+            members[4 * i..4 * i + 4].copy_from_slice(&member.to_le_bytes());
+        }
+        let digest = calculate_hash(&members[..4 * m]);
+        Some(TwinRound {
+            c: proof.creator(),
+            s: proof.sequence(),
+            key: u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]),
+            local_member,
+        })
+    }
+
+    /// FR26 on the active chain for a twin round's support (Story 6.13 AC5):
+    /// `p` is the round-opening block `e_idx`; the signed proposer is its
+    /// creator, no approval evidence lies above it, and the supporter is in
+    /// its carried subgroup. A failed read defers the membership check, as
+    /// (iv-b) is deferred.
+    pub(super) fn on_chain_twin_support_holds(
+        &self,
+        e_idx: u32,
+        p: u32,
+        supporter: u32,
+        proposer: u32,
+    ) -> bool {
+        let Some(s_head) = self
+            .blocks
+            .get(self.active_chain_head_idx)
+            .map(BlockEntry::sequence)
+        else {
+            return true;
+        };
+        if self.active_above(e_idx, s_head - p + 1, None) == AboveP::Evidence {
+            return false;
+        }
+        self.twin_member(e_idx, supporter, proposer).unwrap_or(true)
+    }
+
+    /// Whether `node` is in the carried subgroup of the round-opening fact
+    /// block at `idx` and `proposer` is its creator; `None` on a failed read.
+    /// Its own frame.
+    #[inline(never)]
+    fn twin_member(&self, idx: u32, node: u32, proposer: u32) -> Option<bool> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        let proof = TwinFactView::from_payload(view.payload())?;
+        Some(
+            view.creator() == proposer
+                && (0..usize::from(proof.m())).any(|i| proof.member(i) == Some(node)),
+        )
+    }
+
+    /// The twin round's stop (Story 6.13 AC5): whether any held approval
+    /// evidence closes a run opened by a fact block for `(c, s)`, on any
+    /// branch. A RAM scan for type-4 entries, then reads for each; `None` on a
+    /// failed read (the conservative side: no support).
+    fn holds_twin_approval(&self, c: u32, s: u32) -> Option<bool> {
+        let mut failed = false;
+        for idx in 0..MAX_BLOCKS as u32 {
+            let Some(entry) = self.blocks.get(idx) else {
+                continue;
+            };
+            if entry.payload_type() != PAYLOAD_TYPE_APPROVAL || entry.sequence() <= s {
+                continue;
+            }
+            let opener = match self.evidence_deviation(idx) {
+                Some(Some(q)) => self.ancestor_at(idx, q).ok().flatten(),
+                Some(None) => None,
+                None => {
+                    failed = true;
+                    None
+                }
+            };
+            let Some(opener) = opener else {
+                continue;
+            };
+            if self.blocks.get(opener).and_then(BlockEntry::equivocator) != Some(c) {
+                continue;
+            }
+            match self.fact_sequence(opener) {
+                Some(seq) if seq == s => return Some(true),
+                Some(_) => {}
+                None => failed = true,
+            }
+        }
+        (!failed).then_some(false)
+    }
+
+    /// The proof sequence of the twin fact block at `idx`; `None` on a failed
+    /// read or a payload that does not frame. Its own frame.
+    #[inline(never)]
+    fn fact_sequence(&self, idx: u32) -> Option<u32> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        TwinFactView::from_payload(view.payload()).map(|proof| proof.sequence())
+    }
+
+    /// Story 6.13 AC7 (DEC-276): whether the candidate segment above
+    /// `x_sequence`, from `head` down, carries an approval evidence that
+    /// closes a run opened by a twin fact block whose proof is the active twin
+    /// `y`. A RAM walk over the cached payload type; reads only for approval
+    /// entries. A failed read is no approval, so the hold stays. No approval
+    /// state is kept: the candidate's own blocks say it.
+    pub(super) fn approved_against(&self, head: u32, x_sequence: u32, y: u32) -> bool {
+        let mut cur = head;
+        while let Some(entry) = self.blocks.get(cur) {
+            if entry.sequence() <= x_sequence {
+                break;
+            }
+            if entry.payload_type() == PAYLOAD_TYPE_APPROVAL
+                && let Some(Some(q)) = self.evidence_deviation(cur)
+                && q > x_sequence
+                && let Ok(Some(opener)) = self.ancestor_at(cur, q)
+                && self
+                    .blocks
+                    .get(opener)
+                    .is_some_and(|e| e.payload_type() == PAYLOAD_TYPE_TWIN_FACT)
+                && self.fact_proves(opener, y) == Some(true)
+            {
+                return true;
+            }
+            cur = entry.parent_ref();
+        }
+        false
+    }
+
+    /// Whether the twin fact block at `fact` is round-opening and proves the
+    /// block at `twin` (its header bytes and payload hash); `None` on a failed
+    /// read. One buffer, read twice, in its own frame.
+    #[inline(never)]
+    fn fact_proves(&self, fact: u32, twin: u32) -> Option<bool> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let (header, payload_hash) = {
+            let view = self.view_retained(twin, &mut buf)?;
+            let mut header = [0u8; HEADER_SIZE];
+            header.copy_from_slice(&view.serialized_bytes()[..HEADER_SIZE]);
+            (header, calculate_hash(view.payload()))
+        };
+        let view = self.view_retained(fact, &mut buf)?;
+        let proof = TwinFactView::from_payload(view.payload())?;
+        Some(
+            proof.m() > 0
+                && *proof.proof_header() == header[..]
+                && *proof.proof_payload_hash() == payload_hash[..],
+        )
     }
 
     /// Whether the held twin fact block at `idx` opens a round (`m ≥ 1`, Story
