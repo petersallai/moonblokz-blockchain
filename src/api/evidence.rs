@@ -47,9 +47,10 @@ pub(super) fn run_before(run: u32, block: &BlockView<'_>) -> u32 {
 /// proposer and every registered node (`0..=last_node`, the same range on
 /// every node at the same chain position) ranked above it, minus `cv(d)`,
 /// with checked arithmetic; and `k`, the number of nodes ranked above the
-/// proposer (`u` included). `Ok(None)` on an overflow or `k = 0` (the chain's
-/// data: evidence); `Err` on an engine refusal (local). The caller checks that
-/// `u` heads the order.
+/// proposer (`u` included). `Ok(None)` on an overflow or, for a deviation,
+/// `k = 0` (the chain's data: evidence); `Err` on an engine refusal (local).
+/// The caller checks that `u` heads the order. A twin run's opener may be the
+/// top itself (`top_allowed`, Story 6.13 AC4): its `k` is 0.
 pub(super) fn deviation_sum<const MAX_NODES: usize>(
     engine: &VoteEngine<MAX_NODES>,
     last_node: u32,
@@ -57,6 +58,7 @@ pub(super) fn deviation_sum<const MAX_NODES: usize>(
     vote_scale: u64,
     r_eff: u64,
     cv_d: u32,
+    top_allowed: bool,
 ) -> Result<Option<(u64, u32)>, ()> {
     let mut sum = Some(0u64);
     let mut k = 0u32;
@@ -72,7 +74,7 @@ pub(super) fn deviation_sum<const MAX_NODES: usize>(
         k += u32::from(above);
     }
     Ok(sum
-        .filter(|_| k != 0)
+        .filter(|_| k != 0 || top_allowed)
         .and_then(|sum| sum.checked_mul(r_eff))
         .and_then(|sum| sum.checked_sub(u64::from(cv_d)))
         .map(|value| (value, k)))
@@ -278,22 +280,33 @@ impl<
             return Err(ProcessingError::StorageRead);
         };
 
-        // 1–2. The subgroup at `p − 1` and the signers in rank order.
+        // 1–2. The subgroup at `p − 1` and the signers in rank order. A twin
+        // run's subgroup is the one its opener carries (Story 6.13 AC4, D11),
+        // checked when the opener was applied.
+        let twin = d.payload_type() == PAYLOAD_TYPE_TWIN_FACT;
         let mut members = [0u32; MAX_SUBGROUP];
-        let m = match self.evidence_members(
-            tip,
-            p,
-            d_parent,
-            creator_d,
-            u,
-            projection,
-            w,
-            required_support,
-            &mut members,
-        ) {
-            Err(()) => return Err(ProcessingError::StorageRead),
-            Ok(None) => return Err(invalid(ValidationReason::EvidenceSubgroup)),
-            Ok(Some(m)) => m,
+        let m = if twin {
+            match self.fact_members(d_idx, &mut members) {
+                Some(m) if m > 0 => m,
+                Some(_) => return Err(invalid(ValidationReason::EvidenceSubgroup)),
+                None => return Err(ProcessingError::StorageRead),
+            }
+        } else {
+            match self.evidence_members(
+                tip,
+                p,
+                d_parent,
+                creator_d,
+                u,
+                projection,
+                w,
+                required_support,
+                &mut members,
+            ) {
+                Err(()) => return Err(ProcessingError::StorageRead),
+                Ok(None) => return Err(invalid(ValidationReason::EvidenceSubgroup)),
+                Ok(Some(m)) => m,
+            }
         };
         let r_eff = required_signers(m);
         let n = evidence.signer_count() as usize;
@@ -358,15 +371,22 @@ impl<
             if engine.top_creator() != Some(u) {
                 return false;
             }
-            let (sum, k) =
-                match deviation_sum(engine, last_node, creator_d, vote_scale, r_eff as u64, cv_d) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => {
-                        verdict = Some(ValidationReason::EvidenceVoteSum);
-                        return true;
-                    }
-                    Err(()) => return false,
-                };
+            let (sum, k) = match deviation_sum(
+                engine,
+                last_node,
+                creator_d,
+                vote_scale,
+                r_eff as u64,
+                cv_d,
+                twin,
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    verdict = Some(ValidationReason::EvidenceVoteSum);
+                    return true;
+                }
+                Err(()) => return false,
+            };
             if sum != claimed {
                 verdict = Some(ValidationReason::EvidenceVoteSum);
                 return true;
@@ -375,7 +395,7 @@ impl<
             // that fits. Every listed id a late node, strictly descending in
             // the order (so distinct), and exactly `L − 1` late nodes above the
             // last one — no scratch list, the same predicates as the builder.
-            let expected = (k as usize - 1).min(late_room);
+            let expected = (k as usize).saturating_sub(1).min(late_room);
             let mut previous = None;
             let listed_ok = late_count == expected
                 && (0..late_count).all(|i| {

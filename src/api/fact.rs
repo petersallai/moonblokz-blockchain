@@ -538,6 +538,21 @@ impl<
         )
     }
 
+    /// The ranked subgroup the round-opening twin fact block at `idx` carries,
+    /// into `out` (Story 6.13 AC4, D11); its `m`, 0 for a penalty-only block;
+    /// `None` on a failed read. Its own frame.
+    #[inline(never)]
+    pub(super) fn fact_members(&self, idx: u32, out: &mut [u32; MAX_SUBGROUP]) -> Option<usize> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let view = self.view_retained(idx, &mut buf)?;
+        let proof = TwinFactView::from_payload(view.payload())?;
+        let m = usize::from(proof.m());
+        for (i, slot) in out.iter_mut().enumerate().take(m) {
+            *slot = proof.member(i)?;
+        }
+        Some(m)
+    }
+
     /// Whether the held twin fact block at `idx` opens a round (`m ≥ 1`, Story
     /// 6.13 T2); `Err` on a failed read. Its own read buffer.
     #[inline(never)]

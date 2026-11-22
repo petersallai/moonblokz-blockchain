@@ -334,9 +334,15 @@ impl<
             if engine.top_creator() != Some(u) {
                 return false;
             }
-            let Ok(Some((supporter_vote_sum, _))) =
-                deviation_sum(engine, last_node, local, vote_scale, r_eff as u64, cv_d)
-            else {
+            let Ok(Some((supporter_vote_sum, _))) = deviation_sum(
+                engine,
+                last_node,
+                local,
+                vote_scale,
+                r_eff as u64,
+                cv_d,
+                false,
+            ) else {
                 return false;
             };
             for n in 0..=last_node {
