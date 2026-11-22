@@ -11,7 +11,9 @@
 use super::fixtures::*;
 use super::*;
 use crate::api::fact::credit_excluded;
-use crate::approval::{NonConflictRing, RING_KIND_TWIN, support_message_bytes};
+use crate::approval::{
+    NonConflictRing, RING_KIND_TWIN, node_value, subgroup_size, support_message_bytes, twin_seed,
+};
 use crate::staged_validation::tier1_gate;
 use moonblokz_chain_types::{calculate_hash, twin_fact_size};
 
@@ -65,7 +67,12 @@ fn fact_with(
 /// The fact block proving `proof` on `head`, with the real header of `bc`'s
 /// top creator and the real snapshot of `proof`'s creator: `bc` stands at
 /// `head`.
-fn fact_on(bc: &TestChain, head: &Block, proof: &Block, members: &[u32]) -> Block {
+fn fact_on<S: StorageTrait>(
+    bc: &Chain16<S>,
+    head: &Block,
+    proof: &Block,
+    members: &[u32],
+) -> Block {
     let creator = bc.vote_engine.top_creator().expect("a top");
     let engine = &bc.vote_engine;
     fact_with(
@@ -82,7 +89,7 @@ fn fact_on(bc: &TestChain, head: &Block, proof: &Block, members: &[u32]) -> Bloc
 
 /// The per-block step's verdict on `block` as a direct extension of `bc`'s
 /// head, the I-43 check included, on a scratch entry removed again.
-fn fact_reason(bc: &mut TestChain, block: &Block) -> Option<ValidationReason> {
+fn fact_reason<S: StorageTrait>(bc: &mut Chain16<S>, block: &Block) -> Option<ValidationReason> {
     let view = block.view();
     let idx = bc.blocks.next_free_index().expect("a free slot");
     let head = bc.active_chain_head_idx;
@@ -555,4 +562,168 @@ fn twin_resolution_is_replay_deterministic() {
         (outcomes, head_of(&bc), votes, bc.active_branch_value)
     };
     assert_eq!(run(), run());
+}
+
+/// T4 (c): the round's seed is bound to the opener's rank `j`. On the Story
+/// 6.4 chain (`a3` node 1, `a4` node 4, `a5` node 3; node 1 on top) node #3
+/// twins `a5` on `a4`. `A` at `a4` without node 3 is `{0, 1, 4}` (`m = 3`), so
+/// the members' order depends on the seed. A retry by a node of rank `j ≥ 1`
+/// must carry round `j`'s order, not round 0's.
+#[test]
+fn the_round_seed_is_bound_to_the_openers_rank() {
+    let (_, mut l, [_, _, _, _, a4, a5]) = support_chain(0);
+    let y = resign(
+        &tx_block(5, a4.view().hash(), 0, votes_for(5, 2, 1, 9_999)),
+        3,
+        a5.view().consumed_votes(),
+        key_of(3),
+    );
+    let engine = &l.vote_engine;
+    let top = engine.top_creator().expect("top");
+    assert_eq!(top, 1);
+    // A retry opener: the node of rank `j`, a deviation naming the top.
+    let (opener, j) = [0u32, 2, 4, 5]
+        .into_iter()
+        .map(|n| {
+            (
+                n,
+                (0..6).filter(|&m| engine.ranks_above(m, n)).count() as u32,
+            )
+        })
+        .find(|&(_, j)| j >= 1)
+        .expect("a lower rank");
+    let order = |j: u32| {
+        let seed = twin_seed(5, 0, 3, j);
+        let mut members = [0u32, 1, 4];
+        members.sort_by_key(|&n| node_value(&seed, n));
+        assert_eq!(subgroup_size(40, 3), Some(3));
+        members
+    };
+    assert_ne!(order(0), order(j), "precondition: the rounds differ");
+    let retry = |members: [u32; 3]| {
+        let signer = Crypto::new([key_of(opener); PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("key");
+        let template = fact_with(
+            6,
+            a5.view().hash(),
+            opener,
+            key_of(opener),
+            0,
+            &y,
+            0,
+            &members,
+        );
+        let view = template.view();
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            version: 1,
+            sequence: 6,
+            creator: opener,
+            mined_amount: 0,
+            payload_type: 0,
+            consumed_votes: vote_snapshot(engine.accumulated_vote_of(opener)),
+            first_voted_node: top,
+            consumed_votes_from_first_voted_node: vote_snapshot(engine.accumulated_vote_of(top)),
+            previous_hash: a5.view().hash(),
+            signature: [0u8; SIGNATURE_SIZE],
+        });
+        let mut payload = std::vec::Vec::from(view.payload());
+        payload[HEADER_SIZE + 32..HEADER_SIZE + 36]
+            .copy_from_slice(&vote_snapshot(engine.accumulated_vote_of(3)).to_le_bytes());
+        builder
+            .twin_fact_payload_mut(payload.len())
+            .ok()
+            .expect("fits")
+            .copy_from_slice(&payload);
+        builder.build_signed(&signer).ok().expect("signs")
+    };
+    let right = retry(order(j));
+    let round_zero = retry(order(0));
+    assert_eq!(fact_reason(&mut l, &right), None);
+    assert_eq!(
+        fact_reason(&mut l, &round_zero),
+        Some(ValidationReason::TwinFactSubgroup)
+    );
+}
+
+/// FR72: the fact block's snapshot carries the vote the equivocator banked
+/// between its twin and the fact block, and undoing the block restores it. In
+/// this two-node world the opener is the equivocator itself (the top), so its
+/// creator reset and the twin reset coincide (AC6); the vote crate's own test
+/// observes the twin reset alone.
+#[test]
+fn the_snapshot_restores_credits_banked_since_the_twin() {
+    let (mut bc, _, a3, y) = twin_chain();
+    // Node #0's block voting twice for node #1 (the equivocator).
+    let b4 = alt(4, a3.view().hash(), 0, 0, 2, 61, false);
+    assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
+    let banked = bc.vote_engine.accumulated_vote_of(1);
+    assert_eq!(banked, 2000);
+    let e = fact_on(&bc, &b4, &y, &[0]);
+    let snapshot = TwinFactView::from_payload(e.view().payload())
+        .expect("frames")
+        .snapshot();
+    assert_eq!(snapshot, vote_snapshot(banked));
+    assert!(matches!(
+        receive(&mut bc, &e),
+        ReceiveBlockOutcome::AcceptedAndSendSupport(_)
+    ));
+    assert_eq!(bc.vote_engine.accumulated_vote_of(1), 0, "the twin reset");
+    // The inverse: undoing the fact block restores the banked credits.
+    let bytes = std::vec::Vec::from(e.serialized_bytes());
+    let parent = slot(&bc, &b4);
+    let h = bc.verification_horizon();
+    let blocks = &bc.blocks;
+    let excluded = |node| credit_excluded(blocks, parent, h, node);
+    let view = BlockView::from_bytes(&bytes).ok().expect("parses");
+    bc.vote_engine.undo_block(view, excluded).expect("undoes");
+    assert_eq!(bc.vote_engine.accumulated_vote_of(1), banked);
+}
+
+/// I-43 rule 4 end to end: once a round for `(1, 3)` is approved and its run
+/// closed, a second fact block for `(1, 3)` in the window is refused.
+#[test]
+fn a_second_fact_block_for_one_conflict_is_refused() {
+    let (mut bc, _, a3, y) = twin_chain();
+    let e = fact_on(&bc, &a3, &y, &[0]);
+    receive(&mut bc, &e);
+    let approval = approval_on(5, e.view().hash(), 4, &e, 1000, false);
+    assert_eq!(
+        receive(&mut bc, &approval),
+        ReceiveBlockOutcome::AcceptedSilently
+    );
+    assert_eq!(head_of(&bc), (5, approval.view().hash()), "the run closed");
+    let again = fact_on(&bc, &approval, &y, &[0]);
+    assert_eq!(
+        fact_reason(&mut bc, &again),
+        Some(ValidationReason::TwinFactWindow)
+    );
+}
+
+/// T4 (c): `A` at `P` is taken without `c` even when `c` created blocks in
+/// `P`'s window. On the Story 6.4 chain node #1 (`a3`) also creates `a6` and
+/// twins it: `A` at `a5` is `{0, 1, 3, 4}`, the round's set `{0, 3, 4}` (`m =
+/// 3`; with `c` it would be `m = 4`).
+#[test]
+fn the_round_excludes_the_equivocator_from_a() {
+    let (_, mut l, [_, _, _, _, _, a5]) = support_chain(0);
+    let a6 = real_on(
+        &l,
+        &tx_block(6, a5.view().hash(), 0, votes_for(6, 2, 1, 6_100)),
+        1,
+        key_of(1),
+    );
+    assert_eq!(receive(&mut l, &a6), ReceiveBlockOutcome::AcceptedSilently);
+    let y6 = resign(
+        &tx_block(6, a5.view().hash(), 0, votes_for(6, 4, 1, 6_200)),
+        1,
+        a6.view().consumed_votes(),
+        key_of(1),
+    );
+    let seed = twin_seed(6, 0, 1, 0);
+    let mut members = [0u32, 3, 4];
+    members.sort_by_key(|&n| node_value(&seed, n));
+    assert_eq!(subgroup_size(40, 3), Some(3));
+    let e = fact_on(&l, &a6, &y6, &members);
+    assert_eq!(fact_reason(&mut l, &e), None);
 }
