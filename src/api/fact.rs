@@ -9,7 +9,11 @@ use moonblokz_chain_types::calculate_hash;
 struct TwinRound {
     c: u32,
     s: u32,
-    key: u32,
+    /// The round's index `j`, carried by its opener (code review DN1): the
+    /// ring key, the same on both sides of a split in one round and distinct
+    /// across rounds.
+    j: u32,
+    parent_hash: [u8; HASH_SIZE],
     local_member: bool,
 }
 
@@ -48,8 +52,22 @@ pub(super) struct CreditDrop<'a, S, const MAX_BLOCKS: usize, const MAX_NODES: us
     blocks: &'a BlockTable<MAX_BLOCKS>,
     storage: &'a S,
     parent: u32,
-    h: Option<u32>,
+    /// `H`, or 0 when no fact block lies in the range (the fast path: one
+    /// walk at construction, then every answer is "no").
+    h: u32,
     fault: core::cell::Cell<bool>,
+}
+
+/// The [`CreditDrop`] of the held block at `idx` (its parent's range), the
+/// one constructor the commit, the switch undo and the rewind use.
+pub(super) fn credit_drop<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>(
+    blocks: &'a BlockTable<MAX_BLOCKS>,
+    storage: &'a S,
+    h: Option<u32>,
+    idx: u32,
+) -> CreditDrop<'a, S, MAX_BLOCKS, MAX_NODES> {
+    let parent = blocks.get(idx).map_or(NONE_REF, |entry| entry.parent_ref());
+    CreditDrop::new(blocks, storage, parent, h)
 }
 
 impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>
@@ -64,22 +82,29 @@ impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>
         parent: u32,
         h: Option<u32>,
     ) -> Self {
+        let h = h.unwrap_or(0);
+        let mut any = false;
+        let mut cur = parent;
+        for _ in 0..h {
+            let Some(entry) = blocks.get(cur) else {
+                break;
+            };
+            any |= entry.equivocator_filter().is_some();
+            cur = entry.parent_ref();
+        }
         Self {
             blocks,
             storage,
             parent,
-            h,
+            h: if any { h } else { 0 },
             fault: core::cell::Cell::new(false),
         }
     }
 
     /// Whether a fact block in `[b − H, b − 1]` names `node`.
     pub(super) fn excluded(&self, node: u32) -> bool {
-        let Some(h) = self.h else {
-            return false;
-        };
         let mut cur = self.parent;
-        for _ in 0..h {
+        for _ in 0..self.h {
             let Some(entry) = self.blocks.get(cur) else {
                 return false;
             };
@@ -181,9 +206,15 @@ impl<
     ///
     /// In a window-anchored FR3 pass with earliest block `a` a rule is checked
     /// only where its inputs lie in the segment (rule 1 at `s ≥ a`, 3 with `c`
-    /// seeded, 4 at `q − W ≥ a`, 6 at `P − W + 1 ≥ a` with the roster and
-    /// every vote known, 7 with `c`'s vote seeded); elsewhere it is trusted,
-    /// as DEC-262 trusts an evidence block. A local fault is never evidence.
+    /// seeded, 6 at `P − W + 1 ≥ a` with the roster and every vote known, 7
+    /// with `c`'s vote seeded); elsewhere it is trusted, as DEC-262 trusts an
+    /// evidence block. Rule 4a and 5 are arithmetic, always exact; rule 4b
+    /// walks the held part of the window, so its part below `a` is trusted. A
+    /// local fault is never evidence.
+    ///
+    /// `required_support` and `c`'s key are read at the tip, not at `P`: the
+    /// first is a literal-only chain parameter, the second never changes once
+    /// registered, so both are `P`'s values (code review P10).
     #[inline(never)]
     pub(super) fn judge_twin_fact(
         &mut self,
@@ -261,6 +292,15 @@ impl<
                 let j = (0..=last_node)
                     .filter(|&n| self.vote_engine.ranks_above(n, view.creator()))
                     .count() as u32;
+                // A normal-form opener is the entitled creator (round 0); a
+                // retry is a deviation, whose header I-09 binds to the top
+                // (code review P2). The carried `j` is the opener's rank (DN1).
+                if view.creator() == view.first_voted_node() && j != 0 {
+                    return Err(invalid(ValidationReason::TwinFactKind));
+                }
+                if proof.round() != Some(j) {
+                    return Err(invalid(ValidationReason::TwinFactSubgroup));
+                }
                 match self.fact_subgroup_holds(tip, &proof, j, w, required_support, projection) {
                     Ok(true) => {}
                     Ok(false) => return Err(invalid(ValidationReason::TwinFactSubgroup)),
@@ -341,14 +381,20 @@ impl<
 
     /// I-43 rule 6 (DEC-277, DEC-278): whether the proof's carried subgroup is
     /// round `j`'s — `A` at `P` without `c`, ranked under the twin seed. In
-    /// Ready and on the walk `A` at `P` is the counter corrected exactly: the
-    /// active blocks `[s, q − 1]` leave (by creator, `leaving`), and the blocks
-    /// `[s − W, tail − 1]` that left the counter since `P` return
-    /// (`returned`); `n` is in `A` at `P` iff `returned(n) ∨ count(n) >
-    /// leaving(n)`. At most `2(H − 1)` header reads, all retained (`q ≤ s + H −
-    /// 1`). The FR3 pass has no counter, so it builds one over the window at
-    /// `P` and leaves it invalid again. Its own frame: the two per-node arrays
+    /// Ready and on the walk `A` at `P` is the counter corrected exactly, per
+    /// node: `rest(n) = count(n)`, minus each active block of `n` in `[s, q −
+    /// 1]` (they leave), plus each block of `n` in `[s − W, tail − 1]` (they
+    /// left the counter since `P` and return); `n` is in `A` at `P` iff
+    /// `rest(n) > 0`. At most `2(H − 1)` header reads, all retained (`q ≤ s +
+    /// H − 1`). The FR3 pass has no counter, so it builds one over the window
+    /// at `P` and leaves it invalid again. Its own frame: the per-node `rest`
     /// and the ranked list.
+    ///
+    /// This is the general form of the correction; the deviation's
+    /// (`parent_set_correction`, Story 6.7) is its special case, where every
+    /// leaving block is one creator's, so it needs no per-node array (code
+    /// review DN2: kept separate, since the array on the deviation paths
+    /// would pass `bls-min-sig`'s Core 1 reservation).
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn fact_subgroup_holds(
@@ -363,32 +409,33 @@ impl<
         let (s, c) = (proof.sequence(), proof.creator());
         let parent = s.checked_sub(1).ok_or(())?;
         let p_idx = self.ancestor_at(tip, parent).ok().flatten().ok_or(())?;
-        let mut leaving = [0u8; MAX_NODES];
-        let mut returned = [false; MAX_NODES];
         let in_pass = projection.counter_tail == u32::MAX;
         if in_pass {
             self.build_active_set_over(p_idx, s.saturating_sub(w));
-        } else {
-            let tip_seq = self.blocks.get(tip).ok_or(())?.sequence();
-            for sequence in s..=tip_seq {
-                let creator = self.creator_at(tip, sequence)? as usize;
-                let slot = leaving.get_mut(creator).ok_or(())?;
-                *slot = slot.saturating_add(1);
-            }
-            if let Some(last) = projection.counter_tail.checked_sub(1) {
-                for sequence in s.saturating_sub(w)..=last {
-                    let creator = self.creator_at(tip, sequence)? as usize;
-                    *returned.get_mut(creator).ok_or(())? = true;
-                }
-            }
         }
         if !self.active_set.is_valid() {
             return Err(());
         }
-        let set = &self.active_set;
-        let member = |n: u32| {
-            n != c && (returned[n as usize] || set.count_of(n) > u16::from(leaving[n as usize]))
-        };
+        let mut rest = [0u16; MAX_NODES];
+        for (n, slot) in rest.iter_mut().enumerate() {
+            *slot = self.active_set.count_of(n as u32);
+        }
+        if !in_pass {
+            let tip_seq = self.blocks.get(tip).ok_or(())?.sequence();
+            for sequence in s..=tip_seq {
+                let creator = self.creator_at(tip, sequence)? as usize;
+                let slot = rest.get_mut(creator).ok_or(())?;
+                *slot = slot.checked_sub(1).ok_or(())?;
+            }
+            if let Some(last) = projection.counter_tail.checked_sub(1) {
+                for sequence in s.saturating_sub(w)..=last {
+                    let creator = self.creator_at(tip, sequence)? as usize;
+                    let slot = rest.get_mut(creator).ok_or(())?;
+                    *slot = slot.checked_add(1).ok_or(())?;
+                }
+            }
+        }
+        let member = |n: u32| n != c && rest.get(n as usize).is_some_and(|&r| r > 0);
         let seed = twin_seed(s, self.circulating_currency_at(p_idx), c, j);
         let mut members = [0u32; MAX_SUBGROUP];
         let m = self.rank_members(member, &seed, required_support, &mut members);
@@ -411,14 +458,15 @@ impl<
     }
 
     /// Story 6.13 AC5 (FR12, DEC-277) — the twin round's support for the
-    /// admitted block `x`, a twin fact block. Only a validated one on the
-    /// active chain (its parent on the node's chain, so a late twin's side,
-    /// which no majority stands on, gathers nothing), a round-opening one,
-    /// above the support floor, whose carried subgroup holds the local node.
-    /// A retry (a deviation-form fact block) needs grace admission, as any
-    /// deviation. One support per round: the ring entry `(c, s, round key)`.
-    /// No support once an approval for a twin round of `(c, s)` is held. The
-    /// signed content is the deviation's, with `x`'s creator as proposer.
+    /// admitted block `x`, a round-opening twin fact block: its parent on the
+    /// local active chain (so a late twin's side, which no majority stands on,
+    /// gathers nothing), its creator signature verified, above the support
+    /// floor, its carried subgroup holding the local node. A retry (a
+    /// deviation-form fact block, a sibling of the first opener) needs grace
+    /// admission, as any deviation (code review P3). One support per round:
+    /// the ring entry `(c, s, j)` (DN1). No support once an active approval
+    /// closes a round of the same `(c, s, P)` (P4). The signed content is the
+    /// deviation's, with `x`'s creator as proposer.
     pub(super) fn evaluate_twin_support(
         &mut self,
         x_idx: u32,
@@ -426,10 +474,14 @@ impl<
         x_first_voted: u32,
     ) -> Option<SupportMessage> {
         let x = self.blocks.get(x_idx)?;
-        if !x.is_on_active_chain() || !x.is_signature_verified() {
+        if !x.is_signature_verified() {
             return None;
         }
-        let (q, x_hash) = (x.sequence(), *x.hash());
+        let (q, x_hash, x_parent) = (x.sequence(), *x.hash(), x.parent_ref());
+        let parent = self.blocks.get(x_parent)?;
+        if !parent.is_on_active_chain() || parent.sequence().checked_add(1) != Some(q) {
+            return None;
+        }
         if x_creator != x_first_voted && !self.grace_admits(x_creator) {
             return None;
         }
@@ -438,11 +490,11 @@ impl<
             || !round.local_member
             || self
                 .non_conflict
-                .holds(RING_KIND_TWIN, round.c, round.s, round.key)
-            || self.holds_twin_approval(round.c, round.s) != Some(false)
+                .holds(RING_KIND_TWIN, round.c, round.s, round.j)
+            || self.holds_twin_approval(round.c, round.s, &round.parent_hash) != Some(false)
             || !self
                 .non_conflict
-                .insert(RING_KIND_TWIN, round.c, round.s, round.key)
+                .insert(RING_KIND_TWIN, round.c, round.s, round.j)
         {
             return None;
         }
@@ -467,33 +519,24 @@ impl<
         })
     }
 
-    /// The round a round-opening twin fact block at `idx` opens: its `c` and
-    /// `s`, the round key (the first 4 bytes of the digest of its carried
-    /// members, the same on both sides of a split in one round) and whether
-    /// the local node is a member. `None` for a penalty-only block or a failed
-    /// read. Its own frame.
+    /// The round a round-opening twin fact block at `idx` opens: its `c`, `s`,
+    /// `j` and parent hash, and whether the local node is a member. `None` for
+    /// a penalty-only block or a failed read. Its own frame.
     #[inline(never)]
     fn twin_round_of(&self, idx: u32) -> Option<TwinRound> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
         let proof = TwinFactView::from_payload(view.payload())?;
-        let m = usize::from(proof.m());
-        if m == 0 {
-            return None;
-        }
-        let mut members = [0u8; 4 * MAX_SUBGROUP];
-        let mut local_member = false;
-        for i in 0..m {
-            let member = proof.member(i)?;
-            local_member |= member == self.local_node_id;
-            members[4 * i..4 * i + 4].copy_from_slice(&member.to_le_bytes());
-        }
-        let digest = calculate_hash(&members[..4 * m]);
+        let j = proof.round()?;
+        let local = self.local_node_id;
+        let mut parent_hash = [0u8; HASH_SIZE];
+        parent_hash.copy_from_slice(proof.parent_hash());
         Some(TwinRound {
             c: proof.creator(),
             s: proof.sequence(),
-            key: u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]),
-            local_member,
+            j,
+            parent_hash,
+            local_member: (0..usize::from(proof.m())).any(|i| proof.member(i) == Some(local)),
         })
     }
 
@@ -526,7 +569,7 @@ impl<
     /// block at `idx` and `proposer` is its creator; `None` on a failed read.
     /// Its own frame.
     #[inline(never)]
-    fn twin_member(&self, idx: u32, node: u32, proposer: u32) -> Option<bool> {
+    pub(super) fn twin_member(&self, idx: u32, node: u32, proposer: u32) -> Option<bool> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
         let proof = TwinFactView::from_payload(view.payload())?;
@@ -536,17 +579,22 @@ impl<
         )
     }
 
-    /// The twin round's stop (Story 6.13 AC5): whether any held approval
-    /// evidence closes a run opened by a fact block for `(c, s)`, on any
-    /// branch. A RAM scan for type-4 entries, then reads for each; `None` on a
-    /// failed read (the conservative side: no support).
-    fn holds_twin_approval(&self, c: u32, s: u32) -> Option<bool> {
+    /// The twin round's stop (Story 6.13 AC5): whether an active approval
+    /// evidence closes a run opened by a fact block for `(c, s, P)`. Only an
+    /// active approval counts — it passed Tier 3 — as for the deviation's stop
+    /// (DEC-260); an unvalidated side approval must not silence a round (code
+    /// review P4). A RAM scan for active type-4 entries, then reads for each;
+    /// `None` on a failed read (the conservative side: no support).
+    fn holds_twin_approval(&self, c: u32, s: u32, parent_hash: &[u8; HASH_SIZE]) -> Option<bool> {
         let mut failed = false;
         for idx in 0..MAX_BLOCKS as u32 {
             let Some(entry) = self.blocks.get(idx) else {
                 continue;
             };
-            if entry.payload_type() != PAYLOAD_TYPE_APPROVAL || entry.sequence() <= s {
+            if entry.payload_type() != PAYLOAD_TYPE_APPROVAL
+                || entry.sequence() <= s
+                || !entry.is_on_active_chain()
+            {
                 continue;
             }
             let opener = match self.evidence_deviation(idx) {
@@ -569,7 +617,11 @@ impl<
                 continue;
             }
             match self.fact_sequence(opener) {
-                Some((creator, seq)) if creator == c && seq == s => return Some(true),
+                Some((creator, seq, parent))
+                    if creator == c && seq == s && parent == *parent_hash =>
+                {
+                    return Some(true);
+                }
                 Some(_) => {}
                 None => failed = true,
             }
@@ -577,13 +629,17 @@ impl<
         (!failed).then_some(false)
     }
 
-    /// The proof's creator and sequence of the twin fact block at `idx`;
-    /// `None` on a failed read or a payload that does not frame. Its own frame.
+    /// The proof's creator, sequence and parent hash of the twin fact block
+    /// at `idx`; `None` on a failed read or a payload that does not frame. Its
+    /// own frame.
     #[inline(never)]
-    fn fact_sequence(&self, idx: u32) -> Option<(u32, u32)> {
+    fn fact_sequence(&self, idx: u32) -> Option<(u32, u32, [u8; HASH_SIZE])> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
-        TwinFactView::from_payload(view.payload()).map(|proof| (proof.creator(), proof.sequence()))
+        let proof = TwinFactView::from_payload(view.payload())?;
+        let mut parent = [0u8; HASH_SIZE];
+        parent.copy_from_slice(proof.parent_hash());
+        Some((proof.creator(), proof.sequence(), parent))
     }
 
     /// Story 6.13 AC7 (DEC-276): whether the candidate segment above

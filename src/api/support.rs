@@ -127,6 +127,18 @@ impl<
             if !self.on_chain_support_holds(d_idx, p, supporter, proposer, own) {
                 return None;
             }
+        } else if let Some(x_idx) = self.blocks.find(p, &hash).filter(|&idx| {
+            self.blocks
+                .get(idx)
+                .is_some_and(|e| e.payload_type() == PAYLOAD_TYPE_TWIN_FACT)
+        }) {
+            // A held twin round off the active chain (a retry beside the
+            // first opener): its carried subgroup decides. The (iv-c) stop
+            // does not apply — the top's own opener at `p` is the round it
+            // retries, not a reason to stop (code review P3).
+            if self.twin_member(x_idx, supporter, proposer) == Some(false) {
+                return None;
+            }
         } else if self.is_ready() && self.off_chain_u_block_stops(p, &hash) {
             return None;
         }

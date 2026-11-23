@@ -378,7 +378,13 @@ fn tier1_twin_fact_block(block: &BlockView) -> Result<(), Tier1Failure> {
         return Ok(());
     };
     let s = proof.sequence();
-    if proof.proof_payload_type() == PAYLOAD_TYPE_TWIN_FACT || s == 0 || s >= block.sequence() {
+    // The proof names a block of a defined type other than a fact block's
+    // (1..=4): a twin of a fact block is not a twin the round resolves (code
+    // review P9).
+    if !(PAYLOAD_TYPE_TRANSACTION..=PAYLOAD_TYPE_APPROVAL).contains(&proof.proof_payload_type())
+        || s == 0
+        || s >= block.sequence()
+    {
         return Err(Tier1Failure::MalformedPayload);
     }
     let m = usize::from(proof.m());

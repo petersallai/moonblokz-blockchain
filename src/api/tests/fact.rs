@@ -23,7 +23,8 @@ fn twin_y(a2: &Block) -> Block {
 }
 
 /// A twin fact block at `seq` on `prev` by `creator` (signed with `[key; 32]`),
-/// worth `consumed`, proving `proof` with `snapshot` and `members`.
+/// worth `consumed`, proving `proof` with `snapshot` and `members`; a
+/// round-opening one carries round 0.
 #[allow(clippy::too_many_arguments)]
 fn fact_with(
     seq: u32,
@@ -33,6 +34,25 @@ fn fact_with(
     consumed: u32,
     proof: &Block,
     snapshot: u32,
+    members: &[u32],
+) -> Block {
+    fact_round(
+        seq, prev, creator, key, consumed, proof, snapshot, 0, members,
+    )
+}
+
+/// [`fact_with`] carrying round `j` (written only when `members` is not
+/// empty, as the layout has it).
+#[allow(clippy::too_many_arguments)]
+fn fact_round(
+    seq: u32,
+    prev: [u8; 32],
+    creator: u32,
+    key: u8,
+    consumed: u32,
+    proof: &Block,
+    snapshot: u32,
+    j: u32,
     members: &[u32],
 ) -> Block {
     let signer = Crypto::new([key; PRIVATE_KEY_SIZE]).ok().expect("test key");
@@ -57,8 +77,11 @@ fn fact_with(
     payload[HEADER_SIZE..HEADER_SIZE + 32].copy_from_slice(&calculate_hash(view.payload()));
     payload[HEADER_SIZE + 32..HEADER_SIZE + 36].copy_from_slice(&snapshot.to_le_bytes());
     payload[HEADER_SIZE + 36] = u8::try_from(members.len()).expect("m");
+    if !members.is_empty() {
+        payload[HEADER_SIZE + 37..HEADER_SIZE + 41].copy_from_slice(&j.to_le_bytes());
+    }
     for (i, member) in members.iter().enumerate() {
-        let at = HEADER_SIZE + 37 + 4 * i;
+        let at = HEADER_SIZE + 41 + 4 * i;
         payload[at..at + 4].copy_from_slice(&member.to_le_bytes());
     }
     builder.build_signed(&signer).ok().expect("signs")
@@ -605,11 +628,11 @@ fn the_round_seed_is_bound_to_the_openers_rank() {
         members
     };
     assert_ne!(order(0), order(j), "precondition: the rounds differ");
-    let retry = |members: [u32; 3]| {
+    let retry = |carried: u32, members: [u32; 3]| {
         let signer = Crypto::new([key_of(opener); PRIVATE_KEY_SIZE])
             .ok()
             .expect("key");
-        let template = fact_with(
+        let template = fact_round(
             6,
             a5.view().hash(),
             opener,
@@ -617,6 +640,7 @@ fn the_round_seed_is_bound_to_the_openers_rank() {
             0,
             &y,
             0,
+            carried,
             &members,
         );
         let view = template.view();
@@ -642,13 +666,17 @@ fn the_round_seed_is_bound_to_the_openers_rank() {
             .copy_from_slice(&payload);
         builder.build_signed(&signer).ok().expect("signs")
     };
-    let right = retry(order(j));
-    let round_zero = retry(order(0));
+    let right = retry(j, order(j));
+    // Round 0's order under the right index, and round 0 claimed whole: the
+    // carried `j` is the opener's rank (DN1), and the order is round `j`'s.
+    let wrong = [(j, order(0)), (0, order(0)), (0, order(j))].map(|(c, m)| retry(c, m));
     assert_eq!(fact_reason(&mut l, &right), None);
-    assert_eq!(
-        fact_reason(&mut l, &round_zero),
-        Some(ValidationReason::TwinFactSubgroup)
-    );
+    for block in &wrong {
+        assert_eq!(
+            fact_reason(&mut l, block),
+            Some(ValidationReason::TwinFactSubgroup)
+        );
+    }
 }
 
 /// FR72: the fact block's snapshot carries the vote the equivocator banked

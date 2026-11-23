@@ -282,15 +282,21 @@ impl<
 
         // 1–2. The subgroup at `p − 1` and the signers in rank order. A twin
         // run's subgroup is the one its opener carries (Story 6.13 AC4, D11),
-        // checked when the opener was applied.
-        let twin = d.payload_type() == PAYLOAD_TYPE_TWIN_FACT;
+        // checked when the opener was applied. A penalty-only fact block
+        // (`m = 0`) in deviation form opens an ordinary deviation run, so its
+        // evidence takes the deviation's subgroup (code review P1).
         let mut members = [0u32; MAX_SUBGROUP];
-        let m = if twin {
+        let carried = if d.payload_type() == PAYLOAD_TYPE_TWIN_FACT {
             match self.fact_members(d_idx, &mut members) {
-                Some(m) if m > 0 => m,
-                Some(_) => return Err(invalid(ValidationReason::EvidenceSubgroup)),
+                Some(m) => m,
                 None => return Err(ProcessingError::StorageRead),
             }
+        } else {
+            0
+        };
+        let twin = carried > 0;
+        let m = if twin {
+            carried
         } else {
             match self.evidence_members(
                 tip,

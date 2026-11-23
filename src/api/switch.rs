@@ -165,7 +165,8 @@ impl<
     /// nothing. A forged candidate block is deleted with its descendants as
     /// exact evidence (FR16), as the switch's pre-pass would, and the candidate
     /// drops out without a second verification or a walk. Story 6.13 lifts
-    /// the hold for a candidate carrying a verdict for its twin.
+    /// the hold for a candidate whose side holds an approved twin round
+    /// against the active twin (`approved_against`).
     pub(super) fn twin_held(&mut self, head: u32) -> bool {
         let Some(ancestor) = self.common_ancestor(head) else {
             return false;
@@ -725,23 +726,21 @@ impl<
         // state, never evidence against the block (AC2 step 2).
         if let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
             // FR72: the credit drop the apply made (Story 6.13 AC6).
-            let parent = self
-                .blocks
-                .get(idx)
-                .map_or(NONE_REF, |entry| entry.parent_ref());
-            let drop = fact::CreditDrop::<_, MAX_BLOCKS, MAX_NODES>::new(
+            let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
                 &self.blocks,
                 &self.storage,
-                parent,
                 self.verification_horizon(),
+                idx,
             );
             if !drop.reads_hold(&v) {
                 return Err(());
             }
             let undone = self.vote_engine.undo_block(v, |node| drop.excluded(node));
             if drop.faulted() {
-                // The engine's result is not trusted: escalate (DEC-205).
-                self.reentry_due = true;
+                // The engine's result is not trusted: escalate (DEC-205),
+                // as the commit and the vote step do; the FR3 pass has no
+                // re-entry of its own (code review P7).
+                self.reentry_due |= self.is_ready();
                 return Err(());
             }
             undone.map_err(|_| ())?;

@@ -589,15 +589,11 @@ impl<
             return false;
         }
         // FR72: the credit drop at this block (Story 6.13 AC6).
-        let parent = self
-            .blocks
-            .get(idx)
-            .map_or(NONE_REF, |entry| entry.parent_ref());
-        let drop = fact::CreditDrop::<_, MAX_BLOCKS, MAX_NODES>::new(
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
             &self.blocks,
             &self.storage,
-            parent,
             self.verification_horizon(),
+            idx,
         );
         if !drop.reads_hold(&view) {
             return false;

@@ -101,7 +101,7 @@ const FLAG_STATUS_MASK: u8 = 0b0000_0110;
 /// existence-floor seed source (`max_known_node_id` at the window tail) — without
 /// a storage read per block. Costs no extra memory (reuses free flag bits).
 /// Default `flags == 0` decodes to code 0 ⇒ `transaction`; the admission path
-/// stamps the true type via [`BlockEntry::set_payload_type`] before insertion, so
+/// stamps the true type via [`BlockEntry::set_payload`] before insertion, so
 /// only an explicitly-stamped entry is authoritative (unstamped test entries read
 /// as `transaction`, which the balance-only floor scan simply skips).
 ///
@@ -222,8 +222,9 @@ impl BlockEntry {
 
     /// Stamps the block's `payload_type` (1..=5) into `flags` bits 3-4 and 7
     /// **before** insertion (Story 5.4 review, Story 6.13), stored as
-    /// `payload_type - 1`. A value outside 1..=5 is clamped into the 3-bit
-    /// field; the admission path only ever passes a Tier-1-validated type. See
+    /// `payload_type - 1`. A value outside 1..=5 is masked to the 3-bit field
+    /// (it wraps, it is not clamped); the admission path only ever passes a
+    /// Tier-1-validated type. See
     /// [`FLAG_PAYLOAD_TYPE_MASK`].
     pub(crate) fn set_payload_type(&mut self, payload_type: u8) {
         let code = payload_type.wrapping_sub(1) & 0b111;
