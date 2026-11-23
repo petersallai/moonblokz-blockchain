@@ -176,11 +176,6 @@ impl<
         // `ChainHeadsTable::init`'s own const assert: invisible to `cargo check`
         // while it passes.
         const { assert!(limits_are_expressible(Self::BUILD_LIMITS)) };
-        // Story 6.13 D6 (DEC-280): a block entry caches a twin fact block's
-        // equivocator in 16 bits, which is the whole id only while node ids,
-        // contiguous below `MAX_NODES`, fit them. A wider build needs another
-        // cache first (the confirm-read form, deferred until such a profile).
-        const { assert!(MAX_NODES <= 1 << 16) };
 
         let p = slot.as_mut_ptr();
         // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it

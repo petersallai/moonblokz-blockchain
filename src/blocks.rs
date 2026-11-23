@@ -157,12 +157,12 @@ pub(crate) struct BlockEntry {
     /// that never round-trip through storage. A `u32` on every block-size tier
     /// (DEC-224): `size_of::<BlockEntry>()` is 80 B.
     len: u32,
-    /// The equivocator `c` a twin fact block names (FR72, Story 6.13 D6 (d),
-    /// DEC-280), stamped where the block is in hand; 0 for every other type. It
-    /// fills the entry's 2 B of tail padding, so the entry stays 80 B. 16 bits
-    /// are the whole id because the blockchain is built with `MAX_NODES ≤
-    /// 65 536` (asserted at construction) and node ids are contiguous below it.
-    /// RAM-only: the restart rebuild re-stamps it from the read block.
+    /// The low 16 bits of the equivocator `c` a twin fact block names (FR72,
+    /// Story 6.13 D6 (d), DEC-280), stamped where the block is in hand; 0 for
+    /// every other type. A filter, not the id: node ids are `u32`, so a match
+    /// is confirmed by reading the block wherever ids can exceed 16 bits
+    /// (`MAX_NODES > 65 536`). It fills the entry's 2 B of tail padding, so the
+    /// entry stays 80 B. RAM-only: the restart rebuild re-stamps it.
     equivocator: u16,
 }
 
@@ -258,10 +258,11 @@ impl BlockEntry {
         (((self.flags & FLAG_PAYLOAD_TYPE_MASK) >> FLAG_PAYLOAD_TYPE_SHIFT) | high) + 1
     }
 
-    /// The equivocator a twin fact block names (DEC-280); `None` for any other
-    /// block.
-    pub(crate) fn equivocator(&self) -> Option<u32> {
-        (self.payload_type() == PAYLOAD_TYPE_TWIN_FACT).then_some(u32::from(self.equivocator))
+    /// The low 16 bits of the equivocator a twin fact block names (DEC-280);
+    /// `None` for any other block. A match is a candidate, exact only while
+    /// node ids fit 16 bits.
+    pub(crate) fn equivocator_filter(&self) -> Option<u16> {
+        (self.payload_type() == PAYLOAD_TYPE_TWIN_FACT).then_some(self.equivocator)
     }
 
     pub(crate) fn is_on_active_chain(&self) -> bool {

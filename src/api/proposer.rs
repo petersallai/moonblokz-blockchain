@@ -593,13 +593,27 @@ impl<
             .blocks
             .get(idx)
             .map_or(NONE_REF, |entry| entry.parent_ref());
-        let (blocks, h) = (&self.blocks, self.verification_horizon());
-        let excluded = |node| fact::credit_excluded(blocks, parent, h, node);
-        if undo {
+        let drop = fact::CreditDrop::<_, MAX_BLOCKS, MAX_NODES>::new(
+            &self.blocks,
+            &self.storage,
+            parent,
+            self.verification_horizon(),
+        );
+        if !drop.reads_hold(&view) {
+            return false;
+        }
+        let excluded = |node| drop.excluded(node);
+        let stepped = if undo {
             self.vote_engine.undo_block(view, excluded).is_ok()
         } else {
             self.vote_engine.apply_block(view, excluded).is_ok()
+        };
+        if drop.faulted() {
+            // The engine's result is not trusted: escalate (DEC-205).
+            self.reentry_due |= self.is_ready();
+            return false;
         }
+        stepped
     }
 
     /// Story 6.6 AC8 (FR29, FR27, FR58; D6, D9) — what the proposer's

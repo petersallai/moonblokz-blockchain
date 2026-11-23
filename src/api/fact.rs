@@ -23,31 +23,122 @@ enum Reach {
     Local,
 }
 
-/// FR72 (Story 6.13 AC6; DEC-279, DEC-280): whether `node` gets no step-2
-/// credit in the block whose parent is `parent`, because a twin fact block in
-/// the `H` blocks below that block, `[b − H, b − 1]`, names it. A RAM walk over
-/// the cached payload type and equivocator: no read, no state. `h` is the
-/// chain's verification horizon; without one no fact block can exist.
-pub(super) fn credit_excluded<const MAX_BLOCKS: usize>(
-    blocks: &BlockTable<MAX_BLOCKS>,
+/// Whether node ids can exceed the 16 bits the equivocator filter holds
+/// (DEC-280): then a filter match is confirmed by reading the fact block. Node
+/// ids are contiguous below `MAX_NODES`.
+const fn ids_exceed_filter(max_nodes: usize) -> bool {
+    max_nodes > 1 << 16
+}
+
+/// FR72 (Story 6.13 AC6; DEC-279, DEC-280): the credit-drop predicate of one
+/// applied block `b` — whether a twin fact block in `[b − H, b − 1]` names a
+/// node, so that it gets no step-2 credit. A RAM walk over the cached payload
+/// type and equivocator filter; where node ids can exceed 16 bits a filter
+/// match is confirmed by one read of the fact block (compiled out otherwise).
+/// No state.
+///
+/// A confirm read that fails sets [`Self::faulted`] and answers "not
+/// excluded". The vote engine's apply is atomic only if its predicate is
+/// stable, so a caller first runs [`Self::reads_hold`], which performs every
+/// read the block's credits need: a failure there is a clean local fault,
+/// with nothing mutated. A read that fails only inside the engine (a storage
+/// fault between two reads of one block) leaves the engine's result
+/// untrustworthy; the caller escalates it like a failed restore (DEC-205).
+pub(super) struct CreditDrop<'a, S, const MAX_BLOCKS: usize, const MAX_NODES: usize> {
+    blocks: &'a BlockTable<MAX_BLOCKS>,
+    storage: &'a S,
     parent: u32,
     h: Option<u32>,
-    node: u32,
-) -> bool {
-    let Some(h) = h else {
-        return false;
-    };
-    let mut cur = parent;
-    for _ in 0..h {
-        let Some(entry) = blocks.get(cur) else {
+    fault: core::cell::Cell<bool>,
+}
+
+impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>
+    CreditDrop<'a, S, MAX_BLOCKS, MAX_NODES>
+{
+    /// The predicate for the block whose parent is `parent`, under the
+    /// chain's verification horizon `h` (none before a configuration: then no
+    /// fact block can exist).
+    pub(super) fn new(
+        blocks: &'a BlockTable<MAX_BLOCKS>,
+        storage: &'a S,
+        parent: u32,
+        h: Option<u32>,
+    ) -> Self {
+        Self {
+            blocks,
+            storage,
+            parent,
+            h,
+            fault: core::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether a fact block in `[b − H, b − 1]` names `node`.
+    pub(super) fn excluded(&self, node: u32) -> bool {
+        let Some(h) = self.h else {
             return false;
         };
-        if entry.equivocator() == Some(node) {
+        let mut cur = self.parent;
+        for _ in 0..h {
+            let Some(entry) = self.blocks.get(cur) else {
+                return false;
+            };
+            if entry.equivocator_filter() == Some(node as u16) {
+                if !ids_exceed_filter(MAX_NODES) {
+                    return true;
+                }
+                match fact_creator(self.blocks, self.storage, cur) {
+                    Some(c) if c == node => return true,
+                    Some(_) => {}
+                    None => {
+                        self.fault.set(true);
+                        return false;
+                    }
+                }
+            }
+            cur = entry.parent_ref();
+        }
+        false
+    }
+
+    /// Performs every confirm read `view`'s credits need, before the engine
+    /// runs; `false` when one fails (a local fault, nothing mutated). Always
+    /// `true` where node ids fit the filter.
+    pub(super) fn reads_hold(&self, view: &BlockView<'_>) -> bool {
+        if !ids_exceed_filter(MAX_NODES) {
             return true;
         }
-        cur = entry.parent_ref();
+        if let Some(txs) = view.transactions() {
+            for tx in txs.iter() {
+                self.excluded(tx.vote());
+            }
+        }
+        !self.fault.get()
     }
-    false
+
+    /// Whether a confirm read failed.
+    pub(super) fn faulted(&self) -> bool {
+        self.fault.get()
+    }
+}
+
+/// The equivocator the held twin fact block at `idx` names, read from its
+/// proof; `None` on a failed read. Its own frame, reached only where node ids
+/// can exceed the filter.
+#[inline(never)]
+fn fact_creator<S: StorageTrait, const MAX_BLOCKS: usize>(
+    blocks: &BlockTable<MAX_BLOCKS>,
+    storage: &S,
+    idx: u32,
+) -> Option<u32> {
+    let mut buf = [0u8; MAX_BLOCK_SIZE];
+    storage.read_block_into(idx, &mut buf).ok()?;
+    let n = match blocks.get(idx).map(|entry| entry.len() as usize) {
+        Some(len) if len > 0 && len <= MAX_BLOCK_SIZE => len,
+        _ => MAX_BLOCK_SIZE,
+    };
+    let view = BlockView::from_bytes(&buf[..n]).ok()?;
+    TwinFactView::from_payload(view.payload()).map(|proof| proof.creator())
 }
 
 impl<
@@ -235,9 +326,11 @@ impl<
             let Some(entry) = self.blocks.get(cur) else {
                 return Ok(true);
             };
-            if entry.equivocator() == Some(c) {
+            if entry.equivocator_filter() == Some(c as u16) {
                 let view = self.view_retained(cur, &mut buf).ok_or(())?;
-                if TwinFactView::from_payload(view.payload()).is_some_and(|p| p.sequence() == s) {
+                if TwinFactView::from_payload(view.payload())
+                    .is_some_and(|p| p.creator() == c && p.sequence() == s)
+                {
                     return Ok(false);
                 }
             }
@@ -467,11 +560,16 @@ impl<
             let Some(opener) = opener else {
                 continue;
             };
-            if self.blocks.get(opener).and_then(BlockEntry::equivocator) != Some(c) {
+            if self
+                .blocks
+                .get(opener)
+                .and_then(BlockEntry::equivocator_filter)
+                != Some(c as u16)
+            {
                 continue;
             }
             match self.fact_sequence(opener) {
-                Some(seq) if seq == s => return Some(true),
+                Some((creator, seq)) if creator == c && seq == s => return Some(true),
                 Some(_) => {}
                 None => failed = true,
             }
@@ -479,13 +577,13 @@ impl<
         (!failed).then_some(false)
     }
 
-    /// The proof sequence of the twin fact block at `idx`; `None` on a failed
-    /// read or a payload that does not frame. Its own frame.
+    /// The proof's creator and sequence of the twin fact block at `idx`;
+    /// `None` on a failed read or a payload that does not frame. Its own frame.
     #[inline(never)]
-    fn fact_sequence(&self, idx: u32) -> Option<u32> {
+    fn fact_sequence(&self, idx: u32) -> Option<(u32, u32)> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
-        TwinFactView::from_payload(view.payload()).map(|proof| proof.sequence())
+        TwinFactView::from_payload(view.payload()).map(|proof| (proof.creator(), proof.sequence()))
     }
 
     /// Story 6.13 AC7 (DEC-276): whether the candidate segment above

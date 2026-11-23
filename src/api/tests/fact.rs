@@ -10,7 +10,7 @@
 
 use super::fixtures::*;
 use super::*;
-use crate::api::fact::credit_excluded;
+use crate::api::fact::CreditDrop;
 use crate::approval::{
     NonConflictRing, RING_KIND_TWIN, node_value, subgroup_size, support_message_bytes, twin_seed,
 };
@@ -188,7 +188,7 @@ fn the_payload_type_cache_holds_types_one_to_five() {
         entry.set_payload_type(payload_type);
         assert_eq!(entry.payload_type(), payload_type);
         // Only a type-5 entry names an equivocator (unstamped here: 0).
-        assert_eq!(entry.equivocator().is_some(), payload_type == 5);
+        assert_eq!(entry.equivocator_filter().is_some(), payload_type == 5);
     }
 }
 
@@ -242,7 +242,7 @@ fn a_round_opening_fact_block_is_accepted_supported_and_resets_the_equivocator()
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), 0, "c's twin reset");
     let entry = bc.blocks.get(slot(&bc, &e)).expect("held");
     assert_eq!(entry.payload_type(), PAYLOAD_TYPE_TWIN_FACT);
-    assert_eq!(entry.equivocator(), Some(1));
+    assert_eq!(entry.equivocator_filter(), Some(1));
     assert!(bc.active_open_run != u32::MAX, "it opens a run");
 }
 
@@ -443,12 +443,17 @@ fn the_credit_drop_reads_the_horizon_not_the_window() {
         // (4) lies in `[seq + 1 − 8, seq]`.
         let expected = seq < 4 + 8; // b = seq + 1 ≤ e + H
         assert_eq!(
-            credit_excluded(&bc.blocks, idx, Some(8), 1),
+            CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, idx, Some(8))
+                .excluded(1),
             expected,
             "b = {}",
             seq + 1
         );
-        assert!(!credit_excluded(&bc.blocks, idx, Some(8), 0), "only c");
+        assert!(
+            !CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, idx, Some(8))
+                .excluded(0),
+            "only c"
+        );
     }
 }
 
@@ -539,7 +544,7 @@ fn a_restart_restamps_the_fact_block() {
         .get(bc.blocks.find(4, &e.view().hash()).expect("rebuilt"))
         .expect("held");
     assert_eq!(entry.payload_type(), PAYLOAD_TYPE_TWIN_FACT);
-    assert_eq!(entry.equivocator(), Some(1));
+    assert_eq!(entry.equivocator_filter(), Some(1));
 }
 
 /// AR16 (FR63): one stream — a twin, its round's opener, a run block with
@@ -673,10 +678,11 @@ fn the_snapshot_restores_credits_banked_since_the_twin() {
     let bytes = std::vec::Vec::from(e.serialized_bytes());
     let parent = slot(&bc, &b4);
     let h = bc.verification_horizon();
-    let blocks = &bc.blocks;
-    let excluded = |node| credit_excluded(blocks, parent, h, node);
+    let drop = CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, parent, h);
     let view = BlockView::from_bytes(&bytes).ok().expect("parses");
-    bc.vote_engine.undo_block(view, excluded).expect("undoes");
+    bc.vote_engine
+        .undo_block(view, |node| drop.excluded(node))
+        .expect("undoes");
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), banked);
 }
 
@@ -726,4 +732,55 @@ fn the_round_excludes_the_equivocator_from_a() {
     assert_eq!(subgroup_size(40, 3), Some(3));
     let e = fact_on(&l, &a6, &y6, &members);
     assert_eq!(fact_reason(&mut l, &e), None);
+}
+
+/// DEC-280 on a build whose node ids exceed 16 bits (`MAX_NODES = 70 000`,
+/// the predicate's own parameter): a filter match is confirmed by reading the
+/// fact block. The equivocator is node #1, so node 65 537 (low 16 bits 1)
+/// matches the filter and is refused by the read; a failed read is a fault,
+/// and `reads_hold` reports it before any engine step.
+#[test]
+fn a_wide_build_confirms_a_filter_match_by_reading_the_block() {
+    let (mut bc, _, a3, y) = twin_chain();
+    let e = fact_on(&bc, &a3, &y, &[0]);
+    receive(&mut bc, &e);
+    let e_idx = slot(&bc, &e);
+    let mut parent = e_idx;
+    for seq in 5..=6u32 {
+        let mut entry = BlockEntry::new([seq as u8; 32], parent, seq);
+        entry.set_payload_type(PAYLOAD_TYPE_TRANSACTION);
+        let idx = bc.blocks.next_free_index().expect("free");
+        bc.blocks.insert_at(idx, entry);
+        parent = idx;
+    }
+    let wide =
+        CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, parent, Some(8));
+    assert!(wide.excluded(1), "the read confirms c = 1");
+    assert!(
+        !wide.excluded(65_537),
+        "a 16-bit collision, refused by the read"
+    );
+    assert!(!wide.excluded(2));
+    assert!(!wide.faulted());
+    let narrow =
+        CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, parent, Some(8));
+    assert!(narrow.excluded(1), "the filter is the id");
+
+    // A fact entry whose block cannot be read: the confirm read fails.
+    let mut ghost = BlockEntry::new([0xEE; 32], parent, 7);
+    ghost.set_payload(&e.view());
+    let ghost_idx = bc.blocks.next_free_index().expect("free");
+    bc.blocks.insert_at(ghost_idx, ghost);
+    let faulty =
+        CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, ghost_idx, Some(8));
+    let five = alt(8, [0xEE; 32], 0, 0, 2, 31, false);
+    assert!(
+        !faulty.reads_hold(&five.view()),
+        "the pre-check reports the fault"
+    );
+    assert!(faulty.faulted());
+    let unread =
+        CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, ghost_idx, Some(8));
+    assert!(!unread.excluded(1), "a failed read answers not excluded");
+    assert!(unread.faulted(), "and raises the fault");
 }

@@ -379,12 +379,27 @@ impl<
             .blocks
             .get(idx)
             .map_or(NONE_REF, |entry| entry.parent_ref());
-        let (blocks, h) = (&self.blocks, self.verification_horizon());
-        if let Ok(v) = BlockView::from_bytes(view.serialized_bytes())
-            && let Err(e) = self
-                .vote_engine
-                .apply_block(v, |node| fact::credit_excluded(blocks, parent, h, node))
-        {
+        let drop = fact::CreditDrop::<_, MAX_BLOCKS, MAX_NODES>::new(
+            &self.blocks,
+            &self.storage,
+            parent,
+            self.verification_horizon(),
+        );
+        if !drop.reads_hold(view) {
+            self.invert_transactions(view, idx, usize::MAX);
+            return Err(ProcessingError::StorageRead);
+        }
+        let applied = BlockView::from_bytes(view.serialized_bytes())
+            .map(|v| self.vote_engine.apply_block(v, |node| drop.excluded(node)));
+        let faulted = drop.faulted();
+        if faulted {
+            // A confirm read failed inside the engine: its result is not
+            // trusted. A local fault, escalated in Ready (DEC-205).
+            self.reentry_due |= self.is_ready();
+            self.invert_transactions(view, idx, usize::MAX);
+            return Err(ProcessingError::StorageRead);
+        }
+        if let Ok(Err(e)) = applied {
             self.invert_transactions(view, idx, usize::MAX);
             return Err(ProcessingError::Vote(e));
         }
