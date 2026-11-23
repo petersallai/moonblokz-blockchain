@@ -109,9 +109,10 @@ impl<
                     .active_snake_chain_window()
                     .is_ok_and(|(tail, head)| tail <= p && p <= head)
         });
-        let twin = on_chain
-            .and_then(|idx| self.blocks.get(idx))
-            .is_some_and(|entry| entry.payload_type() == PAYLOAD_TYPE_TWIN_FACT);
+        // A round-opening fact block (a failed read defers to its arm, whose
+        // membership read then defers too); a penalty-only one is an ordinary
+        // deviation (code review P1).
+        let twin = on_chain.is_some_and(|idx| self.is_twin_round(idx));
         if let Some(e_idx) = on_chain.filter(|_| twin) {
             // Story 6.13 AC5: a twin round's support — membership in the
             // block's carried subgroup; the deviation's (iii) and (iv-c) do not
@@ -127,11 +128,11 @@ impl<
             if !self.on_chain_support_holds(d_idx, p, supporter, proposer, own) {
                 return None;
             }
-        } else if let Some(x_idx) = self.blocks.find(p, &hash).filter(|&idx| {
-            self.blocks
-                .get(idx)
-                .is_some_and(|e| e.payload_type() == PAYLOAD_TYPE_TWIN_FACT)
-        }) {
+        } else if let Some(x_idx) = self
+            .blocks
+            .find(p, &hash)
+            .filter(|&idx| self.is_twin_round(idx))
+        {
             // A held twin round off the active chain (a retry beside the
             // first opener): its carried subgroup decides. The (iv-c) stop
             // does not apply — the top's own opener at `p` is the round it
@@ -547,8 +548,12 @@ impl<
         if !self.is_ready() || !self.active_set.is_valid() {
             return None;
         }
-        // Story 6.13 AC5: a twin fact block's round has its own arm.
-        if self.blocks.get(x_idx)?.payload_type() == PAYLOAD_TYPE_TWIN_FACT {
+        // Story 6.13 AC5: a round-opening fact block's round has its own
+        // arm. A penalty-only one in deviation form is an ordinary deviation
+        // (code review P1); a failed read supports nothing.
+        if self.blocks.get(x_idx)?.payload_type() == PAYLOAD_TYPE_TWIN_FACT
+            && self.opens_round_at(x_idx).ok()?
+        {
             return self.evaluate_twin_support(x_idx, x_creator, x_first_voted);
         }
         let w = self.active_chain_length()?;

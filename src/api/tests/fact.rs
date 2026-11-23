@@ -96,11 +96,28 @@ fn fact_on<S: StorageTrait>(
     proof: &Block,
     members: &[u32],
 ) -> Block {
+    fact_at(
+        bc,
+        head.view().sequence(),
+        head.view().hash(),
+        proof,
+        members,
+    )
+}
+
+/// [`fact_on`] over a head given by its sequence and hash.
+fn fact_at<S: StorageTrait>(
+    bc: &Chain16<S>,
+    head_seq: u32,
+    head_hash: [u8; 32],
+    proof: &Block,
+    members: &[u32],
+) -> Block {
     let creator = bc.vote_engine.top_creator().expect("a top");
     let engine = &bc.vote_engine;
     fact_with(
-        head.view().sequence() + 1,
-        head.view().hash(),
+        head_seq + 1,
+        head_hash,
         creator,
         key_of(creator),
         vote_snapshot(engine.accumulated_vote_of(creator)),
@@ -144,6 +161,48 @@ fn twin_chain() -> (TestChain, Block, Block, Block) {
     (bc, a2, a3, y)
 }
 
+/// Room for a chain past `s + W` (32 slots).
+type LongStorage = MemoryBackend<{ 32 * MAX_BLOCK_SIZE + 8000 }>;
+
+/// [`two_creator_chain`] over [`LongStorage`], extended to `last` with
+/// creators alternating (#0 at even sequences), each block crediting the
+/// next creator once; `y` is not admitted. Returns the chain, `a2`, and the
+/// head's hash.
+fn long_chain(last: u32) -> (Chain16<LongStorage>, Block, [u8; 32]) {
+    let mut storage = LongStorage::new();
+    storage
+        .init([1u8; PRIVATE_KEY_SIZE], 0, [0u8; INIT_PARAMS_SIZE])
+        .ok()
+        .expect("the test backend initializes");
+    let mut bc = local_node(0, storage);
+    let genesis = bc
+        .process_genesis(CURRENCY, window_config_builder(16).content())
+        .ok()
+        .expect("genesis succeeds");
+    let a2 = alt(2, genesis.block_one.view().hash(), 0, 0, 1, 7, true);
+    let a3 = alt(3, a2.view().hash(), 1, 1, 0, 8, false);
+    for block in [&a2, &a3] {
+        assert_eq!(
+            receive(&mut bc, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    let mut prev = a3.view().hash();
+    for seq in 4..=last {
+        let creator = u32::from(seq % 2 == 1);
+        let received = u32::from(seq != 4);
+        let block = alt(seq, prev, creator, received, 1, 100 + u64::from(seq), false);
+        assert_eq!(
+            receive(&mut bc, &block),
+            ReceiveBlockOutcome::AcceptedSilently,
+            "seq {seq}"
+        );
+        prev = block.view().hash();
+    }
+    assert_eq!(head_of(&bc), (last, prev));
+    (bc, a2, prev)
+}
+
 /// An approval evidence block at `seq` on `prev` closing the run opened at
 /// `p`, by node #0 under the run header, claiming `vote_sum`, signed by the
 /// one-member subgroup `[0]` over `hash(opener)` (or junk).
@@ -155,8 +214,20 @@ fn approval_on(
     vote_sum: u64,
     junk: bool,
 ) -> Block {
+    approval_over(seq, prev, p, opener.view().hash(), vote_sum, junk)
+}
+
+/// [`approval_on`] whose subgroup signed `signed` as the opener's hash.
+fn approval_over(
+    seq: u32,
+    prev: [u8; 32],
+    p: u32,
+    signed: [u8; 32],
+    vote_sum: u64,
+    junk: bool,
+) -> Block {
     let mut aggregate = {
-        let message = support_message_bytes(0, p, &opener.view().hash());
+        let message = support_message_bytes(0, p, &signed);
         let node_zero = Crypto::new([key_of(0); PRIVATE_KEY_SIZE])
             .ok()
             .expect("key");
@@ -215,6 +286,28 @@ fn the_payload_type_cache_holds_types_one_to_five() {
     }
 }
 
+/// The type's high bit (bit 7) survives every other flag setter.
+#[test]
+fn the_high_type_bit_survives_the_other_flag_setters() {
+    let mut entry = BlockEntry::new([0; 32], NONE_REF, 7);
+    entry.set_payload_type(PAYLOAD_TYPE_TWIN_FACT);
+    entry.set_signature_verified();
+    entry.set_on_active_chain(true);
+    entry.set_on_active_chain(false);
+    entry.set_head_ref_count(3);
+    entry.set_head_ref_count(0);
+    entry.set_status(BlockStatus::Connected);
+    entry.set_len(500);
+    for bit in 0..UTXO_BITFIELD_WIDTH as usize {
+        entry.set_utxo_available(bit, true);
+        entry.set_utxo_available(bit, false);
+    }
+    assert_eq!(entry.payload_type(), PAYLOAD_TYPE_TWIN_FACT);
+    // And the low bits do not leak into it: type 1 after type 5.
+    entry.set_payload_type(PAYLOAD_TYPE_TRANSACTION);
+    assert_eq!(entry.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+}
+
 #[test]
 fn tier1_refuses_a_malformed_proof_or_repeated_members() {
     let (bc, a2, a3, y) = twin_chain();
@@ -263,6 +356,13 @@ fn a_round_opening_fact_block_is_accepted_supported_and_resets_the_equivocator()
     );
     assert_eq!(head_of(&bc), (4, e.view().hash()));
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), 0, "c's twin reset");
+    // Intake: `c` is not in the carried subgroup `[0]`, so its support for
+    // the round is refused (FR26 for a twin round, AC5).
+    let hash = e.view().hash();
+    assert_eq!(
+        intake(&mut bc, &support_by(1, 0, 4, hash)),
+        ReceiveSupportOutcome::Rejected
+    );
     let entry = bc.blocks.get(slot(&bc, &e)).expect("held");
     assert_eq!(entry.payload_type(), PAYLOAD_TYPE_TWIN_FACT);
     assert_eq!(entry.equivocator_filter(), Some(1));
@@ -298,6 +398,12 @@ fn every_i43_rule_refuses_its_violation() {
         fact_reason(&mut bc, &valid(&node_zero_on_a2, 0, &[0])),
         Some(ValidationReason::TwinFactProof)
     );
+    // Rule 1: node #1's block at 3 on another parent is no twin of `a3`.
+    let off_parent = alt(3, [0x5A; 32], 1, 1, 3, 40, false);
+    assert_eq!(
+        fact_reason(&mut bc, &valid(&off_parent, 0, &[0])),
+        Some(ValidationReason::TwinFactProof)
+    );
     // Rule 3: a proof whose signature does not verify.
     let mut bytes = std::vec::Vec::from(y.serialized_bytes());
     bytes[HEADER_SIZE - 1] ^= 0x01;
@@ -316,10 +422,13 @@ fn every_i43_rule_refuses_its_violation() {
         fact_reason(&mut bc, &valid(&y, 0, &[1])),
         Some(ValidationReason::TwinFactSubgroup)
     );
+    // A list of the wrong size. That `c` is left out of `A` is pinned by
+    // `the_round_excludes_the_equivocator_from_a`, where `c` in `A` would
+    // change the subgroup at the same size.
     assert_eq!(
         fact_reason(&mut bc, &valid(&y, 0, &[0, 1])),
         Some(ValidationReason::TwinFactSubgroup),
-        "c is not in A"
+        "the wrong size"
     );
     // Rule 7: the snapshot.
     assert_eq!(
@@ -342,7 +451,83 @@ fn one_fact_block_per_creator_and_sequence_in_the_window() {
     assert_eq!(bc.fact_unique(head, 16, 0, 3), Ok(true));
 }
 
+/// A late twin (FR70): `y` arrives when the head is 10, so a fact block at
+/// `q = 11 = s + H` is penalty-only. A round-opening one there is refused
+/// (rule 5); the penalty-only one is accepted, gathers no support, opens no
+/// run and drops `c`'s credits for `H` blocks.
+#[test]
+fn a_late_twin_gets_a_penalty_only_fact_block() {
+    let (mut bc, a2, head) = long_chain(10);
+    let y = twin_y(&a2);
+    assert_eq!(receive(&mut bc, &y), ReceiveBlockOutcome::AcceptedSilently);
+    assert_eq!(head_of(&bc), (10, head), "y is held");
+    let opening = fact_at(&bc, 10, head, &y, &[0]);
+    assert_eq!(
+        fact_reason(&mut bc, &opening),
+        Some(ValidationReason::TwinFactKind),
+        "q > s + H − 1 opens no round"
+    );
+    let penalty = fact_at(&bc, 10, head, &y, &[]);
+    assert_eq!(fact_reason(&mut bc, &penalty), None);
+    assert_eq!(
+        receive(&mut bc, &penalty),
+        ReceiveBlockOutcome::AcceptedSilently,
+        "no round, no support"
+    );
+    assert_eq!(head_of(&bc), (11, penalty.view().hash()));
+    assert_eq!(bc.active_open_run, u32::MAX, "no run");
+    let idx = slot(&bc, &penalty);
+    assert_eq!(
+        bc.blocks.get(idx).expect("held").equivocator_filter(),
+        Some(1)
+    );
+    let drop = CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, idx, Some(8));
+    assert!(drop.excluded(1) && !drop.excluded(0));
+}
+
+/// I-43 rule 4a: a fact block at `q ≥ s + W` is refused, whatever it carries.
+/// A chain past `s + W` needs balance snapshots before the genesis leaves the
+/// window, so the rule (pure arithmetic, checked first) is judged on a
+/// scratch entry at `q` over the real tip.
+#[test]
+fn a_fact_block_past_the_window_is_refused() {
+    let (mut bc, _, a3, y) = twin_chain();
+    let judge = |bc: &mut TestChain, q: u32| {
+        let block = fact_with(q, a3.view().hash(), 0, key_of(0), 0, &y, 0, &[]);
+        let view = block.view();
+        let idx = bc.blocks.next_free_index().expect("a free slot");
+        let mut entry = BlockEntry::new(view.hash(), slot(bc, &a3), q);
+        entry.set_payload(&view);
+        bc.blocks.insert_at(idx, entry);
+        let verdict = bc.judge_twin_fact(&view, idx, &Projection::COMPLETE);
+        bc.blocks.delete(idx);
+        match verdict {
+            Err(ProcessingError::Invalid { reason, .. }) => Some(reason),
+            _ => None,
+        }
+    };
+    // `s + W = 19`.
+    assert_eq!(judge(&mut bc, 19), Some(ValidationReason::TwinFactWindow));
+    assert_ne!(judge(&mut bc, 18), Some(ValidationReason::TwinFactWindow));
+}
+
 // --- AC4 / D8: the run, the slot -------------------------------------------
+
+/// FR27 rule 4 on a run a fact block opened at `q = 4` (`H = 8`): a replay
+/// ends at `q + H − 1 = 11`, the approval at `q + H = 12`.
+#[test]
+fn a_fact_run_is_bound_like_a_deviation_run() {
+    use crate::api::evidence::run_rules;
+    let (bc, _, a3, y) = twin_chain();
+    let e = fact_on(&bc, &a3, &y, &[0]);
+    let (run, h, bound) = (Some((4, 0)), Some(8), Err(ValidationReason::RunBound));
+    let replay = |seq: u32| alt(seq, [0x5A; 32], 0, 0, 1, u64::from(seq), false);
+    let approval = |seq: u32| approval_on(seq, [0x5A; 32], 4, &e, 0, false);
+    assert_eq!(run_rules(&replay(11).view(), run, h), Ok(()));
+    assert_eq!(run_rules(&replay(12).view(), run, h), bound);
+    assert_eq!(run_rules(&approval(12).view(), run, h), Ok(()));
+    assert_eq!(run_rules(&approval(13).view(), run, h), bound);
+}
 
 #[test]
 fn a_round_opening_fact_block_opens_a_run_of_its_creator() {
@@ -382,20 +567,24 @@ fn a_fact_block_is_clean_at_a_slot() {
 // --- AC5: the twin round's support -----------------------------------------
 
 #[test]
-fn a_twin_round_is_supported_once_per_round_and_keyed_by_its_members() {
+fn a_twin_round_is_supported_once_per_round_and_keyed_by_its_index() {
     let mut ring = NonConflictRing::new();
-    assert!(!ring.holds(RING_KIND_TWIN, 1, 3, 0xAB));
-    assert!(ring.insert(RING_KIND_TWIN, 1, 3, 0xAB));
-    assert!(ring.holds(RING_KIND_TWIN, 1, 3, 0xAB));
-    assert!(!ring.holds(RING_KIND_TWIN, 1, 3, 0xCD), "another round");
-    assert!(ring.insert(RING_KIND_TWIN, 1, 3, 0xCD), "rounds coexist");
-    assert!(ring.holds(RING_KIND_TWIN, 1, 3, 0xAB));
+    assert!(!ring.holds(RING_KIND_TWIN, 1, 3, 0));
+    assert!(ring.insert(RING_KIND_TWIN, 1, 3, 0));
+    assert!(ring.holds(RING_KIND_TWIN, 1, 3, 0));
+    assert!(!ring.holds(RING_KIND_TWIN, 1, 3, 1), "another round");
+    assert!(ring.insert(RING_KIND_TWIN, 1, 3, 1), "rounds coexist");
+    assert!(ring.holds(RING_KIND_TWIN, 1, 3, 0));
 
     // A second admission of the round's opener emits nothing more.
     let (mut bc, _, a3, y) = twin_chain();
     let e = fact_on(&bc, &a3, &y, &[0]);
     receive(&mut bc, &e);
     let idx = slot(&bc, &e);
+    assert!(
+        bc.non_conflict.holds(RING_KIND_TWIN, 1, 3, 0),
+        "the round's entry is (c, s, j)"
+    );
     assert!(
         bc.evaluate_twin_support(idx, 0, 0).is_none(),
         "already supported"
@@ -413,6 +602,10 @@ fn a_node_on_the_other_twin_does_not_support_the_round() {
         ReceiveBlockOutcome::AcceptedSilently
     );
     let idx = slot(&bc, &e_y);
+    // Not for want of a signature, a membership or a ring entry: the parent
+    // `y` is off the local active chain.
+    assert_eq!(verified(&bc, &e_y), Some(true));
+    assert!(!bc.non_conflict.holds(RING_KIND_TWIN, 1, 3, 0));
     assert!(bc.evaluate_twin_support(idx, 0, 0).is_none());
 }
 
@@ -512,10 +705,9 @@ fn an_unapproved_round_on_the_other_twin_stays_held() {
         "it outranks"
     );
     assert_eq!(head_of(&bc), (3, a3.view().hash()), "held: no approval");
-    let y_idx = slot(&bc, &y);
     let a3_idx = slot(&bc, &a3);
     assert!(!bc.approved_against(head, 3, a3_idx));
-    let _ = y_idx;
+    assert!(status_of(&bc, &y).is_some());
 }
 
 #[test]
@@ -546,6 +738,20 @@ fn a_junk_approval_lifts_the_hold_once_and_is_deleted_on_the_replay() {
     assert_eq!(head_of(&bc), (3, a3.view().hash()), "restored");
     assert_eq!(status_of(&bc, &approval), None, "deleted as exact evidence");
     assert!(status_of(&bc, &e_y).is_some(), "the opener stays");
+}
+
+/// An approval whose aggregate signs another block's hash (`a3`, the twin the
+/// round proves) is no approval of `e_y`: the replay deletes it as exact
+/// evidence and the node returns to `a3`.
+#[test]
+fn an_approval_over_another_hash_is_deleted_on_the_replay() {
+    let (mut bc, _, a3, y) = twin_chain();
+    let e_y = opener_on_y(&y, &a3);
+    receive(&mut bc, &e_y);
+    let approval = approval_over(5, e_y.view().hash(), 4, a3.view().hash(), 1000, false);
+    receive(&mut bc, &approval);
+    assert_eq!(head_of(&bc), (3, a3.view().hash()), "restored");
+    assert_eq!(status_of(&bc, &approval), None, "deleted as exact evidence");
 }
 
 // --- FR59 / FR63 -----------------------------------------------------------
@@ -592,6 +798,30 @@ fn twin_resolution_is_replay_deterministic() {
     assert_eq!(run(), run());
 }
 
+/// AR16 over the approved round and the penalty-only block: equal outcomes,
+/// heads and votes on a replay.
+#[test]
+fn approval_and_penalty_streams_are_replay_deterministic() {
+    let approved = || {
+        let (mut bc, _, a3, y) = twin_chain();
+        let e_y = opener_on_y(&y, &a3);
+        let approval = approval_on(5, e_y.view().hash(), 4, &e_y, 1000, false);
+        let outcomes = [receive(&mut bc, &e_y), receive(&mut bc, &approval)];
+        let votes = [0, 1].map(|n| bc.vote_engine.accumulated_vote_of(n));
+        (outcomes, head_of(&bc), votes, bc.active_branch_value)
+    };
+    assert_eq!(approved(), approved());
+    let penalty = || {
+        let (mut bc, a2, head) = long_chain(10);
+        let y = twin_y(&a2);
+        let fact = fact_at(&bc, 10, head, &y, &[]);
+        let outcomes = [receive(&mut bc, &y), receive(&mut bc, &fact)];
+        let votes = [0, 1].map(|n| bc.vote_engine.accumulated_vote_of(n));
+        (outcomes, head_of(&bc), votes, bc.active_branch_value)
+    };
+    assert_eq!(penalty(), penalty());
+}
+
 /// T4 (c): the round's seed is bound to the opener's rank `j`. On the Story
 /// 6.4 chain (`a3` node 1, `a4` node 4, `a5` node 3; node 1 on top) node #3
 /// twins `a5` on `a4`. `A` at `a4` without node 3 is `{0, 1, 4}` (`m = 3`), so
@@ -628,7 +858,7 @@ fn the_round_seed_is_bound_to_the_openers_rank() {
         members
     };
     assert_ne!(order(0), order(j), "precondition: the rounds differ");
-    let retry = |carried: u32, members: [u32; 3]| {
+    let opener_block = |first_voted: u32, carried: u32, members: [u32; 3]| {
         let signer = Crypto::new([key_of(opener); PRIVATE_KEY_SIZE])
             .ok()
             .expect("key");
@@ -651,8 +881,12 @@ fn the_round_seed_is_bound_to_the_openers_rank() {
             mined_amount: 0,
             payload_type: 0,
             consumed_votes: vote_snapshot(engine.accumulated_vote_of(opener)),
-            first_voted_node: top,
-            consumed_votes_from_first_voted_node: vote_snapshot(engine.accumulated_vote_of(top)),
+            first_voted_node: first_voted,
+            consumed_votes_from_first_voted_node: if first_voted == opener {
+                0
+            } else {
+                vote_snapshot(engine.accumulated_vote_of(first_voted))
+            },
             previous_hash: a5.view().hash(),
             signature: [0u8; SIGNATURE_SIZE],
         });
@@ -666,11 +900,18 @@ fn the_round_seed_is_bound_to_the_openers_rank() {
             .copy_from_slice(&payload);
         builder.build_signed(&signer).ok().expect("signs")
     };
+    let retry = |carried: u32, members: [u32; 3]| opener_block(top, carried, members);
     let right = retry(j, order(j));
     // Round 0's order under the right index, and round 0 claimed whole: the
     // carried `j` is the opener's rank (DN1), and the order is round `j`'s.
     let wrong = [(j, order(0)), (0, order(0)), (0, order(j))].map(|(c, m)| retry(c, m));
+    // P2: the same round in normal form, by a node that is not the top.
+    let normal = opener_block(opener, j, order(j));
     assert_eq!(fact_reason(&mut l, &right), None);
+    assert_eq!(
+        fact_reason(&mut l, &normal),
+        Some(ValidationReason::TwinFactKind)
+    );
     for block in &wrong {
         assert_eq!(
             fact_reason(&mut l, block),
@@ -811,4 +1052,195 @@ fn a_wide_build_confirms_a_filter_match_by_reading_the_block() {
         CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, ghost_idx, Some(8));
     assert!(!unread.excluded(1), "a failed read answers not excluded");
     assert!(unread.faulted(), "and raises the fault");
+}
+
+// --- Code review: the patches' own pins ------------------------------------
+
+/// `block` (a fact block) re-signed with `key` under a deviation header
+/// naming `first_voted` with `recorded`: its payload unchanged.
+fn as_deviation(block: &Block, first_voted: u32, recorded: u32, key: u8) -> Block {
+    let view = block.view();
+    let signer = Crypto::new([key; PRIVATE_KEY_SIZE]).ok().expect("key");
+    let mut builder = BlockBuilder::new().header(BlockHeader {
+        version: 1,
+        sequence: view.sequence(),
+        creator: view.creator(),
+        mined_amount: 0,
+        payload_type: 0,
+        consumed_votes: view.consumed_votes(),
+        first_voted_node: first_voted,
+        consumed_votes_from_first_voted_node: recorded,
+        previous_hash: view.previous_hash().try_into().expect("32 bytes"),
+        signature: [0u8; SIGNATURE_SIZE],
+    });
+    builder
+        .twin_fact_payload_mut(view.payload().len())
+        .ok()
+        .expect("fits")
+        .copy_from_slice(view.payload());
+    builder.build_signed(&signer).ok().expect("signs")
+}
+
+/// P1: a penalty-only fact block in deviation form (node #4 under the top,
+/// at `q = 13 = s + H` on the Story 6.4 chain, `c = 3`, `s = 5`) is an
+/// ordinary deviation: its supporters back it through the deviation's
+/// intake, its proposer builds the approval over the deviation's subgroup,
+/// and a validator accepts that approval.
+#[test]
+fn a_penalty_only_fact_block_in_deviation_form_is_an_ordinary_deviation() {
+    const K: u32 = 4;
+    let (mut g, mut l, [_, _, _, _, a4, a5]) = support_chain(K);
+    let y = resign(
+        &tx_block(5, a4.view().hash(), 0, votes_for(5, 2, 1, 9_999)),
+        3,
+        a5.view().consumed_votes(),
+        key_of(3),
+    );
+    let mut run: std::vec::Vec<Block> = std::vec::Vec::new();
+    for seq in 6..=12u32 {
+        let top = g.vote_engine.top_creator().expect("top");
+        let block = normal_after(&g, run.last().unwrap_or(&a5), top, 600 + u64::from(seq));
+        for node in [&mut g, &mut l] {
+            assert_eq!(receive(node, &block), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        run.push(block);
+    }
+    let prev = run.last().expect("12");
+    let top = g.vote_engine.top_creator().expect("top");
+    assert_ne!(top, K, "precondition: a deviation");
+    let snapshot = |n| vote_snapshot(g.vote_engine.accumulated_vote_of(n));
+    let normal = fact_with(
+        13,
+        prev.view().hash(),
+        K,
+        key_of(K),
+        snapshot(K),
+        &y,
+        snapshot(3),
+        &[],
+    );
+    let d = as_deviation(&normal, top, snapshot(top), key_of(K));
+    assert_eq!(receive(&mut l, &d), ReceiveBlockOutcome::AcceptedSilently);
+    assert_eq!(head_of(&l), (13, d.view().hash()));
+    let d_idx = slot(&l, &d);
+    assert!(l.open_approval(d_idx), "the deviation's accumulator opens");
+    let members = l.approval.members().to_vec();
+    let r_eff = members.len() / 2 + 1;
+    for &member in &members[..r_eff] {
+        assert_eq!(
+            intake(&mut l, &support_by(member, K, 13, d.view().hash())),
+            ReceiveSupportOutcome::Accepted,
+            "member {member}: the deviation's intake"
+        );
+    }
+    let e = l.build_evidence_block(d_idx, 0).expect("evidence");
+    // A member, fed the same chain, supports `d` through the deviation's arm.
+    let (_, mut v, _) = support_chain(members[0]);
+    for block in &run {
+        assert_eq!(
+            receive(&mut v, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    set_grace_admits(true);
+    let support = support_for(&mut v, &d);
+    set_grace_admits(false);
+    assert!(support.is_some(), "the deviation's support");
+    for block in [&d, &e] {
+        assert_eq!(
+            receive(&mut g, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    assert_eq!(head_of(&g), (14, e.view().hash()), "the approval passes");
+}
+
+/// P4: the round's stop counts an active approval for `(c, s, P)` only.
+#[test]
+fn only_an_active_approval_of_the_same_conflict_stops_the_round() {
+    let (mut bc, a2, a3, y) = twin_chain();
+    let e = fact_on(&bc, &a3, &y, &[0]);
+    receive(&mut bc, &e);
+    let approval = approval_on(5, e.view().hash(), 4, &e, 1000, false);
+    assert_eq!(
+        receive(&mut bc, &approval),
+        ReceiveBlockOutcome::AcceptedSilently
+    );
+    assert_eq!(head_of(&bc), (5, approval.view().hash()), "precondition");
+    let p = a2.view().hash();
+    assert_eq!(bc.holds_twin_approval(1, 3, &p), Some(true));
+    assert_eq!(
+        bc.holds_twin_approval(1, 3, &[0x5A; 32]),
+        Some(false),
+        "another P"
+    );
+    assert_eq!(bc.holds_twin_approval(1, 2, &p), Some(false), "another s");
+    let idx = slot(&bc, &approval);
+    assert!(bc.blocks.set_on_active_chain(idx, false));
+    assert_eq!(
+        bc.holds_twin_approval(1, 3, &p),
+        Some(false),
+        "a side approval has passed no Tier 3"
+    );
+}
+
+/// P6: `A` at `P` leaves out a node whose only blocks lie above `P`. On the
+/// Story 6.4 chain node #3 twins `a5` on `a4` (`A` at `a4` is `{0, 1, 4}`);
+/// node #5 creates `a7`, so the counter at the tip holds it once, and the
+/// correction subtracts it again (`m = 3`, not 4).
+#[test]
+fn a_node_that_entered_the_window_above_p_is_not_in_the_round() {
+    let (_, mut l, [_, _, _, _, a4, a5]) = support_chain(0);
+    let a6 = real_on(
+        &l,
+        &tx_block(6, a5.view().hash(), 0, votes_for(6, 5, 2, 6_100)),
+        1,
+        key_of(1),
+    );
+    assert_eq!(receive(&mut l, &a6), ReceiveBlockOutcome::AcceptedSilently);
+    assert_eq!(l.vote_engine.top_creator(), Some(5), "precondition");
+    let a7 = real_on(
+        &l,
+        &tx_block(7, a6.view().hash(), 0, votes_for(7, 0, 1, 7_100)),
+        5,
+        key_of(5),
+    );
+    assert_eq!(receive(&mut l, &a7), ReceiveBlockOutcome::AcceptedSilently);
+    let y = resign(
+        &tx_block(5, a4.view().hash(), 0, votes_for(5, 2, 1, 9_999)),
+        3,
+        a5.view().consumed_votes(),
+        key_of(3),
+    );
+    let seed = twin_seed(5, 0, 3, 0);
+    let mut members = [0u32, 1, 4];
+    members.sort_by_key(|&n| node_value(&seed, n));
+    let e = fact_on(&l, &a7, &y, &members);
+    assert_eq!(fact_reason(&mut l, &e), None);
+}
+
+/// P3: a support for a held round off the active chain is checked against
+/// its carried subgroup: node #1 (`c`, not in `[0]`) is refused.
+#[test]
+fn an_off_chain_round_takes_supports_from_its_members_only() {
+    let (mut bc, _, a3, y) = twin_chain();
+    let e_y = opener_on_y(&y, &a3);
+    receive(&mut bc, &e_y);
+    assert_eq!(
+        intake(&mut bc, &support_by(1, 0, 4, e_y.view().hash())),
+        ReceiveSupportOutcome::Rejected
+    );
+}
+
+/// P3: the round's support needs the opener's signature verified.
+#[test]
+fn an_unverified_opener_gets_no_support() {
+    let (mut bc, _, a3, y) = twin_chain();
+    let e = fact_on(&bc, &a3, &y, &[0]);
+    plant(&mut bc, &e, false, true);
+    let idx = slot(&bc, &e);
+    assert!(bc.blocks.set_parent_ref(idx, slot(&bc, &a3)));
+    assert!(bc.evaluate_twin_support(idx, 0, 0).is_none(), "unverified");
+    assert!(bc.blocks.mark_signature_verified(idx));
+    assert!(bc.evaluate_twin_support(idx, 0, 0).is_some(), "verified");
 }

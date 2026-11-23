@@ -585,7 +585,12 @@ impl<
     /// (DEC-260); an unvalidated side approval must not silence a round (code
     /// review P4). A RAM scan for active type-4 entries, then reads for each;
     /// `None` on a failed read (the conservative side: no support).
-    fn holds_twin_approval(&self, c: u32, s: u32, parent_hash: &[u8; HASH_SIZE]) -> Option<bool> {
+    pub(super) fn holds_twin_approval(
+        &self,
+        c: u32,
+        s: u32,
+        parent_hash: &[u8; HASH_SIZE],
+    ) -> Option<bool> {
         let mut failed = false;
         for idx in 0..MAX_BLOCKS as u32 {
             let Some(entry) = self.blocks.get(idx) else {
@@ -705,6 +710,16 @@ impl<
             *slot = proof.member(i)?;
         }
         Some(m)
+    }
+
+    /// Whether the held block at `idx` is a twin fact block opening a round,
+    /// for the support intake: `true` also on a failed read (the round's arm
+    /// then defers its membership read, as (iv-b) is deferred).
+    pub(super) fn is_twin_round(&self, idx: u32) -> bool {
+        self.blocks
+            .get(idx)
+            .is_some_and(|entry| entry.payload_type() == PAYLOAD_TYPE_TWIN_FACT)
+            && self.opens_round_at(idx) != Ok(false)
     }
 
     /// Whether the held twin fact block at `idx` opens a round (`m ≥ 1`, Story
