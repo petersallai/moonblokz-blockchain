@@ -147,14 +147,35 @@ impl<
         required_support: u8,
         out: &mut [u32; MAX_SUBGROUP],
     ) -> Option<usize> {
+        let seed = subgroup_seed(p, self.circulating_currency_at(parent), proposer);
+        self.rank_members(
+            |n| a_prime.contains(&self.active_set, n),
+            &seed,
+            required_support,
+            out,
+        )
+    }
+
+    /// The ranked subgroup core under a given `seed` over the voting set
+    /// `member` (ADR-015): the deviation's ([`Self::rank_subgroup`]) and the
+    /// twin round's (Story 6.13 T4 (c)). `m = subgroup_size(required_support,
+    /// |set|)` and the `m` smallest node values in rank order into `out`; `None`
+    /// for an empty set.
+    pub(super) fn rank_members(
+        &self,
+        member: impl Fn(u32) -> bool,
+        seed: &[u8; HASH_SIZE],
+        required_support: u8,
+        out: &mut [u32; MAX_SUBGROUP],
+    ) -> Option<usize> {
         let last_node = self.node_info.max_known_node_id().min(MAX_NODES as u32 - 1);
-        let member = |n: &u32| a_prime.contains(&self.active_set, *n);
+        let member = |n: &u32| member(*n);
         let eligible = (0..=last_node).filter(member).count() as u32;
         let m = subgroup_size(required_support, eligible)? as usize;
         if m > MAX_SUBGROUP {
             return None;
         }
-        let seed = subgroup_seed(p, self.circulating_currency_at(parent), proposer);
+        let seed = *seed;
         let mut values = [u64::MAX; MAX_SUBGROUP];
         let mut len = 0usize;
         for n in (0..=last_node).filter(member) {
@@ -313,9 +334,15 @@ impl<
             if engine.top_creator() != Some(u) {
                 return false;
             }
-            let Ok(Some((supporter_vote_sum, _))) =
-                deviation_sum(engine, last_node, local, vote_scale, r_eff as u64, cv_d)
-            else {
+            let Ok(Some((supporter_vote_sum, _))) = deviation_sum(
+                engine,
+                last_node,
+                local,
+                vote_scale,
+                r_eff as u64,
+                cv_d,
+                false,
+            ) else {
                 return false;
             };
             for n in 0..=last_node {
@@ -561,11 +588,28 @@ impl<
         if check && self.vote_engine.check_header(&view, true, |_| true) != Ok(true) {
             return false;
         }
-        if undo {
-            self.vote_engine.undo_block(view).is_ok()
-        } else {
-            self.vote_engine.apply_block(view).is_ok()
+        // FR72: the credit drop at this block (Story 6.13 AC6).
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+            &self.blocks,
+            &self.storage,
+            self.verification_horizon(),
+            idx,
+        );
+        if !drop.reads_hold(&view) {
+            return false;
         }
+        let excluded = |node| drop.excluded(node);
+        let stepped = if undo {
+            self.vote_engine.undo_block(view, excluded).is_ok()
+        } else {
+            self.vote_engine.apply_block(view, excluded).is_ok()
+        };
+        if drop.faulted() {
+            // The engine's result is not trusted: escalate (DEC-205).
+            self.reentry_due |= self.is_ready();
+            return false;
+        }
+        stepped
     }
 
     /// Story 6.6 AC8 (FR29, FR27, FR58; D6, D9) — what the proposer's

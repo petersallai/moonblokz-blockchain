@@ -76,6 +76,24 @@ pub(crate) fn subgroup_seed(sequence: u32, currency: u64, proposer: u32) -> [u8;
     calculate_hash(&preimage)
 }
 
+/// Byte length of the twin-round seed preimage (DEC-218 rules, Story 6.13 T4
+/// (c)): `"twin" ‖ s u32 ‖ currency u64 ‖ c u32 ‖ j u32`.
+const TWIN_SEED_PREIMAGE_SIZE: usize = 4 + 4 + 8 + 4 + 4;
+
+/// Story 6.13 T4 (c) (DEC-192 as amended by DEC-277) — the seed of round `j` of
+/// the twin conflict of creator `c` at sequence `s`, whose parent's circulating
+/// currency is `currency`. Bound to the conflict and the round, not to the
+/// fact block, so both sides of a split draw one subgroup per round.
+pub(crate) fn twin_seed(s: u32, currency: u64, c: u32, j: u32) -> [u8; HASH_SIZE] {
+    let mut preimage = [0u8; TWIN_SEED_PREIMAGE_SIZE];
+    preimage[..4].copy_from_slice(b"twin");
+    preimage[4..8].copy_from_slice(&s.to_le_bytes());
+    preimage[8..16].copy_from_slice(&currency.to_le_bytes());
+    preimage[16..20].copy_from_slice(&c.to_le_bytes());
+    preimage[20..].copy_from_slice(&j.to_le_bytes());
+    calculate_hash(&preimage)
+}
+
 /// ADR-015 — a node's ordering key in the subgroup draw:
 /// `(H(seed ‖ node) mod 2³²) · 2³² + node`. The digest is read as a big-endian
 /// number (the KB's hash-order convention), so `mod 2³²` is its last four
@@ -147,9 +165,13 @@ pub(crate) fn support_message_bytes(
     bytes
 }
 
-/// The `kind` of a ring entry that records an FR12 support. `1` is reserved
-/// for Story 6.13's FR71 twin vote, which shares the ring (DEC-198).
+/// The `kind` of a ring entry that records an FR12 support. The twin round's
+/// support shares the ring as [`RING_KIND_TWIN`] (DEC-198).
 pub(crate) const RING_KIND_SUPPORT: u8 = 0;
+/// The `kind` byte of a twin-round support (Story 6.13 T4 (c), DEC-277): the
+/// entry is `(c, s, j)`, `j` the round index the opener carries (code review
+/// DN1), so a node supports one side per round and each round anew.
+pub(crate) const RING_KIND_TWIN: u8 = 1;
 /// The `kind` byte of a never-used slot.
 const RING_KIND_EMPTY: u8 = 0xFF;
 /// Ring capacity (DEC-198).
@@ -252,6 +274,15 @@ impl NonConflictRing {
             }
         }
         RingCheck::Free
+    }
+
+    /// Whether a live entry is exactly `(kind, proposer, sequence, key)`: a twin
+    /// round's identity is all four fields, so two rounds of one conflict do
+    /// not conflict ([`Self::check`]'s rule is the deviation's).
+    pub(crate) fn holds(&self, kind: u8, proposer: u32, sequence: u32, key: u32) -> bool {
+        self.entries.iter().any(|entry| {
+            !self.is_free(entry) && Self::decode(entry) == (kind, proposer, sequence, key)
+        })
     }
 
     /// Records a support. Takes a free slot first; with every slot live, a live
@@ -571,6 +602,13 @@ impl<const MAX_NODES: usize> ActiveSetCounter<MAX_NODES> {
             Some(count) if *count > 0 => *count -= 1,
             _ => self.invalidate(),
         }
+    }
+
+    /// `node`'s count of blocks in the counter's window (0 out of range), for a
+    /// correction to another evaluation point (Story 6.13's twin round, `A` at
+    /// `P`).
+    pub(crate) fn count_of(&self, node: u32) -> u16 {
+        self.counts.get(node as usize).copied().unwrap_or(0)
     }
 
     /// Membership in `A` at `p − 1`, from the head's counts and the

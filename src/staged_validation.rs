@@ -33,7 +33,7 @@
 
 use moonblokz_chain_types::{
     ApprovalView, BlockView, ComplexTransactionView, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
-    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
+    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, PAYLOAD_TYPE_TWIN_FACT, TwinFactView,
 };
 use moonblokz_crypto::{
     CryptoTrait, PUBLIC_KEY_SIZE, PublicKey, PublicKeyTrait, Signature, SignatureTrait,
@@ -330,6 +330,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
         PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
         PAYLOAD_TYPE_APPROVAL => tier1_approval_block(block)?,
+        PAYLOAD_TYPE_TWIN_FACT => tier1_twin_fact_block(block)?,
         _ => return Err(Tier1Failure::UnknownPayloadType),
     }
 
@@ -363,6 +364,35 @@ fn tier1_approval_block(block: &BlockView) -> Result<(), Tier1Failure> {
     match view.bitmap().last() {
         Some(last) if used != 0 && last >> used != 0 => Err(Tier1Failure::MalformedPayload),
         _ => Ok(()),
+    }
+}
+
+/// FR71 Tier 1 for a twin fact block (Story 6.13 AC2, DEC-278): the proof
+/// header names another payload type and a sequence `≥ 1` below the fact
+/// block's own, and the round's members are distinct. The lengths and `m ≤
+/// 2·MAX_AGGREGATED_SIGNATURES − 1` are the framing [`tier1_gate`] applies to
+/// every type; a payload that does not frame is left to that check. Every
+/// state-dependent rule (I-43) is Tier 3's.
+fn tier1_twin_fact_block(block: &BlockView) -> Result<(), Tier1Failure> {
+    let Some(proof) = TwinFactView::from_payload(block.payload()) else {
+        return Ok(());
+    };
+    let s = proof.sequence();
+    // The proof names a block of a defined type other than a fact block's
+    // (1..=4): a twin of a fact block is not a twin the round resolves (code
+    // review P9).
+    if !(PAYLOAD_TYPE_TRANSACTION..=PAYLOAD_TYPE_APPROVAL).contains(&proof.proof_payload_type())
+        || s == 0
+        || s >= block.sequence()
+    {
+        return Err(Tier1Failure::MalformedPayload);
+    }
+    let m = usize::from(proof.m());
+    let distinct = (1..m).all(|i| (0..i).all(|k| proof.member(k) != proof.member(i)));
+    if distinct {
+        Ok(())
+    } else {
+        Err(Tier1Failure::MalformedPayload)
     }
 }
 

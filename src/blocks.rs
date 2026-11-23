@@ -52,6 +52,7 @@
 //! Story 4.4 adds it to `ChainHeadEntry` instead.
 
 use crate::staged_validation::BlockStatus;
+use moonblokz_chain_types::{BlockView, PAYLOAD_TYPE_TWIN_FACT, TwinFactView};
 
 /// Sentinel value for an unresolved parent reference and for an empty
 /// slot's `sequence` (architecture §6.2). `pub(crate)` so the admission path
@@ -100,11 +101,16 @@ const FLAG_STATUS_MASK: u8 = 0b0000_0110;
 /// existence-floor seed source (`max_known_node_id` at the window tail) — without
 /// a storage read per block. Costs no extra memory (reuses free flag bits).
 /// Default `flags == 0` decodes to code 0 ⇒ `transaction`; the admission path
-/// stamps the true type via [`BlockEntry::set_payload_type`] before insertion, so
+/// stamps the true type via [`BlockEntry::set_payload`] before insertion, so
 /// only an explicitly-stamped entry is authoritative (unstamped test entries read
 /// as `transaction`, which the balance-only floor scan simply skips).
+///
+/// Story 6.13 (DEC-278): type 5, the twin fact block, needs a third bit, the
+/// last free one, bit 7, as the field's high bit: `type − 1` is bits 3–4 (low)
+/// plus bit 7 (high). No flag bit is left free.
 const FLAG_PAYLOAD_TYPE_SHIFT: u8 = 3;
 const FLAG_PAYLOAD_TYPE_MASK: u8 = 0b0001_1000;
+const FLAG_PAYLOAD_TYPE_HIGH: u8 = 0b1000_0000;
 
 /// Bit 5 of `flags` (Story 6.2 D6, DEC-157): the block's creator signature
 /// verified against the key derived along the block's own ancestry, so the
@@ -151,6 +157,13 @@ pub(crate) struct BlockEntry {
     /// that never round-trip through storage. A `u32` on every block-size tier
     /// (DEC-224): `size_of::<BlockEntry>()` is 80 B.
     len: u32,
+    /// The low 16 bits of the equivocator `c` a twin fact block names (FR72,
+    /// Story 6.13 D6 (d), DEC-280), stamped where the block is in hand; 0 for
+    /// every other type. A filter, not the id: node ids are `u32`, so a match
+    /// is confirmed by reading the block wherever ids can exceed 16 bits
+    /// (`MAX_NODES > 65 536`). It fills the entry's 2 B of tail padding, so the
+    /// entry stays 80 B. RAM-only: the restart rebuild re-stamps it.
+    equivocator: u16,
 }
 
 // `new`/`is_on_active_chain`/`set_on_active_chain` are consumed starting
@@ -169,6 +182,7 @@ impl BlockEntry {
             head_ref_count: 0,
             flags: 0,
             len: 0,
+            equivocator: 0,
         }
     }
 
@@ -185,6 +199,7 @@ impl BlockEntry {
             head_ref_count: 0,
             flags: 0,
             len: 0,
+            equivocator: 0,
         }
     }
 
@@ -205,20 +220,50 @@ impl BlockEntry {
         self.sequence == NONE_REF
     }
 
-    /// Stamps the block's `payload_type` (1..=4) into `flags` bits 3-4 **before**
-    /// insertion (Story 5.4 review), stored as `payload_type - 1`. A value outside
-    /// 1..=4 is clamped into the 2-bit field; the admission path only ever passes a
-    /// Tier-1-validated type. See [`FLAG_PAYLOAD_TYPE_MASK`].
+    /// Stamps the block's `payload_type` (1..=5) into `flags` bits 3-4 and 7
+    /// **before** insertion (Story 5.4 review, Story 6.13), stored as
+    /// `payload_type - 1`. A value outside 1..=5 is masked to the 3-bit field
+    /// (it wraps, it is not clamped); the admission path only ever passes a
+    /// Tier-1-validated type. See
+    /// [`FLAG_PAYLOAD_TYPE_MASK`].
     pub(crate) fn set_payload_type(&mut self, payload_type: u8) {
-        let code = payload_type.wrapping_sub(1) & 0b11;
-        self.flags = (self.flags & !FLAG_PAYLOAD_TYPE_MASK)
-            | ((code << FLAG_PAYLOAD_TYPE_SHIFT) & FLAG_PAYLOAD_TYPE_MASK);
+        let code = payload_type.wrapping_sub(1) & 0b111;
+        self.flags = (self.flags & !(FLAG_PAYLOAD_TYPE_MASK | FLAG_PAYLOAD_TYPE_HIGH))
+            | (((code & 0b11) << FLAG_PAYLOAD_TYPE_SHIFT) & FLAG_PAYLOAD_TYPE_MASK)
+            | if code & 0b100 != 0 {
+                FLAG_PAYLOAD_TYPE_HIGH
+            } else {
+                0
+            };
     }
 
-    /// The cached `payload_type` (1..=4) from `flags` bits 3-4. An unstamped entry
-    /// (default `flags == 0`) reads as `1` (transaction).
+    /// Stamps everything the entry caches from the block's bytes: the payload
+    /// type and, for a twin fact block, its equivocator (DEC-280).
+    pub(crate) fn set_payload(&mut self, view: &BlockView<'_>) {
+        self.set_payload_type(view.payload_type());
+        self.equivocator = if view.payload_type() == PAYLOAD_TYPE_TWIN_FACT {
+            TwinFactView::from_payload(view.payload()).map_or(0, |proof| proof.creator() as u16)
+        } else {
+            0
+        };
+    }
+
+    /// The cached `payload_type` (1..=5) from `flags` bits 3-4 and 7. An
+    /// unstamped entry (default `flags == 0`) reads as `1` (transaction).
     pub(crate) fn payload_type(&self) -> u8 {
-        ((self.flags & FLAG_PAYLOAD_TYPE_MASK) >> FLAG_PAYLOAD_TYPE_SHIFT) + 1
+        let high = if self.flags & FLAG_PAYLOAD_TYPE_HIGH != 0 {
+            0b100
+        } else {
+            0
+        };
+        (((self.flags & FLAG_PAYLOAD_TYPE_MASK) >> FLAG_PAYLOAD_TYPE_SHIFT) | high) + 1
+    }
+
+    /// The low 16 bits of the equivocator a twin fact block names (DEC-280);
+    /// `None` for any other block. A match is a candidate, exact only while
+    /// node ids fit 16 bits.
+    pub(crate) fn equivocator_filter(&self) -> Option<u16> {
+        (self.payload_type() == PAYLOAD_TYPE_TWIN_FACT).then_some(self.equivocator)
     }
 
     pub(crate) fn is_on_active_chain(&self) -> bool {

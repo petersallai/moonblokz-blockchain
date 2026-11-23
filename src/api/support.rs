@@ -109,12 +109,35 @@ impl<
                     .active_snake_chain_window()
                     .is_ok_and(|(tail, head)| tail <= p && p <= head)
         });
-        if let Some(d_idx) = on_chain {
+        // A round-opening fact block (a failed read defers to its arm, whose
+        // membership read then defers too); a penalty-only one is an ordinary
+        // deviation (code review P1).
+        let twin = on_chain.is_some_and(|idx| self.is_twin_round(idx));
+        if let Some(e_idx) = on_chain.filter(|_| twin) {
+            // Story 6.13 AC5: a twin round's support — membership in the
+            // block's carried subgroup; the deviation's (iii) and (iv-c) do not
+            // apply.
+            if !self.on_chain_twin_support_holds(e_idx, p, supporter, proposer) {
+                return None;
+            }
+        } else if let Some(d_idx) = on_chain {
             // The accumulator's rank lookup replaces (iv-b) only while it is
             // live: a dead one is cleared at the hook and the support is a
             // plain relay, which (iv-b) still classifies.
             let own = self.is_own_tuple(p, &hash, proposer) && self.approval_live_ram().is_some();
             if !self.on_chain_support_holds(d_idx, p, supporter, proposer, own) {
+                return None;
+            }
+        } else if let Some(x_idx) = self
+            .blocks
+            .find(p, &hash)
+            .filter(|&idx| self.is_twin_round(idx))
+        {
+            // A held twin round off the active chain (a retry beside the
+            // first opener): its carried subgroup decides. The (iv-c) stop
+            // does not apply — the top's own opener at `p` is the round it
+            // retries, not a reason to stop (code review P3).
+            if self.twin_member(x_idx, supporter, proposer) == Some(false) {
                 return None;
             }
         } else if self.is_ready() && self.off_chain_u_block_stops(p, &hash) {
@@ -291,7 +314,7 @@ impl<
     /// when its read header is not type 4 or its payload does not frame;
     /// `None` on a failed read. Its own read buffer.
     #[inline(never)]
-    fn evidence_deviation(&self, idx: u32) -> Option<Option<u32>> {
+    pub(super) fn evidence_deviation(&self, idx: u32) -> Option<Option<u32>> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf)?;
         Some(
@@ -524,6 +547,14 @@ impl<
         self.non_conflict.raise_floor(s_head.saturating_sub(h));
         if !self.is_ready() || !self.active_set.is_valid() {
             return None;
+        }
+        // Story 6.13 AC5: a round-opening fact block's round has its own
+        // arm. A penalty-only one in deviation form is an ordinary deviation
+        // (code review P1); a failed read supports nothing.
+        if self.blocks.get(x_idx)?.payload_type() == PAYLOAD_TYPE_TWIN_FACT
+            && self.opens_round_at(x_idx).ok()?
+        {
+            return self.evaluate_twin_support(x_idx, x_creator, x_first_voted);
         }
         let w = self.active_chain_length()?;
         let required_support = self.chain_config.active_configuration()?.required_support();
@@ -853,7 +884,10 @@ impl<
     /// key, in its own frame: the backend's signature value and the signer's
     /// working set never overlap a read buffer.
     #[inline(never)]
-    fn sign_support(&self, bytes: &[u8; SUPPORT_MESSAGE_SIZE]) -> [u8; MULTI_SIGNATURE_SIZE] {
+    pub(super) fn sign_support(
+        &self,
+        bytes: &[u8; SUPPORT_MESSAGE_SIZE],
+    ) -> [u8; MULTI_SIGNATURE_SIZE] {
         *self.crypto.multi_sign(bytes).serialize()
     }
 }

@@ -253,7 +253,7 @@ impl<
         let mut entry = BlockEntry::new(*hash, parent.unwrap_or(NONE_REF), block.sequence());
         entry.set_status(BlockStatus::Stored);
         entry.set_len(block.len() as u32); // exact length for the FR6 byte-exact checks (Story 5.4)
-        entry.set_payload_type(block.payload_type()); // cached in flags for the FR3 floor scan (Story 5.4 review)
+        entry.set_payload(block); // the type for the FR3 floor scan (Story 5.4 review); the equivocator (Story 6.13)
         if signature_verified {
             entry.set_signature_verified();
         }

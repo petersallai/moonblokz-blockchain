@@ -30,6 +30,7 @@ mod acquisition;
 mod admission;
 mod chain_config;
 mod evidence;
+mod fact;
 mod fixtures;
 mod forward;
 mod genesis;

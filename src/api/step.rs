@@ -301,10 +301,11 @@ impl<
                 }
             }
             _ => {
-                // Approval evidence (payload_type 4): its Tier 3 (Story 6.7
-                // AC5) runs after this step at the two Tier-3 drivers
-                // (`judge_evidence_step`), off genesis' static path (D6). The
-                // shared tail applies its FR37 vote effects.
+                // Approval evidence (payload_type 4) and the twin fact block
+                // (5): their Tier 3 (Story 6.7 AC5, Story 6.13 AC3) runs after
+                // this step at the two Tier-3 drivers (`judge_evidence_step`),
+                // off genesis' static path (D6). The shared tail applies their
+                // FR37 vote effects (the fact block's twin reset in the engine).
             }
         }
 
@@ -373,9 +374,28 @@ impl<
         idx: u32,
         derivation: BlockDerivation,
     ) -> Result<(), ProcessingError> {
-        if let Ok(v) = BlockView::from_bytes(view.serialized_bytes())
-            && let Err(e) = self.vote_engine.apply_block(v)
-        {
+        // FR72: the credit drop at this block (Story 6.13 AC6).
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+            &self.blocks,
+            &self.storage,
+            self.verification_horizon(),
+            idx,
+        );
+        if !drop.reads_hold(view) {
+            self.invert_transactions(view, idx, usize::MAX);
+            return Err(ProcessingError::StorageRead);
+        }
+        let applied = BlockView::from_bytes(view.serialized_bytes())
+            .map(|v| self.vote_engine.apply_block(v, |node| drop.excluded(node)));
+        let faulted = drop.faulted();
+        if faulted {
+            // A confirm read failed inside the engine: its result is not
+            // trusted. A local fault, escalated in Ready (DEC-205).
+            self.reentry_due |= self.is_ready();
+            self.invert_transactions(view, idx, usize::MAX);
+            return Err(ProcessingError::StorageRead);
+        }
+        if let Ok(Err(e)) = applied {
             self.invert_transactions(view, idx, usize::MAX);
             return Err(ProcessingError::Vote(e));
         }

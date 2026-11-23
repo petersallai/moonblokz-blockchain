@@ -475,7 +475,7 @@ impl<
         entry_0.set_status(BlockStatus::Active);
         entry_0.set_on_active_chain(true);
         entry_0.set_len(block_0.len() as u32);
-        entry_0.set_payload_type(block_0.payload_type());
+        entry_0.set_payload(&block_0.view());
         self.blocks.insert_at(0, entry_0);
         self.active_chain_head_idx = 0;
         let active_head = self.active_chain_head_idx;
@@ -506,7 +506,7 @@ impl<
         entry_1.set_status(BlockStatus::Active);
         entry_1.set_on_active_chain(true);
         entry_1.set_len(block_1.len() as u32);
-        entry_1.set_payload_type(block_1.payload_type());
+        entry_1.set_payload(&block_1.view());
         self.blocks.insert_at(1, entry_1);
         self.active_chain_head_idx = 1;
         let active_head = self.active_chain_head_idx;

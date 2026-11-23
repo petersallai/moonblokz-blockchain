@@ -165,7 +165,8 @@ impl<
     /// nothing. A forged candidate block is deleted with its descendants as
     /// exact evidence (FR16), as the switch's pre-pass would, and the candidate
     /// drops out without a second verification or a walk. Story 6.13 lifts
-    /// the hold for a candidate carrying a verdict for its twin.
+    /// the hold for a candidate whose side holds an approved twin round
+    /// against the active twin (`approved_against`).
     pub(super) fn twin_held(&mut self, head: u32) -> bool {
         let Some(ancestor) = self.common_ancestor(head) else {
             return false;
@@ -199,7 +200,11 @@ impl<
                 if verified_now {
                     self.blocks.mark_signature_verified(x);
                 }
-                true
+                // Story 6.13 AC7 (FR70, FR71; DEC-276): an approved twin round
+                // on the candidate's segment, against the active twin `y`,
+                // lifts the hold; FR21 then decides. The claim is verified on
+                // the switch's replay (DEC-259).
+                !self.approved_against(head, first, y)
             }
         }
     }
@@ -720,7 +725,25 @@ impl<
         // The vote engine refuses atomically; its errors are the node's own
         // state, never evidence against the block (AC2 step 2).
         if let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
-            self.vote_engine.undo_block(v).map_err(|_| ())?;
+            // FR72: the credit drop the apply made (Story 6.13 AC6).
+            let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+                &self.blocks,
+                &self.storage,
+                self.verification_horizon(),
+                idx,
+            );
+            if !drop.reads_hold(&v) {
+                return Err(());
+            }
+            let undone = self.vote_engine.undo_block(v, |node| drop.excluded(node));
+            if drop.faulted() {
+                // The engine's result is not trusted: escalate (DEC-205),
+                // as the commit and the vote step do; the FR3 pass has no
+                // re-entry of its own (code review P7).
+                self.reentry_due |= self.is_ready();
+                return Err(());
+            }
+            undone.map_err(|_| ())?;
         }
         // Undone top-down: every descendant spend of this block's outputs is
         // undone already and side branches never touch bits, so its bits are
