@@ -63,6 +63,11 @@ pub enum GenesisRejectReason {
     /// configuration itself declares, so every peer would reject it at Tier 1
     /// and the chain would be unusable from its first block.
     GenesisBlockExceedsBlockSizeLimit,
+    /// The crypto instance's public key is not `node_zero_public_key`, the
+    /// chain's trust anchor (FR68, FR69; DEC-293). Genesis would sign blocks
+    /// #0 and #1 with a key that every node, this one included, rejects as not
+    /// node #0's. Checked before anything is signed or written.
+    KeyMismatch,
 }
 
 /// The two genesis blocks produced by [`Blockchain::process_genesis`], created

@@ -333,6 +333,12 @@ impl<
         if self.local_node_id != 0 {
             return Err(GenesisRejectReason::LocalNodeIdNotZero);
         }
+        // FR68 (DEC-293): the instance must hold node #0's key, the anchor every
+        // node checks blocks #0 and #1 against (FR69). Before the storage probe,
+        // which can write a replica repair, and before anything is signed.
+        if self.crypto.public_key().serialize() != &self.node_zero_public_key {
+            return Err(GenesisRejectReason::KeyMismatch);
+        }
         // Genesis is only valid on a fresh chain. Re-running it would overwrite
         // an existing Block #0, and FR54's lock is set-once — the module itself
         // would refuse the second load, so the guard reads the lock rather than

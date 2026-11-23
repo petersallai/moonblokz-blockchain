@@ -490,6 +490,31 @@ fn walking_skeleton_refuses_uninitialized_storage() {
     assert!(!bc.chain_config.is_durable_locked());
 }
 
+/// FR68 (DEC-293): genesis refuses a crypto instance whose key is not the
+/// chain's anchor, before anything is signed or written. Here the instance
+/// holds key `[1; 32]` while the anchor is the public key of `[2; 32]`; the
+/// storage is initialized, so every later guard would pass.
+#[test]
+fn genesis_refuses_a_key_that_is_not_the_node_zero_anchor() {
+    let (crypto, storage, chain_config) = test_backends();
+    let other = Crypto::new([2u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("test private key should be accepted by the backend");
+    let anchor = *other.public_key().serialize();
+    assert_ne!(&anchor, crypto.public_key().serialize());
+    let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+    let bc = TestChain::init(&mut bc_slot, crypto, storage, chain_config, 0, anchor, 0);
+
+    let outcome = bc.process_genesis(1_000_000_000, &BASE_CONFIG_CONTENT);
+
+    assert!(matches!(outcome, Err(GenesisRejectReason::KeyMismatch)));
+    assert_eq!(bc.blocks.len(), 0, "no block reached the in-memory tree");
+    assert!(bc.storage.read_block(0).is_err(), "nothing was saved");
+    assert!(bc.storage.read_block(1).is_err(), "nothing was saved");
+    assert!(!bc.chain_config.is_durable_locked());
+    assert!(bc.lifecycle_phase == LifecyclePhase::Collecting);
+}
+
 /// A configuration whose own `block_size_limit` is smaller than the genesis
 /// blocks it frames would produce a chain no node can accept: every peer
 /// refuses Block #1 at Tier 1, and the founder's own restart refuses it at
