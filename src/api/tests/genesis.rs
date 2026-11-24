@@ -515,6 +515,29 @@ fn genesis_refuses_a_key_that_is_not_the_node_zero_anchor() {
     assert!(bc.lifecycle_phase == LifecyclePhase::Collecting);
 }
 
+/// The key check runs before the storage probe (which can write a replica
+/// repair): with a wrong key and an uninitialized control plane the refusal is
+/// `KeyMismatch`, not `StorageNotInitialized`.
+#[test]
+fn genesis_checks_the_key_before_probing_storage() {
+    let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("test private key should be accepted by the backend");
+    let other = Crypto::new([2u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("test private key should be accepted by the backend");
+    let anchor = *other.public_key().serialize();
+    // Never `init`ed: the storage probe would refuse.
+    let storage = MemoryBackend::<{ 8 * MAX_BLOCK_SIZE + 8000 }>::new();
+    let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+    let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+    let bc = TestChain::init(&mut bc_slot, crypto, storage, chain_config, 0, anchor, 0);
+
+    let outcome = bc.process_genesis(1_000_000_000, &BASE_CONFIG_CONTENT);
+
+    assert!(matches!(outcome, Err(GenesisRejectReason::KeyMismatch)));
+}
+
 /// A configuration whose own `block_size_limit` is smaller than the genesis
 /// blocks it frames would produce a chain no node can accept: every peer
 /// refuses Block #1 at Tier 1, and the founder's own restart refuses it at
