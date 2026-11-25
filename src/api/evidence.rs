@@ -532,8 +532,10 @@ impl<
         let Ok(aggregate) = AggregatedSignature::new(aggregate) else {
             return Some(false);
         };
+        // Built in place: a `from_fn` temporary was copied in (Story 12.2,
+        // DEC-302).
         let mut keys: [Option<PublicKey>; MAX_AGGREGATED_SIGNATURES] =
-            core::array::from_fn(|_| None);
+            [const { None }; MAX_AGGREGATED_SIGNATURES];
         for (slot, signer) in keys.iter_mut().zip(signers) {
             match PublicKey::new(self.registered_key(*signer)?) {
                 Ok(key) => *slot = Some(key),
