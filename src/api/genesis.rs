@@ -357,10 +357,19 @@ impl<
             return Err(GenesisRejectReason::StorageNotInitialized);
         }
 
-        // Both blocks exist once, in the value this method returns (Story
-        // 12.2, DEC-301): the steps build them in place, and every path from
-        // here returns this one local, so it is the caller's slot rather than
-        // a copy of it.
+        // The framed chain-config payload (content + node-#0 signature) must
+        // fit block #1. Checked before anything is built or signed.
+        if initial_chain_config_bytes
+            .len()
+            .checked_add(SIGNATURE_SIZE)
+            .is_none_or(|len| len > MAX_PAYLOAD_SIZE)
+        {
+            return Err(GenesisRejectReason::InitialChainConfigTooLarge);
+        }
+
+        // Both blocks are built once, in place, into this value (Story 12.2,
+        // DEC-301), which every path from here returns: it is moved once into
+        // the caller's slot, never assembled from copies.
         let mut genesis = unbuilt_genesis();
         if let Ok(blocks) = &mut genesis
             && let Err(reason) = self.build_and_commit_genesis(
@@ -388,7 +397,7 @@ impl<
         // Each block is built out of line, in its own step: the builders and
         // the framed payload live only in the steps' frames, popped before the
         // storage writes below. Block #0 cannot be refused, so building it
-        // first leaves the refusal order as it was.
+        // before the content check leaves the refusal order as it was.
         genesis_block_zero(
             &self.crypto,
             &node_zero_public_key,
@@ -536,13 +545,9 @@ impl<
         initial_chain_config_bytes: &[u8],
         out: &mut Block,
     ) -> Result<(), GenesisRejectReason> {
+        // `process_genesis` bounded the framed length by `MAX_PAYLOAD_SIZE`.
         let content_len = initial_chain_config_bytes.len();
-        let Some(payload_len) = content_len
-            .checked_add(SIGNATURE_SIZE)
-            .filter(|len| *len <= MAX_PAYLOAD_SIZE)
-        else {
-            return Err(GenesisRejectReason::InitialChainConfigTooLarge);
-        };
+        let payload_len = content_len + SIGNATURE_SIZE;
         let mut payload = [0u8; MAX_PAYLOAD_SIZE];
         payload[..content_len].copy_from_slice(initial_chain_config_bytes);
         payload[content_len..payload_len]
@@ -574,8 +579,8 @@ impl<
             signature: [0u8; SIGNATURE_SIZE],
         };
         let mut cfg_builder = BlockBuilder::new().header(block_1_header);
-        // The framed payload was bounded by `MAX_PAYLOAD_SIZE` above, so it fits
-        // Block #1.
+        // `process_genesis` bounded the framed payload by `MAX_PAYLOAD_SIZE`,
+        // so it fits block #1.
         if cfg_builder
             .set_chain_config_payload(chain_config_payload)
             .is_err()
