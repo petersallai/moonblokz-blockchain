@@ -357,71 +357,58 @@ impl<
             return Err(GenesisRejectReason::StorageNotInitialized);
         }
 
+        // The framed chain-config payload (content + node-#0 signature) must
+        // fit block #1. Checked before anything is built or signed.
+        if initial_chain_config_bytes
+            .len()
+            .checked_add(SIGNATURE_SIZE)
+            .is_none_or(|len| len > MAX_PAYLOAD_SIZE)
+        {
+            return Err(GenesisRejectReason::InitialChainConfigTooLarge);
+        }
+
+        // Both blocks are built once, in place, into this value (Story 12.2,
+        // DEC-301), which every path from here returns: it is moved once into
+        // the caller's slot, never assembled from copies.
+        let mut genesis = unbuilt_genesis();
+        if let Ok(blocks) = &mut genesis
+            && let Err(reason) = self.build_and_commit_genesis(
+                blocks,
+                initial_total_network_currency,
+                initial_chain_config_bytes,
+            )
+        {
+            genesis = Err(reason);
+        }
+        genesis
+    }
+
+    /// The rest of [`Self::process_genesis`] after the storage probe: builds
+    /// both blocks into `blocks`, checks and derives them, persists them and
+    /// mirrors them into the tree. A refusal is returned in the method's order.
+    fn build_and_commit_genesis(
+        &mut self,
+        blocks: &mut GenesisBlocks,
+        initial_total_network_currency: u64,
+        initial_chain_config_bytes: &[u8],
+    ) -> Result<(), GenesisRejectReason> {
         let node_zero_public_key = *self.crypto.public_key().serialize();
 
-        // FR54 framing: Block #1's payload is the content region followed by the
-        // node-#0 content signature (the Story 5.7 envelope). Framed here rather
-        // than taken framed, because the signature is node #0's and this is the
-        // one place that key is the local one.
-        let content_len = initial_chain_config_bytes.len();
-        let Some(payload_len) = content_len
-            .checked_add(SIGNATURE_SIZE)
-            .filter(|len| *len <= MAX_PAYLOAD_SIZE)
-        else {
-            return Err(GenesisRejectReason::InitialChainConfigTooLarge);
-        };
-        let mut payload = [0u8; MAX_PAYLOAD_SIZE];
-        payload[..content_len].copy_from_slice(initial_chain_config_bytes);
-        payload[content_len..payload_len]
-            .copy_from_slice(self.crypto.sign(initial_chain_config_bytes).serialize());
-        let chain_config_payload = &payload[..payload_len];
-
-        // Tentative first: acceptance runs inside the load and before anything
-        // is retained, so a content refusal leaves the module exactly as it was
-        // and this call writes nothing. The **durable** lock is engaged only
-        // after the last storage write succeeds (below) — FR54's lock is
-        // set-once, and a module locked by a call that then failed on storage
-        // would refuse every retry, with `StorageNotEmpty`, for the life of the
-        // process. A tentative left behind by a failed genesis is harmless: the
-        // next attempt replaces it.
-        self.chain_config
-            .load_tentative(chain_config_payload)
-            .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
-
-        // Block #0: the FR54 fixed description (DEC-269), from the one builder
-        // whose output the Tier 1 genesis-shape check is pinned against.
-        let block_0 = genesis_block_zero(
+        // Each block is built out of line, in its own step: the builders and
+        // the framed payload live only in the steps' frames, popped before the
+        // storage writes below. Block #0 cannot be refused, so building it
+        // before the content check leaves the refusal order as it was.
+        genesis_block_zero(
             &self.crypto,
             &node_zero_public_key,
             initial_total_network_currency,
+            &mut blocks.block_zero,
         );
-
-        // Assemble signed Block #1: the chain-config block, chained to Block #0.
-        let block_1_header = BlockHeader {
-            version: 1,
-            sequence: 1,
-            creator: 0,
-            mined_amount: 0,
-            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
-            consumed_votes: 0,
-            first_voted_node: 0,
-            consumed_votes_from_first_voted_node: 0,
-            previous_hash: block_0.hash(),
-            signature: [0u8; SIGNATURE_SIZE],
-        };
-        let mut cfg_builder = BlockBuilder::new().header(block_1_header);
-        // The framed payload was bounded by `MAX_PAYLOAD_SIZE` above, so it fits
-        // Block #1.
-        if cfg_builder
-            .set_chain_config_payload(chain_config_payload)
-            .is_err()
-        {
-            unreachable!("the framed chain-config payload was capacity-checked");
-        }
-        let block_1 = match cfg_builder.build_signed(&self.crypto) {
-            Ok(b) => b,
-            Err(_) => unreachable!("Block #1 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
-        };
+        self.genesis_block_one(
+            blocks.block_zero.hash(),
+            initial_chain_config_bytes,
+            &mut blocks.block_one,
+        )?;
 
         // Both blocks must fit the block-size limit **the genesis configuration
         // itself declares**, which is a chain value now rather than the framing
@@ -432,7 +419,7 @@ impl<
         // refuses it again at FR6. Checked before any write: a chain that cannot
         // carry its own genesis must not be created.
         let block_size_limit = self.block_size_limit() as usize;
-        if block_0.len() > block_size_limit || block_1.len() > block_size_limit {
+        if blocks.block_zero.len() > block_size_limit || blocks.block_one.len() > block_size_limit {
             return Err(GenesisRejectReason::GenesisBlockExceedsBlockSizeLimit);
         }
 
@@ -448,12 +435,12 @@ impl<
         self.reset_vote_engine();
         let mut projection = Projection::COMPLETE;
         let derived = self
-            .validate_and_derive_block(&block_0.view(), 0, None, &mut projection)
+            .validate_and_derive_block(&blocks.block_zero.view(), 0, None, &mut projection)
             .and_then(|()| {
                 self.validate_and_derive_block(
-                    &block_1.view(),
+                    &blocks.block_one.view(),
                     1,
-                    Some(block_0.hash()),
+                    Some(blocks.block_zero.hash()),
                     &mut projection,
                 )
             });
@@ -475,13 +462,13 @@ impl<
 
         // Block #0 — active-chain anchor (no parent).
         self.storage
-            .save_block(0, &block_0)
+            .save_block(0, &blocks.block_zero)
             .map_err(|_| self.abandon_genesis(GenesisRejectReason::StorageSaveFailed))?;
-        let mut entry_0 = BlockEntry::new(block_0.hash(), NONE_REF, 0);
+        let mut entry_0 = BlockEntry::new(blocks.block_zero.hash(), NONE_REF, 0);
         entry_0.set_status(BlockStatus::Active);
         entry_0.set_on_active_chain(true);
-        entry_0.set_len(block_0.len() as u32);
-        entry_0.set_payload(&block_0.view());
+        entry_0.set_len(blocks.block_zero.len() as u32);
+        entry_0.set_payload(&blocks.block_zero.view());
         self.blocks.insert_at(0, entry_0);
         self.active_chain_head_idx = 0;
         let active_head = self.active_chain_head_idx;
@@ -490,13 +477,13 @@ impl<
 
         // Block #1 — chain-config, chained to Block #0; becomes the active tip.
         self.storage
-            .save_block(1, &block_1)
+            .save_block(1, &blocks.block_one)
             .map_err(|_| self.abandon_genesis(GenesisRejectReason::StorageSaveFailed))?;
         // The durable chain-configuration seam (FR54): the blockchain owns the
         // storage handle, so the durable commit is made here rather than by the
         // configuration module (configuration specification §8.2).
         self.storage
-            .set_chain_configuration(&block_1)
+            .set_chain_configuration(&blocks.block_one)
             .map_err(|_| self.abandon_genesis(GenesisRejectReason::StorageSaveFailed))?;
         // Every durable write has succeeded: promote the tentative to FR54's
         // set-once lock. `promote_durable` can only fail with `NotLoaded` or
@@ -507,12 +494,12 @@ impl<
             .map_err(|_| self.abandon_genesis(GenesisRejectReason::InitialChainConfigRejected))?;
         // The vote engine was parameterized from this same content, tentative,
         // before the derivation above; the lock changes nothing it reads.
-        let block_1_prev_hash = block_0.hash();
-        let mut entry_1 = BlockEntry::new(block_1.hash(), 0, 1);
+        let block_1_prev_hash = blocks.block_zero.hash();
+        let mut entry_1 = BlockEntry::new(blocks.block_one.hash(), 0, 1);
         entry_1.set_status(BlockStatus::Active);
         entry_1.set_on_active_chain(true);
-        entry_1.set_len(block_1.len() as u32);
-        entry_1.set_payload(&block_1.view());
+        entry_1.set_len(blocks.block_one.len() as u32);
+        entry_1.set_payload(&blocks.block_one.view());
         self.blocks.insert_at(1, entry_1);
         self.active_chain_head_idx = 1;
         let active_head = self.active_chain_head_idx;
@@ -538,11 +525,72 @@ impl<
         // genesis therefore writes the field directly rather than through the
         // guarded `set_lifecycle_phase`.
         self.lifecycle_phase = LifecyclePhase::Ready;
+        Ok(())
+    }
 
-        Ok(GenesisBlocks {
-            block_zero: block_0,
-            block_one: block_1,
-        })
+    /// Block #1 of FR54: the chain-config block, chained to block #0
+    /// (`block_zero_hash`), loaded into the configuration module tentatively.
+    ///
+    /// FR54 framing: the payload is the content region followed by the
+    /// node-#0 content signature (the Story 5.7 envelope). Framed here rather
+    /// than taken framed, because the signature is node #0's and genesis is
+    /// the one place that key is the local one.
+    ///
+    /// Out of line (Story 12.2, DEC-301): the framed payload and the builder
+    /// live in this frame, popped before `process_genesis` writes storage.
+    #[inline(never)]
+    fn genesis_block_one(
+        &mut self,
+        block_zero_hash: [u8; 32],
+        initial_chain_config_bytes: &[u8],
+        out: &mut Block,
+    ) -> Result<(), GenesisRejectReason> {
+        // `process_genesis` bounded the framed length by `MAX_PAYLOAD_SIZE`.
+        let content_len = initial_chain_config_bytes.len();
+        let payload_len = content_len + SIGNATURE_SIZE;
+        let mut payload = [0u8; MAX_PAYLOAD_SIZE];
+        payload[..content_len].copy_from_slice(initial_chain_config_bytes);
+        payload[content_len..payload_len]
+            .copy_from_slice(self.crypto.sign(initial_chain_config_bytes).serialize());
+        let chain_config_payload = &payload[..payload_len];
+
+        // Tentative first: acceptance runs inside the load and before anything
+        // is retained, so a content refusal leaves the module exactly as it was
+        // and genesis writes nothing. The **durable** lock is engaged only
+        // after the last storage write succeeds (`process_genesis`) — FR54's
+        // lock is set-once, and a module locked by a call that then failed on
+        // storage would refuse every retry, with `StorageNotEmpty`, for the
+        // life of the process. A tentative left behind by a failed genesis is
+        // harmless: the next attempt replaces it.
+        self.chain_config
+            .load_tentative(chain_config_payload)
+            .map_err(|_| GenesisRejectReason::InitialChainConfigRejected)?;
+
+        let block_1_header = BlockHeader {
+            version: 1,
+            sequence: 1,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: block_zero_hash,
+            signature: [0u8; SIGNATURE_SIZE],
+        };
+        let mut cfg_builder = BlockBuilder::new().header(block_1_header);
+        // `process_genesis` bounded the framed payload by `MAX_PAYLOAD_SIZE`,
+        // so it fits block #1.
+        if cfg_builder
+            .set_chain_config_payload(chain_config_payload)
+            .is_err()
+        {
+            unreachable!("the framed chain-config payload was capacity-checked");
+        }
+        if cfg_builder.build_signed_into(&self.crypto, out).is_err() {
+            unreachable!("Block #1 header.version = 1 and payload fits MAX_BLOCK_SIZE");
+        }
+        Ok(())
     }
 
     /// A refused genesis leaves no derived projection behind: the D6 step ran
@@ -593,6 +641,22 @@ impl<
     }
 }
 
+/// The value `process_genesis` returns, before its steps build the blocks
+/// into it: two header-only blocks. Out of line, so the value is built in
+/// the caller's slot rather than assembled in its frame and copied there.
+#[inline(never)]
+fn unbuilt_genesis() -> Result<GenesisBlocks, GenesisRejectReason> {
+    let mut header = [0u8; HEADER_SIZE];
+    header[0] = 1;
+    match (Block::from_bytes(&header), Block::from_bytes(&header)) {
+        (Ok(block_zero), Ok(block_one)) => Ok(GenesisBlocks {
+            block_zero,
+            block_one,
+        }),
+        _ => unreachable!("a version-1 header is a valid block"),
+    }
+}
+
 /// Block #0 exactly as FR54 fixes it (DEC-269): node #0's registration
 /// (`new_node_id` 0, key `node_zero_public_key`), then node #0's self-transfer
 /// of `initial_total_network_currency`; creator 0, every other header and
@@ -601,11 +665,16 @@ impl<
 /// (`staged_validation::is_genesis_zero_shape`) accepts exactly this layout with
 /// any amount. The order is load-bearing: the registration seeds node #0, so
 /// the self-transfer then credits it the amount.
+///
+/// Built into `out` in place, out of line (Story 12.2, DEC-301): its builder
+/// lives in this frame only.
+#[inline(never)]
 pub(super) fn genesis_block_zero<C: CryptoTrait>(
     crypto: &C,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
     initial_total_network_currency: u64,
-) -> Block {
+    out: &mut Block,
+) {
     let registration = Registration::new_signed(
         0, // vote
         0, // initializer (node #0)
@@ -654,8 +723,7 @@ pub(super) fn genesis_block_zero<C: CryptoTrait>(
     if builder.add_node_transfer(&self_transfer).is_err() {
         unreachable!("Block #0 self-transfer is fixed-size and cannot overflow payload");
     }
-    match builder.build_signed(crypto) {
-        Ok(b) => b,
-        Err(_) => unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE"),
+    if builder.build_signed_into(crypto, out).is_err() {
+        unreachable!("Block #0 header.version = 1 and payload fits MAX_BLOCK_SIZE");
     }
 }

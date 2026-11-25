@@ -57,7 +57,11 @@ pub(super) fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer:
 pub(super) fn genesis_zero_block(amount: u64) -> Block {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
     let anchor = *signer.public_key().serialize();
-    crate::api::genesis::genesis_block_zero(&signer, &anchor, amount)
+    let mut header = [0u8; HEADER_SIZE];
+    header[0] = 1;
+    let mut block = Block::from_bytes(&header).ok().expect("header-only block");
+    crate::api::genesis::genesis_block_zero(&signer, &anchor, amount, &mut block);
+    block
 }
 
 /// A block #0 assembled from its parts, for the Story 6.10 intake and pass
