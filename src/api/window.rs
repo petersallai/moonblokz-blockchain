@@ -57,10 +57,10 @@ impl<
     }
 
     /// The read half of [`Self::tail_obligation`]: one read of the dropping
-    /// block into its own buffer (DEC-136). A failed read is local. An
-    /// `IntegrityFailure` is matched apart from `BackendIo` here, because a
-    /// slot that fails its own hash is permanently unusable and is DEC-320's to
-    /// release and re-fetch (Epic 9); until then both are local failures.
+    /// block through [`Self::view_retained`], into its own buffer (DEC-136). A
+    /// failed read or bytes that no longer parse are local. A slot that fails
+    /// its own hash is DEC-320's to release and re-fetch (Epic 9), in
+    /// `view_retained`, for every reader at once.
     #[inline(never)]
     fn dropping_block_carries_output_above(
         &self,
@@ -68,18 +68,7 @@ impl<
         fee: u64,
     ) -> Result<bool, TailUnreadable> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
-        match self.storage.read_block_into(idx, &mut buf) {
-            Ok(()) => {}
-            Err(StorageError::IntegrityFailure) => return Err(TailUnreadable),
-            Err(_) => return Err(TailUnreadable),
-        }
-        let n = match self.blocks.get(idx).map(|entry| entry.len() as usize) {
-            Some(len) if len > 0 && len <= MAX_BLOCK_SIZE => len,
-            _ => MAX_BLOCK_SIZE,
-        };
-        let view = BlockView::from_bytes(&buf[..n])
-            .ok()
-            .ok_or(TailUnreadable)?;
+        let view = self.view_retained(idx, &mut buf).ok_or(TailUnreadable)?;
         carries_output_above(
             &view,
             |bit| self.blocks.utxo_available(idx, bit) == Some(true),
