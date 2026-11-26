@@ -1018,8 +1018,9 @@ impl<
     ///
     /// Resolves `(block_sequence, output_index)` for a block at
     /// `consuming_seq` whose parent is `parent_idx`, checks the input's
-    /// `declared_amount`, spends the output and returns its address (the key
-    /// the input's signature verifies against, Story 7.1):
+    /// `declared_amount`, and returns the referenced slot and the output's
+    /// address (the key the input's signature verifies against, Story 7.1),
+    /// without spending it:
     /// 1. causality: `block_sequence` must be below `consuming_seq` (Tier 1
     ///    owns this check; here it is a guard);
     /// 2. distance: `consuming_seq - block_sequence` must not exceed the
