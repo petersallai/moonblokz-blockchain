@@ -164,13 +164,10 @@ fn utxo_reference_below_the_anchor_is_unresolvable_without_trust() {
     let mint = utxo_mint_block(h100);
     let mi = admit(&mut bc, &mint);
     assert!(matches!(
-        bc.resolve_and_spend_utxo(mi, 102, 98, 0, 0, false),
+        bc.resolve_utxo(mi, 102, 98, 0, 0, false),
         Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable))
     ));
-    assert!(matches!(
-        bc.resolve_and_spend_utxo(mi, 102, 98, 0, 0, true),
-        Ok(None)
-    ));
+    assert!(matches!(bc.resolve_utxo(mi, 102, 98, 0, 0, true), Ok(None)));
 }
 
 /// AC8 (5) / Story 6.11 AC3 — an `output_index` past the referenced
@@ -525,7 +522,7 @@ fn utxo_bit_without_its_output_is_a_local_fault() {
     bc.blocks.set_utxo_available(mi, 2, true);
 
     assert!(matches!(
-        bc.resolve_and_spend_utxo(mi, 102, 101, 2, 0, false),
+        bc.resolve_utxo(mi, 102, 101, 2, 0, false),
         Err(UtxoSpendError::StorageRead)
     ));
     assert_eq!(bc.blocks.utxo_available(mi, 2), Some(true), "nothing spent");
@@ -804,4 +801,63 @@ fn the_tail_obligation_reads_only_with_a_set_bit_and_a_failed_read_is_local() {
     bc.storage.failing_slot = mi;
     bc.storage.reads_left.set(0);
     assert_eq!(bc.tail_obligation(mi), Err(TailUnreadable));
+}
+
+/// Story 7.1 (AC2) — in the FR3 pass a UTXO input and a balance input are
+/// each verified against their own key; a foreign key is exact evidence.
+#[test]
+fn the_fr3_pass_verifies_input_signatures() {
+    let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    // A UTXO input of the mint's output 1, signed by a foreign key.
+    let (mut bc, h100) = utxo_test_chain();
+    let mint = utxo_mint_block(h100);
+    admit(&mut bc, &mint);
+    let tx = utxo_tx_signed(0, 102, &[(101, 1, 40)], None, &[Err((2, 40))], &foreign);
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+    let si = admit(&mut bc, &spend);
+    assert_eq!(
+        bc.run_processing_pass(si),
+        Err(ProcessingError::Invalid {
+            block_idx: si,
+            reason: ValidationReason::InputSignatureInvalid,
+        }),
+        "UTXO input"
+    );
+    // A balance input of node 1 (seeded with 100), signed by a foreign key.
+    let (mut bc, h100) = utxo_test_chain();
+    let tx = utxo_tx_signed(0, 101, &[], Some((1, 30)), &[Err((2, 30))], &foreign);
+    let spend = complex_tx_block(101, h100, 3, 0, &[&tx]);
+    let si = admit(&mut bc, &spend);
+    assert_eq!(
+        bc.run_processing_pass(si),
+        Err(ProcessingError::Invalid {
+            block_idx: si,
+            reason: ValidationReason::InputSignatureInvalid,
+        }),
+        "balance input"
+    );
+}
+
+/// D4 (DEC-333) — a reference below a window-anchored candidate's anchor is
+/// trusted pre-window history: no address exists to verify against, so its
+/// signature is trusted with its existence and amount, whatever key signed it.
+#[test]
+fn a_trusted_below_anchor_input_needs_no_key() {
+    let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    let (mut bc, h100) = utxo_test_chain();
+    let mint = utxo_mint_block(h100);
+    admit(&mut bc, &mint);
+    let tx = utxo_tx_signed(
+        0,
+        102,
+        &[(98, 0, 50), (86, 3, 30)],
+        None,
+        &[Err((2, 70))],
+        &foreign,
+    );
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+    let si = admit(&mut bc, &spend);
+    bc.run_processing_pass(si)
+        .expect("trusted below the anchor");
+    assert_eq!(bc.node_info.balance_of(2), 70);
 }

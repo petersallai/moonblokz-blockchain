@@ -22,9 +22,10 @@ use moonblokz_chain_types::{
     APPROVAL_DEVIATION_SEQUENCE_OFFSET, APPROVAL_LATE_COUNT_SIZE, APPROVAL_LATE_ENTRY_SIZE,
     APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, APPROVAL_SUPPORTER_VOTE_SUM_OFFSET, ApprovalView,
     Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE,
-    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL,
-    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
-    PAYLOAD_TYPE_TWIN_FACT, REGISTRATION_SIZE, Registration, TransactionView, TwinFactView,
+    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, MAX_TRANSACTION_SIZE, NODE_INFO_SIZE, NodeTransfer,
+    PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG,
+    PAYLOAD_TYPE_TRANSACTION, PAYLOAD_TYPE_TWIN_FACT, REGISTRATION_SIZE, Registration,
+    TransactionView, TwinFactView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
@@ -204,7 +205,7 @@ pub(crate) enum ProcessingError {
     },
 }
 
-/// Why [`Blockchain::resolve_and_spend_utxo`] could not spend a UTXO input
+/// Why [`Blockchain::resolve_utxo`] could not resolve a UTXO input
 /// (Story 6.8). Only `Invalid` is evidence against the consuming block; the
 /// other two are local faults, which FR16 never charges against a block. The
 /// caller maps it into its own error type, adding the consuming block's index.
@@ -239,6 +240,10 @@ pub(crate) enum ValidationReason {
     VoteHeaderMismatch,
     /// A node-transfer / registration transaction signature is invalid.
     TransactionSignatureInvalid,
+    /// A complex-transaction input signature does not verify over the DEC-196
+    /// preimage against its own key: a UTXO input's referenced output address,
+    /// a balance input's `initializer` key (Story 7.1, I-21).
+    InputSignatureInvalid,
     /// A debit (transfer amount+fee, registration price+fee, balance input)
     /// exceeds the initializer's derived balance (negative-balance outcome).
     InsufficientBalance,

@@ -645,6 +645,26 @@ pub(super) fn utxo_tx_vote(
     balance_input: Option<(u32, u64)>,
     outputs: &[Result<u64, (u32, u64)>],
 ) -> moonblokz_chain_types::ComplexTransaction {
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    utxo_tx_signed(vote, seq, utxo_inputs, balance_input, outputs, &signer)
+}
+
+/// [`utxo_tx_vote`] with every input signed by `signer` (DEC-196). Every UTXO
+/// output pays the universal test key (`pubkey([1u8])`), the key every seeded
+/// test node holds, so a `[1u8]`-signed spend of it verifies.
+pub(super) fn utxo_tx_signed(
+    vote: u32,
+    seq: u32,
+    utxo_inputs: &[(u32, u16, u64)],
+    balance_input: Option<(u32, u64)>,
+    outputs: &[Result<u64, (u32, u64)>],
+    signer: &Crypto,
+) -> moonblokz_chain_types::ComplexTransaction {
+    let address = *Crypto::new([1u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("test key")
+        .public_key()
+        .serialize();
     let mut cx = moonblokz_chain_types::ComplexTransaction::new(vote);
     for &(block_sequence, output_index, amount) in utxo_inputs {
         cx.add_utxo_input(block_sequence, output_index, amount, &[0u8; SIGNATURE_SIZE])
@@ -658,13 +678,29 @@ pub(super) fn utxo_tx_vote(
     }
     for output in outputs {
         match *output {
-            Ok(amount) => cx.add_utxo_output(&[0xA5; PUBLIC_KEY_SIZE], amount),
+            Ok(amount) => cx.add_utxo_output(&address, amount),
             Err((receiver, amount)) => cx.add_balance_output(receiver, amount),
         }
         .ok()
         .expect("add output");
     }
+    sign_inputs(&mut cx, signer);
     cx
+}
+
+/// Signs every input of `cx` with `signer` over the DEC-196 preimage.
+pub(super) fn sign_inputs(cx: &mut moonblokz_chain_types::ComplexTransaction, signer: &Crypto) {
+    let mut buf = [0u8; moonblokz_chain_types::MAX_TRANSACTION_SIZE];
+    let len = TransactionView::from_bytes(cx.as_bytes())
+        .and_then(|view| view.input_signing_preimage(&mut buf).map(|p| p.len()))
+        .expect("a complex transaction");
+    let signature = signer.sign(&buf[..len]);
+    let inputs = cx.as_bytes()[5];
+    for i in 0..inputs {
+        cx.set_input_signature(i, signature.serialize())
+            .ok()
+            .expect("input exists");
+    }
 }
 
 pub(super) fn admit(bc: &mut TestChain, block: &Block) -> u32 {
