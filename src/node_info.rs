@@ -1,7 +1,9 @@
 //! `node_info.rs` — FR6, FR50, FR67, FR69.
 //!
 //! Struct-of-arrays per-node derived projection, indexed by `node_id`
-//! (~44 KB Schnorr / ~108 KB BLS at the default `MAX_NODES = 1000`):
+//! (`PUBLIC_KEY_SIZE + 12` B a node — 44 / 108 / 60 B with Schnorr /
+//! `bls-min-sig` / `bls-min-pk`, so 44.0 / 27.9 / 12.7 KB at the RP2040
+//! profiles' `MAX_NODES` 1 000 / 258 / 211):
 //! - `public_keys: [[u8; PUBLIC_KEY_SIZE]; MAX_NODES]` — `node_id → public_key`
 //! - `balances: [u64; MAX_NODES]` — per-node money balance (FR36)
 //! - `seed_source_idx: [u32; MAX_NODES]` — FR50 per-node seed-source block-table
@@ -9,10 +11,13 @@
 //!   `SEED_SOURCE_RELEASED` = seeded, source block released off the tail)
 //! - `max_known_node_id: u32` — FR34 registration-sequence watermark
 //!
-//! **Scope split.** Story 5.3 (FR3) *introduces* this substrate to the extent
-//! the processing-pass reconstruction needs it. The FR34 *queryable surface*
-//! and the block-navigation / UTXO cache are added on top by Story 7.1; the
-//! FR50 `seed_source_sequence` two-trigger machinery by Story 9.3. The FR37
+//! **Scope.** Story 5.3 (FR3) introduced this substrate; Stories 6.0 and 6.3
+//! keep it at the head on every path. With the vote engine and the block table
+//! (`BlockEntry`, the block-navigation-and-UTXO cache) it is the whole FR34
+//! projection set — audited by Story 7.1 (DEC-303). FR34's sixth projection,
+//! the per-node `seed_source_sequence`, is realised as `seed_source_idx`, a
+//! block-table index whose sequence `BlockEntry::sequence` gives in O(1), as
+//! FR34 permits; whether Story 9.3 converts it is that story's decision. The FR37
 //! accumulated-vote registry is **owned by the `moonblokz-vote` crate**
 //! (`VoteEngine`, held separately on `Blockchain`), indexed by the same
 //! `node_id` — it is deliberately *not* duplicated here.
