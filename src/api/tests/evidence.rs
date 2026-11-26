@@ -880,11 +880,11 @@ fn a_valid_evidence_is_verified_once_and_marked() {
 /// refused.
 #[test]
 fn the_accepted_mark_sets_both_bits() {
-    let mut table = BlockTable::<4>::new();
+    let mut table = BlockTable::<4, TEST_UTXO_BYTES>::new();
     let idx = table
         .insert(BlockEntry::new([7; 32], NONE_REF, 3))
         .expect("a slot");
-    let bits = |table: &BlockTable<4>| {
+    let bits = |table: &BlockTable<4, TEST_UTXO_BYTES>| {
         let entry = table.get(idx).expect("held");
         (
             entry.is_signatures_accepted(),

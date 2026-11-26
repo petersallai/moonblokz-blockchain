@@ -1,7 +1,7 @@
 //! `blocks.rs` — FR18.
 //!
-//! Owns the bounded `BlockTable<MAX_BLOCKS>` (~45.6 KB at the default
-//! `MAX_BLOCKS = 600`) — every retained block with its ancestry metadata,
+//! Owns the bounded `BlockTable<MAX_BLOCKS, AVAILABLE_UTXO_BYTES>` (31.2 KB at
+//! the default `MAX_BLOCKS = 600` and the production 4-byte bitfield, DEC-318) — every retained block with its ancestry metadata,
 //! the single authoritative `(sequence, block_hash)` duplicate-detection
 //! index, and the co-located ADR-016 available-UTXO bitfields.
 //!
@@ -59,21 +59,6 @@ use moonblokz_chain_types::{BlockView, PAYLOAD_TYPE_TWIN_FACT, TwinFactView};
 /// (`api::Blockchain::tier1_admit`) can insert a block with an as-yet-
 /// unresolved parent (parent linking / recovery is Story 4.4).
 pub(crate) const NONE_REF: u32 = u32::MAX;
-
-/// ADR-016 available-UTXO bitfield size in bytes, for the architecture §5
-/// default `MAX_BLOCK_UTXO_OUTPUT = 256` (256 / 8 = 32). Bit *i* is 1 exactly
-/// when the block's *i*-th UTXO output exists and is unspent on the current
-/// derived chain (DEC-132). `AVAILABLE_UTXO_BYTES * 8` is also the Tier-1 cap
-/// on a block's UTXO outputs before the durable lock (Story 6.11).
-///
-/// A fixed constant, not derived from `Blockchain`'s `MAX_BLOCK_UTXO_OUTPUT`
-/// const generic: sizing a field from `N / 8` where `N` is a generic parameter
-/// requires the unstable `generic_const_exprs` feature, which this workspace
-/// does not enable (the same constraint already documented for
-/// `moonblokz-crypto-lib`'s fixed-size array API). The build states this width
-/// to the configuration module once, in `Blockchain::BUILD_LIMITS`, which is
-/// where a chain's `max_block_utxo_output` is held within it (FR8).
-pub(crate) const AVAILABLE_UTXO_BYTES: usize = 32;
 
 /// `flags` bit assignment: bit 0 is `is_on_active_chain` (Story 4.1); bits 1-2
 /// carry the FR9 `BlockStatus` (Story 4.2, see [`crate::staged_validation::BlockStatus`]);
@@ -140,8 +125,17 @@ const FLAG_SIGNATURES_ACCEPTED: u8 = 0b0100_0000;
 /// field access rather than an accessor surface, keeping the embedded API
 /// surface small — the same discipline `moonblokz-mempool`'s `IndexEntry`
 /// follows.
+///
+/// `AVAILABLE_UTXO_BYTES` sizes the ADR-016 available-UTXO bitfield: bit *i*
+/// is 1 exactly when the block's *i*-th UTXO output exists and is unspent on
+/// the current derived chain (DEC-132). It is the build's const generic in
+/// bytes (DEC-318; 4 in the RP2040 profiles, 32 outputs), so the array is sized
+/// by it directly and only the bit count `AVAILABLE_UTXO_BYTES · 8` is computed
+/// — as a value, `Blockchain::UTXO_BITFIELD_WIDTH`, which is both the capacity
+/// stated to the configuration module and the Tier-1 cap on a block's UTXO
+/// outputs before the durable lock (Story 6.11).
 #[cfg_attr(test, derive(PartialEq, Eq))]
-pub(crate) struct BlockEntry {
+pub(crate) struct BlockEntry<const AVAILABLE_UTXO_BYTES: usize> {
     hash: [u8; 32],
     parent_ref: u32,
     sequence: u32,
@@ -170,7 +164,7 @@ pub(crate) struct BlockEntry {
 // with Story 4.2/4.3 (Story 4.1's own tests exercise them, but `cargo test`
 // dead-code analysis runs against the non-test build too).
 #[allow(dead_code)]
-impl BlockEntry {
+impl<const AVAILABLE_UTXO_BYTES: usize> BlockEntry<AVAILABLE_UTXO_BYTES> {
     /// An empty slot: `sequence == NONE_REF` is the sentinel `BlockTable`
     /// scans for.
     const fn new_empty() -> Self {
@@ -420,20 +414,22 @@ pub(crate) enum BlockTableError {
 /// field (architecture §6.2).
 #[allow(dead_code)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-pub(crate) struct BlockTable<const MAX_BLOCKS: usize> {
-    blocks: [BlockEntry; MAX_BLOCKS],
+pub(crate) struct BlockTable<const MAX_BLOCKS: usize, const AVAILABLE_UTXO_BYTES: usize> {
+    blocks: [BlockEntry<AVAILABLE_UTXO_BYTES>; MAX_BLOCKS],
 }
 
 // `find`/`insert`/`get`/`walks_to_active_chain` are consumed starting with
 // Story 4.2/4.3/4.4; `init` is already called from `api/genesis.rs`.
 // Story 4.1's tests exercise every method directly.
 #[allow(dead_code)]
-impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
+impl<const MAX_BLOCKS: usize, const AVAILABLE_UTXO_BYTES: usize>
+    BlockTable<MAX_BLOCKS, AVAILABLE_UTXO_BYTES>
+{
     /// Constructs the empty table in place, inside caller-provided storage,
     /// and hands back a `&mut` to it: each `BlockEntry` is written directly
     /// to its final address, one at a time, so no value the size of the
-    /// whole `[BlockEntry; MAX_BLOCKS]` array (~45.6 KB at the default
-    /// `MAX_BLOCKS = 600`) ever exists anywhere in this function — and, as a
+    /// whole `[BlockEntry; MAX_BLOCKS]` array (31.2 KB at the default
+    /// `MAX_BLOCKS = 600` and 4-byte bitfields) ever exists anywhere in this function — and, as a
     /// side effect, no whole-table constant exists for the compiler to bake
     /// into flash either. This is the table's only constructor.
     ///
@@ -457,7 +453,8 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
         // SAFETY: `slot.as_mut_ptr()` is derived from a live `&mut
         // MaybeUninit<Self>`; taking the raw address of a field through it
         // neither reads nor creates a reference to uninitialized memory.
-        let blocks_ptr = unsafe { &raw mut (*slot.as_mut_ptr()).blocks }.cast::<BlockEntry>();
+        let blocks_ptr = unsafe { &raw mut (*slot.as_mut_ptr()).blocks }
+            .cast::<BlockEntry<AVAILABLE_UTXO_BYTES>>();
         for i in 0..MAX_BLOCKS {
             // SAFETY: `blocks_ptr` is derived from a live `&mut
             // MaybeUninit<Self>` and `i < MAX_BLOCKS`, so every write lands
@@ -473,7 +470,7 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
 
     /// The by-value constructor, kept as the **executable specification** of
     /// [`Self::init`]: a struct literal the language forces to be exhaustive.
-    /// Test-only — it materializes the whole ~45.6 KB array by value, which
+    /// Test-only — it materializes the whole table array by value, which
     /// is exactly what `init` exists to avoid on the embedded stack.
     #[cfg(test)]
     pub(crate) fn new() -> Self {
@@ -504,7 +501,10 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// [`Self::next_free_index`] + [`Self::insert_at`] for callers (mainly
     /// tests) that do not run the storage-first two-step; the admission path
     /// uses `next_free_index` + `insert_at` directly to avoid the second scan.
-    pub(crate) fn insert(&mut self, entry: BlockEntry) -> Result<u32, BlockTableError> {
+    pub(crate) fn insert(
+        &mut self,
+        entry: BlockEntry<AVAILABLE_UTXO_BYTES>,
+    ) -> Result<u32, BlockTableError> {
         if entry.sequence == NONE_REF {
             return Err(BlockTableError::ReservedSequence);
         }
@@ -527,7 +527,7 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
     /// duplicate reaching here is a caller bug — asserted in debug, not
     /// re-checked in release (embedded thrift: the public `receive_block`
     /// path establishes the not-a-duplicate invariant exactly once).
-    pub(crate) fn insert_at(&mut self, idx: u32, entry: BlockEntry) {
+    pub(crate) fn insert_at(&mut self, idx: u32, entry: BlockEntry<AVAILABLE_UTXO_BYTES>) {
         debug_assert!(
             entry.sequence != NONE_REF,
             "insert_at: reserved sentinel sequence"
@@ -556,7 +556,7 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
 
     /// Returns the entry at `idx`, or `None` if `idx` is out of bounds or
     /// names an empty slot.
-    pub(crate) fn get(&self, idx: u32) -> Option<&BlockEntry> {
+    pub(crate) fn get(&self, idx: u32) -> Option<&BlockEntry<AVAILABLE_UTXO_BYTES>> {
         self.blocks
             .get(idx as usize)
             .filter(|entry| !entry.is_empty_slot())
@@ -951,6 +951,9 @@ impl<const MAX_BLOCKS: usize> BlockTable<MAX_BLOCKS> {
 
 #[cfg(test)]
 mod tests {
+    /// The production bitfield bytes (DEC-318).
+    const B: usize = 4;
+    type Entry = BlockEntry<B>;
     use super::*;
 
     fn hash_of(byte: u8) -> [u8; 32] {
@@ -959,8 +962,8 @@ mod tests {
 
     /// Test-only stand-in for the deleted by-value `BlockTable::new()`: runs
     /// the safe `init` into a local slot and moves the finished table out.
-    fn empty_table<const N: usize>() -> BlockTable<N> {
-        let mut table = core::mem::MaybeUninit::<BlockTable<N>>::uninit();
+    fn empty_table<const N: usize>() -> BlockTable<N, B> {
+        let mut table = core::mem::MaybeUninit::<BlockTable<N, B>>::uninit();
         BlockTable::init(&mut table);
         // SAFETY: `init` returned, so every entry of `table` is initialized.
         unsafe { table.assume_init() }
@@ -971,9 +974,9 @@ mod tests {
     /// is uninitialized and Miri rejects reading it).
     #[test]
     fn init_is_equivalent_to_new() {
-        let mut slot = core::mem::MaybeUninit::<BlockTable<16>>::uninit();
+        let mut slot = core::mem::MaybeUninit::<BlockTable<16, B>>::uninit();
         let built = BlockTable::init(&mut slot);
-        let spec = BlockTable::<16>::new();
+        let spec = BlockTable::<16, B>::new();
         let BlockTable { blocks } = &*built;
         let BlockTable {
             blocks: spec_blocks,
@@ -986,8 +989,8 @@ mod tests {
     /// spendable.
     #[test]
     fn available_utxo_bit_out_of_range_is_never_available() {
-        let mut entry = BlockEntry::new([1u8; 32], NONE_REF, 3);
-        let width = AVAILABLE_UTXO_BYTES * 8;
+        let mut entry = Entry::new([1u8; 32], NONE_REF, 3);
+        let width = B * 8;
         entry.set_utxo_available(width - 1, true);
         entry.set_utxo_available(width, true);
         assert!(entry.utxo_available(width - 1));
@@ -996,14 +999,20 @@ mod tests {
 
     #[test]
     fn block_entry_size_is_within_budget() {
-        // 32 hash + 4 parent_ref + 4 sequence + 32 available_utxo +
-        // 1 head_ref_count + 1 flags + 4 len = 78 B, 4-byte aligned (largest
-        // field is u32) -> 80 B, matching architecture §6.2. `len` is a `u32` on
-        // every block-size tier (DEC-224, Story 6.15); it was a `u16` in the
-        // tail padding before, at 76 B. Pinned exactly, not just bounded, so a
-        // future field addition must consciously update this (same discipline as
-        // chain-types' `block_view_size_is_pointer_plus_length`).
-        assert_eq!(core::mem::size_of::<BlockEntry>(), 80);
+        // 32 hash + 4 parent_ref + 4 sequence + `AVAILABLE_UTXO_BYTES`
+        // available_utxo + 1 head_ref_count + 1 flags + 4 len + 2 equivocator
+        // = 48 + B, 4-byte aligned (largest field is u32): 52 B at the
+        // production B = 4 (DEC-318), 80 B at the former fixed 32. `len` is a
+        // `u32` on every block-size tier (DEC-224, Story 6.15). Pinned exactly,
+        // not just bounded, so a future field addition must consciously update
+        // this (same discipline as chain-types'
+        // `block_view_size_is_pointer_plus_length`).
+        assert_eq!(core::mem::size_of::<BlockEntry<4>>(), 52);
+        assert_eq!(core::mem::size_of::<BlockEntry<32>>(), 80);
+        assert_eq!(
+            core::mem::size_of::<BlockEntry<B>>(),
+            (48 + B).next_multiple_of(4)
+        );
     }
 
     #[test]
@@ -1018,7 +1027,7 @@ mod tests {
     #[test]
     fn insert_assigns_index_and_is_findable() {
         let mut table = empty_table::<4>();
-        let entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
+        let entry = Entry::new(hash_of(1), NONE_REF, 0);
         let idx = table.insert(entry).unwrap();
         assert_eq!(table.find(0, &hash_of(1)), Some(idx));
         assert_eq!(table.len(), 1);
@@ -1027,9 +1036,7 @@ mod tests {
     #[test]
     fn find_returns_none_for_unknown_sequence_hash() {
         let mut table = empty_table::<4>();
-        table
-            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
-            .unwrap();
+        table.insert(Entry::new(hash_of(1), NONE_REF, 0)).unwrap();
         assert_eq!(table.find(1, &hash_of(1)), None);
         assert_eq!(table.find(0, &hash_of(2)), None);
     }
@@ -1044,11 +1051,9 @@ mod tests {
     #[should_panic(expected = "FR11-dedup")]
     fn insert_at_debug_asserts_caller_deduplicates() {
         let mut table = empty_table::<4>();
-        table
-            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
-            .unwrap();
+        table.insert(Entry::new(hash_of(1), NONE_REF, 0)).unwrap();
         // A second insert of the same (sequence, hash) trips the debug assert.
-        let _ = table.insert(BlockEntry::new(hash_of(1), NONE_REF, 0));
+        let _ = table.insert(Entry::new(hash_of(1), NONE_REF, 0));
     }
 
     #[test]
@@ -1057,7 +1062,7 @@ mod tests {
         // empty slot once stored — insert must refuse it up front rather
         // than silently creating an unreadable/overwritable occupied slot.
         let mut table = empty_table::<4>();
-        let result = table.insert(BlockEntry::new(hash_of(1), NONE_REF, NONE_REF));
+        let result = table.insert(Entry::new(hash_of(1), NONE_REF, NONE_REF));
         assert_eq!(result, Err(BlockTableError::ReservedSequence));
         assert_eq!(table.len(), 0);
     }
@@ -1065,13 +1070,9 @@ mod tests {
     #[test]
     fn insert_rejects_when_table_full() {
         let mut table = empty_table::<2>();
-        table
-            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
-            .unwrap();
-        table
-            .insert(BlockEntry::new(hash_of(2), NONE_REF, 1))
-            .unwrap();
-        let result = table.insert(BlockEntry::new(hash_of(3), NONE_REF, 2));
+        table.insert(Entry::new(hash_of(1), NONE_REF, 0)).unwrap();
+        table.insert(Entry::new(hash_of(2), NONE_REF, 1)).unwrap();
+        let result = table.insert(Entry::new(hash_of(3), NONE_REF, 2));
         assert_eq!(result, Err(BlockTableError::Full));
         assert_eq!(table.len(), 2);
         // Existing entries undisturbed (FR20 — no silent collapse to make room).
@@ -1082,19 +1083,13 @@ mod tests {
     #[test]
     fn ancestry_walk_finds_active_chain_through_multiple_hops() {
         let mut table = empty_table::<8>();
-        let root = table
-            .insert(BlockEntry::new(hash_of(0), NONE_REF, 0))
-            .unwrap();
+        let root = table.insert(Entry::new(hash_of(0), NONE_REF, 0)).unwrap();
         // Mark the root on the active chain.
         table.blocks[root as usize].set_on_active_chain(true);
 
-        let child1 = table.insert(BlockEntry::new(hash_of(1), root, 1)).unwrap();
-        let child2 = table
-            .insert(BlockEntry::new(hash_of(2), child1, 2))
-            .unwrap();
-        let tip = table
-            .insert(BlockEntry::new(hash_of(3), child2, 3))
-            .unwrap();
+        let child1 = table.insert(Entry::new(hash_of(1), root, 1)).unwrap();
+        let child2 = table.insert(Entry::new(hash_of(2), child1, 2)).unwrap();
+        let tip = table.insert(Entry::new(hash_of(3), child2, 3)).unwrap();
 
         assert!(table.walks_to_active_chain(tip));
     }
@@ -1102,19 +1097,15 @@ mod tests {
     #[test]
     fn ancestry_walk_returns_false_on_unresolved_parent() {
         let mut table = empty_table::<4>();
-        let orphan = table
-            .insert(BlockEntry::new(hash_of(1), NONE_REF, 5))
-            .unwrap();
+        let orphan = table.insert(Entry::new(hash_of(1), NONE_REF, 5)).unwrap();
         assert!(!table.walks_to_active_chain(orphan));
     }
 
     #[test]
     fn ancestry_walk_is_bounded() {
         let mut table = empty_table::<4>();
-        let a = table
-            .insert(BlockEntry::new(hash_of(1), NONE_REF, 0))
-            .unwrap();
-        let b = table.insert(BlockEntry::new(hash_of(2), a, 1)).unwrap();
+        let a = table.insert(Entry::new(hash_of(1), NONE_REF, 0)).unwrap();
+        let b = table.insert(Entry::new(hash_of(2), a, 1)).unwrap();
         // Introduce a malformed 2-cycle: a's parent_ref now points to b.
         table.blocks[a as usize].parent_ref = b;
 
@@ -1126,11 +1117,9 @@ mod tests {
     #[test]
     fn multiple_branches_all_retained() {
         let mut table = empty_table::<8>();
-        let root = table
-            .insert(BlockEntry::new(hash_of(0), NONE_REF, 0))
-            .unwrap();
-        let branch_a = table.insert(BlockEntry::new(hash_of(1), root, 1)).unwrap();
-        let branch_b = table.insert(BlockEntry::new(hash_of(2), root, 1)).unwrap();
+        let root = table.insert(Entry::new(hash_of(0), NONE_REF, 0)).unwrap();
+        let branch_a = table.insert(Entry::new(hash_of(1), root, 1)).unwrap();
+        let branch_b = table.insert(Entry::new(hash_of(2), root, 1)).unwrap();
 
         assert_ne!(branch_a, branch_b);
         assert!(table.find(1, &hash_of(1)).is_some());
@@ -1143,10 +1132,10 @@ mod tests {
         // AC1 / AC4: a brand-new entry (and an empty slot) decodes to Stored,
         // the collecting-state default — no explicit set_status needed.
         assert_eq!(
-            BlockEntry::new(hash_of(1), NONE_REF, 0).status(),
+            Entry::new(hash_of(1), NONE_REF, 0).status(),
             BlockStatus::Stored
         );
-        assert_eq!(BlockEntry::new_empty().status(), BlockStatus::Stored);
+        assert_eq!(Entry::new_empty().status(), BlockStatus::Stored);
     }
 
     #[test]
@@ -1156,7 +1145,7 @@ mod tests {
             BlockStatus::Connected,
             BlockStatus::Active,
         ] {
-            let mut entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
+            let mut entry = Entry::new(hash_of(1), NONE_REF, 0);
             entry.set_status(status);
             assert_eq!(entry.status(), status);
         }
@@ -1166,7 +1155,7 @@ mod tests {
     fn status_and_active_chain_bit_are_independent() {
         // The FR9 status (bits 1-2) and is_on_active_chain (bit 0) must not
         // clobber each other — distinct concepts (architecture §6.2).
-        let mut entry = BlockEntry::new(hash_of(1), NONE_REF, 0);
+        let mut entry = Entry::new(hash_of(1), NONE_REF, 0);
         entry.set_on_active_chain(true);
         entry.set_status(BlockStatus::Active);
         assert!(entry.is_on_active_chain());
@@ -1193,7 +1182,7 @@ mod tests {
         let mut table = empty_table::<4>();
         for i in 0..4u32 {
             table
-                .insert(BlockEntry::new(hash_of(i as u8), NONE_REF, i))
+                .insert(Entry::new(hash_of(i as u8), NONE_REF, i))
                 .unwrap();
             assert!(table.len() <= 4);
         }
@@ -1201,7 +1190,7 @@ mod tests {
             assert!(!entry.is_empty_slot());
         }
         assert_eq!(
-            table.insert(BlockEntry::new(hash_of(99), NONE_REF, 99)),
+            table.insert(Entry::new(hash_of(99), NONE_REF, 99)),
             Err(BlockTableError::Full)
         );
     }
@@ -1210,9 +1199,8 @@ mod tests {
 
     /// Insert a metadata-only block, returning its index (the subtree walk is
     /// over the ancestry graph, so no signed block content is needed).
-    fn put<const N: usize>(t: &mut BlockTable<N>, byte: u8, parent: u32, seq: u32) -> u32 {
-        t.insert(BlockEntry::new(hash_of(byte), parent, seq))
-            .unwrap()
+    fn put<const N: usize>(t: &mut BlockTable<N, B>, byte: u8, parent: u32, seq: u32) -> u32 {
+        t.insert(Entry::new(hash_of(byte), parent, seq)).unwrap()
     }
 
     #[test]

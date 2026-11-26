@@ -48,8 +48,9 @@ const fn ids_exceed_filter(max_nodes: usize) -> bool {
 /// with nothing mutated. A read that fails only inside the engine (a storage
 /// fault between two reads of one block) leaves the engine's result
 /// untrustworthy; the caller escalates it like a failed restore (DEC-205).
-pub(super) struct CreditDrop<'a, S, const MAX_BLOCKS: usize, const MAX_NODES: usize> {
-    blocks: &'a BlockTable<MAX_BLOCKS>,
+pub(super) struct CreditDrop<'a, S, const MAX_BLOCKS: usize, const MAX_NODES: usize, const B: usize>
+{
+    blocks: &'a BlockTable<MAX_BLOCKS, B>,
     storage: &'a S,
     parent: u32,
     /// `H`, or 0 when no fact block lies in the range (the fast path: one
@@ -60,24 +61,30 @@ pub(super) struct CreditDrop<'a, S, const MAX_BLOCKS: usize, const MAX_NODES: us
 
 /// The [`CreditDrop`] of the held block at `idx` (its parent's range), the
 /// one constructor the commit, the switch undo and the rewind use.
-pub(super) fn credit_drop<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>(
-    blocks: &'a BlockTable<MAX_BLOCKS>,
+pub(super) fn credit_drop<
+    'a,
+    S: StorageTrait,
+    const MAX_BLOCKS: usize,
+    const MAX_NODES: usize,
+    const B: usize,
+>(
+    blocks: &'a BlockTable<MAX_BLOCKS, B>,
     storage: &'a S,
     h: Option<u32>,
     idx: u32,
-) -> CreditDrop<'a, S, MAX_BLOCKS, MAX_NODES> {
+) -> CreditDrop<'a, S, MAX_BLOCKS, MAX_NODES, B> {
     let parent = blocks.get(idx).map_or(NONE_REF, |entry| entry.parent_ref());
     CreditDrop::new(blocks, storage, parent, h)
 }
 
-impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>
-    CreditDrop<'a, S, MAX_BLOCKS, MAX_NODES>
+impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize, const B: usize>
+    CreditDrop<'a, S, MAX_BLOCKS, MAX_NODES, B>
 {
     /// The predicate for the block whose parent is `parent`, under the
     /// chain's verification horizon `h` (none before a configuration: then no
     /// fact block can exist).
     pub(super) fn new(
-        blocks: &'a BlockTable<MAX_BLOCKS>,
+        blocks: &'a BlockTable<MAX_BLOCKS, B>,
         storage: &'a S,
         parent: u32,
         h: Option<u32>,
@@ -151,8 +158,8 @@ impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize>
 /// proof; `None` on a failed read. Its own frame, reached only where node ids
 /// can exceed the filter.
 #[inline(never)]
-fn fact_creator<S: StorageTrait, const MAX_BLOCKS: usize>(
-    blocks: &BlockTable<MAX_BLOCKS>,
+fn fact_creator<S: StorageTrait, const MAX_BLOCKS: usize, const B: usize>(
+    blocks: &BlockTable<MAX_BLOCKS, B>,
     storage: &S,
     idx: u32,
 ) -> Option<u32> {
@@ -174,7 +181,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -184,7 +191,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// Story 6.13 AC3 (FR71 I-43; DEC-277, DEC-278, DEC-279) — the Tier-3 check

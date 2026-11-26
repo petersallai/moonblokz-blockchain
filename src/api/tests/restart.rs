@@ -647,9 +647,10 @@ fn fr59_a_store_whose_every_slot_is_corrupt_is_refused() {
         .expect("test private key");
     let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
     let node_zero = *crypto.public_key().serialize();
-    let mut slot =
-        core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
-    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
+    let mut slot = core::mem::MaybeUninit::<
+        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+    >::uninit();
+    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
         &mut slot,
         crypto,
         CorruptSlotsStorage,
@@ -826,9 +827,10 @@ fn a_no_usable_tree_refusal_also_stops_accepting_blocks() {
         .ok()
         .expect("test private key");
     let node_zero = *crypto.public_key().serialize();
-    let mut slot =
-        core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
-    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
+    let mut slot = core::mem::MaybeUninit::<
+        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+    >::uninit();
+    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
         &mut slot,
         crypto,
         CorruptSlotsStorage,

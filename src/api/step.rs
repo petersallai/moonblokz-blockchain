@@ -60,7 +60,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -70,7 +70,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// The FR6 per-block step (Story 6.0 AC1): validates one block against the
@@ -375,7 +375,7 @@ impl<
         derivation: BlockDerivation,
     ) -> Result<(), ProcessingError> {
         // FR72: the credit drop at this block (Story 6.13 AC6).
-        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
             &self.blocks,
             &self.storage,
             self.verification_horizon(),

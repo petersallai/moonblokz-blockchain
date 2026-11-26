@@ -34,7 +34,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -44,7 +44,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// The FR21 rank of a valued side head — Connected, and named by a
@@ -726,7 +726,7 @@ impl<
         // state, never evidence against the block (AC2 step 2).
         if let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
             // FR72: the credit drop the apply made (Story 6.13 AC6).
-            let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+            let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
                 &self.blocks,
                 &self.storage,
                 self.verification_horizon(),

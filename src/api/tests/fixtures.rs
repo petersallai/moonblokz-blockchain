@@ -10,7 +10,7 @@ pub(super) type TestChain = Blockchain<
     16,
     TEST_MAX_BLOCKS,
     4,
-    16,
+    TEST_UTXO_BYTES,
 >;
 
 pub(super) fn new_test_chain() -> TestChain {
@@ -173,7 +173,7 @@ pub(super) const W6: u32 = 6;
 /// segment fits the test harness's block storage. Same shape as
 /// `new_test_chain` otherwise (local_node_id 5, join/Collecting), but on
 /// [`W6Storage`].
-pub(super) type W6Chain = Blockchain<Crypto, W6Storage, TestConfig, 16, 6, 16, 4, 16>;
+pub(super) type W6Chain = Blockchain<Crypto, W6Storage, TestConfig, 16, 6, 16, 4, TEST_UTXO_BYTES>;
 
 /// The W6 harness's storage: fourteen block slots. A window-anchored join
 /// holds `W + H = 9` blocks; the others are kept for forks and extensions
@@ -753,7 +753,8 @@ impl<const N: usize> StorageTrait for FailingReadStorage<N> {
 
 /// Every chain of this section shares `TestChain`'s capacities; only the
 /// storage differs (the fault-injecting one of AC6).
-pub(super) type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
+pub(super) type Chain16<S> =
+    Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>;
 
 /// The FR54 currency of every genesis node in this section.
 pub(super) const CURRENCY: u64 = 1_000_000_000;

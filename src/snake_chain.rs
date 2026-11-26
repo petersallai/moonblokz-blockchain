@@ -61,8 +61,12 @@ pub(crate) struct TailUnreadable;
 /// and the available-UTXO bits — in the FR3 pass and on every Ready head
 /// extension (Story 6.0), and the chain switch restores them through its exact
 /// inverses (Story 6.3).
-pub(crate) fn classify_tail_drop<const MAX_BLOCKS: usize, const MAX_NODES: usize>(
-    blocks: &BlockTable<MAX_BLOCKS>,
+pub(crate) fn classify_tail_drop<
+    const MAX_BLOCKS: usize,
+    const MAX_NODES: usize,
+    const B: usize,
+>(
+    blocks: &BlockTable<MAX_BLOCKS, B>,
     node_info: &NodeInfoState<MAX_NODES>,
     tail_idx: u32,
 ) -> Result<TailObligation, TailUnreadable> {
@@ -131,8 +135,8 @@ mod tests {
         Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
     }
 
-    fn blocks() -> BlockTable<8> {
-        let mut slot = core::mem::MaybeUninit::<BlockTable<8>>::uninit();
+    fn blocks() -> BlockTable<8, 4> {
+        let mut slot = core::mem::MaybeUninit::<BlockTable<8, 4>>::uninit();
         BlockTable::init(&mut slot);
         // SAFETY: `init` returned, so every entry of `slot` is initialized.
         unsafe { slot.assume_init() }
@@ -215,7 +219,7 @@ mod tests {
     /// Admits `block` at slot 0 of `table` as the intake path would: the
     /// payload type is stamped into the entry. Nothing is stored durably — the
     /// classification takes no storage (Story 6.11).
-    fn place(table: &mut BlockTable<8>, block: &Block) -> u32 {
+    fn place(table: &mut BlockTable<8, 4>, block: &Block) -> u32 {
         let view = block.view();
         let mut entry = BlockEntry::new(view.hash(), NONE_REF, view.sequence());
         entry.set_payload_type(view.payload_type());

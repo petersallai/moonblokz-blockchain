@@ -18,7 +18,7 @@ fn code_baked_defaults_reproduce_the_retired_stub() {
     assert_eq!(config.inter_block_interval_ms(), 60_000);
     assert_eq!(config.grace_period_window_ms(), 30_000);
     assert_eq!(config.block_size_limit(), 2016);
-    assert_eq!(config.max_utxo_outputs(), 255);
+    assert_eq!(config.max_utxo_outputs(), 32);
     assert_eq!(config.required_support(), 40);
     assert_eq!(config.vote_scale().get(), 1000);
     assert_eq!(config.vote_interest(), 5);

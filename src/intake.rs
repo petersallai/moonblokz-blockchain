@@ -114,7 +114,7 @@ pub(crate) fn classify_block<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >(
     bc: &mut Blockchain<
         C,
@@ -124,7 +124,7 @@ pub(crate) fn classify_block<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >,
     block: &BlockView<'_>,
     window: Option<(u32, u32)>,
@@ -246,7 +246,7 @@ mod tests {
         16,
         TEST_MAX_BLOCKS,
         4,
-        16,
+        TEST_UTXO_BYTES,
     >;
 
     /// The verification horizon the configurations declare beside `W`
@@ -257,6 +257,9 @@ mod tests {
     /// `W + 2·H` (configuration §6 check 16); the test backend stores eight
     /// blocks, so the size only has to pass the check.
     const TEST_MAX_BLOCKS: usize = W as usize + 2 * H as usize;
+
+    /// The production bitfield bytes (DEC-318).
+    const TEST_UTXO_BYTES: usize = 4;
 
     /// The node cap the configurations declare: `TestChain`'s `MAX_NODES`
     /// (DEC-228; the default 1000 would fail configuration §6 check 18).
@@ -628,9 +631,10 @@ mod tests {
         let c = crypto();
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<0>::new();
-        let mut bc_slot =
-            core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
+        let mut bc_slot = core::mem::MaybeUninit::<
+            Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+        >::uninit();
+        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
             &mut bc_slot,
             c,
             storage,

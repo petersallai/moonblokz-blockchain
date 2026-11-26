@@ -11,7 +11,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -21,7 +21,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// This build's capacities, stated for the configuration module's §6
@@ -33,9 +33,9 @@ impl<
     /// checks read exactly what this constant says, and drift between the
     /// blockchain's arrays and the module's bounds stays unrepresentable.
     ///
-    /// - `utxo_unspent_bits` — `UTXO_BITFIELD_WIDTH`, the per-block
-    ///   available-UTXO bitfield width of `BlockEntry` (Story 4.1 fixes the
-    ///   field at 32 bytes).
+    /// - `utxo_unspent_bits` — `Self::UTXO_BITFIELD_WIDTH`, the per-block
+    ///   available-UTXO bitfield width of `BlockEntry`, `AVAILABLE_UTXO_BYTES ·
+    ///   8` (DEC-318).
     /// - `snake_chain_length_max` — `SNAKE_CHAIN_LENGTH_MAX`, the active-chain
     ///   capacity. The chain's own window `W` must fit inside it, whether the
     ///   content declares `W` or leaves it at its default.
@@ -52,7 +52,7 @@ impl<
     ///   scheme. The chain's `signature_scheme` (ID 33, default `schnorr`) must
     ///   equal it (§6 check 19, DEC-252).
     pub const BUILD_LIMITS: BuildLimits = BuildLimits {
-        utxo_unspent_bits: UTXO_BITFIELD_WIDTH,
+        utxo_unspent_bits: Self::UTXO_BITFIELD_WIDTH,
         snake_chain_length_max: {
             // Every chain declares `W >= 1` (configuration §6 check 7), so a
             // zero capacity would compile into a node that refuses every chain.
@@ -101,8 +101,8 @@ impl<
     /// hands back a `&mut` to the initialized value. This is the type's
     /// **only** constructor.
     ///
-    /// `Self` is large (dominated by `blocks: BlockTable<MAX_BLOCKS>`, e.g.
-    /// ~45.6 KB at the default `MAX_BLOCKS = 600`) — large enough that no
+    /// `Self` is large (dominated by `blocks: BlockTable<MAX_BLOCKS, …>`,
+    /// e.g. 31.2 KB at the default `MAX_BLOCKS = 600`) — large enough that no
     /// construction technique *inside* a function that returns `Self` by
     /// value can avoid needing a full `size_of::<Self>()`-sized stack
     /// allocation somewhere (measured across several approaches: a

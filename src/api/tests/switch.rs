@@ -775,7 +775,7 @@ fn ready_intake_checks_branch_independent_signatures() {
             .get(ui)
             .is_some_and(|e| !e.is_signature_verified())
     );
-    assert!(!BlockEntry::new([0; 32], NONE_REF, 1).is_signature_verified());
+    assert!(!BlockEntry::<TEST_UTXO_BYTES>::new([0; 32], NONE_REF, 1).is_signature_verified());
 }
 
 /// AC10.11 / D6 — verify once: a Stored child marked verified is promoted
@@ -844,12 +844,13 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
 ) {
     // `node_info` per node: seed sources are slots, so they are compared
     // as the blocks they name.
-    let source = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, src: Option<u32>| match src {
-        Some(idx) if idx != SEED_SOURCE_RELEASED => {
-            bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
-        }
-        other => Some(other.map(|_| (u32::MAX, [0u8; 32]))),
-    };
+    let source =
+        |bc_blocks: &BlockTable<TEST_MAX_BLOCKS, TEST_UTXO_BYTES>, src: Option<u32>| match src {
+            Some(idx) if idx != SEED_SOURCE_RELEASED => {
+                bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
+            }
+            other => Some(other.map(|_| (u32::MAX, [0u8; 32]))),
+        };
     assert_eq!(
         a.node_info.max_known_node_id(),
         b.node_info.max_known_node_id(),
@@ -877,8 +878,9 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
         a.active_branch_value, b.active_branch_value,
         "{what}: value"
     );
-    let hash_of =
-        |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, idx: u32| bc_blocks.get(idx).map(|e| *e.hash());
+    let hash_of = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS, TEST_UTXO_BYTES>, idx: u32| {
+        bc_blocks.get(idx).map(|e| *e.hash())
+    };
     assert_eq!(
         hash_of(&a.blocks, a.active_chain_head_idx),
         hash_of(&b.blocks, b.active_chain_head_idx),
@@ -896,7 +898,8 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
     // active head's own entry is skipped: it carries no value (DEC-144),
     // and it exists only while the head has no side child.
     type Entry = Option<((u32, [u8; 32]), bool, Option<[u8; 32]>, Option<u64>)>;
-    let entries = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, heads: &ChainHeadsTable<4>| {
+    let entries = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS, TEST_UTXO_BYTES>,
+                   heads: &ChainHeadsTable<4>| {
         let mut out: [Entry; 4] = [None; 4];
         for (slot, (head, anchor)) in heads.occupied_heads().enumerate() {
             let entry = bc_blocks.get(head).expect("an entry names a block");
@@ -964,7 +967,7 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
             "{what}: flag of #{}",
             eb.sequence()
         );
-        for bit in 0..AVAILABLE_UTXO_BYTES * 8 {
+        for bit in 0..TEST_UTXO_BYTES * 8 {
             assert_eq!(
                 a.blocks.utxo_available(ai, bit),
                 b.blocks.utxo_available(idx, bit),

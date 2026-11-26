@@ -278,7 +278,7 @@ fn approval_over(
 #[test]
 fn the_payload_type_cache_holds_types_one_to_five() {
     for payload_type in 1..=5 {
-        let mut entry = BlockEntry::new([0; 32], NONE_REF, 7);
+        let mut entry = BlockEntry::<TEST_UTXO_BYTES>::new([0; 32], NONE_REF, 7);
         entry.set_payload_type(payload_type);
         assert_eq!(entry.payload_type(), payload_type);
         // Only a type-5 entry names an equivocator (unstamped here: 0).
@@ -289,7 +289,7 @@ fn the_payload_type_cache_holds_types_one_to_five() {
 /// The type's high bit (bit 7) survives every other flag setter.
 #[test]
 fn the_high_type_bit_survives_the_other_flag_setters() {
-    let mut entry = BlockEntry::new([0; 32], NONE_REF, 7);
+    let mut entry = BlockEntry::<TEST_UTXO_BYTES>::new([0; 32], NONE_REF, 7);
     entry.set_payload_type(PAYLOAD_TYPE_TWIN_FACT);
     entry.set_signature_verified();
     entry.set_on_active_chain(true);
@@ -298,7 +298,7 @@ fn the_high_type_bit_survives_the_other_flag_setters() {
     entry.set_head_ref_count(0);
     entry.set_status(BlockStatus::Connected);
     entry.set_len(500);
-    for bit in 0..UTXO_BITFIELD_WIDTH as usize {
+    for bit in 0..TestChain::UTXO_BITFIELD_WIDTH as usize {
         entry.set_utxo_available(bit, true);
         entry.set_utxo_available(bit, false);
     }
@@ -316,7 +316,7 @@ fn tier1_refuses_a_malformed_proof_or_repeated_members() {
             &block.view(),
             &bc.node_zero_public_key,
             MAX_BLOCK_SIZE as u32,
-            UTXO_BITFIELD_WIDTH,
+            TestChain::UTXO_BITFIELD_WIDTH,
             &bc.crypto,
         )
     };
@@ -481,7 +481,12 @@ fn a_late_twin_gets_a_penalty_only_fact_block() {
         bc.blocks.get(idx).expect("held").equivocator_filter(),
         Some(1)
     );
-    let drop = CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, idx, Some(8));
+    let drop = CreditDrop::<_, TEST_MAX_BLOCKS, 16, TEST_UTXO_BYTES>::new(
+        &bc.blocks,
+        &bc.storage,
+        idx,
+        Some(8),
+    );
     assert!(drop.excluded(1) && !drop.excluded(0));
 }
 
@@ -659,15 +664,25 @@ fn the_credit_drop_reads_the_horizon_not_the_window() {
         // (4) lies in `[seq + 1 − 8, seq]`.
         let expected = seq < 4 + 8; // b = seq + 1 ≤ e + H
         assert_eq!(
-            CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, idx, Some(8))
-                .excluded(1),
+            CreditDrop::<_, TEST_MAX_BLOCKS, 16, TEST_UTXO_BYTES>::new(
+                &bc.blocks,
+                &bc.storage,
+                idx,
+                Some(8)
+            )
+            .excluded(1),
             expected,
             "b = {}",
             seq + 1
         );
         assert!(
-            !CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, idx, Some(8))
-                .excluded(0),
+            !CreditDrop::<_, TEST_MAX_BLOCKS, 16, TEST_UTXO_BYTES>::new(
+                &bc.blocks,
+                &bc.storage,
+                idx,
+                Some(8)
+            )
+            .excluded(0),
             "only c"
         );
     }
@@ -947,7 +962,12 @@ fn the_snapshot_restores_credits_banked_since_the_twin() {
     let bytes = std::vec::Vec::from(e.serialized_bytes());
     let parent = slot(&bc, &b4);
     let h = bc.verification_horizon();
-    let drop = CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, parent, h);
+    let drop = CreditDrop::<_, TEST_MAX_BLOCKS, 16, TEST_UTXO_BYTES>::new(
+        &bc.blocks,
+        &bc.storage,
+        parent,
+        h,
+    );
     let view = BlockView::from_bytes(&bytes).ok().expect("parses");
     bc.vote_engine
         .undo_block(view, |node| drop.excluded(node))
@@ -1022,8 +1042,12 @@ fn a_wide_build_confirms_a_filter_match_by_reading_the_block() {
         bc.blocks.insert_at(idx, entry);
         parent = idx;
     }
-    let wide =
-        CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, parent, Some(8));
+    let wide = CreditDrop::<_, TEST_MAX_BLOCKS, 70_000, TEST_UTXO_BYTES>::new(
+        &bc.blocks,
+        &bc.storage,
+        parent,
+        Some(8),
+    );
     assert!(wide.excluded(1), "the read confirms c = 1");
     assert!(
         !wide.excluded(65_537),
@@ -1031,8 +1055,12 @@ fn a_wide_build_confirms_a_filter_match_by_reading_the_block() {
     );
     assert!(!wide.excluded(2));
     assert!(!wide.faulted());
-    let narrow =
-        CreditDrop::<_, TEST_MAX_BLOCKS, 16>::new(&bc.blocks, &bc.storage, parent, Some(8));
+    let narrow = CreditDrop::<_, TEST_MAX_BLOCKS, 16, TEST_UTXO_BYTES>::new(
+        &bc.blocks,
+        &bc.storage,
+        parent,
+        Some(8),
+    );
     assert!(narrow.excluded(1), "the filter is the id");
 
     // A fact entry whose block cannot be read: the confirm read fails.
@@ -1040,16 +1068,24 @@ fn a_wide_build_confirms_a_filter_match_by_reading_the_block() {
     ghost.set_payload(&e.view());
     let ghost_idx = bc.blocks.next_free_index().expect("free");
     bc.blocks.insert_at(ghost_idx, ghost);
-    let faulty =
-        CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, ghost_idx, Some(8));
+    let faulty = CreditDrop::<_, TEST_MAX_BLOCKS, 70_000, TEST_UTXO_BYTES>::new(
+        &bc.blocks,
+        &bc.storage,
+        ghost_idx,
+        Some(8),
+    );
     let five = alt(8, [0xEE; 32], 0, 0, 2, 31, false);
     assert!(
         !faulty.reads_hold(&five.view()),
         "the pre-check reports the fault"
     );
     assert!(faulty.faulted());
-    let unread =
-        CreditDrop::<_, TEST_MAX_BLOCKS, 70_000>::new(&bc.blocks, &bc.storage, ghost_idx, Some(8));
+    let unread = CreditDrop::<_, TEST_MAX_BLOCKS, 70_000, TEST_UTXO_BYTES>::new(
+        &bc.blocks,
+        &bc.storage,
+        ghost_idx,
+        Some(8),
+    );
     assert!(!unread.excluded(1), "a failed read answers not excluded");
     assert!(unread.faulted(), "and raises the fault");
 }

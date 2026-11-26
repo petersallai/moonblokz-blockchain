@@ -174,13 +174,15 @@ fn utxo_reference_below_the_anchor_is_unresolvable_without_trust() {
 
 /// AC8 (5) / Story 6.11 AC3 — an `output_index` past the referenced
 /// block's UTXO outputs (or into a block with none) has no available bit:
-/// exact evidence, decided from RAM. Story 6.15: the index is a `u16`, and
-/// one past the 256-bit bitfield is unavailable too — 256 never aliases
-/// output 0, as a truncation to `u8` would make it.
+/// exact evidence, decided from RAM. Story 6.15: the index is a `u16`, and an
+/// index at or past the bitfield's width (`AVAILABLE_UTXO_BYTES · 8`, DEC-318)
+/// is unavailable too; 256 never aliases output 0, as a truncation to `u8`
+/// would make it.
 #[test]
 fn utxo_out_of_bounds_index_is_unavailable() {
     for (referenced, index) in [
         (101, 2),
+        (101, TEST_UTXO_BYTES as u16 * 8),
         (101, 255),
         (101, 256),
         (101, u16::MAX),
@@ -399,7 +401,7 @@ fn utxo_value_overflow_is_invalid() {
 }
 
 type FailingReadChain =
-    Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
+    Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>;
 
 /// The UTXO harness on a [`FailingReadChain`] whose reads all succeed
 /// until a test arms `failing_slot`: chain-config anchor 99, balance block

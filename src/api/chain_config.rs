@@ -11,7 +11,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -21,7 +21,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     // -----------------------------------------------------------------------
@@ -456,7 +456,9 @@ impl<
     pub(super) fn held_max_utxo_outputs(&self) -> u16 {
         self.chain_config
             .active_configuration()
-            .map_or(UTXO_BITFIELD_WIDTH, |config| config.max_utxo_outputs())
+            .map_or(Self::UTXO_BITFIELD_WIDTH, |config| {
+                config.max_utxo_outputs()
+            })
     }
 
     /// The block UTXO-output cap that Tier 1 may **enforce** against an arriving
@@ -467,7 +469,9 @@ impl<
         self.chain_config
             .durable_content()
             .and_then(|_| self.chain_config.active_configuration())
-            .map_or(UTXO_BITFIELD_WIDTH, |config| config.max_utxo_outputs())
+            .map_or(Self::UTXO_BITFIELD_WIDTH, |config| {
+                config.max_utxo_outputs()
+            })
     }
 
     /// The block-size limit **the chain declares**, once any configuration is
