@@ -804,12 +804,23 @@ impl<
         idx: u32,
         buf: &'b mut [u8; MAX_BLOCK_SIZE],
     ) -> Option<BlockView<'b>> {
-        self.storage.read_block_into(idx, buf).ok()?;
+        self.read_retained(idx, buf).ok().flatten()
+    }
+
+    /// [`Self::view_retained`] keeping the storage error: `Err` on a failed
+    /// read, `Ok(None)` on bytes that no longer parse. For a read site that
+    /// must keep `IntegrityFailure` apart from other errors (DEC-320).
+    fn read_retained<'b>(
+        &self,
+        idx: u32,
+        buf: &'b mut [u8; MAX_BLOCK_SIZE],
+    ) -> Result<Option<BlockView<'b>>, StorageError> {
+        self.storage.read_block_into(idx, buf)?;
         let n = match self.blocks.get(idx).map(|entry| entry.len() as usize) {
             Some(len) if len > 0 && len <= MAX_BLOCK_SIZE => len,
             _ => MAX_BLOCK_SIZE,
         };
-        BlockView::from_bytes(&buf[..n]).ok()
+        Ok(BlockView::from_bytes(&buf[..n]).ok())
     }
 
     /// Deletes `target` and its whole descendant subtree, with the FR19
