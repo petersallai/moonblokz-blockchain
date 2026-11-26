@@ -10,7 +10,7 @@ pub(super) type TestChain = Blockchain<
     16,
     TEST_MAX_BLOCKS,
     4,
-    16,
+    TEST_UTXO_BYTES,
 >;
 
 pub(super) fn new_test_chain() -> TestChain {
@@ -173,7 +173,7 @@ pub(super) const W6: u32 = 6;
 /// segment fits the test harness's block storage. Same shape as
 /// `new_test_chain` otherwise (local_node_id 5, join/Collecting), but on
 /// [`W6Storage`].
-pub(super) type W6Chain = Blockchain<Crypto, W6Storage, TestConfig, 16, 6, 16, 4, 16>;
+pub(super) type W6Chain = Blockchain<Crypto, W6Storage, TestConfig, 16, 6, 16, 4, TEST_UTXO_BYTES>;
 
 /// The W6 harness's storage: fourteen block slots. A window-anchored join
 /// holds `W + H = 9` blocks; the others are kept for forks and extensions
@@ -645,6 +645,26 @@ pub(super) fn utxo_tx_vote(
     balance_input: Option<(u32, u64)>,
     outputs: &[Result<u64, (u32, u64)>],
 ) -> moonblokz_chain_types::ComplexTransaction {
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    utxo_tx_signed(vote, seq, utxo_inputs, balance_input, outputs, &signer)
+}
+
+/// [`utxo_tx_vote`] with every input signed by `signer` (DEC-196). Every UTXO
+/// output pays the universal test key (`pubkey([1u8])`), the key every seeded
+/// test node holds, so a `[1u8]`-signed spend of it verifies.
+pub(super) fn utxo_tx_signed(
+    vote: u32,
+    seq: u32,
+    utxo_inputs: &[(u32, u16, u64)],
+    balance_input: Option<(u32, u64)>,
+    outputs: &[Result<u64, (u32, u64)>],
+    signer: &Crypto,
+) -> moonblokz_chain_types::ComplexTransaction {
+    let address = *Crypto::new([1u8; PRIVATE_KEY_SIZE])
+        .ok()
+        .expect("test key")
+        .public_key()
+        .serialize();
     let mut cx = moonblokz_chain_types::ComplexTransaction::new(vote);
     for &(block_sequence, output_index, amount) in utxo_inputs {
         cx.add_utxo_input(block_sequence, output_index, amount, &[0u8; SIGNATURE_SIZE])
@@ -658,13 +678,50 @@ pub(super) fn utxo_tx_vote(
     }
     for output in outputs {
         match *output {
-            Ok(amount) => cx.add_utxo_output(&[0xA5; PUBLIC_KEY_SIZE], amount),
+            Ok(amount) => cx.add_utxo_output(&address, amount),
             Err((receiver, amount)) => cx.add_balance_output(receiver, amount),
         }
         .ok()
         .expect("add output");
     }
+    sign_inputs(&mut cx, signer);
     cx
+}
+
+/// A key no seeded test node holds: its signatures verify against nothing.
+pub(super) fn other_key() -> Crypto {
+    Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
+}
+
+/// The signatures of `cx`'s inputs, in order.
+pub(super) fn input_signatures(
+    cx: &moonblokz_chain_types::ComplexTransaction,
+) -> std::vec::Vec<std::vec::Vec<u8>> {
+    let view = TransactionView::from_bytes(cx.as_bytes()).expect("a transaction");
+    view.as_complex()
+        .expect("complex")
+        .inputs()
+        .map(|input| match (input.as_utxo(), input.as_balance()) {
+            (Some(u), _) => u.signature().to_vec(),
+            (_, Some(b)) => b.signature().to_vec(),
+            _ => unreachable!("an input is UTXO or balance"),
+        })
+        .collect()
+}
+
+/// Signs every input of `cx` with `signer` over the DEC-196 preimage.
+pub(super) fn sign_inputs(cx: &mut moonblokz_chain_types::ComplexTransaction, signer: &Crypto) {
+    let mut buf = [0u8; moonblokz_chain_types::MAX_TRANSACTION_SIZE];
+    let len = TransactionView::from_bytes(cx.as_bytes())
+        .and_then(|view| view.input_signing_preimage(&mut buf).map(|p| p.len()))
+        .expect("a complex transaction");
+    let signature = signer.sign(&buf[..len]);
+    let inputs = cx.as_bytes()[5];
+    for i in 0..inputs {
+        cx.set_input_signature(i, signature.serialize())
+            .ok()
+            .expect("input exists");
+    }
 }
 
 pub(super) fn admit(bc: &mut TestChain, block: &Block) -> u32 {
@@ -753,7 +810,8 @@ impl<const N: usize> StorageTrait for FailingReadStorage<N> {
 
 /// Every chain of this section shares `TestChain`'s capacities; only the
 /// storage differs (the fault-injecting one of AC6).
-pub(super) type Chain16<S> = Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
+pub(super) type Chain16<S> =
+    Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>;
 
 /// The FR54 currency of every genesis node in this section.
 pub(super) const CURRENCY: u64 = 1_000_000_000;

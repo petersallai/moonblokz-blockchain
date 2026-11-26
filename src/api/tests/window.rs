@@ -1395,3 +1395,80 @@ fn horizon_switch_and_release_are_replay_deterministic() {
         "#95 is still in the horizon (H = 3)"
     );
 }
+
+/// Review patch (Story 7.1, AC4b, DEC-330) — end to end on a W6 founder: a
+/// mint at #3 drops when #9 extends the head. With every unspent output at
+/// most the custodian fee (1) nothing is owed, so a plain #9 extends the head
+/// in Ready and passes the FR3 pass; with an output above the fee the plain #9
+/// drops an owed carry-forward — refused at intake, `TailDropUnpreserved` in
+/// the pass. (The switch replay judges its blocks through the same
+/// `judge_head_extension` with a virtual tail.)
+#[test]
+fn a_tail_whose_outputs_are_all_at_most_the_fee_drops_without_a_carry_forward() {
+    for (outputs, owed) in [(&[Ok(1), Ok(1)][..], false), (&[Ok(1), Ok(2)][..], true)] {
+        let (mut founder, g, c1) = w6_founder();
+        let mut chain = std::vec![g, c1];
+        let mut prev = chain[1].view().hash();
+        for seq in 2..=8 {
+            let blk = match seq {
+                3 => {
+                    let paid = outputs.iter().map(|o| o.as_ref().map_or(0, |a| *a)).sum();
+                    let tx = utxo_tx(3, &[], Some((0, paid)), outputs);
+                    complex_tx_block(3, prev, 0, 0, &[&tx])
+                }
+                6 => w6_balance_block(Some(&founder), seq, prev),
+                7 => w6_config_anchor_block(seq, prev),
+                _ => w6_clean_block(seq, prev),
+            };
+            extend_active_head(&mut founder, &blk, 0);
+            prev = blk.view().hash();
+            chain.push(blk);
+        }
+        let plain = w6_clean_block(9, prev);
+
+        // Ready: the head extension's FR48 gate.
+        let (outcome, _) = founder.receive_block(plain.view(), 0);
+        if owed {
+            assert_eq!(
+                outcome,
+                ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+                "an owed carry-forward is missing"
+            );
+            assert_eq!(
+                founder
+                    .blocks
+                    .get(founder.active_chain_head_idx)
+                    .map(|e| *e.hash()),
+                Some(prev)
+            );
+        } else {
+            assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
+            assert_eq!(
+                founder
+                    .blocks
+                    .get(founder.active_chain_head_idx)
+                    .map(|e| *e.hash()),
+                Some(plain.view().hash()),
+                "#3 dropped"
+            );
+        }
+
+        // The FR3 pass over the same segment.
+        let mut bc = new_w6_chain();
+        let refs: std::vec::Vec<&Block> = chain.iter().chain([&plain]).collect();
+        admit_all(&mut bc, &refs);
+        let pi = bc.blocks.find(9, &plain.view().hash()).expect("stored");
+        let verdict = bc.run_processing_pass(pi);
+        if owed {
+            assert!(matches!(
+                verdict,
+                Err(ProcessingError::Invalid {
+                    block_idx,
+                    reason: ValidationReason::TailDropUnpreserved,
+                }) if block_idx == pi
+            ));
+        } else {
+            assert!(verdict.is_ok(), "{verdict:?}");
+        }
+    }
+}

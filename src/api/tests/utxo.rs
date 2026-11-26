@@ -73,7 +73,8 @@ fn spend_verdict(inputs: &[(u32, u16, u64)]) -> (Result<(), ProcessingError>, u3
     let (mut bc, h100) = utxo_test_chain();
     let mint = utxo_mint_block(h100);
     admit(&mut bc, &mint);
-    let tx = utxo_tx(102, inputs, None, &[]);
+    // One 0-amount output: a complex transaction needs one (DEC-308).
+    let tx = utxo_tx(102, inputs, None, &[Err((2, 0))]);
     let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
     let si = admit(&mut bc, &spend);
     (bc.run_processing_pass(si).map(|_| ()), si)
@@ -163,24 +164,23 @@ fn utxo_reference_below_the_anchor_is_unresolvable_without_trust() {
     let mint = utxo_mint_block(h100);
     let mi = admit(&mut bc, &mint);
     assert!(matches!(
-        bc.resolve_and_spend_utxo(mi, 102, 98, 0, 0, false),
+        bc.resolve_utxo(mi, 102, 98, 0, 0, false),
         Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable))
     ));
-    assert!(matches!(
-        bc.resolve_and_spend_utxo(mi, 102, 98, 0, 0, true),
-        Ok(None)
-    ));
+    assert!(matches!(bc.resolve_utxo(mi, 102, 98, 0, 0, true), Ok(None)));
 }
 
 /// AC8 (5) / Story 6.11 AC3 — an `output_index` past the referenced
 /// block's UTXO outputs (or into a block with none) has no available bit:
-/// exact evidence, decided from RAM. Story 6.15: the index is a `u16`, and
-/// one past the 256-bit bitfield is unavailable too — 256 never aliases
-/// output 0, as a truncation to `u8` would make it.
+/// exact evidence, decided from RAM. Story 6.15: the index is a `u16`, and an
+/// index at or past the bitfield's width (`AVAILABLE_UTXO_BYTES · 8`, DEC-318)
+/// is unavailable too; 256 never aliases output 0, as a truncation to `u8`
+/// would make it.
 #[test]
 fn utxo_out_of_bounds_index_is_unavailable() {
     for (referenced, index) in [
         (101, 2),
+        (101, TEST_UTXO_BYTES as u16 * 8),
         (101, 255),
         (101, 256),
         (101, u16::MAX),
@@ -385,8 +385,10 @@ fn utxo_value_overflow_is_invalid() {
         Err(AdmitError::Rejected(Tier1Failure::AmountOverflow))
     );
 
-    let first = utxo_tx(102, &[(101, 0, HALF)], None, &[]);
-    let second = utxo_tx(102, &[(101, 1, HALF)], None, &[]);
+    // Each needs an output (DEC-308); a 0-amount one keeps the whole input
+    // as the fee, so the two fees still overflow.
+    let first = utxo_tx(102, &[(101, 0, HALF)], None, &[Err((2, 0))]);
+    let second = utxo_tx(102, &[(101, 1, HALF)], None, &[Err((2, 0))]);
     let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&first, &second]);
     let si = admit(&mut bc, &spend);
     assert_eq!(
@@ -399,7 +401,7 @@ fn utxo_value_overflow_is_invalid() {
 }
 
 type FailingReadChain =
-    Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, 16>;
+    Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>;
 
 /// The UTXO harness on a [`FailingReadChain`] whose reads all succeed
 /// until a test arms `failing_slot`: chain-config anchor 99, balance block
@@ -520,7 +522,7 @@ fn utxo_bit_without_its_output_is_a_local_fault() {
     bc.blocks.set_utxo_available(mi, 2, true);
 
     assert!(matches!(
-        bc.resolve_and_spend_utxo(mi, 102, 101, 2, 0, false),
+        bc.resolve_utxo(mi, 102, 101, 2, 0, false),
         Err(UtxoSpendError::StorageRead)
     ));
     assert_eq!(bc.blocks.utxo_available(mi, 2), Some(true), "nothing spent");
@@ -734,4 +736,231 @@ fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
         Some(false),
         "no bit of the refused candidate survives"
     );
+}
+
+/// DEC-330 (AC4b) — the FR51 obligation reads the dropping block: unspent
+/// outputs all at most the custodian fee (the code-baked 1) owe no
+/// carry-forward, because each would be discarded and the carry-forward would
+/// have no output (DEC-308); one output above the fee owes it. The RAM
+/// pre-filter still says `Utxo` in both cases.
+#[test]
+fn the_tail_obligation_owes_a_carry_forward_only_above_the_custodian_fee() {
+    for (outputs, owed) in [
+        (&[Ok(1), Ok(1)][..], TailObligation::None),
+        (&[Ok(1), Ok(2)][..], TailObligation::Utxo),
+        (&[Ok(60), Ok(40)][..], TailObligation::Utxo),
+    ] {
+        let (mut bc, h100) = utxo_test_chain();
+        let tx = utxo_tx(101, &[], Some((1, 100)), outputs);
+        let mint = complex_tx_block(101, h100, 3, 0, &[&tx]);
+        let mi = admit(&mut bc, &mint);
+        bc.run_processing_pass(mi).expect("the mint derives");
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, mi),
+            Ok(TailObligation::Utxo),
+            "the bitfield pre-filter"
+        );
+        assert_eq!(bc.tail_obligation(mi), Ok(owed), "{outputs:?}");
+        // The binding the extension that drops the block must satisfy: a
+        // plain block preserves nothing, so it may drop the block only when
+        // nothing is owed (review patch, AC4b).
+        let plain = linked_transfer_block(102, mint.view().hash());
+        let expected = if owed == TailObligation::Utxo {
+            TailBinding::Invalid
+        } else {
+            TailBinding::Advance
+        };
+        assert_eq!(
+            tail_drop_binding(owed, &plain.view()),
+            expected,
+            "{outputs:?}"
+        );
+    }
+}
+
+/// DEC-330 — only a still-unspent output counts: spending the one output
+/// above the fee leaves an all-below-fee block that owes nothing.
+#[test]
+fn a_spent_output_above_the_fee_no_longer_owes_a_carry_forward() {
+    let (mut bc, h100) = utxo_test_chain();
+    let tx = utxo_tx(101, &[], Some((1, 100)), &[Ok(1), Ok(50)]);
+    let mint = complex_tx_block(101, h100, 3, 0, &[&tx]);
+    let mi = admit(&mut bc, &mint);
+    let spend = utxo_tx(102, &[(101, 1, 50)], None, &[Err((2, 50))]);
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&spend]);
+    let si = admit(&mut bc, &spend);
+    bc.run_processing_pass(si).expect("the spend derives");
+    assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true));
+    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::None));
+}
+
+/// DEC-330 — a block with no set bit is classified from RAM, with no read;
+/// one with a set bit is read once, and a failed read is the node's own
+/// failure (`TailUnreadable`), never "no obligation".
+#[test]
+fn the_tail_obligation_reads_only_with_a_set_bit_and_a_failed_read_is_local() {
+    let (mut bc, _, mi) = failing_read_utxo_chain();
+    // Admitted, not derived: no bit is set yet.
+    bc.storage.failing_slot = mi;
+    let reads = bc.storage.reads.get();
+    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::None));
+    assert_eq!(bc.storage.reads.get(), reads, "no set bit, no read");
+
+    bc.storage.failing_slot = NONE_REF;
+    bc.run_processing_pass(mi).expect("the mint derives");
+    let reads = bc.storage.reads.get();
+    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::Utxo));
+    assert_eq!(bc.storage.reads.get(), reads + 1, "one read");
+
+    bc.storage.failing_slot = mi;
+    bc.storage.reads_left.set(0);
+    assert_eq!(bc.tail_obligation(mi), Err(TailUnreadable));
+}
+
+/// Story 7.1 (AC2) — in the FR3 pass a UTXO input and a balance input are
+/// each verified against their own key; a foreign key is exact evidence.
+#[test]
+fn the_fr3_pass_verifies_input_signatures() {
+    let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    // A UTXO input of the mint's output 1, signed by a foreign key.
+    let (mut bc, h100) = utxo_test_chain();
+    let mint = utxo_mint_block(h100);
+    admit(&mut bc, &mint);
+    let tx = utxo_tx_signed(0, 102, &[(101, 1, 40)], None, &[Err((2, 40))], &foreign);
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+    let si = admit(&mut bc, &spend);
+    assert_eq!(
+        bc.run_processing_pass(si),
+        Err(ProcessingError::Invalid {
+            block_idx: si,
+            reason: ValidationReason::InputSignatureInvalid,
+        }),
+        "UTXO input"
+    );
+    // A balance input of node 1 (seeded with 100), signed by a foreign key.
+    let (mut bc, h100) = utxo_test_chain();
+    let tx = utxo_tx_signed(0, 101, &[], Some((1, 30)), &[Err((2, 30))], &foreign);
+    let spend = complex_tx_block(101, h100, 3, 0, &[&tx]);
+    let si = admit(&mut bc, &spend);
+    assert_eq!(
+        bc.run_processing_pass(si),
+        Err(ProcessingError::Invalid {
+            block_idx: si,
+            reason: ValidationReason::InputSignatureInvalid,
+        }),
+        "balance input"
+    );
+}
+
+/// D4 (DEC-333) — a reference below a window-anchored candidate's anchor is
+/// trusted pre-window history: no address exists to verify against, so its
+/// signature is trusted with its existence and amount, whatever key signed it.
+#[test]
+fn a_trusted_below_anchor_input_needs_no_key() {
+    let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    let (mut bc, h100) = utxo_test_chain();
+    let mint = utxo_mint_block(h100);
+    admit(&mut bc, &mint);
+    let tx = utxo_tx_signed(
+        0,
+        102,
+        &[(98, 0, 50), (86, 3, 30)],
+        None,
+        &[Err((2, 70))],
+        &foreign,
+    );
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
+    let si = admit(&mut bc, &spend);
+    bc.run_processing_pass(si)
+        .expect("trusted below the anchor");
+    assert_eq!(bc.node_info.balance_of(2), 70);
+}
+
+/// Review patch (Story 7.1) — a dropping block whose bits are set but whose
+/// transactions do not parse is storage and RAM disagreeing: the amount
+/// reader answers "unknown", never "no obligation".
+#[test]
+fn an_unparseable_dropping_block_owes_an_unknown_obligation() {
+    let cfg = chain_config_anchor_block(99, [0xAB; 32]);
+    assert_eq!(
+        crate::available_utxo::carries_output_above(&cfg.view(), |_| true, 1),
+        None,
+        "a chain-config payload has no transaction list"
+    );
+}
+
+/// Review patch (Story 7.1, AC4b) — an `IntegrityFailure` on the dropping
+/// block's read is a local failure (`TailUnreadable`), never "no obligation".
+#[test]
+fn an_integrity_failure_on_the_dropping_block_is_local() {
+    let crypto = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    let chain_config = locked_chain_config(&crypto, TestChain::BUILD_LIMITS);
+    let node_zero = *crypto.public_key().serialize();
+    let mut slot = core::mem::MaybeUninit::<
+        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+    >::uninit();
+    Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
+        &mut slot,
+        crypto,
+        CorruptSlotsStorage,
+        chain_config,
+        5,
+        node_zero,
+        0,
+    );
+    // SAFETY: `init` returned, so every field of `slot` is initialized.
+    let mut bc = unsafe { slot.assume_init() };
+    // Slot 0 reads back `IntegrityFailure` (`CorruptSlotsStorage`).
+    bc.blocks
+        .insert_at(0, BlockEntry::new([7; 32], NONE_REF, 101));
+    assert!(bc.blocks.set_utxo_available(0, 0, true));
+    assert_eq!(bc.tail_obligation(0), Err(TailUnreadable));
+}
+
+/// Review patch (Story 7.1, AC6) — in an incomplete (window-anchored) pass a
+/// balance input whose initializer the segment has not seeded is trusted with
+/// the rest of its effects: node #0 is not seeded by the harness's balance
+/// block, so its input passes whatever key signed it.
+#[test]
+fn an_unseeded_balance_initializer_is_trusted_in_an_incomplete_pass() {
+    let (mut bc, h100) = utxo_test_chain();
+    assert!(!bc.node_info.is_seeded(0), "the harness seeds nodes 1..=3");
+    let tx = utxo_tx_signed(0, 101, &[], Some((0, 30)), &[Err((2, 30))], &other_key());
+    let block = complex_tx_block(101, h100, 3, 0, &[&tx]);
+    let si = admit(&mut bc, &block);
+    bc.run_processing_pass(si).expect("trusted, not verified");
+}
+
+/// Review patch (Story 7.1, AC6) — the FR3 pass refuses a signature lifted
+/// from another transaction (the `vote` rewritten after signing) and a zeroed
+/// signature, as the Ready extension does.
+#[test]
+fn the_fr3_pass_refuses_lifted_and_zeroed_input_signatures() {
+    let signed = utxo_tx(102, &[(101, 1, 40)], None, &[Err((2, 40))]);
+    let mut lifted = utxo_tx_vote(1, 102, &[(101, 1, 40)], None, &[Err((2, 40))]);
+    let signature = input_signatures(&signed).remove(0);
+    lifted
+        .set_input_signature(0, signature.as_slice().try_into().expect("size"))
+        .ok()
+        .expect("input");
+    let mut zeroed = utxo_tx(102, &[(101, 1, 40)], None, &[Err((2, 40))]);
+    zeroed
+        .set_input_signature(0, &[0u8; SIGNATURE_SIZE])
+        .ok()
+        .expect("input");
+    for (tx, what) in [(&lifted, "lifted"), (&zeroed, "zeroed")] {
+        let (mut bc, h100) = utxo_test_chain();
+        let mint = utxo_mint_block(h100);
+        admit(&mut bc, &mint);
+        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[tx]);
+        let si = admit(&mut bc, &spend);
+        assert_eq!(
+            bc.run_processing_pass(si),
+            Err(ProcessingError::Invalid {
+                block_idx: si,
+                reason: ValidationReason::InputSignatureInvalid,
+            }),
+            "{what}"
+        );
+    }
 }

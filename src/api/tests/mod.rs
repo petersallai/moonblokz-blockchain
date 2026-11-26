@@ -106,6 +106,9 @@ const TEST_MAX_NODES: u32 = 16;
 /// one competing branch of depth `H` (configuration §6 check 16). The test
 /// backend stores eight blocks, so the size only has to pass the check.
 const TEST_MAX_BLOCKS: usize = TEST_W as usize + 2 * TEST_H as usize;
+/// The available-UTXO bitfield bytes of every test chain: the production value
+/// (DEC-318), 32 outputs per block.
+const TEST_UTXO_BYTES: usize = 4;
 
 /// The base override set as a **content region**: one literal entry
 /// declaring `active_chain_length = TEST_W`. Every other parameter resolves
@@ -483,7 +486,7 @@ fn new_chain(
     16,
     TEST_MAX_BLOCKS,
     4,
-    16,
+    TEST_UTXO_BYTES,
 > {
     let node_zero = *crypto.public_key().serialize();
     let mut bc_slot = core::mem::MaybeUninit::uninit();

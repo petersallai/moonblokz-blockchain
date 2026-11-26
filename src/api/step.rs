@@ -60,7 +60,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -70,7 +70,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// The FR6 per-block step (Story 6.0 AC1): validates one block against the
@@ -375,7 +375,7 @@ impl<
         derivation: BlockDerivation,
     ) -> Result<(), ProcessingError> {
         // FR72: the credit drop at this block (Story 6.13 AC6).
-        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
             &self.blocks,
             &self.storage,
             self.verification_horizon(),
@@ -639,32 +639,53 @@ impl<
                     if self.node_info.balance_of(binit) < bi.amount() {
                         return Err(invalid(ValidationReason::InsufficientBalance));
                     }
+                    // DEC-196: the input signs the transaction with the
+                    // initializer's key, verified before the debit (DEC-332);
+                    // skipped where this node accepted the block's signatures
+                    // (DEC-334). An unseeded initializer in an incomplete pass
+                    // is trusted with the rest of its effects.
+                    if !self.signatures_accepted(idx)
+                        && !self.verify_balance_input(tx, bi.signature(), binit)
+                    {
+                        return Err(invalid(ValidationReason::InputSignatureInvalid));
+                    }
                     self.node_info.debit(binit, bi.amount());
                 }
                 in_sum = in_sum.saturating_add(bi.amount());
             } else if let Some(ui) = input.as_utxo() {
-                // [H] ADR-016: resolve along this block's own ancestry and
-                // spend. A non-complete candidate trusts a reference below its
-                // anchor (DEC-129), declared amount included. The input's
-                // signature is Story 7.1 (I-21).
+                // [H] ADR-016: resolve along this block's own ancestry, verify
+                // the input's signature against the output's address, then
+                // spend (DEC-332): a failed verification leaves the bit set.
+                // A non-complete candidate trusts a reference below its anchor
+                // (DEC-129) — declared amount and signature included (DEC-333).
                 let parent = self
                     .blocks
                     .get(idx)
                     .ok_or(ProcessingError::MissingBlock)?
                     .parent_ref();
-                self.resolve_and_spend_utxo(
-                    parent,
-                    seq,
-                    ui.block_sequence(),
-                    ui.output_index(),
-                    ui.amount(),
-                    !projection.complete,
-                )
-                .map_err(|e| match e {
-                    UtxoSpendError::Invalid(reason) => invalid(reason),
-                    UtxoSpendError::StorageRead => ProcessingError::StorageRead,
-                    UtxoSpendError::MissingBlock => ProcessingError::MissingBlock,
-                })?;
+                let resolved = self
+                    .resolve_utxo(
+                        parent,
+                        seq,
+                        ui.block_sequence(),
+                        ui.output_index(),
+                        ui.amount(),
+                        !projection.complete,
+                    )
+                    .map_err(|e| match e {
+                        UtxoSpendError::Invalid(reason) => invalid(reason),
+                        UtxoSpendError::StorageRead => ProcessingError::StorageRead,
+                        UtxoSpendError::MissingBlock => ProcessingError::MissingBlock,
+                    })?;
+                if let Some((ref_idx, address)) = resolved {
+                    if !self.signatures_accepted(idx)
+                        && !self.verify_input_signature(tx, ui.signature(), &address)
+                    {
+                        return Err(invalid(ValidationReason::InputSignatureInvalid));
+                    }
+                    self.blocks
+                        .set_utxo_available(ref_idx, ui.output_index() as usize, false);
+                }
                 in_sum = in_sum.saturating_add(ui.amount());
             }
             applied.0 += 1;
@@ -911,8 +932,8 @@ impl<
     /// `*::new_signed` convention — the signature is the last `SIGNATURE_SIZE`
     /// bytes of the fixed-size transaction). Returns `false` on an unresolvable signer key or a
     /// bad signature. Only node-transfer / registration transactions have this
-    /// fixed trailing-signature layout; balance/UTXO input signatures (embedded, no
-    /// `new_signed` convention) are a deferred seam.
+    /// fixed trailing-signature layout; a complex transaction's input
+    /// signatures are [`Self::verify_input_signature`]'s (DEC-196).
     fn verify_tx_signature(&self, tx_bytes: &[u8], signer_node_id: u32) -> bool {
         #[cfg(test)]
         crate::approval::test_seams::count(
@@ -945,12 +966,61 @@ impl<
         )
     }
 
+    /// A balance input's DEC-196 signature, against its `initializer`'s key:
+    /// node #0's is the trust anchor, any other the registered key; a node with
+    /// no key fails.
+    fn verify_balance_input(
+        &self,
+        tx: &TransactionView<'_>,
+        signature: &[u8],
+        initializer: u32,
+    ) -> bool {
+        let key = if initializer == 0 {
+            self.node_zero_public_key
+        } else {
+            match self.node_info.public_key_of(initializer) {
+                Some(key) => *key,
+                None => return false,
+            }
+        };
+        self.verify_input_signature(tx, signature, &key)
+    }
+
+    /// One complex-transaction input signature (DEC-196, I-21): `signature`
+    /// over the transaction's full bytes with every input's signature field
+    /// zeroed (`TransactionView::input_signing_preimage`, DEC-331), against
+    /// `key` — the referenced output's address for a UTXO input, the
+    /// initializer's key for a balance input. The per-transaction seam Story
+    /// 7.3's intake reuses.
+    ///
+    /// Its own frame (DEC-136, DEC-332): the transaction-sized preimage buffer
+    /// lives only here, a sibling of the resolver's read frame, never across a
+    /// read; the preimage is rebuilt for each input.
+    #[inline(never)]
+    pub(crate) fn verify_input_signature(
+        &self,
+        tx: &TransactionView<'_>,
+        signature: &[u8],
+        key: &[u8; PUBLIC_KEY_SIZE],
+    ) -> bool {
+        #[cfg(test)]
+        crate::approval::test_seams::count(
+            &crate::approval::test_seams::TX_SIGNATURE_VERIFICATIONS,
+        );
+        let mut buf = [0u8; MAX_TRANSACTION_SIZE];
+        let Some(preimage) = tx.input_signing_preimage(&mut buf) else {
+            return false;
+        };
+        verify_signature_bytes(&self.crypto, preimage, signature, key)
+    }
+
     /// ADR-016 UTXO-input resolver (Story 6.8; Story 6.0 reuses it in Ready).
     ///
     /// Resolves `(block_sequence, output_index)` for a block at
     /// `consuming_seq` whose parent is `parent_idx`, checks the input's
-    /// `declared_amount`, spends the output and returns its address (the key
-    /// the input's signature verifies against, Story 7.1):
+    /// `declared_amount`, and returns the referenced slot and the output's
+    /// address (the key the input's signature verifies against, Story 7.1),
+    /// without spending it:
     /// 1. causality: `block_sequence` must be below `consuming_seq` (Tier 1
     ///    owns this check; here it is a guard);
     /// 2. distance: `consuming_seq - block_sequence` must not exceed the
@@ -971,17 +1041,21 @@ impl<
     ///    the address. A failed read is a local fault (`StorageRead`), never
     ///    `Invalid`, and so is a set bit whose output the bytes do not hold
     ///    (storage and RAM disagree); a `declared_amount` other than the
-    ///    output's is `UtxoAmountMismatch`;
-    /// 6. the bit is cleared.
-    pub(crate) fn resolve_and_spend_utxo(
-        &mut self,
+    ///    output's is `UtxoAmountMismatch`.
+    ///
+    /// It spends nothing: the caller verifies the input's signature against
+    /// the returned address and only then clears the bit at the returned slot
+    /// (DEC-332), so a failed verification leaves the output available — and
+    /// Story 7.3's intake can resolve without spending.
+    pub(crate) fn resolve_utxo(
+        &self,
         parent_idx: u32,
         consuming_seq: u32,
         block_sequence: u32,
         output_index: u16,
         declared_amount: u64,
         trust_below_anchor: bool,
-    ) -> Result<Option<[u8; PUBLIC_KEY_SIZE]>, UtxoSpendError> {
+    ) -> Result<Option<(u32, [u8; PUBLIC_KEY_SIZE])>, UtxoSpendError> {
         let ref_idx = match self.locate_utxo_source(parent_idx, consuming_seq, block_sequence)? {
             Some(ref_idx) => ref_idx,
             None if trust_below_anchor => return Ok(None),
@@ -1005,11 +1079,10 @@ impl<
             ));
         }
 
-        self.blocks.set_utxo_available(ref_idx, bit, false);
-        Ok(Some(address))
+        Ok(Some((ref_idx, address)))
     }
 
-    /// Steps 1–3 of [`Self::resolve_and_spend_utxo`], shared with the Tier 2
+    /// Steps 1–3 of [`Self::resolve_utxo`], shared with the Tier 2
     /// structural check (Story 6.1 D6): causality, the `W` distance bound and
     /// the ancestor walk. `Ok(None)` when the walk reaches the anchor first —
     /// the output lies below it; each caller decides whether that is trusted.

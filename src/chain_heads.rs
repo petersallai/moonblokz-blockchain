@@ -256,8 +256,8 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// active-chain block (Connection) or the deepest unresolved-parent block
     /// (Tail). Bounded by `MAX_BLOCKS` (same rationale as
     /// `BlockTable::walks_to_active_chain`).
-    fn locate_anchor<const MAX_BLOCKS: usize>(
-        blocks: &BlockTable<MAX_BLOCKS>,
+    fn locate_anchor<const MAX_BLOCKS: usize, const B: usize>(
+        blocks: &BlockTable<MAX_BLOCKS, B>,
         start_idx: u32,
     ) -> Anchor {
         let mut current = start_idx;
@@ -308,10 +308,10 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// only active-path blocks, because the FR58 reclamation deleted every
     /// branch forked below `S_head − H` first (Story 6.14, DEC-208). Read the `last_request_timestamp = 0` below as the *promotion*
     /// rule (a connected branch has nothing left to request).
-    fn recompute_caches<const MAX_BLOCKS: usize>(
+    fn recompute_caches<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
         slot: usize,
-        blocks: &BlockTable<MAX_BLOCKS>,
+        blocks: &BlockTable<MAX_BLOCKS, B>,
         anchor_block_idx: u32,
         anchor_block_prev_hash: &[u8; 32],
     ) {
@@ -342,9 +342,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// while the new head was still off the active chain, so its
     /// `tail_or_connection_idx` still names the old head; once the new head is
     /// marked it anchors on itself. Entries of side heads are untouched.
-    pub(crate) fn refresh_head<const MAX_BLOCKS: usize>(
+    pub(crate) fn refresh_head<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &BlockTable<MAX_BLOCKS>,
+        blocks: &BlockTable<MAX_BLOCKS, B>,
         head_idx: u32,
     ) {
         if let Some(slot) = self.slot_of_head(head_idx) {
@@ -370,9 +370,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// FR21 event (iii): subtracts the value of the block that became the new
     /// `S_tail` from every entry whose head is Connected — the block left every
     /// sum. Exact by construction: every such sum contains it.
-    pub(crate) fn subtract_branch_value<const MAX_BLOCKS: usize>(
+    pub(crate) fn subtract_branch_value<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &BlockTable<MAX_BLOCKS>,
+        blocks: &BlockTable<MAX_BLOCKS, B>,
         value: u64,
     ) {
         for head in self.heads.iter_mut() {
@@ -404,9 +404,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// `previous_hash` resolved in the tree, else `None`; `prev_hash` is its
     /// `previous_hash` (in hand — no storage read); `active_head_idx` is the
     /// global `active_chain_head_idx` (`NONE_REF` = none).
-    pub(crate) fn on_block_admitted<const MAX_BLOCKS: usize>(
+    pub(crate) fn on_block_admitted<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &mut BlockTable<MAX_BLOCKS>,
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
         new_idx: u32,
         parent: Option<u32>,
         prev_hash: [u8; 32],
@@ -463,9 +463,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// [`Self::select_parent_recovery`] already reads as "never requested, so
     /// immediately eligible". A restarted node's FR19 recovery schedule
     /// therefore **restarts**; it does not resume.
-    pub(crate) fn rebuild_from_blocks<const MAX_BLOCKS: usize>(
+    pub(crate) fn rebuild_from_blocks<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &mut BlockTable<MAX_BLOCKS>,
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
         arrival_now: u64,
         active_head_idx: u32,
     ) {
@@ -545,9 +545,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
         }
     }
 
-    fn insert_head<const MAX_BLOCKS: usize>(
+    fn insert_head<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &mut BlockTable<MAX_BLOCKS>,
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
         head_idx: u32,
         arrival_now: u64,
         prev_hash: &[u8; 32],
@@ -599,9 +599,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// waiting for X — including the shared-tail siblings that phase 1's
     /// resolve-once left with an already-linked tail — so none is stranded as a
     /// zombie still emitting recovery requests for a block now in the tree.
-    fn resolve_pending_tails<const MAX_BLOCKS: usize>(
+    fn resolve_pending_tails<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &mut BlockTable<MAX_BLOCKS>,
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
         x_idx: u32,
         x_prev_hash: &[u8; 32],
     ) {
@@ -669,9 +669,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// `head_ref_count`; a block reaching 0 is deleted from the tree (its durable
     /// slot released for reuse), a block staying > 0 is shared and terminates the
     /// walk. Removes the entry.
-    fn evict_one<const MAX_BLOCKS: usize>(
+    fn evict_one<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &mut BlockTable<MAX_BLOCKS>,
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
         active_head_idx: u32,
     ) {
         let Some(victim_slot) = self.select_eviction_victim(blocks, active_head_idx) else {
@@ -711,9 +711,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
 
     /// FR19 eviction victim selection: smallest `head_sequence` among non-active
     /// heads, tie broken by smallest `head_block_id` (big-endian). Pure `&self`.
-    fn select_eviction_victim<const MAX_BLOCKS: usize>(
+    fn select_eviction_victim<const MAX_BLOCKS: usize, const B: usize>(
         &self,
-        blocks: &BlockTable<MAX_BLOCKS>,
+        blocks: &BlockTable<MAX_BLOCKS, B>,
         active_head_idx: u32,
     ) -> Option<usize> {
         let mut best: Option<(usize, u32, [u8; 32])> = None;
@@ -748,9 +748,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// — the caller applies the timestamp writes on the winner via
     /// [`Self::mark_requested`]. Returns the winning slot and the request
     /// (missing-parent hash + `tail.sequence − 1`).
-    pub(crate) fn select_parent_recovery<const MAX_BLOCKS: usize>(
+    pub(crate) fn select_parent_recovery<const MAX_BLOCKS: usize, const B: usize>(
         &self,
-        blocks: &BlockTable<MAX_BLOCKS>,
+        blocks: &BlockTable<MAX_BLOCKS, B>,
         now: u64,
         per_head_retry: u64,
     ) -> Option<(usize, ParentRecoveryRequest)> {
@@ -851,9 +851,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// the anchor's parent — a block below `S_tail` that FR60 refuses. A
     /// Stored head keeps its missing-parent hash (the `Anchor::Tail` arm reads
     /// its own cache). No storage reads, no `now`.
-    pub(crate) fn recompute_all_caches<const MAX_BLOCKS: usize>(
+    pub(crate) fn recompute_all_caches<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &BlockTable<MAX_BLOCKS>,
+        blocks: &BlockTable<MAX_BLOCKS, B>,
     ) {
         for slot in 0..MAX_BRANCH_COUNT {
             if !self.heads[slot].is_empty() {
@@ -956,9 +956,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// is therefore an idempotent write on this path, not a demotion. That arm
     /// itself is very much live — it serves a brand-new Stored head, the
     /// extension of a Stored branch, and a deepened tail-point in event (ii).
-    pub(crate) fn on_blocks_deleted<const MAX_BLOCKS: usize>(
+    pub(crate) fn on_blocks_deleted<const MAX_BLOCKS: usize, const B: usize>(
         &mut self,
-        blocks: &mut BlockTable<MAX_BLOCKS>,
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
         deleted: &[u32],
         reattach_idx: u32,
     ) {
@@ -1061,7 +1061,9 @@ impl<const MAX_BRANCH_COUNT: usize> ChainHeadsTable<MAX_BRANCH_COUNT> {
     /// child edges, then floor tips at 1. Takes no `&self`: the counts are a
     /// function of the block-tree's edges alone, so the tip table is
     /// deliberately not consulted.
-    fn recompute_head_ref_counts<const MAX_BLOCKS: usize>(blocks: &mut BlockTable<MAX_BLOCKS>) {
+    fn recompute_head_ref_counts<const MAX_BLOCKS: usize, const B: usize>(
+        blocks: &mut BlockTable<MAX_BLOCKS, B>,
+    ) {
         for idx in 0..MAX_BLOCKS {
             blocks.set_head_ref_count(idx as u32, 0);
         }
@@ -1099,15 +1101,15 @@ mod tests {
     // Insert a metadata-only block, returning its index. The chain_heads logic is
     // over the block-tree metadata graph, so we build exact ancestry shapes with
     // `BlockEntry::new(hash, parent_ref, sequence)` without signed blocks.
-    fn put<const N: usize>(t: &mut BlockTable<N>, byte: u8, parent: u32, seq: u32) -> u32 {
+    fn put<const N: usize>(t: &mut BlockTable<N, 4>, byte: u8, parent: u32, seq: u32) -> u32 {
         t.insert(BlockEntry::new(hash_of(byte), parent, seq))
             .unwrap()
     }
 
     /// Test-only stand-in for the deleted by-value `BlockTable::new()`: runs
     /// the safe `init` into a local slot and moves the finished table out.
-    fn empty_blocks<const N: usize>() -> BlockTable<N> {
-        let mut table = core::mem::MaybeUninit::<BlockTable<N>>::uninit();
+    fn empty_blocks<const N: usize>() -> BlockTable<N, 4> {
+        let mut table = core::mem::MaybeUninit::<BlockTable<N, 4>>::uninit();
         BlockTable::init(&mut table);
         // SAFETY: `init` returned, so every entry of `table` is initialized.
         unsafe { table.assume_init() }

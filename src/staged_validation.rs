@@ -130,6 +130,11 @@ pub(crate) enum Tier1Failure {
     /// A complex transaction's output amounts, or its declared input amounts
     /// (balance and UTXO), sum beyond `u64::MAX`.
     AmountOverflow,
+    /// A complex transaction with no output (DEC-308, I-55), with or without
+    /// inputs: one with inputs would only burn them into the fee, and an empty
+    /// zero-input one is never a carry-forward, because no FR51 obligation
+    /// arises unless an unspent output exceeds the custodian fee (DEC-330).
+    ComplexWithoutOutput,
     /// `block.sequence ≤ block_sequence` for a complex-tx UTXO input: the
     /// referenced output's block is not a strict ancestor (ADR-016 causality).
     UtxoInputNotBeforeBlock,
@@ -474,6 +479,14 @@ fn tier1_transaction_block<C: CryptoTrait>(
     Ok(())
 }
 
+/// DEC-308 (I-55): a complex transaction needs at least one output — the one
+/// predicate Tier 1 and Story 7.3's FR14 intake share. Exact once the output
+/// count is coherent with the bytes, which `TransactionView::from_bytes` and
+/// Tier 1's output pass both guarantee.
+pub(crate) fn complex_has_output(cx: &ComplexTransactionView) -> bool {
+    cx.output_count() != 0
+}
+
 /// Tier 1 over one complex transaction; returns its UTXO-output count for the
 /// block-wide cap.
 fn tier1_complex_tx(
@@ -532,6 +545,9 @@ fn tier1_complex_tx(
     // (DEC-011); the FR6 pass relies on it.
     if output_sum > u128::from(u64::MAX) || declared_input_sum > u128::from(u64::MAX) {
         return Err(Tier1Failure::AmountOverflow);
+    }
+    if !complex_has_output(cx) {
+        return Err(Tier1Failure::ComplexWithoutOutput);
     }
 
     // Zero-input complex tx (UTXO carry-forward, FR51) is exempt from the
@@ -1662,6 +1678,62 @@ mod tests {
                 Err(Tier1Failure::AmountOverflow)
             );
         }
+    }
+
+    /// DEC-308 (I-55): a complex transaction without an output is refused at
+    /// Tier 1 — with inputs, and the 7-byte empty one with none — after the
+    /// sum bound, so an overflowing transaction still reports the overflow.
+    #[test]
+    fn tier1_rejects_a_complex_transaction_without_output() {
+        let c = crypto(1);
+        let with_inputs = complex_block(5, 3, &c, |cx| {
+            cx.add_balance_input(4, 8, 30, 0, &DUMMY_SIG).ok().unwrap();
+            cx.add_utxo_input(4, 0, 20, &DUMMY_SIG).ok().unwrap();
+        });
+        let empty = complex_block(5, 3, &c, |_| {});
+        for block in [with_inputs, empty] {
+            assert_eq!(
+                tier1_gate(
+                    &block.view(),
+                    &pubkey_bytes(&crypto(2)),
+                    NORMAL_LIMIT,
+                    UTXO_LIMIT,
+                    &c
+                ),
+                Err(Tier1Failure::ComplexWithoutOutput)
+            );
+        }
+        let overflowing = complex_block(5, 3, &c, |cx| {
+            cx.add_balance_input(4, 8, u64::MAX, 0, &DUMMY_SIG)
+                .ok()
+                .unwrap();
+            cx.add_balance_input(4, 8, 1, 0, &DUMMY_SIG).ok().unwrap();
+        });
+        assert_eq!(
+            tier1_gate(
+                &overflowing.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
+            Err(Tier1Failure::AmountOverflow)
+        );
+        // One output is enough, a zero-amount balance output included.
+        let one_output = complex_block(5, 3, &c, |cx| {
+            cx.add_balance_input(4, 8, 30, 0, &DUMMY_SIG).ok().unwrap();
+            cx.add_balance_output(9, 0).ok().unwrap();
+        });
+        assert_eq!(
+            tier1_gate(
+                &one_output.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                &c
+            ),
+            Ok(())
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -21,7 +21,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// FR2 dominant-chain acquisition: evaluate the collecting-phase stopping
@@ -1024,8 +1024,9 @@ impl<
                 .filter(|&d| d < count)
                 .and_then(|d| marked.get(d))
             {
-                match classify_tail_drop(&self.blocks, &self.node_info, *dropped) {
-                    // An empty slot is the node's own inconsistency: local.
+                match self.tail_obligation(*dropped) {
+                    // An empty slot or a failed read of the dropping block
+                    // (DEC-330) is the node's own failure: local.
                     Err(_) => {
                         result = Err(ProcessingError::MissingBlock);
                         break;

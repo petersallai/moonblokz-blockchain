@@ -775,7 +775,7 @@ fn ready_intake_checks_branch_independent_signatures() {
             .get(ui)
             .is_some_and(|e| !e.is_signature_verified())
     );
-    assert!(!BlockEntry::new([0; 32], NONE_REF, 1).is_signature_verified());
+    assert!(!BlockEntry::<TEST_UTXO_BYTES>::new([0; 32], NONE_REF, 1).is_signature_verified());
 }
 
 /// AC10.11 / D6 — verify once: a Stored child marked verified is promoted
@@ -844,12 +844,13 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
 ) {
     // `node_info` per node: seed sources are slots, so they are compared
     // as the blocks they name.
-    let source = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, src: Option<u32>| match src {
-        Some(idx) if idx != SEED_SOURCE_RELEASED => {
-            bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
-        }
-        other => Some(other.map(|_| (u32::MAX, [0u8; 32]))),
-    };
+    let source =
+        |bc_blocks: &BlockTable<TEST_MAX_BLOCKS, TEST_UTXO_BYTES>, src: Option<u32>| match src {
+            Some(idx) if idx != SEED_SOURCE_RELEASED => {
+                bc_blocks.get(idx).map(|e| Some((e.sequence(), *e.hash())))
+            }
+            other => Some(other.map(|_| (u32::MAX, [0u8; 32]))),
+        };
     assert_eq!(
         a.node_info.max_known_node_id(),
         b.node_info.max_known_node_id(),
@@ -877,8 +878,9 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
         a.active_branch_value, b.active_branch_value,
         "{what}: value"
     );
-    let hash_of =
-        |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, idx: u32| bc_blocks.get(idx).map(|e| *e.hash());
+    let hash_of = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS, TEST_UTXO_BYTES>, idx: u32| {
+        bc_blocks.get(idx).map(|e| *e.hash())
+    };
     assert_eq!(
         hash_of(&a.blocks, a.active_chain_head_idx),
         hash_of(&b.blocks, b.active_chain_head_idx),
@@ -896,7 +898,8 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
     // active head's own entry is skipped: it carries no value (DEC-144),
     // and it exists only while the head has no side child.
     type Entry = Option<((u32, [u8; 32]), bool, Option<[u8; 32]>, Option<u64>)>;
-    let entries = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS>, heads: &ChainHeadsTable<4>| {
+    let entries = |bc_blocks: &BlockTable<TEST_MAX_BLOCKS, TEST_UTXO_BYTES>,
+                   heads: &ChainHeadsTable<4>| {
         let mut out: [Entry; 4] = [None; 4];
         for (slot, (head, anchor)) in heads.occupied_heads().enumerate() {
             let entry = bc_blocks.get(head).expect("an entry names a block");
@@ -964,7 +967,7 @@ fn assert_same_projection<S: StorageTrait, T: StorageTrait>(
             "{what}: flag of #{}",
             eb.sequence()
         );
-        for bit in 0..AVAILABLE_UTXO_BYTES * 8 {
+        for bit in 0..TEST_UTXO_BYTES * 8 {
             assert_eq!(
                 a.blocks.utxo_available(ai, bit),
                 b.blocks.utxo_available(idx, bit),
@@ -2053,4 +2056,38 @@ fn fr23_switch_survives_a_restart() {
     let _ = restarted.initialize_from_storage(0);
     assert!(restarted.is_ready());
     assert_eq!(head_of(&restarted), (3, s3.view().hash()));
+}
+
+/// Story 7.1 (AC2, DEC-259) — a side block's input signatures are Tier 3:
+/// `n4`, node #1's fork spending the mint's (3, 0) with a foreign-key input
+/// signature, passes Tier 2 and is stored; the switch toward it verifies the
+/// input at the replay, refuses it, deletes it and restores `o4`.
+#[test]
+fn a_side_blocks_input_signature_is_verified_at_the_switch_replay() {
+    // A foreign-key UTXO input, then (review patch) a foreign-key balance input.
+    let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
+    for (inputs, balance) in [(&[(3, 0, 60)][..], None), (&[][..], Some((0, 60)))] {
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let (mut replica, _) = faulty_utxo_genesis();
+        let o4_tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(60)]);
+        let o4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&o4_tx]);
+        for node in [&mut bc, &mut replica] {
+            assert_eq!(receive(node, &o4), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let n4_tx = utxo_tx_signed(0, 4, inputs, balance, &[Ok(30), Ok(30)], &foreign);
+        let n4 = resign(
+            &complex_tx_block(4, mint.view().hash(), 0, 0, &[&n4_tx]),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        assert_eq!(receive(&mut bc, &n4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (4, o4.view().hash()), "restored");
+        assert_eq!(
+            status_of(&bc, &n4),
+            None,
+            "refused at the replay and deleted"
+        );
+        assert_same_projection(&bc, &replica, "restored after a bad input signature");
+    }
 }

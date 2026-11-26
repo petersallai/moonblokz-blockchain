@@ -184,7 +184,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -194,7 +194,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// Story 6.7 AC5 (FR6, FR9 Tier 3, FR12, FR27; DEC-172, DEC-184, DEC-216;

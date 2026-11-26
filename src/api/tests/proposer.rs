@@ -1065,7 +1065,7 @@ fn a_block_with_bytes_after_its_payload_is_refused() {
             &trailing.view(),
             &l.node_zero_public_key,
             MAX_BLOCK_SIZE as u32,
-            UTXO_BITFIELD_WIDTH,
+            TestChain::UTXO_BITFIELD_WIDTH,
             &l.crypto,
         ),
         Err(Tier1Failure::MalformedPayload),
@@ -1150,7 +1150,7 @@ fn tier1_refuses_a_framed_evidence_with_a_byte_after_it() {
             view,
             &l.node_zero_public_key,
             MAX_BLOCK_SIZE as u32,
-            UTXO_BITFIELD_WIDTH,
+            TestChain::UTXO_BITFIELD_WIDTH,
             &l.crypto,
         )
     };

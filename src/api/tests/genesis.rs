@@ -19,9 +19,10 @@ use super::*;
 #[test]
 fn init_sets_expected_defaults() {
     let (crypto, storage, chain_config) = construction_backends();
-    let mut bc_slot =
-        core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
-    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
+    let mut bc_slot = core::mem::MaybeUninit::<
+        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+    >::uninit();
+    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
         &mut bc_slot,
         crypto,
         storage,
@@ -108,9 +109,10 @@ fn init_sets_expected_defaults() {
 #[test]
 fn init_is_equivalent_to_new() {
     let (crypto, storage, chain_config) = construction_backends();
-    let mut slot =
-        core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
-    let built = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
+    let mut slot = core::mem::MaybeUninit::<
+        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+    >::uninit();
+    let built = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
         &mut slot,
         crypto,
         storage,
@@ -120,7 +122,7 @@ fn init_is_equivalent_to_new() {
         0xDEAD_BEEF,
     );
     let (crypto, storage, chain_config) = construction_backends();
-    let spec = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::new(
+    let spec = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::new(
         crypto,
         storage,
         chain_config,
@@ -422,9 +424,10 @@ fn walking_skeleton_refuses_storage_save_failure() {
     let chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
     let node_zero = *crypto.public_key().serialize();
 
-    let mut bc_slot =
-        core::mem::MaybeUninit::<Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>>::uninit();
-    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, 16>::init(
+    let mut bc_slot = core::mem::MaybeUninit::<
+        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+    >::uninit();
+    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
         &mut bc_slot,
         crypto,
         BlockWriteFailsStorage,

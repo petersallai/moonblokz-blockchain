@@ -12,7 +12,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -22,7 +22,7 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
     /// Story 6.6 AC4 (D2) — opens the FR27 accumulator for the local node's
@@ -589,7 +589,7 @@ impl<
             return false;
         }
         // FR72: the credit drop at this block (Story 6.13 AC6).
-        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES>(
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
             &self.blocks,
             &self.storage,
             self.verification_horizon(),
@@ -614,7 +614,7 @@ impl<
 
     /// Story 6.6 AC8 (FR29, FR27, FR58; D6, D9) — what the proposer's
     /// deviation-bearing branch, whose tip is at `tip_seq`, does next.
-    /// `obligation` is `classify_tail_drop` of the block the branch's next
+    /// `obligation` is `tail_obligation` (DEC-330) of the block the branch's next
     /// extension would drop, computed by the caller; `last_emit_ms` is when the
     /// deviation block or the branch's last replay was emitted (the caller's
     /// state: FR46's fifth tracked deadline, Story 8.4). In order:

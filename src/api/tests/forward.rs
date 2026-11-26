@@ -1585,3 +1585,157 @@ fn branch_values_are_order_independent_and_survive_a_restart() {
     );
     assert_eq!(restarted.chain_heads.branch_value_of(ri), reference_side);
 }
+
+// --- Story 7.1: complex-transaction input signatures (DEC-196, I-21) -----
+
+/// AC6 — on the Ready head extension every input is verified against its own
+/// key: a UTXO input against the output's address, a balance input against
+/// its initializer's key. A foreign key, a signature lifted from another
+/// transaction (the `vote` rewritten after signing) and a zeroed signature are
+/// each refused at intake, exact evidence, nothing stored or applied.
+#[test]
+fn input_signatures_are_verified_on_the_ready_extension() {
+    let utxo = || utxo_genesis().0;
+    let (_, mint) = utxo_genesis();
+    let prev = mint.view().hash();
+    let refused = |cx: &moonblokz_chain_types::ComplexTransaction| {
+        let block = complex_tx_block(4, prev, 0, 0, &[cx]);
+        assert_refused_at_intake(utxo, &block, ValidationReason::InputSignatureInvalid);
+    };
+
+    // A UTXO input signed by a key other than the output's address.
+    refused(&utxo_tx_signed(
+        0,
+        4,
+        &[(3, 0, 60)],
+        None,
+        &[Err((1, 60))],
+        &other_key(),
+    ));
+    // A balance input signed by a key other than node #0's.
+    refused(&utxo_tx_signed(
+        0,
+        4,
+        &[],
+        Some((0, 10)),
+        &[Err((1, 10))],
+        &other_key(),
+    ));
+
+    // Valid signatures moved onto a transaction whose `vote` differs: every
+    // input commits to the vote, so every one fails.
+    let signed = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 70))]);
+    let mut lifted = utxo_tx_vote(1, 4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 70))]);
+    for (i, signature) in input_signatures(&signed).iter().enumerate() {
+        lifted
+            .set_input_signature(i as u8, signature.as_slice().try_into().expect("size"))
+            .ok()
+            .expect("input");
+    }
+    refused(&lifted);
+
+    // A zeroed signature.
+    let mut zeroed = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+    zeroed
+        .set_input_signature(0, &[0u8; SIGNATURE_SIZE])
+        .ok()
+        .expect("input");
+    refused(&zeroed);
+
+    // The correctly signed transaction is accepted.
+    let mut bc = utxo_genesis().0;
+    let good = complex_tx_block(4, prev, 0, 0, &[&signed]);
+    assert_eq!(
+        receive(&mut bc, &good),
+        ReceiveBlockOutcome::AcceptedSilently
+    );
+    assert_eq!(head_of(&bc).1, good.view().hash());
+}
+
+/// AC3 (DEC-332) — resolve, verify, then spend: a transaction whose UTXO input
+/// verified and was spent, and whose later balance input then fails its
+/// signature, leaves nothing applied — the UTXO bit set again, the balances
+/// and every other projection as before.
+#[test]
+fn a_failed_input_signature_leaves_nothing_applied() {
+    let (mut bc, mint) = utxo_genesis();
+    let (replica, _) = utxo_genesis();
+    let mut cx = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 70))]);
+    let mut buf = [0u8; moonblokz_chain_types::MAX_TRANSACTION_SIZE];
+    let len = TransactionView::from_bytes(cx.as_bytes())
+        .and_then(|v| v.input_signing_preimage(&mut buf).map(|p| p.len()))
+        .expect("complex");
+    let foreign = other_key().sign(&buf[..len]);
+    cx.set_input_signature(1, foreign.serialize())
+        .ok()
+        .expect("the balance input");
+    let block = complex_tx_block(4, mint.view().hash(), 0, 0, &[&cx]);
+    assert_eq!(
+        step_reason(&mut bc, &block),
+        Some(ValidationReason::InputSignatureInvalid)
+    );
+    let mi = bc.active_chain_head_idx;
+    assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true), "not spent");
+    assert_same_state(&bc, &replica, "failed input signature");
+}
+
+/// DEC-334 — a block whose signatures this node has accepted (bit 6) is
+/// derived again without verifying its input signatures; resolution and the
+/// spend still run. With the bit clear, each input is verified once.
+#[test]
+fn accepted_signatures_skip_input_verification_only() {
+    for (accepted, verifications) in [(true, 0), (false, 1)] {
+        let (mut bc, mint) = utxo_genesis();
+        let mi = bc.active_chain_head_idx;
+        assert_eq!(bc.undo_active_head(), Ok(()));
+        if !accepted {
+            bc.blocks.clear_signatures_accepted();
+        }
+        let parent = *bc
+            .blocks
+            .get(bc.active_chain_head_idx)
+            .expect("parent")
+            .hash();
+        let before = crate::approval::test_seams::counted(&TX_SIGNATURE_VERIFICATIONS);
+        let mut projection = Projection::COMPLETE;
+        bc.derive_block(&mint.view(), mi, Some(parent), &mut projection)
+            .expect("the mint derives again");
+        assert_eq!(
+            crate::approval::test_seams::counted(&TX_SIGNATURE_VERIFICATIONS) - before,
+            verifications,
+            "accepted: {accepted}"
+        );
+    }
+}
+
+/// Review patch (Story 7.1, D5) — under the bit-6 skip the UTXO input is
+/// still resolved and spent: re-deriving an accepted spend after undoing it
+/// verifies nothing and clears the referenced bit again.
+#[test]
+fn the_bit_six_skip_still_resolves_and_spends() {
+    let (mut bc, mint) = utxo_genesis();
+    let mi = bc.active_chain_head_idx;
+    let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+    let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
+    assert_eq!(
+        receive(&mut bc, &spend),
+        ReceiveBlockOutcome::AcceptedSilently
+    );
+    let si = bc.active_chain_head_idx;
+    assert_eq!(bc.undo_active_head(), Ok(()));
+    assert_eq!(
+        bc.blocks.utxo_available(mi, 0),
+        Some(true),
+        "the undo restored it"
+    );
+    let before = crate::approval::test_seams::counted(&TX_SIGNATURE_VERIFICATIONS);
+    let mut projection = Projection::COMPLETE;
+    bc.derive_block(&spend.view(), si, Some(mint.view().hash()), &mut projection)
+        .expect("the spend derives again");
+    assert_eq!(
+        crate::approval::test_seams::counted(&TX_SIGNATURE_VERIFICATIONS) - before,
+        0,
+        "accepted signatures are not verified again"
+    );
+    assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "spent again");
+}

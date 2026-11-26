@@ -22,9 +22,10 @@ use moonblokz_chain_types::{
     APPROVAL_DEVIATION_SEQUENCE_OFFSET, APPROVAL_LATE_COUNT_SIZE, APPROVAL_LATE_ENTRY_SIZE,
     APPROVAL_M_OFFSET, APPROVAL_PREFIX_SIZE, APPROVAL_SUPPORTER_VOTE_SUM_OFFSET, ApprovalView,
     Block, BlockBuilder, BlockHeader, BlockView, ComplexTransactionView, HASH_SIZE, HEADER_SIZE,
-    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, NODE_INFO_SIZE, NodeTransfer, PAYLOAD_TYPE_APPROVAL,
-    PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
-    PAYLOAD_TYPE_TWIN_FACT, REGISTRATION_SIZE, Registration, TransactionView, TwinFactView,
+    MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE, MAX_TRANSACTION_SIZE, NODE_INFO_SIZE, NodeTransfer,
+    PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG,
+    PAYLOAD_TYPE_TRANSACTION, PAYLOAD_TYPE_TWIN_FACT, REGISTRATION_SIZE, Registration,
+    TransactionView, TwinFactView,
 };
 use moonblokz_configuration::{
     BuildLimits, ChainConfigTrait, ChainInfoSource, chain_info, limits_are_expressible,
@@ -43,8 +44,8 @@ use crate::approval::{
     SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView, in_subgroup, node_value,
     required_signers, subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
 };
-use crate::available_utxo::utxo_output_at;
-use crate::blocks::{AVAILABLE_UTXO_BYTES, BlockEntry, BlockTable, NONE_REF};
+use crate::available_utxo::{carries_output_above, utxo_output_at};
+use crate::blocks::{BlockEntry, BlockTable, NONE_REF};
 use crate::branch_value::{Rank, block_value, value_cap};
 use crate::chain_heads::ChainHeadsTable;
 use crate::intake::classify_block;
@@ -174,12 +175,6 @@ impl<const MAX_NODES: usize> APrime<'_, MAX_NODES> {
     }
 }
 
-/// The available-UTXO bitfield width in bits: this build's capacity for a
-/// block's UTXO outputs, stated to the configuration module in `BUILD_LIMITS`
-/// and enforced at Tier 1 before the durable lock (DEC-132).
-const UTXO_BITFIELD_WIDTH: u16 = (AVAILABLE_UTXO_BYTES * 8) as u16;
-const _: () = assert!(AVAILABLE_UTXO_BYTES * 8 <= u16::MAX as usize);
-
 /// Failure modes of the FR3 processing pass (Story 5.3).
 ///
 /// Derive-only: an `Err` routes to the minimal FR5 phase-revert in
@@ -210,7 +205,7 @@ pub(crate) enum ProcessingError {
     },
 }
 
-/// Why [`Blockchain::resolve_and_spend_utxo`] could not spend a UTXO input
+/// Why [`Blockchain::resolve_utxo`] could not resolve a UTXO input
 /// (Story 6.8). Only `Invalid` is evidence against the consuming block; the
 /// other two are local faults, which FR16 never charges against a block. The
 /// caller maps it into its own error type, adding the consuming block's index.
@@ -245,6 +240,10 @@ pub(crate) enum ValidationReason {
     VoteHeaderMismatch,
     /// A node-transfer / registration transaction signature is invalid.
     TransactionSignatureInvalid,
+    /// A complex-transaction input signature does not verify over the DEC-196
+    /// preimage against its own key: a UTXO input's referenced output address,
+    /// a balance input's `initializer` key (Story 7.1, I-21).
+    InputSignatureInvalid,
     /// A debit (transfer amount+fee, registration price+fee, balance input)
     /// exceeds the initializer's derived balance (negative-balance outcome).
     InsufficientBalance,
@@ -553,7 +552,8 @@ enum ConfigPreload {
 ///
 /// Defaults (architecture §5): `MAX_NODES = 1000`,
 /// `SNAKE_CHAIN_LENGTH_MAX = 500`, `MAX_BLOCKS = 600`,
-/// `MAX_BRANCH_COUNT = 40`, `MAX_BLOCK_UTXO_OUTPUT = 256`.
+/// `MAX_BRANCH_COUNT = 40`, `AVAILABLE_UTXO_BYTES = 4` (DEC-318: the
+/// available-UTXO bitfield in bytes, 32 outputs per block).
 ///
 /// `SNAKE_CHAIN_LENGTH_MAX` is this build's **capacity** for the active-chain
 /// window, not the window: the length in force, `W`, is chain configuration
@@ -571,7 +571,7 @@ pub struct Blockchain<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 > {
     // Adjacent-component handles (immutable construction inputs).
     crypto: Crypto,
@@ -604,7 +604,7 @@ pub struct Blockchain<
     restart_refused: bool,
 
     // FR18 bounded block-tree — data layer landed in Story 4.1.
-    blocks: BlockTable<MAX_BLOCKS>,
+    blocks: BlockTable<MAX_BLOCKS, AVAILABLE_UTXO_BYTES>,
 
     // FR19 chain_heads tip table — landed in Story 4.4.
     chain_heads: ChainHeadsTable<MAX_BRANCH_COUNT>,
@@ -711,17 +711,6 @@ pub struct Blockchain<
     // of a seed is identity on the values, and every state below it follows
     // from the exact inverses. A chain switch may walk back across the FR3
     // pass's seed points; FR58's bound keeps it above `a + H`.
-    //
-    // Deliberately no standalone placeholder for:
-    // - `MAX_BLOCK_UTXO_OUTPUT`: NOT wired into `BlockEntry.available_utxo`
-    //   sizing (Story 4.1 fixes that field at a 32-byte constant — see
-    //   `blocks::AVAILABLE_UTXO_BYTES` — because deriving an array length from a
-    //   generic const parameter via division requires the unstable
-    //   `generic_const_exprs` feature). Story 5.8 settled the ownership instead
-    //   of the sizing: the *chain's* value is a configuration parameter read
-    //   through the handle, and the *build's* capacity is stated once to the
-    //   configuration module in `BUILD_LIMITS` (`AVAILABLE_UTXO_BYTES * 8`), which
-    //   is where the two are now reconciled.
 }
 
 impl<
@@ -732,7 +721,7 @@ impl<
     const SNAKE_CHAIN_LENGTH_MAX: u32,
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
-    const MAX_BLOCK_UTXO_OUTPUT: usize,
+    const AVAILABLE_UTXO_BYTES: usize,
 >
     Blockchain<
         Crypto,
@@ -742,9 +731,23 @@ impl<
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >
 {
+    /// The available-UTXO bitfield width in bits, `AVAILABLE_UTXO_BYTES · 8`:
+    /// this build's capacity for a block's UTXO outputs (DEC-318), stated to the
+    /// configuration module in `BUILD_LIMITS` and enforced at Tier 1 before the
+    /// durable lock (DEC-132). The byte count is the const generic, so the
+    /// field is sized by it directly and only this bit count is computed — as a
+    /// value, which needs no `generic_const_exprs`. A build must hold at least
+    /// one byte, and its bit count must fit the `u16` the chain's
+    /// `max_block_utxo_output` is declared in.
+    pub(crate) const UTXO_BITFIELD_WIDTH: u16 = {
+        assert!(AVAILABLE_UTXO_BYTES >= 1);
+        assert!(AVAILABLE_UTXO_BYTES * 8 <= u16::MAX as usize);
+        (AVAILABLE_UTXO_BYTES * 8) as u16
+    };
+
     /// The `(creator, first_voted_node)` of a retained block's header; `None`
     /// on a failed read.
     fn header_at(&self, idx: u32) -> Option<(u32, u32)> {
@@ -801,12 +804,23 @@ impl<
         idx: u32,
         buf: &'b mut [u8; MAX_BLOCK_SIZE],
     ) -> Option<BlockView<'b>> {
-        self.storage.read_block_into(idx, buf).ok()?;
+        self.read_retained(idx, buf).ok().flatten()
+    }
+
+    /// [`Self::view_retained`] keeping the storage error: `Err` on a failed
+    /// read, `Ok(None)` on bytes that no longer parse. For a read site that
+    /// must keep `IntegrityFailure` apart from other errors (DEC-320).
+    fn read_retained<'b>(
+        &self,
+        idx: u32,
+        buf: &'b mut [u8; MAX_BLOCK_SIZE],
+    ) -> Result<Option<BlockView<'b>>, StorageError> {
+        self.storage.read_block_into(idx, buf)?;
         let n = match self.blocks.get(idx).map(|entry| entry.len() as usize) {
             Some(len) if len > 0 && len <= MAX_BLOCK_SIZE => len,
             _ => MAX_BLOCK_SIZE,
         };
-        BlockView::from_bytes(&buf[..n]).ok()
+        Ok(BlockView::from_bytes(&buf[..n]).ok())
     }
 
     /// Deletes `target` and its whole descendant subtree, with the FR19

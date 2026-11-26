@@ -44,3 +44,27 @@ pub(crate) fn utxo_output_at(
         .nth(output_index as usize)
         .and_then(|utxo| Some((utxo.address().try_into().ok()?, utxo.amount())))
 }
+
+/// DEC-330: whether a block still holds an unspent UTXO output whose amount
+/// exceeds the custodian `fee` — the only case in which FR51 owes a
+/// carry-forward when the block drops, since an output at most the fee is
+/// discarded (DEC-196(d)). `available(i)` is the block's available-UTXO bit
+/// `i`; the amounts come from the block's bytes. `None` when the block's
+/// transactions do not parse: a block with a set bit always holds them, so
+/// that is storage and RAM disagreeing — the caller's local failure, never
+/// "no obligation".
+pub(crate) fn carries_output_above(
+    view: &BlockView,
+    available: impl Fn(usize) -> bool,
+    fee: u64,
+) -> Option<bool> {
+    Some(
+        view.transactions()?
+            .iter()
+            .filter_map(|tx| tx.as_complex())
+            .flat_map(|cx| cx.outputs())
+            .filter_map(|output| output.as_utxo())
+            .enumerate()
+            .any(|(i, utxo)| available(i) && utxo.amount() > fee),
+    )
+}
