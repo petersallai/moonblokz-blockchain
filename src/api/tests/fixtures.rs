@@ -688,6 +688,27 @@ pub(super) fn utxo_tx_signed(
     cx
 }
 
+/// A key no seeded test node holds: its signatures verify against nothing.
+pub(super) fn other_key() -> Crypto {
+    Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
+}
+
+/// The signatures of `cx`'s inputs, in order.
+pub(super) fn input_signatures(
+    cx: &moonblokz_chain_types::ComplexTransaction,
+) -> std::vec::Vec<std::vec::Vec<u8>> {
+    let view = TransactionView::from_bytes(cx.as_bytes()).expect("a transaction");
+    view.as_complex()
+        .expect("complex")
+        .inputs()
+        .map(|input| match (input.as_utxo(), input.as_balance()) {
+            (Some(u), _) => u.signature().to_vec(),
+            (_, Some(b)) => b.signature().to_vec(),
+            _ => unreachable!("an input is UTXO or balance"),
+        })
+        .collect()
+}
+
 /// Signs every input of `cx` with `signer` over the DEC-196 preimage.
 pub(super) fn sign_inputs(cx: &mut moonblokz_chain_types::ComplexTransaction, signer: &Crypto) {
     let mut buf = [0u8; moonblokz_chain_types::MAX_TRANSACTION_SIZE];

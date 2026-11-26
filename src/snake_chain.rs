@@ -55,7 +55,13 @@ pub(crate) struct TailUnreadable;
 /// 2. `SeedSource` — some node's `seed_source_idx` is this slot, O(`MAX_NODES`);
 /// 3. `Utxo` — any of the block's available-UTXO bits is set. A set bit means
 ///    an unspent output exists (DEC-132), and Tier 1 keeps every output within
-///    the bitfield, so no storage read is needed (Story 6.11).
+///    the bitfield (Story 6.11).
+///
+/// This is the RAM **pre-filter** only. Since DEC-330 a set bit owes a
+/// carry-forward only when one of those outputs exceeds the custodian fee,
+/// which takes a read of the block: every caller judging a tail drop uses
+/// `Blockchain::tail_obligation` (`api/window.rs`), which wraps this function
+/// and reads only when this one answers `Utxo`.
 ///
 /// The shared per-block step keeps both inputs current — `seed_source_idx`
 /// and the available-UTXO bits — in the FR3 pass and on every Ready head

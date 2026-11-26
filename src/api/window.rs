@@ -80,11 +80,12 @@ impl<
         let view = BlockView::from_bytes(&buf[..n])
             .ok()
             .ok_or(TailUnreadable)?;
-        Ok(carries_output_above(
+        carries_output_above(
             &view,
             |bit| self.blocks.utxo_available(idx, bit) == Some(true),
             fee,
-        ))
+        )
+        .ok_or(TailUnreadable)
     }
 
     /// The [`TailStep`] of the block that becomes `S_tail` when the window

@@ -1588,26 +1588,6 @@ fn branch_values_are_order_independent_and_survive_a_restart() {
 
 // --- Story 7.1: complex-transaction input signatures (DEC-196, I-21) -----
 
-fn other_key() -> Crypto {
-    Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("test key")
-}
-
-/// The signatures of `cx`'s inputs, in order.
-fn input_signatures(
-    cx: &moonblokz_chain_types::ComplexTransaction,
-) -> std::vec::Vec<std::vec::Vec<u8>> {
-    let view = TransactionView::from_bytes(cx.as_bytes()).expect("a transaction");
-    view.as_complex()
-        .expect("complex")
-        .inputs()
-        .map(|input| match (input.as_utxo(), input.as_balance()) {
-            (Some(u), _) => u.signature().to_vec(),
-            (_, Some(b)) => b.signature().to_vec(),
-            _ => unreachable!("an input is UTXO or balance"),
-        })
-        .collect()
-}
-
 /// AC6 — on the Ready head extension every input is verified against its own
 /// key: a UTXO input against the output's address, a balance input against
 /// its initializer's key. A foreign key, a signature lifted from another
@@ -1726,4 +1706,36 @@ fn accepted_signatures_skip_input_verification_only() {
             "accepted: {accepted}"
         );
     }
+}
+
+/// Review patch (Story 7.1, D5) — under the bit-6 skip the UTXO input is
+/// still resolved and spent: re-deriving an accepted spend after undoing it
+/// verifies nothing and clears the referenced bit again.
+#[test]
+fn the_bit_six_skip_still_resolves_and_spends() {
+    let (mut bc, mint) = utxo_genesis();
+    let mi = bc.active_chain_head_idx;
+    let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+    let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
+    assert_eq!(
+        receive(&mut bc, &spend),
+        ReceiveBlockOutcome::AcceptedSilently
+    );
+    let si = bc.active_chain_head_idx;
+    assert_eq!(bc.undo_active_head(), Ok(()));
+    assert_eq!(
+        bc.blocks.utxo_available(mi, 0),
+        Some(true),
+        "the undo restored it"
+    );
+    let before = crate::approval::test_seams::counted(&TX_SIGNATURE_VERIFICATIONS);
+    let mut projection = Projection::COMPLETE;
+    bc.derive_block(&spend.view(), si, Some(mint.view().hash()), &mut projection)
+        .expect("the spend derives again");
+    assert_eq!(
+        crate::approval::test_seams::counted(&TX_SIGNATURE_VERIFICATIONS) - before,
+        0,
+        "accepted signatures are not verified again"
+    );
+    assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false), "spent again");
 }

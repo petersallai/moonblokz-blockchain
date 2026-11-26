@@ -2064,27 +2064,30 @@ fn fr23_switch_survives_a_restart() {
 /// input at the replay, refuses it, deletes it and restores `o4`.
 #[test]
 fn a_side_blocks_input_signature_is_verified_at_the_switch_replay() {
-    let (mut bc, mint) = faulty_utxo_genesis();
-    let (mut replica, _) = faulty_utxo_genesis();
-    let o4_tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(60)]);
-    let o4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&o4_tx]);
-    for node in [&mut bc, &mut replica] {
-        assert_eq!(receive(node, &o4), ReceiveBlockOutcome::AcceptedSilently);
-    }
+    // A foreign-key UTXO input, then (review patch) a foreign-key balance input.
     let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
-    let n4_tx = utxo_tx_signed(0, 4, &[(3, 0, 60)], None, &[Ok(30), Ok(30)], &foreign);
-    let n4 = resign(
-        &complex_tx_block(4, mint.view().hash(), 0, 0, &[&n4_tx]),
-        1,
-        vote_snapshot(1000),
-        NODE_ONE_KEY,
-    );
-    assert_eq!(receive(&mut bc, &n4), ReceiveBlockOutcome::AcceptedSilently);
-    assert_eq!(head_of(&bc), (4, o4.view().hash()), "restored");
-    assert_eq!(
-        status_of(&bc, &n4),
-        None,
-        "refused at the replay and deleted"
-    );
-    assert_same_projection(&bc, &replica, "restored after a bad input signature");
+    for (inputs, balance) in [(&[(3, 0, 60)][..], None), (&[][..], Some((0, 60)))] {
+        let (mut bc, mint) = faulty_utxo_genesis();
+        let (mut replica, _) = faulty_utxo_genesis();
+        let o4_tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(60)]);
+        let o4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&o4_tx]);
+        for node in [&mut bc, &mut replica] {
+            assert_eq!(receive(node, &o4), ReceiveBlockOutcome::AcceptedSilently);
+        }
+        let n4_tx = utxo_tx_signed(0, 4, inputs, balance, &[Ok(30), Ok(30)], &foreign);
+        let n4 = resign(
+            &complex_tx_block(4, mint.view().hash(), 0, 0, &[&n4_tx]),
+            1,
+            vote_snapshot(1000),
+            NODE_ONE_KEY,
+        );
+        assert_eq!(receive(&mut bc, &n4), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(head_of(&bc), (4, o4.view().hash()), "restored");
+        assert_eq!(
+            status_of(&bc, &n4),
+            None,
+            "refused at the replay and deleted"
+        );
+        assert_same_projection(&bc, &replica, "restored after a bad input signature");
+    }
 }

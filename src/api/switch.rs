@@ -717,7 +717,7 @@ impl<
         // exactly its own outputs, all set (every later spend of them is undone
         // already).
         let (fees, outputs) = fees_and_utxo_outputs(&view);
-        if (0..AVAILABLE_UTXO_BYTES * 8)
+        if (0..Self::UTXO_BITFIELD_WIDTH as usize)
             .any(|bit| self.blocks.utxo_available(idx, bit) != Some(bit < outputs))
         {
             return Err(());
