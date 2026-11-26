@@ -1024,7 +1024,7 @@ impl<
                 .filter(|&d| d < count)
                 .and_then(|d| marked.get(d))
             {
-                match classify_tail_drop(&self.blocks, &self.node_info, *dropped) {
+                match self.tail_obligation(*dropped) {
                     // An empty slot is the node's own inconsistency: local.
                     Err(_) => {
                         result = Err(ProcessingError::MissingBlock);

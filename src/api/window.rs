@@ -24,6 +24,69 @@ impl<
         AVAILABLE_UTXO_BYTES,
     >
 {
+    /// FR48 / FR51 classification of the block about to drop off the tail
+    /// (DEC-330): [`classify_tail_drop`]'s RAM decision, except that a block
+    /// whose available-UTXO bitfield has a set bit owes a carry-forward only
+    /// when one of those unspent outputs exceeds the custodian fee — otherwise
+    /// its exact carry-forward would have no output, which DEC-308 refuses, and
+    /// the block could never drop. No set bit, no read; a set bit costs one
+    /// read of the dropping block, in its own frame. The one decision for the
+    /// Ready extension, the FR3 pass and FR12 eligibility (Stories 8.3 / 9.5
+    /// reuse it on the creator side).
+    ///
+    /// The fee is read from the held configuration. Story 7.2 binds the
+    /// per-block chain-info source (DEC-305); until then a computed custodian
+    /// fee's chain-info reads decline and fall through. A configuration not
+    /// held, an empty slot or a failed read is the node's own failure
+    /// ([`TailUnreadable`]), never "no obligation".
+    pub(super) fn tail_obligation(&self, dropped: u32) -> Result<TailObligation, TailUnreadable> {
+        let obligation = classify_tail_drop(&self.blocks, &self.node_info, dropped)?;
+        if obligation != TailObligation::Utxo {
+            return Ok(obligation);
+        }
+        let fee = self
+            .chain_config
+            .active_configuration()
+            .ok_or(TailUnreadable)?
+            .custodian_fee();
+        if self.dropping_block_carries_output_above(dropped, fee)? {
+            Ok(TailObligation::Utxo)
+        } else {
+            Ok(TailObligation::None)
+        }
+    }
+
+    /// The read half of [`Self::tail_obligation`]: one read of the dropping
+    /// block into its own buffer (DEC-136). A failed read is local. An
+    /// `IntegrityFailure` is matched apart from `BackendIo` here, because a
+    /// slot that fails its own hash is permanently unusable and is DEC-320's to
+    /// release and re-fetch (Epic 9); until then both are local failures.
+    #[inline(never)]
+    fn dropping_block_carries_output_above(
+        &self,
+        idx: u32,
+        fee: u64,
+    ) -> Result<bool, TailUnreadable> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        match self.storage.read_block_into(idx, &mut buf) {
+            Ok(()) => {}
+            Err(StorageError::IntegrityFailure) => return Err(TailUnreadable),
+            Err(_) => return Err(TailUnreadable),
+        }
+        let n = match self.blocks.get(idx).map(|entry| entry.len() as usize) {
+            Some(len) if len > 0 && len <= MAX_BLOCK_SIZE => len,
+            _ => MAX_BLOCK_SIZE,
+        };
+        let view = BlockView::from_bytes(&buf[..n])
+            .ok()
+            .ok_or(TailUnreadable)?;
+        Ok(carries_output_above(
+            &view,
+            |bit| self.blocks.utxo_available(idx, bit) == Some(true),
+            fee,
+        ))
+    }
+
     /// The [`TailStep`] of the block that becomes `S_tail` when the window
     /// advances past `tail`: its active-chain child. `None` on a failed read —
     /// a local failure. The tail is never the head here: that needs `W = 1`,

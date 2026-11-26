@@ -145,8 +145,7 @@ impl<
             // be evaluated: a local failure, never trust.
             match self.dropped_by_extension(head, tail, w) {
                 Ok(Some(dropped)) => {
-                    let Ok(obligation) = classify_tail_drop(&self.blocks, &self.node_info, dropped)
-                    else {
+                    let Ok(obligation) = self.tail_obligation(dropped) else {
                         return Extension::Local;
                     };
                     if tail_drop_binding(obligation, view) == TailBinding::Invalid {

@@ -43,7 +43,7 @@ use crate::approval::{
     SUPPORT_MESSAGE_SIZE, SupportDedupe, SupportMessage, SupportView, in_subgroup, node_value,
     required_signers, subgroup_seed, subgroup_size, support_body_tail, support_message_bytes,
 };
-use crate::available_utxo::utxo_output_at;
+use crate::available_utxo::{carries_output_above, utxo_output_at};
 use crate::blocks::{BlockEntry, BlockTable, NONE_REF};
 use crate::branch_value::{Rank, block_value, value_cap};
 use crate::chain_heads::ChainHeadsTable;

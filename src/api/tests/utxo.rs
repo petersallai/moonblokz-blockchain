@@ -740,3 +740,68 @@ fn fr9_lock_time_size_rollback_leaves_no_available_utxo_bit() {
         "no bit of the refused candidate survives"
     );
 }
+
+/// DEC-330 (AC4b) — the FR51 obligation reads the dropping block: unspent
+/// outputs all at most the custodian fee (the code-baked 1) owe no
+/// carry-forward, because each would be discarded and the carry-forward would
+/// have no output (DEC-308); one output above the fee owes it. The RAM
+/// pre-filter still says `Utxo` in both cases.
+#[test]
+fn the_tail_obligation_owes_a_carry_forward_only_above_the_custodian_fee() {
+    for (outputs, owed) in [
+        (&[Ok(1), Ok(1)][..], TailObligation::None),
+        (&[Ok(1), Ok(2)][..], TailObligation::Utxo),
+        (&[Ok(60), Ok(40)][..], TailObligation::Utxo),
+    ] {
+        let (mut bc, h100) = utxo_test_chain();
+        let tx = utxo_tx(101, &[], Some((1, 100)), outputs);
+        let mint = complex_tx_block(101, h100, 3, 0, &[&tx]);
+        let mi = admit(&mut bc, &mint);
+        bc.run_processing_pass(mi).expect("the mint derives");
+        assert_eq!(
+            classify_tail_drop(&bc.blocks, &bc.node_info, mi),
+            Ok(TailObligation::Utxo),
+            "the bitfield pre-filter"
+        );
+        assert_eq!(bc.tail_obligation(mi), Ok(owed), "{outputs:?}");
+    }
+}
+
+/// DEC-330 — only a still-unspent output counts: spending the one output
+/// above the fee leaves an all-below-fee block that owes nothing.
+#[test]
+fn a_spent_output_above_the_fee_no_longer_owes_a_carry_forward() {
+    let (mut bc, h100) = utxo_test_chain();
+    let tx = utxo_tx(101, &[], Some((1, 100)), &[Ok(1), Ok(50)]);
+    let mint = complex_tx_block(101, h100, 3, 0, &[&tx]);
+    let mi = admit(&mut bc, &mint);
+    let spend = utxo_tx(102, &[(101, 1, 50)], None, &[Err((2, 50))]);
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&spend]);
+    let si = admit(&mut bc, &spend);
+    bc.run_processing_pass(si).expect("the spend derives");
+    assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true));
+    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::None));
+}
+
+/// DEC-330 — a block with no set bit is classified from RAM, with no read;
+/// one with a set bit is read once, and a failed read is the node's own
+/// failure (`TailUnreadable`), never "no obligation".
+#[test]
+fn the_tail_obligation_reads_only_with_a_set_bit_and_a_failed_read_is_local() {
+    let (mut bc, _, mi) = failing_read_utxo_chain();
+    // Admitted, not derived: no bit is set yet.
+    bc.storage.failing_slot = mi;
+    let reads = bc.storage.reads.get();
+    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::None));
+    assert_eq!(bc.storage.reads.get(), reads, "no set bit, no read");
+
+    bc.storage.failing_slot = NONE_REF;
+    bc.run_processing_pass(mi).expect("the mint derives");
+    let reads = bc.storage.reads.get();
+    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::Utxo));
+    assert_eq!(bc.storage.reads.get(), reads + 1, "one read");
+
+    bc.storage.failing_slot = mi;
+    bc.storage.reads_left.set(0);
+    assert_eq!(bc.tail_obligation(mi), Err(TailUnreadable));
+}
