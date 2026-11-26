@@ -73,7 +73,8 @@ fn spend_verdict(inputs: &[(u32, u16, u64)]) -> (Result<(), ProcessingError>, u3
     let (mut bc, h100) = utxo_test_chain();
     let mint = utxo_mint_block(h100);
     admit(&mut bc, &mint);
-    let tx = utxo_tx(102, inputs, None, &[]);
+    // One 0-amount output: a complex transaction needs one (DEC-308).
+    let tx = utxo_tx(102, inputs, None, &[Err((2, 0))]);
     let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&tx]);
     let si = admit(&mut bc, &spend);
     (bc.run_processing_pass(si).map(|_| ()), si)
@@ -387,8 +388,10 @@ fn utxo_value_overflow_is_invalid() {
         Err(AdmitError::Rejected(Tier1Failure::AmountOverflow))
     );
 
-    let first = utxo_tx(102, &[(101, 0, HALF)], None, &[]);
-    let second = utxo_tx(102, &[(101, 1, HALF)], None, &[]);
+    // Each needs an output (DEC-308); a 0-amount one keeps the whole input
+    // as the fee, so the two fees still overflow.
+    let first = utxo_tx(102, &[(101, 0, HALF)], None, &[Err((2, 0))]);
+    let second = utxo_tx(102, &[(101, 1, HALF)], None, &[Err((2, 0))]);
     let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&first, &second]);
     let si = admit(&mut bc, &spend);
     assert_eq!(
