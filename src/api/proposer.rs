@@ -614,7 +614,7 @@ impl<
 
     /// Story 6.6 AC8 (FR29, FR27, FR58; D6, D9) — what the proposer's
     /// deviation-bearing branch, whose tip is at `tip_seq`, does next.
-    /// `obligation` is `classify_tail_drop` of the block the branch's next
+    /// `obligation` is `tail_obligation` (DEC-330) of the block the branch's next
     /// extension would drop, computed by the caller; `last_emit_ms` is when the
     /// deviation block or the branch's last replay was emitted (the caller's
     /// state: FR46's fifth tracked deadline, Story 8.4). In order:

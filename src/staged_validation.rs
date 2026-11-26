@@ -479,8 +479,6 @@ fn tier1_transaction_block<C: CryptoTrait>(
     Ok(())
 }
 
-/// Tier 1 over one complex transaction; returns its UTXO-output count for the
-/// block-wide cap.
 /// DEC-308 (I-55): a complex transaction needs at least one output — the one
 /// predicate Tier 1 and Story 7.3's FR14 intake share. Exact once the output
 /// count is coherent with the bytes, which `TransactionView::from_bytes` and
@@ -489,6 +487,8 @@ pub(crate) fn complex_has_output(cx: &ComplexTransactionView) -> bool {
     cx.output_count() != 0
 }
 
+/// Tier 1 over one complex transaction; returns its UTXO-output count for the
+/// block-wide cap.
 fn tier1_complex_tx(
     cx: &ComplexTransactionView,
     vote: u32,

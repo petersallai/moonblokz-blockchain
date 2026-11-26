@@ -149,14 +149,15 @@ pub(crate) struct BlockEntry<const AVAILABLE_UTXO_BYTES: usize> {
     /// (block-creator signature, chain-config content-identity) trim the read-back
     /// bytes to this length first. `0` for entries constructed directly in tests
     /// that never round-trip through storage. A `u32` on every block-size tier
-    /// (DEC-224): `size_of::<BlockEntry>()` is 80 B.
+    /// (DEC-224): `size_of::<BlockEntry<B>>()` is `48 + B` rounded up to 4 —
+    /// 52 B at the production 4-byte bitfield (DEC-318).
     len: u32,
     /// The low 16 bits of the equivocator `c` a twin fact block names (FR72,
     /// Story 6.13 D6 (d), DEC-280), stamped where the block is in hand; 0 for
     /// every other type. A filter, not the id: node ids are `u32`, so a match
     /// is confirmed by reading the block wherever ids can exceed 16 bits
-    /// (`MAX_NODES > 65 536`). It fills the entry's 2 B of tail padding, so the
-    /// entry stays 80 B. RAM-only: the restart rebuild re-stamps it.
+    /// (`MAX_NODES > 65 536`). It fills the entry's 2 B of tail padding, so it
+    /// adds nothing to the entry's size. RAM-only: the restart rebuild re-stamps it.
     equivocator: u16,
 }
 
