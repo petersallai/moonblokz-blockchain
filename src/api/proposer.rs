@@ -413,19 +413,27 @@ impl<
     /// Epic 9's replay blocks later. The FR27 overrides (`consumed_votes = 0`,
     /// `first_voted_node = creator = local`, `consumed_votes_from_first_voted_node
     /// = 0`); the rest per FR45. `mined_amount` is FR45's `mining_reward` (ID 5)
-    /// at the block's sequence, the code-baked default 0 until Story 7.2 adds
-    /// its accessor here. `payload_type` is the payload setter's. `None` at
+    /// at the block's pre-state — the active head's post-state, bound through
+    /// [`Self::chain_info_at_head`] (DEC-197), so it is the value the validator
+    /// resolves (Story 7.2). `payload_type` is the payload setter's. `None` at
     /// `u32::MAX`.
-    fn post_deviation_header(
+    pub(super) fn post_deviation_header(
         &self,
         tip_seq: u32,
         tip_hash: [u8; HASH_SIZE],
     ) -> Option<BlockHeader> {
+        let chain_info = self.chain_info_at_head();
+        let mined_amount = self
+            .chain_config
+            .active_configuration()
+            .map_or(0, |configuration| {
+                configuration.with_chain_info(&chain_info).mining_reward()
+            });
         Some(BlockHeader {
             version: SUPPORTED_VERSION,
             sequence: tip_seq.checked_add(1)?,
             creator: self.local_node_id,
-            mined_amount: 0,
+            mined_amount,
             payload_type: 0,
             consumed_votes: 0,
             first_voted_node: self.local_node_id,
@@ -570,10 +578,29 @@ impl<
 
     /// One vote step of the projection (D4) on the block at `idx`: `undo_block`
     /// or `apply_block`, after an optional creator check. `false` on a failed
-    /// read, a foreign creator or a refused step (atomic: nothing changed). Its
-    /// own read buffer.
-    #[inline(never)]
+    /// read, a foreign creator or a refused step (atomic: nothing changed).
+    /// The step-4 liveness candidate is read first (DEC-339), so its read
+    /// buffer and the step's are siblings, never nested (DEC-136).
     fn vote_step(&mut self, idx: u32, undo: bool, creator: Option<u32>, check: bool) -> bool {
+        let Some(seq) = self.blocks.get(idx).map(BlockEntry::sequence) else {
+            return false;
+        };
+        let Ok(liveness) = self.liveness_candidate(idx, seq, 0) else {
+            return false;
+        };
+        self.vote_step_with(idx, undo, creator, check, liveness)
+    }
+
+    /// [`Self::vote_step`] with its liveness candidate. Its own read buffer.
+    #[inline(never)]
+    fn vote_step_with(
+        &mut self,
+        idx: u32,
+        undo: bool,
+        creator: Option<u32>,
+        check: bool,
+        liveness: Option<u32>,
+    ) -> bool {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let Some(view) = self.view_retained(idx, &mut buf) else {
             return false;
@@ -595,14 +622,18 @@ impl<
             self.verification_horizon(),
             idx,
         );
-        if !drop.reads_hold(&view) {
+        if !drop.reads_hold(&view, liveness) {
             return false;
         }
         let excluded = |node| drop.excluded(node);
         let stepped = if undo {
-            self.vote_engine.undo_block(view, excluded).is_ok()
+            self.vote_engine
+                .undo_block(view, excluded, liveness)
+                .is_ok()
         } else {
-            self.vote_engine.apply_block(view, excluded).is_ok()
+            self.vote_engine
+                .apply_block(view, excluded, liveness)
+                .is_ok()
         };
         if drop.faulted() {
             // The engine's result is not trusted: escalate (DEC-205).
@@ -663,8 +694,12 @@ impl<
         if u64::from(p) + u64::from(h) <= u64::from(tip_seq) + 1 {
             return ApprovalStep::Hold;
         }
+        // DEC-197: local pacing, read at the active head's post-state.
+        let chain_info = self.chain_info_at_head();
         let due = last_emit_ms.saturating_add(u64::from(
-            configuration.deviation_replay_insertion_delay_ms(),
+            configuration
+                .with_chain_info(&chain_info)
+                .deviation_replay_insertion_delay_ms(),
         ));
         if now >= due {
             ApprovalStep::Replay

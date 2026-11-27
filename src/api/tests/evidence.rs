@@ -1032,8 +1032,10 @@ fn alternative_evidence(d: &Block, e: &Block, members: &[u32]) -> Block {
     })
 }
 
-/// A block by node 1 on `e_alt`, which a node holding `d`, `e_alt` builds
-/// (any deviation and its evidence).
+/// A block by node 5 on `e_alt`, which a node holding `d`, `e_alt` builds
+/// (any deviation and its evidence). Node 5 holds the chain's only vote
+/// (1 000 at #5), so `x8` is worth more than 0 and the twin branch outranks
+/// the active one by value, not by a hash-dependent tie-break.
 fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     let (mut g, _, _) = support_chain(2);
     for block in [d, e_alt] {
@@ -1043,7 +1045,7 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
         );
     }
     assert_eq!(head_of(&g), (7, e_alt.view().hash()));
-    normal_after(&g, e_alt, 1, 81)
+    normal_after(&g, e_alt, 5, 81)
 }
 
 /// Story 6.12 (FR70, DEC-273) — a second valid evidence of one deviation

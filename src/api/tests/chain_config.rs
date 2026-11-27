@@ -21,7 +21,8 @@ fn code_baked_defaults_reproduce_the_retired_stub() {
     assert_eq!(config.max_utxo_outputs(), 32);
     assert_eq!(config.required_support(), 40);
     assert_eq!(config.vote_scale().get(), 1000);
-    assert_eq!(config.vote_interest(), 5);
+    // DEC-176 / DEC-343: the default rate is 100, no longer the stub's 5.
+    assert_eq!(config.vote_interest(), 100);
     assert_eq!(config.parent_recovery_per_head_retry_interval_ms(), 120_000);
     assert_eq!(config.parent_recovery_min_emit_interval_ms(), 10_000);
     // The one value the fixtures declare rather than default (Story 5.11).

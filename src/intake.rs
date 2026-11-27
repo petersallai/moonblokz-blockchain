@@ -298,8 +298,8 @@ mod tests {
     ];
 
     /// A second content region, equally valid and distinct in bytes: the base
-    /// entry plus a literal declaring `vote_interest`'s own default value.
-    const OTHER_CONFIG_CONTENT: [u8; 26] = [
+    /// entry plus a literal declaring `mining_reward`'s own default value 0.
+    const OTHER_CONFIG_CONTENT: [u8; 29] = [
         5,
         0,
         parameter::ACTIVE_CHAIN_LENGTH,
@@ -320,9 +320,12 @@ mod tests {
         N.to_le_bytes()[1],
         N.to_le_bytes()[2],
         N.to_le_bytes()[3],
-        parameter::VOTE_INTEREST,
-        1,
-        5,
+        parameter::MINING_REWARD,
+        4,
+        0,
+        0,
+        0,
+        0,
         parameter::SIGNATURE_SCHEME,
         1,
         moonblokz_crypto::SIGNATURE_SCHEME,

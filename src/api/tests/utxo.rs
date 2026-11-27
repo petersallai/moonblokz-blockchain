@@ -248,12 +248,23 @@ fn utxo_input_not_before_block_is_rejected_at_intake() {
 
 /// AC8 (8) / AC6 — the fee counts UTXO outputs: a balance input of 100
 /// paid entirely into a UTXO output leaves no surplus, so the creator gets
-/// its mined amount and nothing more (it used to get another 100).
+/// its mined amount and nothing more (it used to get another 100). The chain
+/// declares `mining_reward = 7`, which the block's `mined_amount` must equal
+/// (Story 7.2).
 #[test]
 fn utxo_output_is_not_paid_out_as_fee() {
-    let (mut bc, h100) = utxo_test_chain();
+    let mut bc = rewarded_test_chain(7);
+    let cfg_hash = admit_rewarded_anchor(&mut bc, 99, [0xAB; 32], 7);
+    let seed = balance_block_mined(
+        100,
+        cfg_hash,
+        &[(1, 100, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
+        3,
+        7,
+    );
+    admit(&mut bc, &seed);
     let tx = utxo_tx(101, &[], Some((1, 100)), &[Ok(100)]);
-    let block = complex_tx_block(101, h100, 3, 7, &[&tx]);
+    let block = complex_tx_block(101, seed.view().hash(), 3, 7, &[&tx]);
     let bi = admit(&mut bc, &block);
 
     bc.run_processing_pass(bi).expect("pass succeeds");
@@ -760,7 +771,7 @@ fn the_tail_obligation_owes_a_carry_forward_only_above_the_custodian_fee() {
             Ok(TailObligation::Utxo),
             "the bitfield pre-filter"
         );
-        assert_eq!(bc.tail_obligation(mi), Ok(owed), "{outputs:?}");
+        assert_eq!(bc.tail_obligation(mi, true), Ok(owed), "{outputs:?}");
         // The binding the extension that drops the block must satisfy: a
         // plain block preserves nothing, so it may drop the block only when
         // nothing is owed (review patch, AC4b).
@@ -791,7 +802,7 @@ fn a_spent_output_above_the_fee_no_longer_owes_a_carry_forward() {
     let si = admit(&mut bc, &spend);
     bc.run_processing_pass(si).expect("the spend derives");
     assert_eq!(bc.blocks.utxo_available(mi, 0), Some(true));
-    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::None));
+    assert_eq!(bc.tail_obligation(mi, true), Ok(TailObligation::None));
 }
 
 /// DEC-330 — a block with no set bit is classified from RAM, with no read;
@@ -803,18 +814,18 @@ fn the_tail_obligation_reads_only_with_a_set_bit_and_a_failed_read_is_local() {
     // Admitted, not derived: no bit is set yet.
     bc.storage.failing_slot = mi;
     let reads = bc.storage.reads.get();
-    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::None));
+    assert_eq!(bc.tail_obligation(mi, true), Ok(TailObligation::None));
     assert_eq!(bc.storage.reads.get(), reads, "no set bit, no read");
 
     bc.storage.failing_slot = NONE_REF;
     bc.run_processing_pass(mi).expect("the mint derives");
     let reads = bc.storage.reads.get();
-    assert_eq!(bc.tail_obligation(mi), Ok(TailObligation::Utxo));
+    assert_eq!(bc.tail_obligation(mi, true), Ok(TailObligation::Utxo));
     assert_eq!(bc.storage.reads.get(), reads + 1, "one read");
 
     bc.storage.failing_slot = mi;
     bc.storage.reads_left.set(0);
-    assert_eq!(bc.tail_obligation(mi), Err(TailUnreadable));
+    assert_eq!(bc.tail_obligation(mi, true), Err(TailUnreadable));
 }
 
 /// Story 7.1 (AC2) — in the FR3 pass a UTXO input and a balance input are
@@ -914,7 +925,7 @@ fn an_integrity_failure_on_the_dropping_block_is_local() {
     bc.blocks
         .insert_at(0, BlockEntry::new([7; 32], NONE_REF, 101));
     assert!(bc.blocks.set_utxo_available(0, 0, true));
-    assert_eq!(bc.tail_obligation(0), Err(TailUnreadable));
+    assert_eq!(bc.tail_obligation(0, true), Err(TailUnreadable));
 }
 
 /// Review patch (Story 7.1, AC6) — in an incomplete (window-anchored) pass a

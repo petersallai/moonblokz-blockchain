@@ -166,8 +166,9 @@ type LongStorage = MemoryBackend<{ 32 * MAX_BLOCK_SIZE + 8000 }>;
 
 /// [`two_creator_chain`] over [`LongStorage`], extended to `last` with
 /// creators alternating (#0 at even sequences), each block crediting the
-/// next creator once; `y` is not admitted. Returns the chain, `a2`, and the
-/// head's hash.
+/// next creator once; `y` is not admitted. Each block carries its creator's
+/// real vote, so the DEC-178 liveness credit, due from `s = H`, is in it.
+/// Returns the chain, `a2`, and the head's hash.
 fn long_chain(last: u32) -> (Chain16<LongStorage>, Block, [u8; 32]) {
     let mut storage = LongStorage::new();
     storage
@@ -192,6 +193,8 @@ fn long_chain(last: u32) -> (Chain16<LongStorage>, Block, [u8; 32]) {
         let creator = u32::from(seq % 2 == 1);
         let received = u32::from(seq != 4);
         let block = alt(seq, prev, creator, received, 1, 100 + u64::from(seq), false);
+        let key = if creator == 0 { 1 } else { NODE_ONE_KEY };
+        let block = real_on(&bc, &block, creator, key);
         assert_eq!(
             receive(&mut bc, &block),
             ReceiveBlockOutcome::AcceptedSilently,
@@ -601,7 +604,16 @@ fn a_node_on_the_other_twin_does_not_support_the_round() {
     // The opener on `y`'s branch is a side block for a node on `a3`.
     let (mut bc, _, _, y) = twin_chain();
     let top = 0;
-    let e_y = fact_with(4, y.view().hash(), top, key_of(top), 3015, &y, 0, &[0]);
+    let e_y = fact_with(
+        4,
+        y.view().hash(),
+        top,
+        key_of(top),
+        vote_snapshot(1000),
+        &y,
+        0,
+        &[0],
+    );
     assert_eq!(
         receive(&mut bc, &e_y),
         ReceiveBlockOutcome::AcceptedSilently
@@ -630,14 +642,15 @@ fn credits_to_the_equivocator_are_dropped_inside_the_horizon() {
     assert_eq!(head_of(&bc), (5, five.view().hash()));
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), 0, "no credit");
 
-    // Control: the same votes without a fact block are credited.
+    // Control: the same votes without a fact block are credited — once,
+    // under the per-target cap (DEC-176).
     let (mut control, _, _, a3) = two_creator_chain();
     let four = alt(4, a3.view().hash(), 0, 0, 2, 31, false);
     assert_eq!(
         receive(&mut control, &four),
         ReceiveBlockOutcome::AcceptedSilently
     );
-    assert_eq!(control.vote_engine.accumulated_vote_of(1), 2000);
+    assert_eq!(control.vote_engine.accumulated_vote_of(1), 1000);
 }
 
 /// The set reads exactly `[b − H, b − 1]`: a fact block `H` below the block
@@ -690,15 +703,15 @@ fn the_credit_drop_reads_the_horizon_not_the_window() {
 
 // --- AC7: the approval's exception to the hold -----------------------------
 
-/// The other side's opener `e_y` on `y` (node #0, the top there with 3 000
-/// from `y`'s votes), proving `a3`.
+/// The other side's opener `e_y` on `y` (node #0, the top there with 1 000
+/// from `y`'s three votes, one credit under DEC-176), proving `a3`.
 fn opener_on_y(y: &Block, a3: &Block) -> Block {
     fact_with(
         4,
         y.view().hash(),
         0,
         key_of(0),
-        vote_snapshot(3000),
+        vote_snapshot(1000),
         a3,
         0,
         &[0],
@@ -947,7 +960,7 @@ fn the_snapshot_restores_credits_banked_since_the_twin() {
     let b4 = alt(4, a3.view().hash(), 0, 0, 2, 61, false);
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
     let banked = bc.vote_engine.accumulated_vote_of(1);
-    assert_eq!(banked, 2000);
+    assert_eq!(banked, 1000, "two votes, one credit (DEC-176)");
     let e = fact_on(&bc, &b4, &y, &[0]);
     let snapshot = TwinFactView::from_payload(e.view().payload())
         .expect("frames")
@@ -970,7 +983,7 @@ fn the_snapshot_restores_credits_banked_since_the_twin() {
     );
     let view = BlockView::from_bytes(&bytes).ok().expect("parses");
     bc.vote_engine
-        .undo_block(view, |node| drop.excluded(node))
+        .undo_block(view, |node| drop.excluded(node), None)
         .expect("undoes");
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), banked);
 }
@@ -1076,7 +1089,7 @@ fn a_wide_build_confirms_a_filter_match_by_reading_the_block() {
     );
     let five = alt(8, [0xEE; 32], 0, 0, 2, 31, false);
     assert!(
-        !faulty.reads_hold(&five.view()),
+        !faulty.reads_hold(&five.view(), None),
         "the pre-check reports the fault"
     );
     assert!(faulty.faulted());

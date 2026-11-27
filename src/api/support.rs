@@ -683,7 +683,7 @@ impl<
     /// unclassifiable or unreadable block: `false`.
     #[inline(never)]
     pub(super) fn extension_preserves(&self, x_idx: u32, dropped: u32) -> bool {
-        match self.tail_obligation(dropped) {
+        match self.tail_obligation(dropped, true) {
             Ok(TailObligation::None) => true,
             Ok(obligation) => {
                 let mut buf = [0u8; MAX_BLOCK_SIZE];

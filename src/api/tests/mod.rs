@@ -29,6 +29,7 @@ use crate::approval::test_seams::{AGGREGATE_VERIFICATIONS, TX_SIGNATURE_VERIFICA
 mod acquisition;
 mod admission;
 mod chain_config;
+mod crediting;
 mod evidence;
 mod fact;
 mod fixtures;
@@ -110,12 +111,11 @@ const TEST_MAX_BLOCKS: usize = TEST_W as usize + 2 * TEST_H as usize;
 /// (DEC-318), 32 outputs per block.
 const TEST_UTXO_BYTES: usize = 4;
 
-/// The base override set as a **content region**: one literal entry
-/// declaring `active_chain_length = TEST_W`. Every other parameter resolves
-/// to its code-baked default, and those defaults are exactly the constants
-/// the retired `FixedChainConfig` returned — which is why the suite's
-/// expected values are unchanged. The last entry declares the build's
-/// signature scheme ([`declare_build_scheme`]).
+/// The base override set as a **content region**: literal entries declaring
+/// `active_chain_length = TEST_W`, its horizon and the node cap. Every other
+/// parameter resolves to its code-baked default — `vote_interest` to 100
+/// (DEC-176, DEC-343), so the suite runs at the production rate. The last entry
+/// declares the build's signature scheme ([`declare_build_scheme`]).
 const BASE_CONFIG_CONTENT: [u8; 23] = [
     4,
     0,
@@ -143,9 +143,9 @@ const BASE_CONFIG_CONTENT: [u8; 23] = [
 ];
 
 /// A second content region, valid and **distinct in bytes** but resolving
-/// identically: the base entry plus a literal declaring `vote_interest`'s
-/// own default. Used where a test needs two different chain-config contents.
-const OTHER_CONFIG_CONTENT: [u8; 26] = [
+/// identically: the base entries plus a literal declaring `mining_reward`'s
+/// own default 0. Used where a test needs two different chain-config contents.
+const OTHER_CONFIG_CONTENT: [u8; 29] = [
     5,
     0,
     parameter::ACTIVE_CHAIN_LENGTH,
@@ -166,9 +166,12 @@ const OTHER_CONFIG_CONTENT: [u8; 26] = [
     TEST_MAX_NODES.to_le_bytes()[1],
     TEST_MAX_NODES.to_le_bytes()[2],
     TEST_MAX_NODES.to_le_bytes()[3],
-    parameter::VOTE_INTEREST,
-    1,
-    5,
+    parameter::MINING_REWARD,
+    4,
+    0,
+    0,
+    0,
+    0,
     parameter::SIGNATURE_SCHEME,
     1,
     moonblokz_crypto::SIGNATURE_SCHEME,

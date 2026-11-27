@@ -3,53 +3,85 @@
 
 use super::*;
 
+/// FR36(b): the fee one transaction pays its block's creator — the one
+/// definition the per-block step credits and the committed-block undo debits
+/// (deferred-work D30). A node transfer and a registration pay their explicit
+/// fee (`registration_price` is absorbed, never credited; block #0's
+/// registration pays none, FR54); a complex transaction pays the surplus of its
+/// inputs over its outputs, and a zero-input carry-forward pays none (FR51).
+/// The step's own checks (inputs cover outputs, declared UTXO amounts equal
+/// the referenced outputs) make the complex surplus exact.
+pub(super) fn transaction_fee(tx: &TransactionView<'_>, is_genesis_zero: bool) -> u64 {
+    if let Some(nt) = tx.as_node_transfer() {
+        nt.fee() as u64
+    } else if let Some(reg) = tx.as_registration() {
+        if is_genesis_zero { 0 } else { reg.fee() }
+    } else if let Some(cx) = tx.as_complex() {
+        if cx.input_count() == 0 {
+            return 0;
+        }
+        let in_sum = cx.inputs().fold(0u64, |sum, input| {
+            sum.saturating_add(
+                input
+                    .as_balance()
+                    .map(|bi| bi.amount())
+                    .or_else(|| input.as_utxo().map(|ui| ui.amount()))
+                    .unwrap_or(0),
+            )
+        });
+        let out_sum = cx.outputs().fold(0u64, |sum, output| {
+            sum.saturating_add(
+                output
+                    .as_utxo()
+                    .map(|uo| uo.amount())
+                    .or_else(|| output.as_balance().map(|bo| bo.amount()))
+                    .unwrap_or(0),
+            )
+        });
+        in_sum.saturating_sub(out_sum)
+    } else {
+        0
+    }
+}
+
 /// FR36(b): the transaction-fee total the per-block step credited to the
-/// block's creator, recomputed from the payload for the committed-block undo
-/// (Story 6.3 AC2) — the sums of `apply_transaction` / `apply_complex`, whose
-/// checks made them exact — and the block's UTXO-output count, its own
-/// available-UTXO bits (the AC2 precondition of the undo).
+/// block's creator, recomputed for the committed-block undo (Story 6.3 AC2)
+/// from [`transaction_fee`] — whose sum the step checked, so it is exact —
+/// and the block's UTXO-output count, its own available-UTXO bits (the AC2
+/// precondition of the undo).
 pub(super) fn fees_and_utxo_outputs(view: &BlockView<'_>) -> (u64, usize) {
     let Some(txs) = view.transactions() else {
         return (0, 0);
     };
-    let mut outputs = 0usize;
     let is_genesis_zero = view.sequence() == 0;
+    let mut outputs = 0usize;
     let mut total = 0u64;
     for tx in txs.iter() {
-        if let Some(nt) = tx.as_node_transfer() {
-            total = total.wrapping_add(nt.fee() as u64);
-        } else if let Some(reg) = tx.as_registration() {
-            if !is_genesis_zero {
-                total = total.wrapping_add(reg.fee());
-            }
-        } else if let Some(cx) = tx.as_complex() {
+        if let Some(cx) = tx.as_complex() {
             outputs += cx
                 .outputs()
                 .filter(|output| output.as_utxo().is_some())
                 .count();
-            if cx.input_count() == 0 {
-                continue;
-            }
-            let mut in_sum: u64 = 0;
-            for input in cx.inputs() {
-                if let Some(bi) = input.as_balance() {
-                    in_sum = in_sum.saturating_add(bi.amount());
-                } else if let Some(ui) = input.as_utxo() {
-                    in_sum = in_sum.saturating_add(ui.amount());
-                }
-            }
-            let mut out_sum: u64 = 0;
-            for output in cx.outputs() {
-                if let Some(uo) = output.as_utxo() {
-                    out_sum = out_sum.saturating_add(uo.amount());
-                } else if let Some(bo) = output.as_balance() {
-                    out_sum = out_sum.saturating_add(bo.amount());
-                }
-            }
-            total = total.wrapping_add(in_sum.saturating_sub(out_sum));
         }
+        total = total.wrapping_add(transaction_fee(&tx, is_genesis_zero));
     }
     (total, outputs)
+}
+
+/// FR36(c) (DEC-306): the replay reward the block's creator earns — the
+/// literal-only `replay_block_reward` (DEC-341) for a replay-bearing block,
+/// else 0. The step and its undo read it alike: the configuration does not
+/// change under a committed block (Ready holds the durable lock).
+pub(super) fn replay_reward<Config: ChainConfigTrait>(
+    config: &Config,
+    view: &BlockView<'_>,
+) -> u64 {
+    if is_fr36_exempt(view) || !is_replay_bearing(view) {
+        return 0;
+    }
+    config
+        .active_configuration()
+        .map_or(0, |configuration| configuration.replay_block_reward())
 }
 
 impl<
@@ -169,9 +201,27 @@ impl<
             }
         }
 
+        // (d) FR6 / FR9 (DEC-217): `mined_amount` is the `mining_reward` at the
+        //     block's pre-state, resolved under the pre-state chain-info source
+        //     (DEC-305), before any effect so a failure inverts nothing. Where
+        //     the source declined, the check is skipped, never evaluated against
+        //     the fall-through value (DEC-340); the credit is the header's.
+        if !is_genesis && self.mined_amount_mismatch(view, projection.complete) {
+            return Err(invalid(ValidationReason::MinedAmountMismatch));
+        }
+        // (e) DEC-178 / DEC-339: the creator of block `s − H` for the liveness
+        //     credit, read now so the commit needs no read; a window-anchored
+        //     pass skips the credit below `a + H` (DEC-210). A failed read is
+        //     the node's own fault, never evidence.
+        let liveness = self
+            .liveness_candidate(idx, seq, projection.vote_seed_from)
+            .map_err(|()| ProcessingError::StorageRead)?;
+
         let mut derivation = BlockDerivation {
             total_fees: 0,
+            replay_reward: replay_reward(&self.chain_config, view),
             utxo_outputs: 0,
+            liveness,
         };
         // How many transactions have applied their effects, for the prefix
         // inversion on a later failure.
@@ -345,10 +395,12 @@ impl<
             });
         }
 
-        // FR36 creator credit, checked here so the commit tail cannot fail.
+        // FR36 creator credit (a) + (b) + (c), checked here so the commit tail
+        // cannot fail.
         if !is_genesis && self.node_info.is_seeded(view.creator()) {
             let fits = (view.mined_amount() as u64)
                 .checked_add(derivation.total_fees)
+                .and_then(|credit| credit.checked_add(derivation.replay_reward))
                 .and_then(|credit| {
                     self.node_info
                         .balance_of(view.creator())
@@ -363,11 +415,12 @@ impl<
     }
 
     /// The second half of the per-block step: the FR37 vote apply — the last
-    /// fallible operation, and atomic — then the commit tail (D1 precondition
-    /// 5), the effects no later check of the block reads: the FR36 creator
-    /// credit (`mined_amount` + fees; FR36(c) is Epic 9), the D9 seed-source
-    /// moves and the block's own available-UTXO bits. On a vote failure the
-    /// effects of [`Self::derive_block`] are inverted.
+    /// fallible operation, and atomic, its step-4 liveness candidate carried
+    /// from the derive — then the commit tail (D1 precondition 5), the effects
+    /// no later check of the block reads: the FR36 creator credit
+    /// (`mined_amount` + fees + the replay reward, DEC-306), the D9
+    /// seed-source moves and the block's own available-UTXO bits. On a vote
+    /// failure the effects of [`Self::derive_block`] are inverted.
     pub(super) fn commit_block(
         &mut self,
         view: &BlockView<'_>,
@@ -381,12 +434,14 @@ impl<
             self.verification_horizon(),
             idx,
         );
-        if !drop.reads_hold(view) {
+        if !drop.reads_hold(view, derivation.liveness) {
             self.invert_transactions(view, idx, usize::MAX);
             return Err(ProcessingError::StorageRead);
         }
-        let applied = BlockView::from_bytes(view.serialized_bytes())
-            .map(|v| self.vote_engine.apply_block(v, |node| drop.excluded(node)));
+        let applied = BlockView::from_bytes(view.serialized_bytes()).map(|v| {
+            self.vote_engine
+                .apply_block(v, |node| drop.excluded(node), derivation.liveness)
+        });
         let faulted = drop.faulted();
         if faulted {
             // A confirm read failed inside the engine: its result is not
@@ -402,7 +457,7 @@ impl<
         if !is_fr36_exempt(view) && self.node_info.is_seeded(view.creator()) {
             self.node_info.credit(
                 view.creator(),
-                view.mined_amount() as u64 + derivation.total_fees,
+                view.mined_amount() as u64 + derivation.total_fees + derivation.replay_reward,
             );
         }
         if let Some(payload) = view.balances() {
@@ -420,6 +475,69 @@ impl<
         self.blocks.mark_signatures_accepted(idx);
         self.active_open_run = run_after(self.active_open_run, view);
         Ok(())
+    }
+
+    /// FR6 / FR9 Tier 2 (DEC-217): whether `view`'s `mined_amount` differs
+    /// from the `mining_reward` resolved at its pre-state. `served` says
+    /// whether the pre-state chain-info source answers (§4.6 rule 5); a
+    /// resolution that read a declined value is no mismatch — the check is
+    /// skipped (DEC-305, DEC-340). Without a configuration there is nothing to
+    /// check against. The side-block Tier 2 calls it with `served = false`.
+    pub(super) fn mined_amount_mismatch(&self, view: &BlockView<'_>, served: bool) -> bool {
+        let source = self.projection_chain_info(served);
+        let Some(configuration) = self.chain_config.active_configuration() else {
+            return false;
+        };
+        let reward = configuration.with_chain_info(&source).mining_reward();
+        !source.declined() && view.mined_amount() != reward
+    }
+
+    /// DEC-178 / DEC-339: the creator of block `s − H` when the step-4
+    /// liveness credit of the block at `idx` with sequence `s` is due (held
+    /// from `s = H` on; the genesis blocks are derived before their slots
+    /// are written) —
+    /// `None` below `s = H`, without a configuration, and below `seed_from`
+    /// (a window-anchored FR3 pass passes `a + H`, whose creator of `s − H`
+    /// lies below its segment, DEC-210; everything else passes 0). One header
+    /// read, along the block's own ancestry (a switch replay's active chain is
+    /// mid-walk). `Err` when that ancestor is not held or not readable — a
+    /// local fault; an `IntegrityFailure` stays apart at the read (DEC-320).
+    ///
+    /// The switch undo and the rewind pass 0: they never reach a block below
+    /// `a + H` (the switch bound keeps `A ≥ a + H`, DEC-211; a rewind's blocks
+    /// lie at or above an evidence block's `p − 1` in Ready, and in the FR3
+    /// pass only where `p − W ≥ a`, DEC-262), so their candidate is the one the
+    /// live step used.
+    pub(super) fn liveness_candidate(
+        &self,
+        idx: u32,
+        seq: u32,
+        seed_from: u32,
+    ) -> Result<Option<u32>, ()> {
+        let Some(h) = self.verification_horizon() else {
+            return Ok(None);
+        };
+        if seq < h || seq < seed_from {
+            return Ok(None);
+        }
+        let parent = self.blocks.get(idx).ok_or(())?.parent_ref();
+        let target = self.ancestor_at(parent, seq - h).ok().flatten().ok_or(())?;
+        self.creator_of_retained(target).map(Some)
+    }
+
+    /// The creator in the header of the retained block at `idx`, by one read
+    /// into its own buffer (DEC-136). `Err` on a failed read or bytes that no
+    /// longer parse; an `IntegrityFailure` is matched apart (DEC-320), though
+    /// it stays a local fault until O-026's release path exists.
+    #[inline(never)]
+    fn creator_of_retained(&self, idx: u32) -> Result<u32, ()> {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        match self.read_retained(idx, &mut buf) {
+            Ok(Some(view)) => Ok(view.creator()),
+            Ok(None) => Err(()),
+            Err(StorageError::IntegrityFailure) => Err(()),
+            Err(_) => Err(()),
+        }
     }
 
     /// Checks one transaction and applies its effects, atomically: on `Err`
@@ -468,7 +586,7 @@ impl<
                     return Err(invalid(ValidationReason::TransactionSignatureInvalid));
                 }
             }
-            let fee = nt.fee() as u64;
+            let fee = transaction_fee(tx, false);
             let debit = nt
                 .amount()
                 .checked_add(fee)
@@ -562,14 +680,10 @@ impl<
             // derivable yet, as for every other transaction kind: a seeded
             // creator's balance must stay exact, or a later balance block
             // listing it fails the D9 equality.
-            let total_fees = if is_genesis_zero {
-                derivation.total_fees
-            } else {
-                derivation
-                    .total_fees
-                    .checked_add(reg.fee())
-                    .ok_or(invalid(ValidationReason::ValueOverflow))?
-            };
+            let total_fees = derivation
+                .total_fees
+                .checked_add(transaction_fee(tx, is_genesis_zero))
+                .ok_or(invalid(ValidationReason::ValueOverflow))?;
             // Effects, after every check. `registration_price` is absorbed
             // (debited, credited to no node); the fee goes to the creator.
             if debits {
@@ -722,14 +836,11 @@ impl<
             applied.1 += 1;
         }
         // [D] The fee is the surplus over all inputs and outputs; a zero-input
-        // carry-forward pays none (FR6).
-        if cx.input_count() > 0 {
-            let fee = in_sum.saturating_sub(out_sum);
-            derivation.total_fees = derivation
-                .total_fees
-                .checked_add(fee)
-                .ok_or(invalid(ValidationReason::ValueOverflow))?;
-        }
+        // carry-forward pays none (FR6) — `transaction_fee`, the one definition.
+        derivation.total_fees = derivation
+            .total_fees
+            .checked_add(transaction_fee(tx, is_genesis_zero))
+            .ok_or(invalid(ValidationReason::ValueOverflow))?;
         Ok(())
     }
 
