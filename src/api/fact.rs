@@ -133,10 +133,11 @@ impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize, const
         false
     }
 
-    /// Performs every confirm read `view`'s credits need, before the engine
-    /// runs; `false` when one fails (a local fault, nothing mutated). Always
-    /// `true` where node ids fit the filter.
-    pub(super) fn reads_hold(&self, view: &BlockView<'_>) -> bool {
+    /// Performs every confirm read `view`'s credits need — its vote targets
+    /// and the step-4 liveness candidate (DEC-178) — before the engine runs;
+    /// `false` when one fails (a local fault, nothing mutated). Always `true`
+    /// where node ids fit the filter.
+    pub(super) fn reads_hold(&self, view: &BlockView<'_>, liveness: Option<u32>) -> bool {
         if !ids_exceed_filter(MAX_NODES) {
             return true;
         }
@@ -144,6 +145,9 @@ impl<'a, S: StorageTrait, const MAX_BLOCKS: usize, const MAX_NODES: usize, const
             for tx in txs.iter() {
                 self.excluded(tx.vote());
             }
+        }
+        if let Some(node) = liveness {
+            self.excluded(node);
         }
         !self.fault.get()
     }

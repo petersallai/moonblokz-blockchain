@@ -569,27 +569,59 @@ impl<
     /// The head extension (Story 6.0) and the chain switch (Story 6.3) keep
     /// `node_info` — the watermark included — at the active head's state;
     /// Story 7.2 completes the per-block update set (FR35).
-    pub(super) fn chain_info_at_head(&self) -> ChainInfoAtHead {
-        ChainInfoAtHead {
-            registered_node_count: self
-                .is_ready()
+    pub(super) fn chain_info_at_head(&self) -> ProjectionChainInfo {
+        self.chain_info_served(self.is_ready())
+    }
+
+    /// The chain-info source of a per-block step, bound at the applied
+    /// block's pre-state (specification §4.6 rule 4; DEC-305): built before
+    /// the block's own registrations move the watermark. `served` is
+    /// `Projection::complete` — Ready, a genesis-anchored FR3 pass, genesis —
+    /// and false at every position of a window-anchored pass and at side-block
+    /// Tier 2, where every read declines (DEC-340).
+    pub(super) fn chain_info_pre_state(&self, served: bool) -> ProjectionChainInfo {
+        self.chain_info_served(served)
+    }
+
+    fn chain_info_served(&self, served: bool) -> ProjectionChainInfo {
+        ProjectionChainInfo {
+            registered_node_count: served
                 .then(|| u64::from(self.node_info.max_known_node_id()) + 1),
+            declined: core::cell::Cell::new(false),
         }
     }
 }
 
 /// The blockchain's chain-info source: values read once, at bind time, from the
 /// FR34 projections. A thin read: no field, no cache, no maintenance of its own.
-pub(super) struct ChainInfoAtHead {
+///
+/// It records whether it declined a read (§4.6 rule 5): the resolved value
+/// cannot show that a program's tier fell through, and a consensus check
+/// whose resolution read a declined value is skipped, never evaluated against
+/// the fall-through value. A nested `GETCONFIG` reads through the same source,
+/// so its declines are recorded too.
+pub(super) struct ProjectionChainInfo {
     /// Node ids are contiguous, so the count is the node-id watermark plus one.
     registered_node_count: Option<u64>,
+    declined: core::cell::Cell<bool>,
 }
 
-impl ChainInfoSource for ChainInfoAtHead {
+impl ProjectionChainInfo {
+    /// Whether any read through this source declined since it was built.
+    pub(super) fn declined(&self) -> bool {
+        self.declined.get()
+    }
+}
+
+impl ChainInfoSource for ProjectionChainInfo {
     fn read(&self, id: u8, args: &[u64]) -> Option<u64> {
-        match (id, args) {
+        let value = match (id, args) {
             (chain_info::REGISTERED_NODE_COUNT, []) => self.registered_node_count,
             _ => None,
+        };
+        if value.is_none() {
+            self.declined.set(true);
         }
+        value
     }
 }

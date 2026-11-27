@@ -49,9 +49,10 @@ impl<
     /// active chain, so whether the output is unspent on this branch is Tier 3.
     ///
     /// The other FR9 Tier 2 items join here and in the shared head step
-    /// together: `mined_amount`, fee and price rules (7.2 / 7.3), the approval
-    /// threshold (6.7), the structural `snake_chain` checks (9.2 / 9.3 / 9.5 /
-    /// 6.6). Registration-key uniqueness is Tier 3 on a side branch (D6).
+    /// together: `mined_amount` (7.2, below), fee and price rules (7.3), the
+    /// approval threshold (6.7), the structural `snake_chain` checks (9.2 /
+    /// 9.3 / 9.5 / 6.6). Registration-key uniqueness is Tier 3 on a side
+    /// branch (D6).
     pub(super) fn tier2_check(
         &self,
         view: &BlockView<'_>,
@@ -68,6 +69,13 @@ impl<
             block_idx: idx,
             reason,
         };
+        // FR6 / FR9 Tier 2 (DEC-217): `mined_amount` against `mining_reward`.
+        // A side block's pre-state is not the head's, so the chain-info source
+        // declines here (DEC-305): a reward that reads chain-info is judged at
+        // the switch replay instead; a literal one is judged now.
+        if !is_fr36_exempt(view) && self.mined_amount_mismatch(view, false) {
+            return Err(invalid(ValidationReason::MinedAmountMismatch));
+        }
         match self.deviation_run_at(parent_idx) {
             Ok(run) => run_rules(view, run, h).map_err(invalid)?,
             Err(()) => {
@@ -145,7 +153,7 @@ impl<
             // be evaluated: a local failure, never trust.
             match self.dropped_by_extension(head, tail, w) {
                 Ok(Some(dropped)) => {
-                    let Ok(obligation) = self.tail_obligation(dropped) else {
+                    let Ok(obligation) = self.tail_obligation(dropped, true) else {
                         return Extension::Local;
                     };
                     if tail_drop_binding(obligation, view) == TailBinding::Invalid {

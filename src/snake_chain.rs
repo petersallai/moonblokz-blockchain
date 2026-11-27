@@ -18,7 +18,9 @@
 //! preservation-binding decision on a head extension. The `u32::MAX` refusal
 //! rule is Story 8.1; the replay generators are Stories 9.2–9.5.
 
-use moonblokz_chain_types::{BlockView, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG};
+use moonblokz_chain_types::{
+    BlockView, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION,
+};
 
 use crate::blocks::BlockTable;
 use crate::node_info::NodeInfoState;
@@ -113,15 +115,35 @@ pub(crate) fn tail_drop_binding(obligation: TailObligation, extension: &BlockVie
         TailObligation::None => true,
         TailObligation::ChainConfig => extension.payload_type() == PAYLOAD_TYPE_CHAIN_CONFIG,
         TailObligation::SeedSource => extension.payload_type() == PAYLOAD_TYPE_BALANCE,
-        TailObligation::Utxo => extension.transactions().is_some_and(|txs| {
-            txs.iter()
-                .any(|tx| tx.as_complex().is_some_and(|cx| cx.input_count() == 0))
-        }),
+        TailObligation::Utxo => carries_carry_forward(extension),
     };
     if preserved {
         TailBinding::Advance
     } else {
         TailBinding::Invalid
+    }
+}
+
+/// Whether `block` carries a zero-input complex transaction — the FR51
+/// carry-forward shape. One definition for the FR48 binding above and the
+/// FR36(c) replay predicate.
+pub(crate) fn carries_carry_forward(block: &BlockView) -> bool {
+    block.transactions().is_some_and(|txs| {
+        txs.iter()
+            .any(|tx| tx.as_complex().is_some_and(|cx| cx.input_count() == 0))
+    })
+}
+
+/// FR36(c) (DEC-306): whether `block` carries an essential-state replay
+/// obligation, decided from its bytes — a balance block (FR50), a chain-config
+/// block (FR49; the genesis #1 is FR36-exempt before this is asked) or a
+/// transaction block carrying a carry-forward (FR51). Its creator earns one
+/// `replay_block_reward`, however many carry-forwards the block holds.
+pub(crate) fn is_replay_bearing(block: &BlockView) -> bool {
+    match block.payload_type() {
+        PAYLOAD_TYPE_BALANCE | PAYLOAD_TYPE_CHAIN_CONFIG => true,
+        PAYLOAD_TYPE_TRANSACTION => carries_carry_forward(block),
+        _ => false,
     }
 }
 

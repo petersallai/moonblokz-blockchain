@@ -609,7 +609,11 @@ impl<
             }
             self.previous_seed_sources(parent, &owners[..count], &mut sources[..count])?;
         }
-        let creator = self.undo_committed_block(idx, &owners[..count], &sources[..count])?;
+        // DEC-339: the liveness candidate the apply used, read before the
+        // undo's own read buffer exists (DEC-136).
+        let liveness = self.liveness_candidate(idx, entry.sequence(), 0)?;
+        let creator =
+            self.undo_committed_block(idx, &owners[..count], &sources[..count], liveness)?;
         self.active_set.remove(creator);
         self.blocks.set_status(idx, BlockStatus::Connected);
         self.blocks.set_on_active_chain(idx, false);
@@ -708,6 +712,7 @@ impl<
         idx: u32,
         owners: &[u32],
         sources: &[u32],
+        liveness: Option<u32>,
     ) -> Result<u32, ()> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf).ok_or(())?;
@@ -732,10 +737,12 @@ impl<
                 self.verification_horizon(),
                 idx,
             );
-            if !drop.reads_hold(&v) {
+            if !drop.reads_hold(&v, liveness) {
                 return Err(());
             }
-            let undone = self.vote_engine.undo_block(v, |node| drop.excluded(node));
+            let undone = self
+                .vote_engine
+                .undo_block(v, |node| drop.excluded(node), liveness);
             if drop.faulted() {
                 // The engine's result is not trusted: escalate (DEC-205),
                 // as the commit and the vote step do; the FR3 pass has no
@@ -753,8 +760,9 @@ impl<
             self.node_info.move_seed_source(*owner, *source);
         }
         if !is_fr36_exempt(&view) && self.node_info.is_seeded(view.creator()) {
+            let reward = replay_reward(&self.chain_config, &view);
             self.node_info
-                .debit(view.creator(), view.mined_amount() as u64 + fees);
+                .debit(view.creator(), view.mined_amount() as u64 + fees + reward);
         }
         self.invert_transactions(&view, idx, usize::MAX);
         self.active_branch_value = remaining_value;

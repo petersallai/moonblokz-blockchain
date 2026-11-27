@@ -1024,7 +1024,7 @@ impl<
                 .filter(|&d| d < count)
                 .and_then(|d| marked.get(d))
             {
-                match self.tail_obligation(*dropped) {
+                match self.tail_obligation(*dropped, projection.complete) {
                     // An empty slot or a failed read of the dropping block
                     // (DEC-330) is the node's own failure: local.
                     Err(_) => {

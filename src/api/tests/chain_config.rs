@@ -710,8 +710,9 @@ fn fr8_lock_is_arrival_order_independent() {
             bc.receive_block(block.view(), 0);
         }
         // The locked content as a fingerprint: its first two bytes are the
-        // `config_value_count`, which is 4 for the base override set config A
-        // carries (window, horizon, node cap and scheme) and 5 for config B's.
+        // `config_value_count`, which is 5 for the base override set config A
+        // carries (window, horizon, node cap, vote interest and scheme) and 6
+        // for config B's.
         let locked = bc
             .chain_config
             .durable_content()
@@ -728,7 +729,7 @@ fn fr8_lock_is_arrival_order_independent() {
     );
     assert_eq!(
         a_first,
-        (true, 4, [4, 0]),
+        (true, 4, [5, 0]),
         "and they converge on config A — the candidate's own — with the side branch gone"
     );
 }

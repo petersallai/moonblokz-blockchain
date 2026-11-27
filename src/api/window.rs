@@ -34,21 +34,32 @@ impl<
     /// Ready extension, the FR3 pass and FR12 eligibility (Stories 8.3 / 9.5
     /// reuse it on the creator side).
     ///
-    /// The fee is read from the held configuration. Story 7.2 binds the
-    /// per-block chain-info source (DEC-305); until then a computed custodian
-    /// fee's chain-info reads decline and fall through. A configuration not
-    /// held, an empty slot or a failed read is the node's own failure
-    /// ([`TailUnreadable`]), never "no obligation".
-    pub(super) fn tail_obligation(&self, dropped: u32) -> Result<TailObligation, TailUnreadable> {
+    /// The fee is resolved at the carrying head's pre-state under the per-block
+    /// chain-info source (DEC-305), `served` as for the step (DEC-340): where
+    /// a computed fee's chain-info read declined, the binding is not judged —
+    /// the tail drops as the chain carries it, trusted like the pre-seed zone,
+    /// never classified against the fall-through fee (DEC-330). A
+    /// configuration not held, an empty slot or a failed read is the node's
+    /// own failure ([`TailUnreadable`]), never "no obligation".
+    pub(super) fn tail_obligation(
+        &self,
+        dropped: u32,
+        served: bool,
+    ) -> Result<TailObligation, TailUnreadable> {
         let obligation = classify_tail_drop(&self.blocks, &self.node_info, dropped)?;
         if obligation != TailObligation::Utxo {
             return Ok(obligation);
         }
+        let source = self.chain_info_pre_state(served);
         let fee = self
             .chain_config
             .active_configuration()
             .ok_or(TailUnreadable)?
+            .with_chain_info(&source)
             .custodian_fee();
+        if source.declined() {
+            return Ok(TailObligation::None);
+        }
         if self.dropping_block_carries_output_above(dropped, fee)? {
             Ok(TailObligation::Utxo)
         } else {

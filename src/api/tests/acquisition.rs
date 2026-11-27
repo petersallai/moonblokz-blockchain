@@ -1305,14 +1305,15 @@ fn credit_block(
 
 /// AC4 / FR36 — the creator credit is auto-accepted (skipped) for an unseeded
 /// creator (pre-seed zone): no phantom balance is written to an unknown
-/// baseline. Uses a non-zero `mined_amount` so the credit is observable.
+/// baseline. Uses a non-zero `mined_amount` so the credit is observable, on a
+/// chain whose `mining_reward` it equals (Story 7.2).
 #[test]
 fn fr3_creator_credit_skipped_for_unseeded_creator() {
-    let mut bc = new_test_chain();
+    let mut bc = rewarded_test_chain(500);
     // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
     // block in scope, so the segment is anchored by one. Inert with
     // respect to everything below — see `chain_config_anchor_block`.
-    let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+    let cfg_hash = admit_rewarded_anchor(&mut bc, 99, [0xAB; 32], 500);
     let blk = credit_block(100, cfg_hash, 8, 500, 7, 9, 0);
     let bi = bc
         .tier1_admit(&blk.view(), &blk.view().hash(), 0)
@@ -1331,18 +1332,19 @@ fn fr3_creator_credit_skipped_for_unseeded_creator() {
     );
 }
 
-/// FR36 — a seeded creator IS credited its `mined_amount` (+ fees).
+/// FR36 — a seeded creator IS credited its `mined_amount` (+ fees), which
+/// equals the chain's `mining_reward` (Story 7.2).
 #[test]
 fn fr3_creator_credit_applied_to_seeded_creator() {
-    let mut bc = new_test_chain();
+    let mut bc = rewarded_test_chain(500);
     // FR8 (Story 5.9, AC3): the candidate must carry a chain-config
     // block in scope, so the segment is anchored by one. Inert with
     // respect to everything below — see `chain_config_anchor_block`.
-    let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
+    let cfg_hash = admit_rewarded_anchor(&mut bc, 99, [0xAB; 32], 500);
     // max_node_id 9 so the transfer's (unseeded, pre-window) initializer 7 and
     // receiver 9 are within the valid node-id range — only node 3 is
     // individually seeded (partial FR50 coverage).
-    let anchor = balance_block(100, cfg_hash, &[(3, 100, 0, 0x33)], 9);
+    let anchor = balance_block_mined(100, cfg_hash, &[(3, 100, 0, 0x33)], 9, 500);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
     let blk = credit_block(101, anchor.view().hash(), 3, 500, 7, 9, 0);
@@ -1665,7 +1667,7 @@ fn fr6_rejects_divergent_chain_config() {
     let mut builder = BlockBuilder::new().header(header);
     let mut config_payload = window_config_builder(TEST_W);
     config_payload
-        .add_literal(parameter::VOTE_INTEREST, &[5])
+        .add_literal(parameter::MINING_REWARD, &0u32.to_le_bytes())
         .ok()
         .expect("a one-entry override set frames");
     builder
@@ -1766,7 +1768,9 @@ fn admit_all(bc: &mut TestChain, blocks: &[&Block]) -> u32 {
 /// `mined_amount` (before 6.10 the sequence alone exempted it).
 #[test]
 fn a_sequence_one_transaction_block_gets_the_ordinary_fr36_credit() {
-    let mut bc = new_test_chain();
+    // A chain whose `mining_reward` is 5, so `mined_amount = 5` is valid
+    // (FR6, Story 7.2) and the credit observable.
+    let mut bc = rewarded_test_chain(5);
     let genesis = genesis_zero_block(1_000);
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
     let nt = NodeTransfer::new_signed(0, 0, 0, 0, 0, 0, 0, &signer);
@@ -1785,7 +1789,7 @@ fn a_sequence_one_transaction_block_gets_the_ordinary_fr36_credit() {
     let mut builder = BlockBuilder::new().header(header);
     builder.add_node_transfer(&nt).ok().expect("add transfer");
     let one = builder.build_signed(&signer).ok().expect("build signed");
-    let cfg = chain_config_anchor_block(2, one.view().hash());
+    let cfg = chain_config_block_mined(2, one.view().hash(), &mut rewarded_config_builder(5), 5);
     // #2 and #1 first, as orphans, so block #0's arrival completes the
     // genesis-anchored candidate and the node goes Ready on it (FR2–FR4).
     for block in [&cfg, &one, &genesis] {
@@ -1793,10 +1797,13 @@ fn a_sequence_one_transaction_block_gets_the_ordinary_fr36_credit() {
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
     }
     assert!(bc.is_ready());
+    // Block #2, a non-genesis chain-config block, is replay-bearing (FR36
+    // (c), DEC-306): node #0 also earns its `mined_amount` and the 100
+    // `replay_block_reward`.
     assert_eq!(
         bc.node_info.balance_of(0),
-        1_005,
-        "the minted 1 000 plus block #1's mined_amount"
+        1_000 + 5 + 5 + 100,
+        "the minted 1 000 plus block #1's mined_amount, plus block #2's credit"
     );
     // The chain-switch inverse uses the same predicate: undoing #2 and then
     // #1 takes the credit back (`api/switch.rs` `undo_committed_block`).

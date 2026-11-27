@@ -336,12 +336,23 @@ pub(super) fn chain_config_block_from(
     prev: [u8; 32],
     payload_builder: &mut ChainConfigPayloadBuilder,
 ) -> Block {
+    chain_config_block_mined(seq, prev, payload_builder, 0)
+}
+
+/// [`chain_config_block_from`] with a `mined_amount`: on a chain that declares
+/// a `mining_reward`, every non-genesis block must carry it (FR6, Story 7.2).
+pub(super) fn chain_config_block_mined(
+    seq: u32,
+    prev: [u8; 32],
+    payload_builder: &mut ChainConfigPayloadBuilder,
+    mined_amount: u32,
+) -> Block {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
     let header = BlockHeader {
         version: 1,
         sequence: seq,
         creator: 0,
-        mined_amount: 0,
+        mined_amount,
         payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
         consumed_votes: 0,
         first_voted_node: 0,
@@ -359,14 +370,14 @@ pub(super) fn chain_config_block_from(
 }
 
 /// A **second, equally valid** override set, distinct in bytes from the base
-/// one: the base entry plus a literal declaring `vote_interest`'s own default
-/// value. It resolves every parameter identically to the base set, so a node
+/// one: the base entries plus a literal declaring `mining_reward`'s own
+/// default value 0. It resolves every parameter identically to the base set, so a node
 /// adopting it behaves the same — the only thing that differs is the content
 /// bytes, which is exactly what the FR7/FR8 byte-identity rules turn on.
 pub(super) fn alt_config_builder() -> ChainConfigPayloadBuilder {
     let mut builder = window_config_builder(TEST_W);
     builder
-        .add_literal(parameter::VOTE_INTEREST, &[5])
+        .add_literal(parameter::MINING_REWARD, &0u32.to_le_bytes())
         .ok()
         .expect("one literal entry is well-formed");
     builder
@@ -378,8 +389,8 @@ pub(super) fn alt_config_builder() -> ChainConfigPayloadBuilder {
 /// below the build's block capacity, so a realistic block can exceed it.
 ///
 /// Five bytes above the largest of the test configuration block (its
-/// 32-byte content: the four-byte `W`, `H`, block-size and node-cap entries
-/// and the one-byte scheme and support entries), the one-entry balance
+/// 35-byte content: the four-byte `W`, `H`, block-size and node-cap entries
+/// and the one-byte vote-interest, scheme and support entries), the one-entry balance
 /// block and the one-transfer block (a clean slot's, Story 6.7 D8), so all
 /// fit; below the three-entry balance block and the three-output
 /// transaction block the fixtures exceed it with. Derived from the scheme's
@@ -387,7 +398,7 @@ pub(super) fn alt_config_builder() -> ChainConfigPayloadBuilder {
 /// `bls-min-pk`, against 254 / 430 / 334 B for the smaller of the two large
 /// fixtures.
 pub(super) const SMALL_BLOCK_SIZE_LIMIT: u32 = {
-    let config_block = HEADER_SIZE + 32 + SIGNATURE_SIZE;
+    let config_block = HEADER_SIZE + 35 + SIGNATURE_SIZE;
     let balance_block = HEADER_SIZE + 8 + NODE_INFO_SIZE;
     let transfer_block = HEADER_SIZE + 2 + moonblokz_chain_types::NODE_TRANSFER_SIZE;
     let mut largest = config_block;
@@ -435,6 +446,49 @@ pub(super) fn content_of(block: &Block) -> &[u8] {
 /// returns its hash, for use as the next block's `previous_hash`. The block
 /// is deliberately admitted through `tier1_admit`, so the FR7 content
 /// signature is really verified on the way in.
+/// The test window's override set plus `mining_reward = reward` (ID 5).
+pub(super) fn rewarded_config_builder(reward: u32) -> ChainConfigPayloadBuilder {
+    let mut builder = window_config_builder(TEST_W);
+    builder
+        .add_literal(parameter::MINING_REWARD, &reward.to_le_bytes())
+        .ok()
+        .expect("a four-byte literal is well-formed");
+    builder
+}
+
+/// [`new_test_chain`] durably locked on [`rewarded_config_builder`], for the
+/// FR36 (a) credit tests: since Story 7.2 a block's `mined_amount` must equal
+/// the chain's `mining_reward` (FR6, DEC-217), so a credit is observable only
+/// on a chain that declares one.
+pub(super) fn rewarded_test_chain(reward: u32) -> TestChain {
+    let (crypto, storage, _) = test_backends();
+    let mut chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+    chain_config
+        .load_durable(rewarded_config_builder(reward).build_signed(&crypto))
+        .ok()
+        .expect("a rewarded override set is accepted content");
+    let node_zero = *crypto.public_key().serialize();
+    let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
+    TestChain::init(&mut bc_slot, crypto, storage, chain_config, 5, node_zero, 0);
+    // SAFETY: `init` returned, so every field of `bc_slot` is initialized.
+    unsafe { bc_slot.assume_init() }
+}
+
+/// [`admit_chain_config_anchor`] for a [`rewarded_test_chain`]: the anchor
+/// carries the rewarded content and the reward as its `mined_amount`.
+pub(super) fn admit_rewarded_anchor(
+    bc: &mut TestChain,
+    seq: u32,
+    prev: [u8; 32],
+    reward: u32,
+) -> [u8; 32] {
+    let cfg = chain_config_block_mined(seq, prev, &mut rewarded_config_builder(reward), reward);
+    let hash = cfg.view().hash();
+    bc.tier1_admit(&cfg.view(), &hash, 0)
+        .expect("chain-config anchor admitted");
+    hash
+}
+
 pub(super) fn admit_chain_config_anchor(bc: &mut TestChain, seq: u32, prev: [u8; 32]) -> [u8; 32] {
     let cfg = chain_config_anchor_block(seq, prev);
     let hash = cfg.view().hash();
@@ -449,6 +503,18 @@ pub(super) fn balance_block(
     entries: &[(u32, u64, u32, u8)],
     max_node_id: u32,
 ) -> Block {
+    balance_block_mined(seq, prev, entries, max_node_id, 0)
+}
+
+/// [`balance_block`] with a `mined_amount` (a chain declaring a
+/// `mining_reward`, Story 7.2).
+pub(super) fn balance_block_mined(
+    seq: u32,
+    prev: [u8; 32],
+    entries: &[(u32, u64, u32, u8)],
+    max_node_id: u32,
+    mined: u32,
+) -> Block {
     use moonblokz_chain_types::NodeInfo;
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
     // Seed every node with the *real* universal test public key (node zero's,
@@ -462,7 +528,7 @@ pub(super) fn balance_block(
         version: 1,
         sequence: seq,
         creator: 0,
-        mined_amount: 0,
+        mined_amount: mined,
         payload_type: PAYLOAD_TYPE_BALANCE,
         consumed_votes: 0,
         first_voted_node: 0,
@@ -1187,13 +1253,15 @@ pub(super) fn votes_for(
 
 /// An active-chain block by node `creator` (#0 or #1) carrying its real
 /// FR21 value on a chain whose creators alternate between #0 and #1, each
-/// block crediting only the next creator. `received` is the number of
-/// credits the previous block gave `creator` — its whole accumulated vote,
-/// since its own last block reset it — so `consumed_votes =
-/// I(1000 · received)` (= `1005 · received` while `received ≤ 200`, below
-/// the interest cap). The block casts `out` credits
-/// for the other node (or, with `out == 0`, one for its own creator, which
-/// the reset wipes). `register` puts node #1's registration first.
+/// block crediting only the next creator. `received` is the number of votes
+/// the previous block cast for `creator`; under the per-target credit cap
+/// (DEC-176, Story 7.2) any number of them is one credit, which is its whole
+/// accumulated vote, since its own last block reset it — so `consumed_votes
+/// = I(1000)` (1005 at the test `vote_interest`) when `received ≥ 1`, else
+/// 0. The block casts `out` votes for the other node (or, with `out == 0`,
+/// one for its own creator, which the reset wipes). `register` puts node
+/// #1's registration first. The chains are shorter than `H`, so no liveness
+/// credit (DEC-178) enters.
 pub(super) fn alt(
     seq: u32,
     prev: [u8; 32],
@@ -1217,7 +1285,12 @@ pub(super) fn alt(
         }
     });
     let key = if creator == 0 { 1 } else { NODE_ONE_KEY };
-    resign(&template, creator, vote_snapshot(1000 * received), key)
+    resign(
+        &template,
+        creator,
+        vote_snapshot(1000 * received.min(1)),
+        key,
+    )
 }
 
 /// `block` as `creator`'s (signed with `key`), worth its real FR21 value on

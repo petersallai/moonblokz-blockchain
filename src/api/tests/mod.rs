@@ -29,6 +29,7 @@ use crate::approval::test_seams::{AGGREGATE_VERIFICATIONS, TX_SIGNATURE_VERIFICA
 mod acquisition;
 mod admission;
 mod chain_config;
+mod crediting;
 mod evidence;
 mod fact;
 mod fixtures;
@@ -110,42 +111,20 @@ const TEST_MAX_BLOCKS: usize = TEST_W as usize + 2 * TEST_H as usize;
 /// (DEC-318), 32 outputs per block.
 const TEST_UTXO_BYTES: usize = 4;
 
-/// The base override set as a **content region**: one literal entry
-/// declaring `active_chain_length = TEST_W`. Every other parameter resolves
-/// to its code-baked default, and those defaults are exactly the constants
-/// the retired `FixedChainConfig` returned — which is why the suite's
-/// expected values are unchanged. The last entry declares the build's
-/// signature scheme ([`declare_build_scheme`]).
-const BASE_CONFIG_CONTENT: [u8; 23] = [
-    4,
-    0,
-    parameter::ACTIVE_CHAIN_LENGTH,
-    4,
-    TEST_W.to_le_bytes()[0],
-    TEST_W.to_le_bytes()[1],
-    TEST_W.to_le_bytes()[2],
-    TEST_W.to_le_bytes()[3],
-    parameter::VERIFICATION_HORIZON,
-    4,
-    test_horizon(TEST_W).to_le_bytes()[0],
-    test_horizon(TEST_W).to_le_bytes()[1],
-    test_horizon(TEST_W).to_le_bytes()[2],
-    test_horizon(TEST_W).to_le_bytes()[3],
-    parameter::MAX_NODE_COUNT,
-    4,
-    TEST_MAX_NODES.to_le_bytes()[0],
-    TEST_MAX_NODES.to_le_bytes()[1],
-    TEST_MAX_NODES.to_le_bytes()[2],
-    TEST_MAX_NODES.to_le_bytes()[3],
-    parameter::SIGNATURE_SCHEME,
-    1,
-    moonblokz_crypto::SIGNATURE_SCHEME,
-];
+/// The `vote_interest` every test configuration declares: the registry's
+/// pre-7.2 default 5, whose vote arithmetic the suite's hand-computed values
+/// (branch values, header snapshots, late-list votes) were written against.
+/// The registry default is 50 since DEC-176 (Story 7.2); the vote rules are
+/// the same at any rate, and the tests that exercise the new default use a
+/// configuration of their own.
+const TEST_VOTE_INTEREST: u8 = 5;
 
-/// A second content region, valid and **distinct in bytes** but resolving
-/// identically: the base entry plus a literal declaring `vote_interest`'s
-/// own default. Used where a test needs two different chain-config contents.
-const OTHER_CONFIG_CONTENT: [u8; 26] = [
+/// The base override set as a **content region**: literal entries declaring
+/// `active_chain_length = TEST_W`, its horizon, the node cap and
+/// [`TEST_VOTE_INTEREST`]. Every other parameter resolves to its code-baked
+/// default. The last entry declares the build's signature scheme
+/// ([`declare_build_scheme`]).
+const BASE_CONFIG_CONTENT: [u8; 26] = [
     5,
     0,
     parameter::ACTIVE_CHAIN_LENGTH,
@@ -168,7 +147,45 @@ const OTHER_CONFIG_CONTENT: [u8; 26] = [
     TEST_MAX_NODES.to_le_bytes()[3],
     parameter::VOTE_INTEREST,
     1,
-    5,
+    TEST_VOTE_INTEREST,
+    parameter::SIGNATURE_SCHEME,
+    1,
+    moonblokz_crypto::SIGNATURE_SCHEME,
+];
+
+/// A second content region, valid and **distinct in bytes** but resolving
+/// identically: the base entries plus a literal declaring `mining_reward`'s
+/// own default 0. Used where a test needs two different chain-config contents.
+const OTHER_CONFIG_CONTENT: [u8; 32] = [
+    6,
+    0,
+    parameter::ACTIVE_CHAIN_LENGTH,
+    4,
+    TEST_W.to_le_bytes()[0],
+    TEST_W.to_le_bytes()[1],
+    TEST_W.to_le_bytes()[2],
+    TEST_W.to_le_bytes()[3],
+    parameter::VERIFICATION_HORIZON,
+    4,
+    test_horizon(TEST_W).to_le_bytes()[0],
+    test_horizon(TEST_W).to_le_bytes()[1],
+    test_horizon(TEST_W).to_le_bytes()[2],
+    test_horizon(TEST_W).to_le_bytes()[3],
+    parameter::MAX_NODE_COUNT,
+    4,
+    TEST_MAX_NODES.to_le_bytes()[0],
+    TEST_MAX_NODES.to_le_bytes()[1],
+    TEST_MAX_NODES.to_le_bytes()[2],
+    TEST_MAX_NODES.to_le_bytes()[3],
+    parameter::VOTE_INTEREST,
+    1,
+    TEST_VOTE_INTEREST,
+    parameter::MINING_REWARD,
+    4,
+    0,
+    0,
+    0,
+    0,
     parameter::SIGNATURE_SCHEME,
     1,
     moonblokz_crypto::SIGNATURE_SCHEME,
@@ -195,6 +212,10 @@ fn window_horizon_config_builder(w: u32, h: u32) -> ChainConfigPayloadBuilder {
         .add_literal(parameter::MAX_NODE_COUNT, &TEST_MAX_NODES.to_le_bytes())
         .ok()
         .expect("a four-byte literal is well-formed");
+    builder
+        .add_literal(parameter::VOTE_INTEREST, &[TEST_VOTE_INTEREST])
+        .ok()
+        .expect("a one-byte literal is well-formed");
     declare_build_scheme(&mut builder);
     builder
 }

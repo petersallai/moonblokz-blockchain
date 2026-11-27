@@ -53,7 +53,8 @@ use crate::lifecycle::is_legal_transition;
 use crate::node_info::{NodeInfoState, SEED_SOURCE_RELEASED};
 use crate::prng::Prng;
 use crate::snake_chain::{
-    TailBinding, TailObligation, TailUnreadable, classify_tail_drop, tail_drop_binding,
+    TailBinding, TailObligation, TailUnreadable, classify_tail_drop, is_replay_bearing,
+    tail_drop_binding,
 };
 use crate::staged_validation::{
     BlockStatus, SUPPORTED_VERSION, Tier1Failure, tier1_chain_config_block, tier1_gate,
@@ -90,7 +91,7 @@ pub use outcomes::{
     ReceiveSupportOutcome, ReceiveTransactionOutcome, RejectReason, RestartRejectReason,
     TickOutcome, TransactionState, TxStateQueryError,
 };
-use step::{fees_and_utxo_outputs, is_fr36_exempt};
+use step::{fees_and_utxo_outputs, is_fr36_exempt, replay_reward};
 
 /// Why the active-chain snake-chain window is unavailable — the `Err` side of
 /// [`Blockchain::active_snake_chain_window`]. A `Result` rather than `Option`
@@ -360,6 +361,9 @@ pub(crate) enum ValidationReason {
     /// FR72 I-43 rule 7 (DEC-279): the snapshot is not the equivocator's vote
     /// after the block's interest step.
     TwinFactSnapshot,
+    /// FR6 / FR9 Tier 2 (DEC-217): a non-genesis block's `mined_amount` is not
+    /// the `mining_reward` resolved at its pre-state (Story 7.2).
+    MinedAmountMismatch,
 }
 
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass
@@ -518,8 +522,14 @@ enum Projected {
 struct BlockDerivation {
     /// FR36(b) transaction-fee total.
     total_fees: u64,
+    /// FR36(c): the `replay_block_reward` when the block is replay-bearing,
+    /// else 0 (DEC-306; literal-only, DEC-341).
+    replay_reward: u64,
     /// The block's UTXO-output count: its available-UTXO bits to set.
     utxo_outputs: usize,
+    /// DEC-178: the creator of block `s − H` when the liveness credit is due
+    /// (DEC-339: read here, so the commit needs no read).
+    liveness: Option<u32>,
 }
 
 /// The FR3 candidate chain-config preload verdict — see
