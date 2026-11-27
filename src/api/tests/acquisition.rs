@@ -487,9 +487,10 @@ fn fr3_derives_balance_block_seed_and_watermark() {
         "watermark from max_node_id"
     );
     // vote_count seeds accumulated vote; the balance block's own acceptance
-    // applies FR37 interest (0 on values < vote_scale) + creator(0) reset.
+    // applies FR37 interest (`⌊v / 20⌋` at the default `vote_interest` 50:
+    // 10 stays 10, 20 becomes 21) + creator(0) reset.
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), 10);
-    assert_eq!(bc.vote_engine.accumulated_vote_of(2), 20);
+    assert_eq!(bc.vote_engine.accumulated_vote_of(2), 21);
     // FR38 creator-order is a read-through of the vote registry: node 2
     // (vote 20) outranks node 1 (vote 10); the zero-vote tail follows by
     // ascending node id.

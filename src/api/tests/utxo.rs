@@ -248,18 +248,28 @@ fn utxo_input_not_before_block_is_rejected_at_intake() {
 
 /// AC8 (8) / AC6 — the fee counts UTXO outputs: a balance input of 100
 /// paid entirely into a UTXO output leaves no surplus, so the creator gets
-/// nothing (it used to get another 100). The chain's `mining_reward` is 0,
-/// which since Story 7.2 the block's `mined_amount` must equal.
+/// its mined amount and nothing more (it used to get another 100). The chain
+/// declares `mining_reward = 7`, which the block's `mined_amount` must equal
+/// (Story 7.2).
 #[test]
 fn utxo_output_is_not_paid_out_as_fee() {
-    let (mut bc, h100) = utxo_test_chain();
+    let mut bc = rewarded_test_chain(7);
+    let cfg_hash = admit_rewarded_anchor(&mut bc, 99, [0xAB; 32], 7);
+    let seed = balance_block_mined(
+        100,
+        cfg_hash,
+        &[(1, 100, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
+        3,
+        7,
+    );
+    admit(&mut bc, &seed);
     let tx = utxo_tx(101, &[], Some((1, 100)), &[Ok(100)]);
-    let block = complex_tx_block(101, h100, 3, 0, &[&tx]);
+    let block = complex_tx_block(101, seed.view().hash(), 3, 7, &[&tx]);
     let bi = admit(&mut bc, &block);
 
     bc.run_processing_pass(bi).expect("pass succeeds");
 
-    assert_eq!(bc.node_info.balance_of(3), 0, "mined 0, fee 0");
+    assert_eq!(bc.node_info.balance_of(3), 7, "mined 7, fee 0");
     assert_eq!(bc.node_info.balance_of(1), 0);
 }
 

@@ -83,7 +83,7 @@ fn fr22_equal_value_goes_to_the_larger_tip() {
         // Open-ended: the tip's hash follows the scheme's keys, and a tip
         // near either end leaves few siblings on that side.
         let smaller = (100..100_000)
-            .map(|amount| valued(3, a2.view().hash(), 1005, amount))
+            .map(|amount| valued(3, a2.view().hash(), 1050, amount))
             .find(|blk| (blk.view().hash() < tip.hash()) == lower_hash)
             .expect("a one-transaction sibling");
         assert!(smaller.view().len() < tip.len());
@@ -98,7 +98,7 @@ fn fr22_equal_value_goes_to_the_larger_tip() {
     }
     let larger = revalue(
         &tx_block(3, a2.view().hash(), 0, votes_for(3, 0, 3, 500)),
-        1005,
+        1050,
     );
     assert!(larger.view().len() > tip.len());
     assert_eq!(
@@ -119,7 +119,7 @@ fn fr22_tie_goes_to_the_lower_hash_not_the_creator() {
         let (mut bc, _, a2, a3) = two_creator_chain();
         let tip = a3.view();
         let side = (100..100_000)
-            .map(|amount| valued(3, a2.view().hash(), 1005, amount))
+            .map(|amount| valued(3, a2.view().hash(), 1050, amount))
             .find(|blk| {
                 let view = blk.view();
                 view.len() == tip.len() && (view.hash() < tip.hash()) == want_lower
@@ -433,7 +433,7 @@ fn fr22_compares_after_the_continuation() {
     );
     bc.storage.failing_read_slot = NONE_REF;
 
-    // Above `b4` (worth 0), below `b4` + `c5` (2 015).
+    // Above `b4` (worth 0), below `b4` + `c5` (`I(1050 + 1000)` = 2 152).
     let x = valued(4, mint.view().hash(), 1500, 40);
     assert_eq!(receive(&mut bc, &x), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (5, c5.view().hash()), "the continuation ran");
@@ -465,7 +465,7 @@ fn i09_vote_headers_are_verified_at_ready_intake() {
             prev,
             1,
             NODE_ONE_KEY,
-            1005 + 1000,
+            1050 + 1000,
             1,
             0,
             votes_for(3, 1, 1, 40),
@@ -473,15 +473,15 @@ fn i09_vote_headers_are_verified_at_ready_intake() {
         // A normal block with a wrong value.
         headed(3, prev, 1, NODE_ONE_KEY, 2000, 1, 0, votes_for(3, 0, 1, 41)),
         // The normal form with a deviation field (Tier 1 form).
-        headed(3, prev, 1, NODE_ONE_KEY, 1005, 1, 5, votes_for(3, 0, 1, 42)),
+        headed(3, prev, 1, NODE_ONE_KEY, 1050, 1, 5, votes_for(3, 0, 1, 42)),
         // A deviation naming a node that is not the top.
         headed(3, prev, 0, 1, 0, 5, 10, votes_for(3, 0, 1, 43)),
         // A deviation with a wrong snapshot of the top (its pre-interest value).
         headed(3, prev, 0, 1, 0, 1, 1000, votes_for(3, 0, 1, 44)),
         // A deviation counting its own credit (AR-005).
-        headed(3, prev, 0, 1, 1000, 1, 1005, votes_for(3, 0, 1, 45)),
+        headed(3, prev, 0, 1, 1000, 1, 1050, votes_for(3, 0, 1, 45)),
         // A deviation above the top's snapshot (Tier 1 form).
-        headed(3, prev, 0, 1, 4000, 1, 1005, votes_for(3, 0, 1, 46)),
+        headed(3, prev, 0, 1, 4000, 1, 1050, votes_for(3, 0, 1, 46)),
     ];
     for (i, bad) in refused.iter().enumerate() {
         let free = bc.blocks.next_free_index();
@@ -496,7 +496,7 @@ fn i09_vote_headers_are_verified_at_ready_intake() {
             "case {i}: nothing stored"
         );
     }
-    let d3 = headed(3, prev, 0, 1, 0, 1, 1005, |b| {
+    let d3 = headed(3, prev, 0, 1, 0, 1, 1050, |b| {
         votes_for(3, 0, 1, 47)(b);
         votes_for(3, 1, 1, 48)(b);
     });
@@ -521,7 +521,7 @@ fn i09_mismatch_in_the_fr3_pass_is_deleted() {
         // A deviation with a wrong snapshot of the top (its pre-interest value).
         headed(3, prev, 0, 1, 0, 1, 1000, votes_for(3, 0, 1, 52)),
         // A deviation counting its own credit (AR-005).
-        headed(3, prev, 0, 1, 1000, 1, 1005, votes_for(3, 0, 1, 53)),
+        headed(3, prev, 0, 1, 1000, 1, 1050, votes_for(3, 0, 1, 53)),
     ];
     for (i, bad3) in bad.iter().enumerate() {
         let mut mesh = new_unconfigured_test_chain();
@@ -660,7 +660,7 @@ fn fr28_two_stage_scoring_end_to_end() {
             1,
             0,
             1,
-            1005,
+            1050,
             votes_for(3, 1, 2, 60),
         )
     };
@@ -675,7 +675,7 @@ fn fr28_two_stage_scoring_end_to_end() {
         "the deviation is active at once"
     );
     assert_eq!(receive(&mut bc, &n), ReceiveBlockOutcome::AcceptedSilently);
-    assert_eq!(v(&n), 1005);
+    assert_eq!(v(&n), 1050);
     assert_eq!(
         head_of(&bc),
         (3, n.view().hash()),
@@ -1127,7 +1127,7 @@ fn seeding_balance_block<S: StorageTrait>(state: &Chain16<S>, seq: u32, prev: [u
     builder.build_signed(&signer).ok().expect("build signed")
 }
 
-/// `s3`: node #1's block at #3 on `a2`, worth 1005, larger than `a3` (three
+/// `s3`: node #1's block at #3 on `a2`, worth 1050, larger than `a3` (three
 /// credits for node #0). Beside node #0's [`zero_tip`] it is an honest fork
 /// that wins by value (Story 6.12); beside node #1's `a3` it would be a
 /// twin (FR70).
@@ -1258,7 +1258,7 @@ fn fr23_undo_inverts_every_block_kind() {
         1,
         0,
         1,
-        1005,
+        1050,
         votes_for(3, 1, 2, 60),
     );
     check(bc, &replica, &d, "deviation");
@@ -1321,7 +1321,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
     let (mi, oi) = (slot(&bc, &mint), slot(&bc, &o4));
     assert_eq!(bc.blocks.utxo_available(mi, 0), Some(false));
     assert_eq!(bc.blocks.utxo_available(oi, 0), Some(true));
-    // `n4`, node #1's, spends the same (3, 0) into two outputs: worth 1005.
+    // `n4`, node #1's, spends the same (3, 0) into two outputs: worth 1050.
     let n4 = resign(
         &spend(&[Ok(30), Ok(30)])(&mint),
         1,
@@ -1343,7 +1343,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
 
     // An output only the abandoned branch holds: `x5` spends (4, 0),
     // which on its own branch is `x4`, a block without outputs. Here `o4`
-    // is node #1's (worth 1005) and `x4` node #0's (worth 0), an honest
+    // is node #1's (worth 1050) and `x4` node #0's (worth 0), an honest
     // fork (FR70) that outranks only with `x5` (node #1's, credited by the
     // mint and `x4`).
     let (mut bc, mint) = faulty_utxo_genesis();

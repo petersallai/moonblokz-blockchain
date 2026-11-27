@@ -620,10 +620,27 @@ fn mined_balance_block(
 #[test]
 fn balance_block_repeats_the_pre_state_in_ready() {
     // Two nodes: #0 (the creator) and #1, registered at #2. A transfer at
-    // #3 gives #1 a vote so the snapshot has a non-trivial vote count.
+    // #3 gives #1 a vote so the snapshot has a non-trivial vote count. The
+    // chain declares `mining_reward = 3`, so every block carries it (FR6,
+    // Story 7.2) and the creator credit is observable.
     let build = || {
-        let (mut bc, _, b1) = ready_genesis(16);
-        let reg = register(2, b1.view().hash(), 1, 0x31);
+        let (crypto, storage, chain_config) = test_backends();
+        let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
+        let mut config = window_config_builder(16);
+        config
+            .add_literal(parameter::MINING_REWARD, &3u32.to_le_bytes())
+            .ok()
+            .expect("a four-byte literal is well-formed");
+        let b1 = bc
+            .process_genesis(CURRENCY, config.content())
+            .ok()
+            .expect("genesis succeeds")
+            .block_one;
+        let reg = tx_block(2, b1.view().hash(), 3, |b| {
+            b.add_registration(&registration_tx(0, 1, 0x31))
+                .ok()
+                .expect("add registration");
+        });
         receive(&mut bc, &reg);
         let nt = NodeTransfer::new_signed(
             1,
@@ -635,7 +652,7 @@ fn balance_block_repeats_the_pre_state_in_ready() {
             0,
             &Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key"),
         );
-        let t3 = tx_block(3, reg.view().hash(), 0, |b| {
+        let t3 = tx_block(3, reg.view().hash(), 3, |b| {
             b.add_node_transfer(&nt).ok().expect("transfer");
         });
         receive(&mut bc, &t3);
@@ -658,14 +675,14 @@ fn balance_block_repeats_the_pre_state_in_ready() {
             0,
         ),
     ] {
-        let bad = mined_balance_block(4, prev, &[entry], 1, 0);
+        let bad = mined_balance_block(4, prev, &[entry], 1, 3);
         assert_eq!(
             step_reason(&mut bc, &bad),
             Some(ValidationReason::BalanceSnapshotMismatch)
         );
     }
     // An entry for a node that does not exist is Invalid in Ready.
-    let ghost = mined_balance_block(4, prev, &[(2, 0, 0, 0)], 1, 0);
+    let ghost = mined_balance_block(4, prev, &[(2, 0, 0, 0)], 1, 3);
     assert_eq!(
         step_reason(&mut bc, &ghost),
         Some(ValidationReason::NodeIdOutOfRange)
@@ -674,8 +691,11 @@ fn balance_block_repeats_the_pre_state_in_ready() {
     // A mismatch as a stored child is deleted, derived state untouched.
     let (mut replica, _) = build();
     let mut bad_child_chain = build().0;
-    let filler = transfer(4, prev, 0, 7);
-    let bad = mined_balance_block(5, filler.view().hash(), &[(owner, 0, votes, 0)], 1, 0);
+    let filler_tx = transfer_tx(4, 0, 7);
+    let filler = tx_block(4, prev, 3, |b| {
+        b.add_node_transfer(&filler_tx).ok().expect("transfer");
+    });
+    let bad = mined_balance_block(5, filler.view().hash(), &[(owner, 0, votes, 0)], 1, 3);
     receive(&mut bad_child_chain, &bad);
     receive(&mut bad_child_chain, &filler);
     receive(&mut replica, &filler);
@@ -688,19 +708,18 @@ fn balance_block_repeats_the_pre_state_in_ready() {
 
     // The matching snapshot is accepted: the entries leave balances and
     // votes as they were; only the block-level effects apply.
-    let good = mined_balance_block(4, prev, &[(owner, balance, votes, 0)], 1, 0);
+    let good = mined_balance_block(4, prev, &[(owner, balance, votes, 0)], 1, 3);
     let vote_one = bc.vote_engine.accumulated_vote_of(1);
     assert_eq!(
         receive(&mut bc, &good),
         ReceiveBlockOutcome::AcceptedSilently
     );
     assert_eq!(head_of(&bc), (4, good.view().hash()));
-    // FR36 (c): a balance block is replay-bearing, so its creator earns the
-    // `replay_block_reward` (default 100, DEC-306); `mined_amount` is the
-    // chain's `mining_reward`, 0.
+    // FR36: the mined amount 3 (a), and, a balance block being replay-bearing,
+    // the `replay_block_reward` (default 100, DEC-306) (c).
     assert_eq!(
         bc.node_info.balance_of(0),
-        balance + 100,
+        balance + 3 + 100,
         "the creator credit"
     );
     assert_eq!(
@@ -988,7 +1007,7 @@ fn branch_value_is_seeded_at_every_ready_entry() {
     }
     assert!(mesh.is_ready());
     assert_eq!(head_of(&mesh), (3, a3.view().hash()));
-    assert_eq!(v(&a3), 1005);
+    assert_eq!(v(&a3), 1050);
     assert_eq!(
         mesh.active_branch_value,
         v(&b1) + v(&a2) + v(&a3),
@@ -1126,7 +1145,7 @@ fn failed_new_tail_read_is_a_local_failure() {
         "the retry extended"
     );
     assert_eq!(bc.active_snake_chain_window(), Ok((1, 6)));
-    assert_eq!(v(&b4), 1005, "two votes, one credit (DEC-176)");
+    assert_eq!(v(&b4), 1050, "two votes, one credit (DEC-176)");
     assert_eq!(
         bc.active_branch_value,
         v(&b2) + v(&b3) + v(&b4) + v(&b5) + v(&snapshot)
@@ -1153,7 +1172,7 @@ fn branch_value_follows_direct_and_continuation_extensions() {
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(receive(&mut bc, &b3), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (4, b4.view().hash()));
-    assert_eq!((v(&b3), v(&b4)), (1005, 0), "distinct real values");
+    assert_eq!((v(&b3), v(&b4)), (1050, 0), "distinct real values");
     assert_eq!(bc.active_branch_value, v(&b2) + v(&b3) + v(&b4));
     assert_eq!(
         bc.active_branch_value,

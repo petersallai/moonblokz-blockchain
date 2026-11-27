@@ -50,7 +50,7 @@ impl<
         if obligation != TailObligation::Utxo {
             return Ok(obligation);
         }
-        let source = self.chain_info_pre_state(served);
+        let source = self.projection_chain_info(served);
         let fee = self
             .chain_config
             .active_configuration()

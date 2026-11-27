@@ -484,7 +484,7 @@ impl<
     /// skipped (DEC-305, DEC-340). Without a configuration there is nothing to
     /// check against. The side-block Tier 2 calls it with `served = false`.
     pub(super) fn mined_amount_mismatch(&self, view: &BlockView<'_>, served: bool) -> bool {
-        let source = self.chain_info_pre_state(served);
+        let source = self.projection_chain_info(served);
         let Some(configuration) = self.chain_config.active_configuration() else {
             return false;
         };

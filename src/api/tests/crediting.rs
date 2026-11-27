@@ -163,6 +163,22 @@ fn a_size_dependent_reward_is_judged_at_the_pre_state() {
         );
     }
     assert!(joiner.vote_engine == g.vote_engine, "the same votes");
+
+    // A joiner given the stale value at #3 refuses it in its pass and goes
+    // Ready on the prefix.
+    let mut refusing = new_unconfigured_test_chain();
+    for block in [&stale, &b2, &b1, &b0] {
+        assert_eq!(
+            receive(&mut refusing, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    assert!(refusing.is_ready());
+    assert_eq!(head_of(&refusing), (2, b2.view().hash()));
+    assert!(
+        refusing.blocks.find(3, &stale.view().hash()).is_none(),
+        "deleted"
+    );
 }
 
 /// Rule 5: where the source declines, a check whose resolution read
@@ -214,7 +230,7 @@ fn a_nested_decline_is_recorded() {
         .ok()
         .expect("the program frames");
     let (g, _, b1) = genesis_with(&builder);
-    let source = g.chain_info_pre_state(false);
+    let source = g.projection_chain_info(false);
     let reward = g
         .chain_config
         .active_configuration()
@@ -223,7 +239,7 @@ fn a_nested_decline_is_recorded() {
         .mining_reward();
     assert_eq!(reward, 100, "the nested price fell through to its default");
     assert!(source.declined(), "and the decline is visible");
-    let served = g.chain_info_pre_state(true);
+    let served = g.projection_chain_info(true);
     let reward = g
         .chain_config
         .active_configuration()
@@ -328,7 +344,7 @@ fn a_replay_reward_that_overflows_the_creator_is_invalid() {
 
 /// On the W6 harness (`H = 3`, #2 a clean slot): node #0 registers node #1
 /// at #3, and node #1 creates #4, so node #0 — the creator of #1 — gains
-/// `⌈1000 / 5⌉ = 200` (DEC-178). At #3 the candidate (node #0, creator of
+/// `⌈1000 / 50⌉ = 20` (DEC-178, at the default `vote_interest`). At #3 the candidate (node #0, creator of
 /// #0) is the block's own creator, so nothing is credited there. The undo
 /// takes the credit back.
 #[test]
@@ -338,25 +354,33 @@ fn the_liveness_credit_reaches_the_creator_of_s_minus_h() {
     assert_eq!(receive(&mut bc, &b2), ReceiveBlockOutcome::AcceptedSilently);
     let b3 = register(3, b2.view().hash(), 1, NODE_ONE_KEY);
     assert_eq!(receive(&mut bc, &b3), ReceiveBlockOutcome::AcceptedSilently);
+    // The exact boundary `s = H`: the candidate is read (the creator of #0)
+    // and skipped only because it is #3's own creator.
+    let b3_idx = bc.active_chain_head_idx;
+    assert_eq!(bc.liveness_candidate(b3_idx, 3, 0), Ok(Some(0)), "s = H");
+    assert_eq!(bc.liveness_candidate(NONE_REF, 2, 0), Ok(None), "s < H");
     assert_eq!(
         bc.vote_engine.accumulated_vote_of(0),
         0,
         "reset at #3, and no credit to the block's own creator"
     );
-    let before = (
-        bc.node_info.balance_of(0),
-        bc.vote_engine.accumulated_vote_of(1),
-    );
+    // A replica that stops at #3: the undo of #4 must reach its projection.
+    let (mut replica, _, _) = ready_genesis_w6();
+    for block in [&b2, &b3] {
+        assert_eq!(
+            receive(&mut replica, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
     let b4 = real_on(
         &bc,
         &tx_block(4, b3.view().hash(), 0, votes_for(4, 1, 1, 70)),
         1,
         NODE_ONE_KEY,
     );
-    assert_eq!(bc.liveness_candidate(NONE_REF, 2, 0), Ok(None), "s < H");
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (4, b4.view().hash()));
-    assert_eq!(bc.vote_engine.accumulated_vote_of(0), 200);
+    assert_eq!(bc.vote_engine.accumulated_vote_of(0), 20);
     let b4_idx = bc.active_chain_head_idx;
     assert_eq!(bc.liveness_candidate(b4_idx, 4, 0), Ok(Some(0)));
     // A window-anchored pass below `a + H` asks for no candidate (DEC-210).
@@ -364,13 +388,7 @@ fn the_liveness_credit_reaches_the_creator_of_s_minus_h() {
 
     assert_eq!(bc.undo_active_head(), Ok(()));
     assert_eq!(bc.vote_engine.accumulated_vote_of(0), 0, "undone");
-    assert_eq!(
-        (
-            bc.node_info.balance_of(0),
-            bc.vote_engine.accumulated_vote_of(1)
-        ),
-        before
-    );
+    same_projection(&bc, &replica, "the liveness credit undone");
 }
 
 /// An unreadable `s − H` is the node's own failure, never evidence: the

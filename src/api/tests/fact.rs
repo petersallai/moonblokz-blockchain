@@ -604,7 +604,16 @@ fn a_node_on_the_other_twin_does_not_support_the_round() {
     // The opener on `y`'s branch is a side block for a node on `a3`.
     let (mut bc, _, _, y) = twin_chain();
     let top = 0;
-    let e_y = fact_with(4, y.view().hash(), top, key_of(top), 3015, &y, 0, &[0]);
+    let e_y = fact_with(
+        4,
+        y.view().hash(),
+        top,
+        key_of(top),
+        vote_snapshot(1000),
+        &y,
+        0,
+        &[0],
+    );
     assert_eq!(
         receive(&mut bc, &e_y),
         ReceiveBlockOutcome::AcceptedSilently

@@ -389,8 +389,8 @@ pub(super) fn alt_config_builder() -> ChainConfigPayloadBuilder {
 /// below the build's block capacity, so a realistic block can exceed it.
 ///
 /// Five bytes above the largest of the test configuration block (its
-/// 35-byte content: the four-byte `W`, `H`, block-size and node-cap entries
-/// and the one-byte vote-interest, scheme and support entries), the one-entry balance
+/// 32-byte content: the four-byte `W`, `H`, block-size and node-cap entries
+/// and the one-byte scheme and support entries), the one-entry balance
 /// block and the one-transfer block (a clean slot's, Story 6.7 D8), so all
 /// fit; below the three-entry balance block and the three-output
 /// transaction block the fixtures exceed it with. Derived from the scheme's
@@ -398,7 +398,7 @@ pub(super) fn alt_config_builder() -> ChainConfigPayloadBuilder {
 /// `bls-min-pk`, against 254 / 430 / 334 B for the smaller of the two large
 /// fixtures.
 pub(super) const SMALL_BLOCK_SIZE_LIMIT: u32 = {
-    let config_block = HEADER_SIZE + 35 + SIGNATURE_SIZE;
+    let config_block = HEADER_SIZE + 32 + SIGNATURE_SIZE;
     let balance_block = HEADER_SIZE + 8 + NODE_INFO_SIZE;
     let transfer_block = HEADER_SIZE + 2 + moonblokz_chain_types::NODE_TRANSFER_SIZE;
     let mut largest = config_block;
@@ -1221,11 +1221,11 @@ pub(super) fn valued(seq: u32, prev: [u8; 32], value: u32, amount: u64) -> Block
 pub(super) const NODE_ONE_KEY: u8 = 0x31;
 
 /// `I(av)`: FR37 step 1 under the test configuration (`vote_scale` 1000,
-/// `vote_interest` 5, so the bump is `min(⌊av / 200⌋, 1000)`) — the
+/// the default `vote_interest` 50, so the bump is `min(⌊av / 20⌋, 1000)`) — the
 /// post-interest, pre-credit snapshot a block's `consumed_votes` carries
 /// (DEC-156).
 pub(super) fn vote_snapshot(av: u32) -> u32 {
-    av + (av / 200).min(1000)
+    av + (av / 20).min(1000)
 }
 
 /// The FR21 value of `block`: its header `consumed_votes`.
@@ -1257,7 +1257,7 @@ pub(super) fn votes_for(
 /// the previous block cast for `creator`; under the per-target credit cap
 /// (DEC-176, Story 7.2) any number of them is one credit, which is its whole
 /// accumulated vote, since its own last block reset it — so `consumed_votes
-/// = I(1000)` (1005 at the test `vote_interest`) when `received ≥ 1`, else
+/// = I(1000)` (1050 at the default `vote_interest` 50) when `received ≥ 1`, else
 /// 0. The block casts `out` votes for the other node (or, with `out == 0`,
 /// one for its own creator, which the reset wipes). `register` puts node
 /// #1's registration first. The chains are shorter than `H`, so no liveness
@@ -1438,7 +1438,7 @@ pub(super) fn faulty_genesis(w: u32) -> (Chain16<FaultyStorage>, Block) {
 /// the mint and #4.
 pub(super) fn utxo_side_fixture() -> (Chain16<FaultyStorage>, Block, Block) {
     let (mut bc, mint) = faulty_utxo_genesis();
-    // Node #1's, credited once by the mint: worth `I(1000)` = 1005 (I-09),
+    // Node #1's, credited once by the mint: worth `I(1000)` = 1050 (I-09),
     // above the free values the side blocks of these Tier 2 tests carry,
     // so none of them is switched to (Story 6.3).
     let b4 = real_on(&bc, &transfer(4, mint.view().hash(), 0, 7), 1, NODE_ONE_KEY);
@@ -1485,7 +1485,7 @@ pub(super) fn headed(
 }
 
 /// A genesis node on `W = 16` with `a2` (node #0's, registering node #1
-/// and crediting it once) and `a3` (node #1's, worth 1005).
+/// and crediting it once) and `a3` (node #1's, worth 1050).
 pub(super) fn two_creator_chain() -> (TestChain, Block, Block, Block) {
     let (mut bc, _, b1) = ready_genesis(16);
     let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
@@ -1493,7 +1493,7 @@ pub(super) fn two_creator_chain() -> (TestChain, Block, Block, Block) {
     for blk in [&a2, &a3] {
         assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
     }
-    assert_eq!(bc.active_branch_value, 1005);
+    assert_eq!(bc.active_branch_value, 1050);
     (bc, b1, a2, a3)
 }
 

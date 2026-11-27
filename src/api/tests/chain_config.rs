@@ -21,7 +21,8 @@ fn code_baked_defaults_reproduce_the_retired_stub() {
     assert_eq!(config.max_utxo_outputs(), 32);
     assert_eq!(config.required_support(), 40);
     assert_eq!(config.vote_scale().get(), 1000);
-    assert_eq!(config.vote_interest(), 5);
+    // DEC-176 (Story 7.2): the default rate is 50, no longer the stub's 5.
+    assert_eq!(config.vote_interest(), 50);
     assert_eq!(config.parent_recovery_per_head_retry_interval_ms(), 120_000);
     assert_eq!(config.parent_recovery_min_emit_interval_ms(), 10_000);
     // The one value the fixtures declare rather than default (Story 5.11).
@@ -710,9 +711,8 @@ fn fr8_lock_is_arrival_order_independent() {
             bc.receive_block(block.view(), 0);
         }
         // The locked content as a fingerprint: its first two bytes are the
-        // `config_value_count`, which is 5 for the base override set config A
-        // carries (window, horizon, node cap, vote interest and scheme) and 6
-        // for config B's.
+        // `config_value_count`, which is 4 for the base override set config A
+        // carries (window, horizon, node cap and scheme) and 5 for config B's.
         let locked = bc
             .chain_config
             .durable_content()
@@ -729,7 +729,7 @@ fn fr8_lock_is_arrival_order_independent() {
     );
     assert_eq!(
         a_first,
-        (true, 4, [5, 0]),
+        (true, 4, [4, 0]),
         "and they converge on config A — the candidate's own — with the side branch gone"
     );
 }
