@@ -89,14 +89,14 @@ pub(super) fn late_room(room: usize, m: usize, n: usize) -> Option<usize> {
         .map(|free| (free / APPROVAL_LATE_ENTRY_SIZE).min(u16::MAX as usize))
 }
 
-/// DEC-184's late node: ranked above the proposer at `p − 1`, other than `u`.
+/// DEC-184's late node: ranked above the proposer at `p − 1` — the
+/// originally-top node `u` included, as the list's first entry (DEC-344).
 pub(super) fn is_late<const MAX_NODES: usize>(
     engine: &VoteEngine<MAX_NODES>,
     n: u32,
     proposer: u32,
-    u: u32,
 ) -> bool {
-    n != u && engine.ranks_above(n, proposer)
+    engine.ranks_above(n, proposer)
 }
 
 /// Story 6.7 AC4 rules 1–5 for `block` on a parent whose open run is `run`
@@ -316,7 +316,9 @@ impl<
         };
         let r_eff = required_signers(m);
         let n = evidence.signer_count() as usize;
-        if usize::from(evidence.m()) != m || n < r_eff {
+        // DEC-347: exactly `r_eff` signers, the builder's form (DEC-236). An
+        // extra signer would shrink the late room the list is judged against.
+        if usize::from(evidence.m()) != m || n != r_eff {
             return Err(invalid(ValidationReason::EvidenceSubgroup));
         }
         let mut signers = [0u32; MAX_AGGREGATED_SIGNATURES];
@@ -398,10 +400,12 @@ impl<
                 return true;
             }
             // The late list: the prefix of the late nodes in creator order
-            // that fits. Every listed id a late node, strictly descending in
-            // the order (so distinct), and exactly `L − 1` late nodes above the
-            // last one — no scratch list, the same predicates as the builder.
-            let expected = (k as usize).saturating_sub(1).min(late_room);
+            // that fits, `u` first (DEC-344: all `k` ranks above the
+            // proposer). Every listed id a late node, strictly descending in
+            // the order (so distinct), and exactly `late_count − 1` late nodes
+            // above the last one — no scratch list, the same predicates as the
+            // builder.
+            let expected = (k as usize).min(late_room);
             let mut previous = None;
             let listed_ok = late_count == expected
                 && (0..late_count).all(|i| {
@@ -409,16 +413,14 @@ impl<
                         return false;
                     };
                     let ok = id <= last_node
-                        && is_late(engine, id, creator_d, u)
+                        && is_late(engine, id, creator_d)
                         && previous.is_none_or(|q| engine.ranks_above(q, id));
                     previous = Some(id);
                     ok
                 })
                 && previous.is_none_or(|last| {
                     (0..=last_node)
-                        .filter(|&n| {
-                            is_late(engine, n, creator_d, u) && engine.ranks_above(n, last)
-                        })
+                        .filter(|&n| is_late(engine, n, creator_d) && engine.ranks_above(n, last))
                         .count()
                         == late_count - 1
                 });

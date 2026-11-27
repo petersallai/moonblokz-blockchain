@@ -983,7 +983,7 @@ fn the_snapshot_restores_credits_banked_since_the_twin() {
     );
     let view = BlockView::from_bytes(&bytes).ok().expect("parses");
     bc.vote_engine
-        .undo_block(view, |node| drop.excluded(node), None)
+        .undo_block(view, |node| drop.excluded(node), None, None)
         .expect("undoes");
     assert_eq!(bc.vote_engine.accumulated_vote_of(1), banked);
 }

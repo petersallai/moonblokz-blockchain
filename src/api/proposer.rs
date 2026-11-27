@@ -328,9 +328,9 @@ impl<
                 return true;
             }
             // At `p − 1`: `u` heads the order; DEC-216's value (shared with
-            // the evidence check, Story 6.7 AC8); the late nodes, the ranks
-            // above the proposer but `u`, kept in creator order by bounded
-            // insertion.
+            // the evidence check, Story 6.7 AC8); the late nodes, every rank
+            // above the proposer with `u` first (DEC-344), kept in creator
+            // order by bounded insertion.
             if engine.top_creator() != Some(u) {
                 return false;
             }
@@ -346,7 +346,7 @@ impl<
                 return false;
             };
             for n in 0..=last_node {
-                if !is_late(engine, n, local, u) {
+                if !is_late(engine, n, local) {
                     continue;
                 }
                 if late_count == late_room
@@ -588,10 +588,15 @@ impl<
         let Ok(liveness) = self.liveness_candidate(idx, seq, 0) else {
             return false;
         };
-        self.vote_step_with(idx, undo, creator, check, liveness)
+        let Ok(hold_exit) = self.hold_exit_slot(idx, seq, 0) else {
+            return false;
+        };
+        self.vote_step_with(idx, undo, creator, check, liveness, hold_exit)
     }
 
-    /// [`Self::vote_step`] with its liveness candidate. Its own read buffer.
+    /// [`Self::vote_step`] with its liveness candidate and the late-node
+    /// hold's exit slot (DEC-346). Its own read buffer; the engine frame
+    /// reads the exit block into a second one.
     #[inline(never)]
     fn vote_step_with(
         &mut self,
@@ -600,6 +605,7 @@ impl<
         creator: Option<u32>,
         check: bool,
         liveness: Option<u32>,
+        hold_exit: Option<u32>,
     ) -> bool {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let Some(view) = self.view_retained(idx, &mut buf) else {
@@ -615,32 +621,17 @@ impl<
         if check && self.vote_engine.check_header(&view, true, |_| true) != Ok(true) {
             return false;
         }
-        // FR72: the credit drop at this block (Story 6.13 AC6).
-        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
-            &self.blocks,
-            &self.storage,
-            self.verification_horizon(),
-            idx,
-        );
-        if !drop.reads_hold(&view, liveness) {
-            return false;
+        // The FR72 credit drop (Story 6.13 AC6) and the late-node hold's exit
+        // (DEC-346), as the live step runs them.
+        match self.run_vote_step(&view, idx, undo, liveness, hold_exit) {
+            VoteRun::Ran(stepped) => stepped.is_ok(),
+            VoteRun::Unread => false,
+            VoteRun::Faulted => {
+                // The engine's result is not trusted: escalate (DEC-205).
+                self.reentry_due |= self.is_ready();
+                false
+            }
         }
-        let excluded = |node| drop.excluded(node);
-        let stepped = if undo {
-            self.vote_engine
-                .undo_block(view, excluded, liveness)
-                .is_ok()
-        } else {
-            self.vote_engine
-                .apply_block(view, excluded, liveness)
-                .is_ok()
-        };
-        if drop.faulted() {
-            // The engine's result is not trusted: escalate (DEC-205).
-            self.reentry_due |= self.is_ready();
-            return false;
-        }
-        stepped
     }
 
     /// Story 6.6 AC8 (FR29, FR27, FR58; D6, D9) — what the proposer's

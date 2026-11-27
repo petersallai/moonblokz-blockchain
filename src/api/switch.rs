@@ -612,8 +612,15 @@ impl<
         // DEC-339: the liveness candidate the apply used, read before the
         // undo's own read buffer exists (DEC-136).
         let liveness = self.liveness_candidate(idx, entry.sequence(), 0)?;
-        let creator =
-            self.undo_committed_block(idx, &owners[..count], &sources[..count], liveness)?;
+        // DEC-346: the late-node hold's exit slot the apply used (RAM).
+        let hold_exit = self.hold_exit_slot(idx, entry.sequence(), 0)?;
+        let creator = self.undo_committed_block(
+            idx,
+            &owners[..count],
+            &sources[..count],
+            liveness,
+            hold_exit,
+        )?;
         self.active_set.remove(creator);
         self.blocks.set_status(idx, BlockStatus::Connected);
         self.blocks.set_on_active_chain(idx, false);
@@ -713,6 +720,7 @@ impl<
         owners: &[u32],
         sources: &[u32],
         liveness: Option<u32>,
+        hold_exit: Option<u32>,
     ) -> Result<u32, ()> {
         let mut buf = [0u8; MAX_BLOCK_SIZE];
         let view = self.view_retained(idx, &mut buf).ok_or(())?;
@@ -729,28 +737,18 @@ impl<
         }
         // The vote engine refuses atomically; its errors are the node's own
         // state, never evidence against the block (AC2 step 2).
-        if let Ok(v) = BlockView::from_bytes(view.serialized_bytes()) {
-            // FR72: the credit drop the apply made (Story 6.13 AC6).
-            let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
-                &self.blocks,
-                &self.storage,
-                self.verification_horizon(),
-                idx,
-            );
-            if !drop.reads_hold(&v, liveness) {
-                return Err(());
-            }
-            let undone = self
-                .vote_engine
-                .undo_block(v, |node| drop.excluded(node), liveness);
-            if drop.faulted() {
-                // The engine's result is not trusted: escalate (DEC-205),
-                // as the commit and the vote step do; the FR3 pass has no
+        // The FR72 credit drop and the late-node hold's exit the apply used
+        // (Story 6.13 AC6, DEC-346).
+        match self.run_vote_step(&view, idx, true, liveness, hold_exit) {
+            VoteRun::Ran(undone) => undone.map_err(|_| ())?,
+            VoteRun::Unread => return Err(()),
+            VoteRun::Faulted => {
+                // The engine's result is not trusted: escalate (DEC-205), as
+                // the commit and the vote step do; the FR3 pass has no
                 // re-entry of its own (code review P7).
                 self.reentry_due |= self.is_ready();
                 return Err(());
             }
-            undone.map_err(|_| ())?;
         }
         // Undone top-down: every descendant spend of this block's outputs is
         // undone already and side branches never touch bits, so its bits are

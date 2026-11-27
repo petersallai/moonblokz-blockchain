@@ -29,7 +29,7 @@ fn evidence_observer(proposer: u32) -> (SupportChain, Block, Block) {
 /// An evidence block at `seq` on `prev` by `creator` in the FR27 override
 /// header, its payload `ev` laid out per DEC-195, signed with the creator's
 /// fixture key (so Tier 1's creator signature passes).
-fn evidence_block(seq: u32, prev: [u8; 32], creator: u32, ev: &Evidence) -> Block {
+pub(super) fn evidence_block(seq: u32, prev: [u8; 32], creator: u32, ev: &Evidence) -> Block {
     let signer = Crypto::new([key_of(creator); PRIVATE_KEY_SIZE])
         .ok()
         .expect("key");
@@ -921,8 +921,9 @@ fn refused_evidence_case(
     assert_eq!(head_of(&g), (7, e.view().hash()), "the control");
 }
 
-/// AC5 step 2: a wrong `m`, or fewer than `r_eff` signers (one support,
-/// its own valid aggregate), is `EvidenceSubgroup`.
+/// AC5 step 2: a wrong `m`, or a signer count other than `r_eff` — one
+/// support, or (Story 7.7 AC3, DEC-347) every member's, each with its own valid
+/// aggregate — is `EvidenceSubgroup`.
 #[test]
 fn a_wrong_subgroup_is_refused() {
     refused_evidence_case(4, ValidationReason::EvidenceSubgroup, |ev| ev.m += 1);
@@ -932,6 +933,21 @@ fn a_wrong_subgroup_is_refused() {
         ev.bitmap = std::vec![0b01];
         ev.aggregate = aggregate_by(&members[..1], 4, 6, &hash);
     });
+    // Proposer 2's subgroup has a spare member (`m = 3`, `r_eff = 2`): all
+    // three sign.
+    let (d, _, members) = evidence_by(2);
+    let hash = d.view().hash();
+    assert_eq!(members.len(), 3, "m = 3, r_eff = 2");
+    let verified = counted(&AGGREGATE_VERIFICATIONS);
+    refused_evidence_case(2, ValidationReason::EvidenceSubgroup, |ev| {
+        ev.bitmap = std::vec![0b111];
+        ev.aggregate = aggregate_by(&members, 2, 6, &hash);
+    });
+    assert_eq!(
+        counted(&AGGREGATE_VERIFICATIONS) - verified,
+        1,
+        "a padded evidence is refused before its aggregate (only the control verifies)"
+    );
 }
 
 /// AC5 step 4: `supporter_vote_sum` one above or below `B_k − cv(d)` is
@@ -952,12 +968,13 @@ fn a_wrong_vote_sum_is_refused() {
     );
 }
 
-/// AC5 step 4: proposer 2's late list (nodes 5 and 0) dropped, extended,
-/// reordered, or with a wrong value at the tip is `EvidenceLateList`.
+/// AC5 step 4: proposer 2's late list (`u`, then nodes 5 and 0, DEC-344)
+/// dropped, extended, reordered, or with a wrong value at the tip is
+/// `EvidenceLateList`.
 #[test]
 fn a_wrong_late_list_is_refused() {
     let (_, e, _) = evidence_by(2);
-    assert_eq!(evidence_of(&e, 2).late.len(), 2, "two late entries");
+    assert_eq!(evidence_of(&e, 2).late.len(), 3, "three late entries");
     let late = ValidationReason::EvidenceLateList;
     refused_evidence_case(2, late, |ev| {
         ev.late.pop();
@@ -966,20 +983,19 @@ fn a_wrong_late_list_is_refused() {
     refused_evidence_case(2, late, |ev| ev.late.swap(0, 1));
     refused_evidence_case(2, late, |ev| ev.late[0].1 += 1);
     // Review: the right count, one listed id wrong — beyond the roster
-    // (99), or a registered node that is not late at `p − 1`.
-    for id in [99, 1, 2, 4] {
+    // (99), or a registered node that is not late at `p − 1` (the proposer
+    // 2, nodes 3 and 4; `u` = 1 is listed now, Story 7.7).
+    for id in [99, 3, 2, 4] {
         refused_evidence_case(2, late, |ev| ev.late[1].0 = id);
     }
-    // `u` heads the order, so in front of node 0, with its true value at
-    // the tip, it keeps the order, the count of late nodes above the last
-    // entry and the values: only "late" refuses it.
-    let (g, d, _) = evidence_observer(2);
+    // Story 7.7 (DEC-344): `u` is the list's first entry; the pre-7.7 form,
+    // the same list without it, is short by one.
+    let (_, d, _) = evidence_observer(2);
     let u = d.view().first_voted_node();
-    let at_tip = g
-        .vote_engine
-        .grown(g.vote_engine.accumulated_vote_of(u))
-        .expect("grown");
-    refused_evidence_case(2, late, |ev| ev.late[0] = (u, at_tip));
+    assert_eq!(evidence_of(&e, 2).late[0].0, u, "u first");
+    refused_evidence_case(2, late, |ev| {
+        ev.late.remove(0);
+    });
 }
 
 /// AC5 step 5: a corrupted aggregate byte (the framing kept) is
@@ -1033,9 +1049,9 @@ fn alternative_evidence(d: &Block, e: &Block, members: &[u32]) -> Block {
 }
 
 /// A block by node 5 on `e_alt`, which a node holding `d`, `e_alt` builds
-/// (any deviation and its evidence). Node 5 holds the chain's only vote
-/// (1 000 at #5), so `x8` is worth more than 0 and the twin branch outranks
-/// the active one by value, not by a hash-dependent tie-break.
+/// (any deviation and its evidence). Node 5 held the chain's only vote
+/// (1 000 at #5) until the evidence, whose late list resets it (Story 7.7,
+/// DEC-344), so `x8` is worth 0: it lengthens the branch, nothing more.
 fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     let (mut g, _, _) = support_chain(2);
     for block in [d, e_alt] {
@@ -1048,10 +1064,39 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     normal_after(&g, e_alt, 5, 81)
 }
 
+/// Two blocks on `e_alt` that make its branch outrank the active one by
+/// value, not by a hash-dependent tie-break: the evidence leaves every vote
+/// at 0 (its late list resets nodes 1, 5 and 0, Story 7.7), so `x8` (node 3)
+/// votes for node 4, and `x9` (node 4) is worth `I(1000)`.
+fn valued_children_of_alternative(d: &Block, e_alt: &Block) -> (Block, Block) {
+    let (mut g, _, _) = support_chain(2);
+    for block in [d, e_alt] {
+        assert_eq!(
+            receive(&mut g, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    let x8 = real_on(
+        &g,
+        &tx_block(8, e_alt.view().hash(), 0, votes_for(8, 4, 1, 81)),
+        3,
+        key_of(3),
+    );
+    assert_eq!(receive(&mut g, &x8), ReceiveBlockOutcome::AcceptedSilently);
+    let x9 = real_on(
+        &g,
+        &tx_block(9, x8.view().hash(), 0, votes_for(9, 3, 1, 82)),
+        4,
+        key_of(4),
+    );
+    assert!(x9.view().consumed_votes() > 0, "x9 carries value");
+    (x8, x9)
+}
+
 /// Story 6.12 (FR70, DEC-273) — a second valid evidence of one deviation
 /// is a twin: `e` and `e'` are the proposer's two children of `d` (FR16
 /// admits only its blocks above `d`). FR21 ranks the twin branch above the
-/// active one at `e'` or at `x8` (which, depends on the scheme's hashes and
+/// active one at `e'`, `x8` or `x9` (which, depends on the scheme's hashes and
 /// sizes; the pre-6.12 test switched under every scheme); it is held
 /// wherever it is compared, the node stays on the evidence it adopted first, `e'` is never
 /// judged (no aggregate verification), and the values are exact. An honest proposer
@@ -1061,7 +1106,7 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
 fn a_second_evidence_of_one_deviation_is_a_held_twin() {
     let (d, e, members) = evidence_by(2);
     let e_alt = alternative_evidence(&d, &e, &members);
-    let x8 = child_of_alternative(&d, &e_alt);
+    let (x8, x9) = valued_children_of_alternative(&d, &e_alt);
     let (mut g, _, built) = evidence_observer(2);
     assert_eq!(built.serialized_bytes(), e.serialized_bytes());
     assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
@@ -1076,8 +1121,11 @@ fn a_second_evidence_of_one_deviation_is_a_held_twin() {
     assert_eq!(receive(&mut g, &x8), ReceiveBlockOutcome::AcceptedSilently);
     let x8i = g.blocks.find(8, &x8.view().hash()).expect("held");
     let ranked_x8 = g.switch_target([Some(x8i), None]).is_some();
+    assert_eq!(receive(&mut g, &x9), ReceiveBlockOutcome::AcceptedSilently);
+    let x9i = g.blocks.find(9, &x9.view().hash()).expect("held");
+    let ranked_x9 = g.switch_target([Some(x9i), None]).is_some();
     assert!(
-        ranked_alt || ranked_x8,
+        ranked_alt || ranked_x8 || ranked_x9,
         "FR21 ranks the twin branch first at one admission"
     );
     assert_eq!(head_of(&g), (7, e.view().hash()), "still held");

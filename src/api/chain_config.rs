@@ -430,6 +430,14 @@ impl<
             .map(|config| config.verification_horizon())
     }
 
+    /// DEC-337: the late-node hold length `L = min(H, 255)` — at most 255, so
+    /// a hold count fits a `u8` on every build (DEC-338); `None` without a
+    /// configuration. `H` is literal-only and locked, so `L` never changes on
+    /// a chain.
+    pub(crate) fn late_hold_length(&self) -> Option<u32> {
+        self.verification_horizon().map(late_hold_length_of)
+    }
+
     /// The chain's node cap `max_node_count` (DEC-228) the held configuration
     /// declares. Never cached (FR56).
     ///
@@ -618,5 +626,15 @@ impl ChainInfoSource for ProjectionChainInfo {
             self.declined.set(true);
         }
         value
+    }
+}
+
+/// DEC-337: the late-node hold length for the verification horizon `h`,
+/// `L = min(H, 255)`.
+pub(crate) const fn late_hold_length_of(h: u32) -> u32 {
+    if h > u8::MAX as u32 {
+        u8::MAX as u32
+    } else {
+        h
     }
 }

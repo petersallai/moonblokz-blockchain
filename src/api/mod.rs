@@ -91,7 +91,7 @@ pub use outcomes::{
     ReceiveSupportOutcome, ReceiveTransactionOutcome, RejectReason, RestartRejectReason,
     TickOutcome, TransactionState, TxStateQueryError,
 };
-use step::{fees_and_utxo_outputs, is_fr36_exempt, replay_reward};
+use step::{VoteRun, fees_and_utxo_outputs, is_fr36_exempt, replay_reward};
 
 /// Why the active-chain snake-chain window is unavailable — the `Err` side of
 /// [`Blockchain::active_snake_chain_window`]. A `Result` rather than `Option`
@@ -497,12 +497,17 @@ enum PrePass {
 const NO_OPEN_RUN: u32 = u32::MAX;
 
 /// Whether a per-block step error is evidence against the block (Story 6.0
-/// AC3/AC6, DEC-037). A failed read, an inconsistent in-memory ancestry and
-/// an unparameterized vote engine are the node's own faults.
+/// AC3/AC6, DEC-037). A failed read, an inconsistent in-memory ancestry, an
+/// unparameterized vote engine and a late-node hold count out of range (an
+/// exit releasing a hold this node never opened, Story 7.7 — no block's
+/// bytes can cause it) are the node's own faults.
 fn is_evidence(err: &ProcessingError) -> bool {
     match err {
         ProcessingError::Invalid { .. } => true,
-        ProcessingError::Vote(e) => *e != VoteEngineError::NotParameterized,
+        ProcessingError::Vote(e) => !matches!(
+            e,
+            VoteEngineError::NotParameterized | VoteEngineError::HoldCountOutOfRange
+        ),
         ProcessingError::StorageRead
         | ProcessingError::MissingBlock
         | ProcessingError::MarkOverflow => false,
@@ -530,6 +535,9 @@ struct BlockDerivation {
     /// DEC-178: the creator of block `s − H` when the liveness credit is due
     /// (DEC-339: read here, so the commit needs no read).
     liveness: Option<u32>,
+    /// DEC-346: the slot of block `s − L` when it is an approval evidence
+    /// block whose late-node hold ends with this block; the commit reads it.
+    hold_exit: Option<u32>,
 }
 
 /// The FR3 candidate chain-config preload verdict — see

@@ -886,6 +886,45 @@ fn fr3_pass_seeds_a_window_anchored_vote_at_a_plus_h() {
     ));
 }
 
+/// Story 7.7 AC8 (DEC-337, DEC-344, DEC-346) — a window-anchored joiner
+/// holds what the network holds. The segment starts at `a = 99` (`W = 6`,
+/// `H = L = 3`); the evidence block `e@101` lies inside it, while its
+/// deviation (`p = 97`) lies below it (`d < a ≤ e`), so the joiner learns
+/// the held node #3 from the list alone. #3 is seeded at #102 (`a + H`) and
+/// stays held through `e + L = 104`: the votes for it at #103 and #104
+/// credit nothing, the one at #105 credits `vote_scale` — 1 000, where a
+/// pass without the hold would end at 3 310. #104's exit releases it.
+#[test]
+fn a_window_anchored_pass_holds_a_listed_node_past_a_plus_h() {
+    let mut bc = new_w6_chain();
+    let floor = balance_block(99, [0xAB; 32], &[(3, 0, 0, 0x33)], 3);
+    let cfg = w6_config_anchor_block(100, floor.view().hash());
+    let mut aggregate = std::vec![
+        0u8;
+        AGGREGATED_SIGNATURE_CONSTANT_SIZE + AGGREGATED_SIGNATURE_VARIABLE_SIZE
+    ];
+    // Schnorr's aggregate leads with its big-endian signer count.
+    aggregate[..2].copy_from_slice(&1u16.to_be_bytes());
+    let evidence = Evidence {
+        supporter_vote_sum: 0,
+        deviation_sequence: 97,
+        m: 1,
+        bitmap: std::vec![0b1],
+        aggregate,
+        late: std::vec![(3, 0)],
+    };
+    // By node #0: every fixture key is node #0's (`balance_block`).
+    let e = super::evidence::evidence_block(101, cfg.view().hash(), 0, &evidence);
+    let seed = balance_block(102, e.view().hash(), &[(3, 0, 0, 0x33)], 3);
+    let b103 = tx_block(103, seed.view().hash(), 0, votes_for(103, 3, 1, 41));
+    let b104 = tx_block(104, b103.view().hash(), 0, votes_for(104, 3, 1, 42));
+    let b105 = tx_block(105, b104.view().hash(), 0, votes_for(105, 3, 1, 43));
+    admit_all(&mut bc, &[&floor, &cfg, &e, &seed, &b103, &b104, &b105]);
+    let tip = bc.blocks.find(105, &b105.view().hash()).expect("stored");
+    assert!(bc.run_processing_pass(tip).is_ok(), "the segment validates");
+    assert_eq!(bc.vote_engine.accumulated_vote_of(3), 1000);
+}
+
 /// AC5 / AC12.5 (DEC-208) — Ready intake refuses a block at `S_new ≤ S_head
 /// − H` as Out-of-Snake-Chain-Window and stores nothing: a late child of a
 /// window block and a late child of a horizon block. A re-sent horizon
