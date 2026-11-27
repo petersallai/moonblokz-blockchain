@@ -1221,11 +1221,11 @@ pub(super) fn valued(seq: u32, prev: [u8; 32], value: u32, amount: u64) -> Block
 pub(super) const NODE_ONE_KEY: u8 = 0x31;
 
 /// `I(av)`: FR37 step 1 under the test configuration (`vote_scale` 1000,
-/// the default `vote_interest` 50, so the bump is `min(⌊av / 20⌋, 1000)`) — the
+/// the default `vote_interest` 100, so the bump is `min(⌊av / 10⌋, 1000)`) — the
 /// post-interest, pre-credit snapshot a block's `consumed_votes` carries
 /// (DEC-156).
 pub(super) fn vote_snapshot(av: u32) -> u32 {
-    av + (av / 20).min(1000)
+    av + (av / 10).min(1000)
 }
 
 /// The FR21 value of `block`: its header `consumed_votes`.
@@ -1257,7 +1257,7 @@ pub(super) fn votes_for(
 /// the previous block cast for `creator`; under the per-target credit cap
 /// (DEC-176, Story 7.2) any number of them is one credit, which is its whole
 /// accumulated vote, since its own last block reset it — so `consumed_votes
-/// = I(1000)` (1050 at the default `vote_interest` 50) when `received ≥ 1`, else
+/// = I(1000)` (1100 at the default `vote_interest` 100) when `received ≥ 1`, else
 /// 0. The block casts `out` votes for the other node (or, with `out == 0`,
 /// one for its own creator, which the reset wipes). `register` puts node
 /// #1's registration first. The chains are shorter than `H`, so no liveness
@@ -1438,7 +1438,7 @@ pub(super) fn faulty_genesis(w: u32) -> (Chain16<FaultyStorage>, Block) {
 /// the mint and #4.
 pub(super) fn utxo_side_fixture() -> (Chain16<FaultyStorage>, Block, Block) {
     let (mut bc, mint) = faulty_utxo_genesis();
-    // Node #1's, credited once by the mint: worth `I(1000)` = 1050 (I-09),
+    // Node #1's, credited once by the mint: worth `I(1000)` = 1100 (I-09),
     // above the free values the side blocks of these Tier 2 tests carry,
     // so none of them is switched to (Story 6.3).
     let b4 = real_on(&bc, &transfer(4, mint.view().hash(), 0, 7), 1, NODE_ONE_KEY);
@@ -1485,7 +1485,7 @@ pub(super) fn headed(
 }
 
 /// A genesis node on `W = 16` with `a2` (node #0's, registering node #1
-/// and crediting it once) and `a3` (node #1's, worth 1050).
+/// and crediting it once) and `a3` (node #1's, worth 1100).
 pub(super) fn two_creator_chain() -> (TestChain, Block, Block, Block) {
     let (mut bc, _, b1) = ready_genesis(16);
     let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
@@ -1493,7 +1493,7 @@ pub(super) fn two_creator_chain() -> (TestChain, Block, Block, Block) {
     for blk in [&a2, &a3] {
         assert_eq!(receive(&mut bc, blk), ReceiveBlockOutcome::AcceptedSilently);
     }
-    assert_eq!(bc.active_branch_value, 1050);
+    assert_eq!(bc.active_branch_value, 1100);
     (bc, b1, a2, a3)
 }
 

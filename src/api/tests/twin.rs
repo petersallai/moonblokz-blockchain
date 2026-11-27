@@ -15,7 +15,7 @@ fn attempted<S: StorageTrait>(bc: &Chain16<S>, block: &Block) -> bool {
 }
 
 /// On [`two_creator_chain`]: node #1's sibling of `a3` (node #1's), worth
-/// the same 1050 but larger (three votes for node #0, one credit under
+/// the same 1100 but larger (three votes for node #0, one credit under
 /// DEC-176) — FR21 ranks it
 /// above `a3`, so only the hold keeps `a3`.
 fn twin_of_a3(a2: &Block, salt: u64) -> Block {
@@ -44,7 +44,7 @@ fn a_twin_of_the_active_block_is_held() {
     );
     assert_eq!(head_of(&bc), (3, a3.view().hash()), "held");
     assert_eq!(status_of(&bc, &x), Some(BlockStatus::Connected));
-    assert_eq!(bc.chain_heads.branch_value_of(xi), Some(1050));
+    assert_eq!(bc.chain_heads.branch_value_of(xi), Some(1100));
 
     // Extending the twin branch changes nothing: its first divergent block
     // is still the twin.
@@ -78,7 +78,7 @@ fn a_twin_of_the_active_block_is_held() {
 }
 
 /// AC3 positive control — an honest fork, a different creator at the
-/// divergence point: the expected creator's late `a3` (node #1, 1050)
+/// divergence point: the expected creator's late `a3` (node #1, 1100)
 /// beats node #0's `d3` (worth 0), and the node switches.
 #[test]
 fn an_honest_fork_switches() {
@@ -99,7 +99,7 @@ fn an_honest_fork_switches() {
 /// compared. Built in collecting so neither side head is switched to on
 /// arrival: at the Ready entry FR2 picks `d3` (the lowest tip hash), the
 /// driver's best is node #0's forged twin `x` (5000), which the hold keeps,
-/// and `a3` (node #1, 1050) is no candidate of that comparison. One
+/// and `a3` (node #1, 1100) is no candidate of that comparison. One
 /// comparison of both then skips `x` and switches to `a3`.
 #[test]
 fn a_held_twin_yields_to_the_next_ranked_candidate() {
@@ -193,7 +193,7 @@ fn the_twin_check_verifies_once_and_only_a_same_creator_sibling() {
     assert_eq!(count() - before, 0, "the mark spares the second check");
 
     // Node #1's claimed header signed with another key.
-    let forged = headed(3, a2.view().hash(), 1, 0x42, 1050, 1, 0, |b| {
+    let forged = headed(3, a2.view().hash(), 1, 0x42, 1100, 1, 0, |b| {
         votes_for(3, 0, 2, 72)(b)
     });
     plant_child(&mut bc, &forged, a2i, false, true);

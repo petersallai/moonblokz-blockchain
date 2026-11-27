@@ -344,7 +344,7 @@ fn a_replay_reward_that_overflows_the_creator_is_invalid() {
 
 /// On the W6 harness (`H = 3`, #2 a clean slot): node #0 registers node #1
 /// at #3, and node #1 creates #4, so node #0 — the creator of #1 — gains
-/// `⌈1000 / 50⌉ = 20` (DEC-178, at the default `vote_interest`). At #3 the candidate (node #0, creator of
+/// `⌈1000 / 100⌉ = 10` (DEC-178, at the default `vote_interest`). At #3 the candidate (node #0, creator of
 /// #0) is the block's own creator, so nothing is credited there. The undo
 /// takes the credit back.
 #[test]
@@ -380,7 +380,7 @@ fn the_liveness_credit_reaches_the_creator_of_s_minus_h() {
     );
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (4, b4.view().hash()));
-    assert_eq!(bc.vote_engine.accumulated_vote_of(0), 20);
+    assert_eq!(bc.vote_engine.accumulated_vote_of(0), 10);
     let b4_idx = bc.active_chain_head_idx;
     assert_eq!(bc.liveness_candidate(b4_idx, 4, 0), Ok(Some(0)));
     // A window-anchored pass below `a + H` asks for no candidate (DEC-210).

@@ -1007,7 +1007,7 @@ fn branch_value_is_seeded_at_every_ready_entry() {
     }
     assert!(mesh.is_ready());
     assert_eq!(head_of(&mesh), (3, a3.view().hash()));
-    assert_eq!(v(&a3), 1050);
+    assert_eq!(v(&a3), 1100);
     assert_eq!(
         mesh.active_branch_value,
         v(&b1) + v(&a2) + v(&a3),
@@ -1145,7 +1145,7 @@ fn failed_new_tail_read_is_a_local_failure() {
         "the retry extended"
     );
     assert_eq!(bc.active_snake_chain_window(), Ok((1, 6)));
-    assert_eq!(v(&b4), 1050, "two votes, one credit (DEC-176)");
+    assert_eq!(v(&b4), 1100, "two votes, one credit (DEC-176)");
     assert_eq!(
         bc.active_branch_value,
         v(&b2) + v(&b3) + v(&b4) + v(&b5) + v(&snapshot)
@@ -1172,7 +1172,7 @@ fn branch_value_follows_direct_and_continuation_extensions() {
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(receive(&mut bc, &b3), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(head_of(&bc), (4, b4.view().hash()));
-    assert_eq!((v(&b3), v(&b4)), (1050, 0), "distinct real values");
+    assert_eq!((v(&b3), v(&b4)), (1100, 0), "distinct real values");
     assert_eq!(bc.active_branch_value, v(&b2) + v(&b3) + v(&b4));
     assert_eq!(
         bc.active_branch_value,
