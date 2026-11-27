@@ -1681,9 +1681,19 @@ pub(super) fn support_chain_on<S: StorageTrait>(
     w: u32,
     extra: impl FnOnce(&mut ChainConfigPayloadBuilder),
 ) -> (SupportChain, Chain16<S>, [Block; 6]) {
-    let mut g = local_node(0, local_storage(0));
     let mut config = window_config_builder(w);
     extra(&mut config);
+    support_chain_with(local, storage, config)
+}
+
+/// [`support_chain_on`] on the configuration `config` (Story 7.7: a horizon
+/// short enough for a whole late-node hold to fit the test storage).
+pub(super) fn support_chain_with<S: StorageTrait>(
+    local: u32,
+    storage: S,
+    config: ChainConfigPayloadBuilder,
+) -> (SupportChain, Chain16<S>, [Block; 6]) {
+    let mut g = local_node(0, local_storage(0));
     let genesis = g
         .process_genesis(CURRENCY, config.content())
         .ok()

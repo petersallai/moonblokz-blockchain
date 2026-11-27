@@ -91,7 +91,7 @@ pub use outcomes::{
     ReceiveSupportOutcome, ReceiveTransactionOutcome, RejectReason, RestartRejectReason,
     TickOutcome, TransactionState, TxStateQueryError,
 };
-use step::{fees_and_utxo_outputs, is_fr36_exempt, replay_reward};
+use step::{VoteRun, fees_and_utxo_outputs, is_fr36_exempt, replay_reward};
 
 /// Why the active-chain snake-chain window is unavailable — the `Err` side of
 /// [`Blockchain::active_snake_chain_window`]. A `Result` rather than `Option`
@@ -530,6 +530,9 @@ struct BlockDerivation {
     /// DEC-178: the creator of block `s − H` when the liveness credit is due
     /// (DEC-339: read here, so the commit needs no read).
     liveness: Option<u32>,
+    /// DEC-346: the slot of block `s − L` when it is an approval evidence
+    /// block whose late-node hold ends with this block; the commit reads it.
+    hold_exit: Option<u32>,
 }
 
 /// The FR3 candidate chain-config preload verdict — see

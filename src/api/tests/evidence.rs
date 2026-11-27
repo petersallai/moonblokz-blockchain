@@ -29,7 +29,7 @@ fn evidence_observer(proposer: u32) -> (SupportChain, Block, Block) {
 /// An evidence block at `seq` on `prev` by `creator` in the FR27 override
 /// header, its payload `ev` laid out per DEC-195, signed with the creator's
 /// fixture key (so Tier 1's creator signature passes).
-fn evidence_block(seq: u32, prev: [u8; 32], creator: u32, ev: &Evidence) -> Block {
+pub(super) fn evidence_block(seq: u32, prev: [u8; 32], creator: u32, ev: &Evidence) -> Block {
     let signer = Crypto::new([key_of(creator); PRIVATE_KEY_SIZE])
         .ok()
         .expect("key");
@@ -1048,9 +1048,9 @@ fn alternative_evidence(d: &Block, e: &Block, members: &[u32]) -> Block {
 }
 
 /// A block by node 5 on `e_alt`, which a node holding `d`, `e_alt` builds
-/// (any deviation and its evidence). Node 5 holds the chain's only vote
-/// (1 000 at #5), so `x8` is worth more than 0 and the twin branch outranks
-/// the active one by value, not by a hash-dependent tie-break.
+/// (any deviation and its evidence). Node 5 held the chain's only vote
+/// (1 000 at #5) until the evidence, whose late list resets it (Story 7.7,
+/// DEC-344), so `x8` is worth 0: it lengthens the branch, nothing more.
 fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     let (mut g, _, _) = support_chain(2);
     for block in [d, e_alt] {
@@ -1063,10 +1063,39 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
     normal_after(&g, e_alt, 5, 81)
 }
 
+/// Two blocks on `e_alt` that make its branch outrank the active one by
+/// value, not by a hash-dependent tie-break: the evidence leaves every vote
+/// at 0 (its late list resets nodes 1, 5 and 0, Story 7.7), so `x8` (node 3)
+/// votes for node 4, and `x9` (node 4) is worth `I(1000)`.
+fn valued_children_of_alternative(d: &Block, e_alt: &Block) -> (Block, Block) {
+    let (mut g, _, _) = support_chain(2);
+    for block in [d, e_alt] {
+        assert_eq!(
+            receive(&mut g, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    let x8 = real_on(
+        &g,
+        &tx_block(8, e_alt.view().hash(), 0, votes_for(8, 4, 1, 81)),
+        3,
+        key_of(3),
+    );
+    assert_eq!(receive(&mut g, &x8), ReceiveBlockOutcome::AcceptedSilently);
+    let x9 = real_on(
+        &g,
+        &tx_block(9, x8.view().hash(), 0, votes_for(9, 3, 1, 82)),
+        4,
+        key_of(4),
+    );
+    assert!(x9.view().consumed_votes() > 0, "x9 carries value");
+    (x8, x9)
+}
+
 /// Story 6.12 (FR70, DEC-273) — a second valid evidence of one deviation
 /// is a twin: `e` and `e'` are the proposer's two children of `d` (FR16
 /// admits only its blocks above `d`). FR21 ranks the twin branch above the
-/// active one at `e'` or at `x8` (which, depends on the scheme's hashes and
+/// active one at `e'`, `x8` or `x9` (which, depends on the scheme's hashes and
 /// sizes; the pre-6.12 test switched under every scheme); it is held
 /// wherever it is compared, the node stays on the evidence it adopted first, `e'` is never
 /// judged (no aggregate verification), and the values are exact. An honest proposer
@@ -1076,7 +1105,7 @@ fn child_of_alternative(d: &Block, e_alt: &Block) -> Block {
 fn a_second_evidence_of_one_deviation_is_a_held_twin() {
     let (d, e, members) = evidence_by(2);
     let e_alt = alternative_evidence(&d, &e, &members);
-    let x8 = child_of_alternative(&d, &e_alt);
+    let (x8, x9) = valued_children_of_alternative(&d, &e_alt);
     let (mut g, _, built) = evidence_observer(2);
     assert_eq!(built.serialized_bytes(), e.serialized_bytes());
     assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
@@ -1091,8 +1120,11 @@ fn a_second_evidence_of_one_deviation_is_a_held_twin() {
     assert_eq!(receive(&mut g, &x8), ReceiveBlockOutcome::AcceptedSilently);
     let x8i = g.blocks.find(8, &x8.view().hash()).expect("held");
     let ranked_x8 = g.switch_target([Some(x8i), None]).is_some();
+    assert_eq!(receive(&mut g, &x9), ReceiveBlockOutcome::AcceptedSilently);
+    let x9i = g.blocks.find(9, &x9.view().hash()).expect("held");
+    let ranked_x9 = g.switch_target([Some(x9i), None]).is_some();
     assert!(
-        ranked_alt || ranked_x8,
+        ranked_alt || ranked_x8 || ranked_x9,
         "FR21 ranks the twin branch first at one admission"
     );
     assert_eq!(head_of(&g), (7, e.view().hash()), "still held");

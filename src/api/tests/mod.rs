@@ -35,6 +35,7 @@ mod fact;
 mod fixtures;
 mod forward;
 mod genesis;
+mod late_hold;
 mod proposer;
 mod restart;
 mod support;

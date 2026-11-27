@@ -3,6 +3,17 @@
 
 use super::*;
 
+/// What one vote-engine step run by [`Blockchain::run_vote_step`] came to.
+pub(super) enum VoteRun {
+    /// The engine ran: its result, atomic on `Err`.
+    Ran(Result<(), VoteEngineError>),
+    /// A read the step needs failed before the engine ran: nothing changed.
+    Unread,
+    /// An FR72 confirm read failed inside the engine: its result is not
+    /// trusted (DEC-280); the caller escalates it like a failed restore.
+    Faulted,
+}
+
 /// FR36(b): the fee one transaction pays its block's creator — the one
 /// definition the per-block step credits and the committed-block undo debits
 /// (deferred-work D30). A node transfer and a registration pay their explicit
@@ -216,12 +227,20 @@ impl<
         let liveness = self
             .liveness_candidate(idx, seq, projection.vote_seed_from)
             .map_err(|()| ProcessingError::StorageRead)?;
+        // (f) DEC-346: block `s − L` when an evidence block's late-node hold
+        //     ends with this block — found in RAM (its cached payload type);
+        //     the commit reads it. A window-anchored pass starts at its
+        //     earliest block `a`: a block below it was never applied.
+        let hold_exit = self
+            .hold_exit_slot(idx, seq, projection.anchor)
+            .map_err(|()| ProcessingError::StorageRead)?;
 
         let mut derivation = BlockDerivation {
             total_fees: 0,
             replay_reward: replay_reward(&self.chain_config, view),
             utxo_outputs: 0,
             liveness,
+            hold_exit,
         };
         // How many transactions have applied their effects, for the prefix
         // inversion on a later failure.
@@ -427,32 +446,25 @@ impl<
         idx: u32,
         derivation: BlockDerivation,
     ) -> Result<(), ProcessingError> {
-        // FR72: the credit drop at this block (Story 6.13 AC6).
-        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
-            &self.blocks,
-            &self.storage,
-            self.verification_horizon(),
-            idx,
-        );
-        if !drop.reads_hold(view, derivation.liveness) {
-            self.invert_transactions(view, idx, usize::MAX);
-            return Err(ProcessingError::StorageRead);
-        }
-        let applied = BlockView::from_bytes(view.serialized_bytes()).map(|v| {
-            self.vote_engine
-                .apply_block(v, |node| drop.excluded(node), derivation.liveness)
-        });
-        let faulted = drop.faulted();
-        if faulted {
-            // A confirm read failed inside the engine: its result is not
-            // trusted. A local fault, escalated in Ready (DEC-205).
-            self.reentry_due |= self.is_ready();
-            self.invert_transactions(view, idx, usize::MAX);
-            return Err(ProcessingError::StorageRead);
-        }
-        if let Ok(Err(e)) = applied {
-            self.invert_transactions(view, idx, usize::MAX);
-            return Err(ProcessingError::Vote(e));
+        // The FR37 step with the FR72 credit drop (Story 6.13 AC6) and the
+        // late-node hold's exit (DEC-346).
+        match self.run_vote_step(view, idx, false, derivation.liveness, derivation.hold_exit) {
+            VoteRun::Ran(Ok(())) => {}
+            VoteRun::Ran(Err(e)) => {
+                self.invert_transactions(view, idx, usize::MAX);
+                return Err(ProcessingError::Vote(e));
+            }
+            VoteRun::Unread => {
+                self.invert_transactions(view, idx, usize::MAX);
+                return Err(ProcessingError::StorageRead);
+            }
+            VoteRun::Faulted => {
+                // A confirm read failed inside the engine: its result is not
+                // trusted. A local fault, escalated in Ready (DEC-205).
+                self.reentry_due |= self.is_ready();
+                self.invert_transactions(view, idx, usize::MAX);
+                return Err(ProcessingError::StorageRead);
+            }
         }
         if !is_fr36_exempt(view) && self.node_info.is_seeded(view.creator()) {
             self.node_info.credit(
@@ -523,6 +535,91 @@ impl<
         let parent = self.blocks.get(idx).ok_or(())?.parent_ref();
         let target = self.ancestor_at(parent, seq - h).ok().flatten().ok_or(())?;
         self.creator_of_retained(target).map(Some)
+    }
+
+    /// DEC-346: the slot of block `s − L` on the ancestry of the block at `idx`
+    /// (sequence `seq`) when it is an approval evidence block, whose late-node
+    /// hold ends with this block — decided from the cached payload type, with
+    /// no read. `None` below `s = L`, without a configuration, for any other
+    /// block, and below `seed_from`: a window-anchored FR3 pass passes its
+    /// earliest block `a`, below which nothing was applied; everything else
+    /// passes 0 (Ready holds `s ≥ a + W + H − 1`, the switch bound keeps
+    /// `A ≥ a + H`, DEC-211, and a rewind runs only where `p − W ≥ a`,
+    /// DEC-262). `Err` when that ancestor is not held — a local fault.
+    pub(super) fn hold_exit_slot(
+        &self,
+        idx: u32,
+        seq: u32,
+        seed_from: u32,
+    ) -> Result<Option<u32>, ()> {
+        let Some(exit_seq) = self
+            .late_hold_length()
+            .and_then(|l| seq.checked_sub(l))
+            .filter(|&exit_seq| exit_seq >= seed_from)
+        else {
+            return Ok(None);
+        };
+        let parent = self.blocks.get(idx).ok_or(())?.parent_ref();
+        let slot = self
+            .ancestor_at(parent, exit_seq)
+            .ok()
+            .flatten()
+            .ok_or(())?;
+        let entry = self.blocks.get(slot).ok_or(())?;
+        Ok((entry.payload_type() == PAYLOAD_TYPE_APPROVAL).then_some(slot))
+    }
+
+    /// One FR37 vote-engine step — the apply, or with `undo` its exact
+    /// inverse — of the held block `view` at `idx`, with the FR72 credit drop,
+    /// the step-4 liveness candidate and the late-node hold's exit block
+    /// (DEC-346). Every read the step needs happens before the engine runs
+    /// (DEC-280): the exit block into this frame's own buffer — the second
+    /// block buffer live during the engine call, by design (DEC-346) — and
+    /// the credit drop's confirm reads; a failed one leaves the engine
+    /// untouched. The one engine driver of the commit, the switch undo and the
+    /// rewind step, so all three run the same step.
+    #[inline(never)]
+    pub(super) fn run_vote_step(
+        &mut self,
+        view: &BlockView<'_>,
+        idx: u32,
+        undo: bool,
+        liveness: Option<u32>,
+        hold_exit: Option<u32>,
+    ) -> VoteRun {
+        let mut buf = [0u8; MAX_BLOCK_SIZE];
+        let exit = match hold_exit.map(|slot| self.read_retained(slot, &mut buf)) {
+            None => None,
+            Some(Ok(Some(exit))) => Some(exit),
+            // An `IntegrityFailure` is matched apart (DEC-320), a local fault
+            // like the rest until O-026's release path exists.
+            Some(Err(StorageError::IntegrityFailure)) => return VoteRun::Unread,
+            Some(Ok(None) | Err(_)) => return VoteRun::Unread,
+        };
+        let drop = fact::credit_drop::<_, MAX_BLOCKS, MAX_NODES, AVAILABLE_UTXO_BYTES>(
+            &self.blocks,
+            &self.storage,
+            self.verification_horizon(),
+            idx,
+        );
+        if !drop.reads_hold(view, liveness) {
+            return VoteRun::Unread;
+        }
+        // The engine takes the view by value; the bytes parsed already.
+        let Ok(block) = BlockView::from_bytes(view.serialized_bytes()) else {
+            return VoteRun::Unread;
+        };
+        let excluded = |node| drop.excluded(node);
+        let result = if undo {
+            self.vote_engine.undo_block(block, excluded, liveness, exit)
+        } else {
+            self.vote_engine
+                .apply_block(block, excluded, liveness, exit)
+        };
+        if drop.faulted() {
+            return VoteRun::Faulted;
+        }
+        VoteRun::Ran(result)
     }
 
     /// The creator in the header of the retained block at `idx`, by one read
