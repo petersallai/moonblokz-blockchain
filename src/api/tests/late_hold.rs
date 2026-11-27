@@ -235,6 +235,37 @@ fn an_unreadable_exit_block_is_local() {
     assert_eq!(engine_votes(&g), before);
 }
 
+/// AC6 / DEC-346: the exit is found in RAM — block `s − L` when it is an
+/// evidence block, no exit for any other (so no read), none below `s = L`
+/// or below a window-anchored pass's earliest block.
+#[test]
+fn the_exit_is_the_evidence_block_l_blocks_back() {
+    let (mut g, _, _, r, e) = run_with_replay();
+    assert_eq!(receive(&mut g, &e), ReceiveBlockOutcome::AcceptedSilently);
+    let e_idx = g.active_chain_head_idx;
+    let mut prev = e;
+    for seq in 9..=12u32 {
+        let block = votes_after(&g, &prev, 3, &[4], u64::from(seq));
+        assert_eq!(
+            receive(&mut g, &block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        prev = block;
+    }
+    let head = g.active_chain_head_idx;
+    assert_eq!(g.hold_exit_slot(head, 12, 0), Ok(Some(e_idx)), "s − L = 8");
+    let r_idx = g.blocks.find(7, &r.view().hash()).expect("held");
+    let at_11 = g.blocks.get(head).expect("head").parent_ref();
+    assert_eq!(
+        g.hold_exit_slot(at_11, 11, 0),
+        Ok(None),
+        "#7 is no evidence"
+    );
+    assert_ne!(r_idx, e_idx);
+    assert_eq!(g.hold_exit_slot(head, 12, 9), Ok(None), "below the anchor");
+    assert_eq!(g.hold_exit_slot(head, 3, 0), Ok(None), "s < L");
+}
+
 /// AC9: `L = min(H, 255)` — the hold count's `u8` holds every build's
 /// count, and `H > 255` holds for 255 blocks.
 #[test]
