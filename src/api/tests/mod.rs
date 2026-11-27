@@ -113,8 +113,8 @@ const TEST_UTXO_BYTES: usize = 4;
 
 /// The base override set as a **content region**: literal entries declaring
 /// `active_chain_length = TEST_W`, its horizon and the node cap. Every other
-/// parameter resolves to its code-baked default — `vote_interest` to 50
-/// (DEC-176), so the suite runs at the production rate. The last entry
+/// parameter resolves to its code-baked default — `vote_interest` to 100
+/// (DEC-176, DEC-343), so the suite runs at the production rate. The last entry
 /// declares the build's signature scheme ([`declare_build_scheme`]).
 const BASE_CONFIG_CONTENT: [u8; 23] = [
     4,
