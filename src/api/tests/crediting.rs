@@ -390,3 +390,37 @@ fn an_unreadable_liveness_ancestor_is_local() {
     );
     bc.storage.failing_read_slot = NONE_REF;
 }
+
+// --- AC4: the custodian fee in the FR51 tail classification (DEC-330) -------
+
+/// `custodian_fee = 10 · GETCHAININFO 1`: served, the program's 10 decides
+/// (two outputs of 5 owe nothing, though the default fee 1 would owe them);
+/// declined, the binding is not judged at all, never against the fall-through
+/// fee (DEC-340).
+#[test]
+fn a_chain_info_custodian_fee_binds_the_tail_classification() {
+    let mut builder = window_config_builder(TEST_W);
+    builder
+        .add_bytecode(parameter::CUSTODIAN_FEE, &REWARD_PER_NODE_PROGRAM[..7])
+        .ok()
+        .expect("the program frames");
+    for (outputs, served) in [
+        (&[Ok(5), Ok(5)][..], TailObligation::None),
+        (&[Ok(60), Ok(40)][..], TailObligation::Utxo),
+    ] {
+        let (mut bc, _, b1) = genesis_with(&builder);
+        let tx = utxo_tx(2, &[], Some((0, 100)), outputs);
+        let mint = complex_tx_block(2, b1.view().hash(), 0, 0, &[&tx]);
+        assert_eq!(
+            receive(&mut bc, &mint),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        let mi = bc.active_chain_head_idx;
+        assert_eq!(bc.tail_obligation(mi, true), Ok(served), "{outputs:?}");
+        assert_eq!(
+            bc.tail_obligation(mi, false),
+            Ok(TailObligation::None),
+            "declined: not judged ({outputs:?})"
+        );
+    }
+}
