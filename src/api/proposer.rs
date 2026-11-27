@@ -328,9 +328,9 @@ impl<
                 return true;
             }
             // At `p − 1`: `u` heads the order; DEC-216's value (shared with
-            // the evidence check, Story 6.7 AC8); the late nodes, the ranks
-            // above the proposer but `u`, kept in creator order by bounded
-            // insertion.
+            // the evidence check, Story 6.7 AC8); the late nodes, every rank
+            // above the proposer with `u` first (DEC-344), kept in creator
+            // order by bounded insertion.
             if engine.top_creator() != Some(u) {
                 return false;
             }
@@ -346,7 +346,7 @@ impl<
                 return false;
             };
             for n in 0..=last_node {
-                if !is_late(engine, n, local, u) {
+                if !is_late(engine, n, local) {
                     continue;
                 }
                 if late_count == late_room

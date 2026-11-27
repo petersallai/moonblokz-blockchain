@@ -921,8 +921,9 @@ fn refused_evidence_case(
     assert_eq!(head_of(&g), (7, e.view().hash()), "the control");
 }
 
-/// AC5 step 2: a wrong `m`, or fewer than `r_eff` signers (one support,
-/// its own valid aggregate), is `EvidenceSubgroup`.
+/// AC5 step 2: a wrong `m`, or a signer count other than `r_eff` — one
+/// support, or (Story 7.7 AC3, DEC-347) every member's, each with its own valid
+/// aggregate — is `EvidenceSubgroup`.
 #[test]
 fn a_wrong_subgroup_is_refused() {
     refused_evidence_case(4, ValidationReason::EvidenceSubgroup, |ev| ev.m += 1);
@@ -932,6 +933,21 @@ fn a_wrong_subgroup_is_refused() {
         ev.bitmap = std::vec![0b01];
         ev.aggregate = aggregate_by(&members[..1], 4, 6, &hash);
     });
+    // Proposer 2's subgroup has a spare member (`m = 3`, `r_eff = 2`): all
+    // three sign.
+    let (d, _, members) = evidence_by(2);
+    let hash = d.view().hash();
+    assert_eq!(members.len(), 3, "m = 3, r_eff = 2");
+    let verified = counted(&AGGREGATE_VERIFICATIONS);
+    refused_evidence_case(2, ValidationReason::EvidenceSubgroup, |ev| {
+        ev.bitmap = std::vec![0b111];
+        ev.aggregate = aggregate_by(&members, 2, 6, &hash);
+    });
+    assert_eq!(
+        counted(&AGGREGATE_VERIFICATIONS) - verified,
+        1,
+        "a padded evidence is refused before its aggregate (only the control verifies)"
+    );
 }
 
 /// AC5 step 4: `supporter_vote_sum` one above or below `B_k − cv(d)` is
@@ -952,12 +968,13 @@ fn a_wrong_vote_sum_is_refused() {
     );
 }
 
-/// AC5 step 4: proposer 2's late list (nodes 5 and 0) dropped, extended,
-/// reordered, or with a wrong value at the tip is `EvidenceLateList`.
+/// AC5 step 4: proposer 2's late list (`u`, then nodes 5 and 0, DEC-344)
+/// dropped, extended, reordered, or with a wrong value at the tip is
+/// `EvidenceLateList`.
 #[test]
 fn a_wrong_late_list_is_refused() {
     let (_, e, _) = evidence_by(2);
-    assert_eq!(evidence_of(&e, 2).late.len(), 2, "two late entries");
+    assert_eq!(evidence_of(&e, 2).late.len(), 3, "three late entries");
     let late = ValidationReason::EvidenceLateList;
     refused_evidence_case(2, late, |ev| {
         ev.late.pop();
@@ -970,16 +987,14 @@ fn a_wrong_late_list_is_refused() {
     for id in [99, 1, 2, 4] {
         refused_evidence_case(2, late, |ev| ev.late[1].0 = id);
     }
-    // `u` heads the order, so in front of node 0, with its true value at
-    // the tip, it keeps the order, the count of late nodes above the last
-    // entry and the values: only "late" refuses it.
-    let (g, d, _) = evidence_observer(2);
+    // Story 7.7 (DEC-344): `u` is the list's first entry; the pre-7.7 form,
+    // the same list without it, is short by one.
+    let (_, d, _) = evidence_observer(2);
     let u = d.view().first_voted_node();
-    let at_tip = g
-        .vote_engine
-        .grown(g.vote_engine.accumulated_vote_of(u))
-        .expect("grown");
-    refused_evidence_case(2, late, |ev| ev.late[0] = (u, at_tip));
+    assert_eq!(evidence_of(&e, 2).late[0].0, u, "u first");
+    refused_evidence_case(2, late, |ev| {
+        ev.late.remove(0);
+    });
 }
 
 /// AC5 step 5: a corrupted aggregate byte (the framing kept) is

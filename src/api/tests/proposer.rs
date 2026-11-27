@@ -647,11 +647,12 @@ fn the_evidence_block_carries_the_approval() {
     assert!(cv > 0, "d consumes votes");
     assert_eq!(ev.supporter_vote_sum, 2 * sum - cv);
 
-    // (f) the late list: the ranks above the proposer but `u`, in creator
-    // order, valued after the evidence's interest step at the tip (`d`).
+    // (f) the late list: every rank above the proposer, `u` first (DEC-344),
+    // in creator order, valued after the evidence's interest step at the tip
+    // (`d`).
+    assert_eq!(above[0], u, "u heads the ranks above the proposer");
     let late: std::vec::Vec<(u32, u32)> = above
         .iter()
-        .filter(|&&n| n != u)
         .map(|&n| {
             (
                 n,
@@ -670,16 +671,23 @@ fn the_evidence_block_carries_the_approval() {
 }
 
 /// AC9 test 5 (f) — the late list is the prefix that fits: one entry room.
+/// Story 7.7 AC2: here `m = 3` and `r_eff = 2`, so the one-entry room is
+/// exactly configuration check 20's floor at `required_support = 2`
+/// (`approval_fixed_size(2·2 − 1, 2) + APPROVAL_LATE_ENTRY_SIZE`, DEC-345):
+/// at that floor the builder lists exactly `u` (DEC-344).
 #[test]
 fn the_late_list_is_truncated_to_the_room() {
     let (_, mut l, _, d, d_idx) = proposer_chain(2);
     accumulate(&mut l, &d, d_idx, 2);
+    let u = d.view().first_voted_node();
     let full = l.build_evidence_block(d_idx, 0).expect("untruncated");
     assert_eq!(
         evidence_of(&full, 2).late.len(),
-        2,
-        "nodes 5 and 0 above it"
+        3,
+        "u, then nodes 5 and 0 above it"
     );
+    assert_eq!(l.approval.counts().0, 3, "m = 3");
+    assert_eq!(l.approval.counts().1, 2, "r_eff = 2");
     let fixed = moonblokz_chain_types::approval_fixed_size(3, 2);
     let with_room = |l: &mut SupportChain, room: usize| {
         crate::approval::test_seams::PAYLOAD_ROOM.with(|cell| cell.set(room));
@@ -694,7 +702,7 @@ fn the_late_list_is_truncated_to_the_room() {
         evidence_of(&full, 2).late[..1],
         "the prefix in creator order"
     );
-    assert_eq!(ev.late[0].0, 5);
+    assert_eq!(ev.late[0].0, u, "check 20's floor holds exactly u");
     assert_eq!(one.view().payload().len(), fixed + APPROVAL_LATE_ENTRY_SIZE);
     let none = with_room(&mut l, fixed).expect("no room for a late entry");
     assert!(evidence_of(&none, 2).late.is_empty());
