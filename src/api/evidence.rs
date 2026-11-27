@@ -402,8 +402,9 @@ impl<
             // The late list: the prefix of the late nodes in creator order
             // that fits, `u` first (DEC-344: all `k` ranks above the
             // proposer). Every listed id a late node, strictly descending in
-            // the order (so distinct), and exactly `L − 1` late nodes above the
-            // last one — no scratch list, the same predicates as the builder.
+            // the order (so distinct), and exactly `late_count − 1` late nodes
+            // above the last one — no scratch list, the same predicates as the
+            // builder.
             let expected = (k as usize).min(late_room);
             let mut previous = None;
             let listed_ok = late_count == expected

@@ -983,8 +983,9 @@ fn a_wrong_late_list_is_refused() {
     refused_evidence_case(2, late, |ev| ev.late.swap(0, 1));
     refused_evidence_case(2, late, |ev| ev.late[0].1 += 1);
     // Review: the right count, one listed id wrong — beyond the roster
-    // (99), or a registered node that is not late at `p − 1`.
-    for id in [99, 1, 2, 4] {
+    // (99), or a registered node that is not late at `p − 1` (the proposer
+    // 2, nodes 3 and 4; `u` = 1 is listed now, Story 7.7).
+    for id in [99, 3, 2, 4] {
         refused_evidence_case(2, late, |ev| ev.late[1].0 = id);
     }
     // Story 7.7 (DEC-344): `u` is the list's first entry; the pre-7.7 form,
