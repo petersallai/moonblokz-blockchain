@@ -274,3 +274,16 @@ fn the_hold_length_is_capped_at_255() {
         assert_eq!(late_hold_length_of(h), l, "H = {h}");
     }
 }
+
+/// AC5: a hold count out of range is the node's own state (an exit for a
+/// hold it never opened), never evidence against the block; an arithmetic
+/// overflow of a vote still is.
+#[test]
+fn a_hold_count_fault_is_not_evidence() {
+    assert!(!is_evidence(&ProcessingError::Vote(
+        VoteEngineError::HoldCountOutOfRange
+    )));
+    assert!(is_evidence(&ProcessingError::Vote(
+        VoteEngineError::AccumulatedVoteOverflow
+    )));
+}

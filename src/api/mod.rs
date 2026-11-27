@@ -497,12 +497,17 @@ enum PrePass {
 const NO_OPEN_RUN: u32 = u32::MAX;
 
 /// Whether a per-block step error is evidence against the block (Story 6.0
-/// AC3/AC6, DEC-037). A failed read, an inconsistent in-memory ancestry and
-/// an unparameterized vote engine are the node's own faults.
+/// AC3/AC6, DEC-037). A failed read, an inconsistent in-memory ancestry, an
+/// unparameterized vote engine and a late-node hold count out of range (an
+/// exit releasing a hold this node never opened, Story 7.7 — no block's
+/// bytes can cause it) are the node's own faults.
 fn is_evidence(err: &ProcessingError) -> bool {
     match err {
         ProcessingError::Invalid { .. } => true,
-        ProcessingError::Vote(e) => *e != VoteEngineError::NotParameterized,
+        ProcessingError::Vote(e) => !matches!(
+            e,
+            VoteEngineError::NotParameterized | VoteEngineError::HoldCountOutOfRange
+        ),
         ProcessingError::StorageRead
         | ProcessingError::MissingBlock
         | ProcessingError::MarkOverflow => false,
