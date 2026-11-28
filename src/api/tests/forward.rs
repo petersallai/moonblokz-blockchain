@@ -9,7 +9,11 @@ use super::*;
 /// AC2 / AC10.4: the derived state of two nodes is identical — `node_info`,
 /// the vote engine, the whole block table (statuses, chain flags,
 /// available-UTXO bits), `chain_heads`, the head and the tail.
-fn assert_same_state<S: StorageTrait, T: StorageTrait>(a: &Chain16<S>, b: &Chain16<T>, what: &str) {
+pub(super) fn assert_same_state<S: StorageTrait, T: StorageTrait>(
+    a: &Chain16<S>,
+    b: &Chain16<T>,
+    what: &str,
+) {
     assert!(a.node_info == b.node_info, "{what}: node_info");
     assert!(a.vote_engine == b.vote_engine, "{what}: votes");
     assert!(a.blocks == b.blocks, "{what}: block table");
@@ -43,7 +47,13 @@ fn utxo_genesis() -> (TestChain, Block) {
         receive(&mut bc, &reg),
         ReceiveBlockOutcome::AcceptedSilently
     );
-    let mint_tx = utxo_tx(3, &[], Some((0, 100)), &[Ok(60), Ok(40)]);
+    let mint_tx = utxo_tx_vote(
+        1,
+        3,
+        &[],
+        Some((0, 100 + 3 * CX_FEE)),
+        &[Ok(60 + CX_FEE), Ok(40 + CX_FEE)],
+    );
     let mint = complex_tx_block(3, reg.view().hash(), 0, 0, &[&mint_tx]);
     assert_eq!(
         receive(&mut bc, &mint),
@@ -64,8 +74,14 @@ fn step_inverses_restore_the_derived_state_exactly() {
     let (replica, _) = utxo_genesis();
     let (seq, prev) = (4, mint.view().hash());
     let nt = transfer_tx(seq, 1, 500);
-    let reg = registration_tx(0, 2, 0x32);
-    let cx = utxo_tx(seq, &[(3, 1, 40)], Some((0, 10)), &[Err((1, 45))]);
+    let reg = registration_tx(seq - 1, 0, 2, 0x32);
+    let cx = utxo_tx_vote(
+        1,
+        seq,
+        &[(3, 1, 40 + CX_FEE)],
+        Some((0, 10)),
+        &[Err((1, 45))],
+    );
     let blocks = [
         tx_block(seq, prev, 0, |b| {
             b.add_node_transfer(&nt).ok().expect("transfer");
@@ -109,9 +125,12 @@ fn forward_extension_promotes_each_direct_extension() {
     }
     assert_eq!(bc.node_info.max_known_node_id(), 1);
     assert_eq!(bc.node_info.balance_of(1), 150);
-    // Registration 50 + 1, transfers 101 + 51; every fee back to the
-    // creator, node #0.
-    assert_eq!(bc.node_info.balance_of(0), CURRENCY - 51 - 101 - 51 + 3);
+    // The registration price is absorbed; every fee goes back to the
+    // creator, node #0, so only the price and the transferred amounts leave.
+    assert_eq!(
+        bc.node_info.balance_of(0),
+        CURRENCY - TEST_REGISTRATION_PRICE - 100 - 50
+    );
     assert!(bc.is_ready());
 }
 
@@ -212,8 +231,8 @@ fn invalid_direct_extension_is_not_stored_and_leaves_no_trace() {
     assert_refused_at_intake(genesis, &overspend, ValidationReason::InsufficientBalance);
 
     // A duplicate key after an earlier registration's debit and seeding.
-    let first = registration_tx(0, 1, 0x31);
-    let dup = registration_tx(0, 2, 0x31);
+    let first = registration_tx(1, 0, 1, 0x31);
+    let dup = registration_tx(1, 0, 2, 0x31);
     let duplicate = tx_block(2, prev, 0, |b| {
         b.add_registration(&first).ok().expect("first");
         b.add_registration(&dup).ok().expect("second");
@@ -223,8 +242,8 @@ fn invalid_direct_extension_is_not_stored_and_leaves_no_trace() {
     // A UTXO spend after an earlier input spent the same output.
     let utxo = || utxo_genesis().0;
     let (_, mint) = utxo_genesis();
-    let spend = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
-    let again = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+    let spend = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Err((1, 60))]);
+    let again = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Err((1, 60))]);
     let double = complex_tx_block(4, mint.view().hash(), 0, 0, &[&spend, &again]);
     assert_refused_at_intake(utxo, &double, ValidationReason::UtxoUnavailable);
 }
@@ -273,7 +292,7 @@ fn read_failure_at_intake_stores_the_extension_and_retries_it() {
     let (mut bc, mint) = faulty_utxo_genesis();
     let (replica, _) = faulty_utxo_genesis();
     let mint_idx = bc.active_chain_head_idx;
-    let tx = utxo_tx(4, &[(3, 1, 40)], None, &[Err((1, 40))]);
+    let tx = utxo_tx(4, &[(3, 1, 40 + CX_FEE)], None, &[Err((1, 40))]);
     let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
 
     bc.storage.failing_read_slot = mint_idx;
@@ -307,14 +326,14 @@ fn read_failure_at_intake_stores_the_extension_and_retries_it() {
     );
     assert_eq!(bc.active_chain_head_idx, si, "the retry extended the head");
     assert_eq!(bc.blocks.utxo_available(mint_idx, 1), Some(false));
-    assert_eq!(bc.node_info.balance_of(1), 40);
+    assert_eq!(bc.node_info.balance_of(1), NODE_ONE_FUNDS + 40);
 }
 
 #[test]
 fn save_failure_inverts_the_extension_and_is_unstorable() {
     let (mut bc, mint) = faulty_utxo_genesis();
     let (replica, _) = faulty_utxo_genesis();
-    let tx = utxo_tx(4, &[(3, 1, 40)], Some((0, 5)), &[Err((1, 44))]);
+    let tx = utxo_tx_vote(1, 4, &[(3, 1, 40 + CX_FEE)], Some((0, 5)), &[Err((1, 44))]);
     let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
     bc.storage.fail_saves = true;
     assert_eq!(
@@ -466,10 +485,16 @@ fn extended_genesis() -> (TestChain, [Block; 7]) {
     receive(&mut bc, &reg);
     let t3 = transfer(3, reg.view().hash(), 1, 100);
     receive(&mut bc, &t3);
-    let mint_tx = utxo_tx(4, &[], Some((0, 100)), &[Ok(60), Ok(40)]);
+    let mint_tx = utxo_tx_vote(
+        1,
+        4,
+        &[],
+        Some((0, 100 + 3 * CX_FEE)),
+        &[Ok(60 + CX_FEE), Ok(40 + CX_FEE)],
+    );
     let mint = complex_tx_block(4, t3.view().hash(), 0, 0, &[&mint_tx]);
     receive(&mut bc, &mint);
-    let spend_tx = utxo_tx(5, &[(4, 0, 60)], None, &[Err((1, 59))]);
+    let spend_tx = utxo_tx(5, &[(4, 0, 60 + CX_FEE)], None, &[Err((1, 59))]);
     let spend = complex_tx_block(5, mint.view().hash(), 0, 0, &[&spend_tx]);
     receive(&mut bc, &spend);
     let snap = snapshot_block(&bc, 6, spend.view().hash());
@@ -637,7 +662,7 @@ fn balance_block_repeats_the_pre_state_in_ready() {
             .expect("genesis succeeds")
             .block_one;
         let reg = tx_block(2, b1.view().hash(), 3, |b| {
-            b.add_registration(&registration_tx(0, 1, 0x31))
+            b.add_registration(&registration_tx(1, 0, 1, 0x31))
                 .ok()
                 .expect("add registration");
         });
@@ -648,7 +673,7 @@ fn balance_block_repeats_the_pre_state_in_ready() {
             0,
             1,
             10,
-            1,
+            TEST_TRANSFER_FEE,
             0,
             &Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key"),
         );
@@ -691,7 +716,7 @@ fn balance_block_repeats_the_pre_state_in_ready() {
     // A mismatch as a stored child is deleted, derived state untouched.
     let (mut replica, _) = build();
     let mut bad_child_chain = build().0;
-    let filler_tx = transfer_tx(4, 0, 7);
+    let filler_tx = transfer_tx_vote(4, 0, 7, 1);
     let filler = tx_block(4, prev, 3, |b| {
         b.add_node_transfer(&filler_tx).ok().expect("transfer");
     });
@@ -761,7 +786,7 @@ fn balance_block_snapshot_is_checked_in_fr3() {
         .expect("#100");
     assert_eq!(bc.run_processing_pass(tip).map(|_| ()), Ok(()));
     assert!(bc.node_info.is_seeded(1));
-    assert_eq!(bc.node_info.balance_of(1), 100);
+    assert_eq!(bc.node_info.balance_of(1), NODE_ONE_FUNDS);
 }
 
 // --- AC10.12: complete context in Ready (D3) ----------------------------
@@ -793,14 +818,14 @@ fn ready_has_no_trust_zone() {
         Some(ValidationReason::UnseededActor)
     );
     // An initializer that is not seeded (here: does not exist).
-    let foreign = transfer_block(2, prev, 7, 0, 1, 1, 0);
+    let foreign = transfer_block(2, prev, 7, 0, 1, TEST_TRANSFER_FEE, 0);
     assert_eq!(
         step_reason(&mut bc, &foreign),
         Some(ValidationReason::UnseededActor)
     );
     // As a stored child, it is deleted.
     let a = transfer(2, prev, 0, 7);
-    let child = transfer_block(3, a.view().hash(), 7, 0, 1, 1, 0);
+    let child = transfer_block(3, a.view().hash(), 7, 0, 1, TEST_TRANSFER_FEE, 0);
     receive(&mut bc, &child);
     receive(&mut bc, &a);
     assert_eq!(head_of(&bc), (2, a.view().hash()));
@@ -817,10 +842,10 @@ fn missing_block_repairs_the_index_and_deletes_nothing() {
     let genesis = genesis_zero_block(1_000);
     bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
-    let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+    let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     bc.tier1_admit(&b1.view(), &b1.view().hash(), 0)
         .expect("b1 admitted");
-    let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+    let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let bi2 = bc
         .tier1_admit(&b2.view(), &b2.view().hash(), 0)
         .expect("b2 admitted");
@@ -881,10 +906,10 @@ fn registration_fee_reaches_the_creator_when_the_initializer_is_unseeded() {
         "precondition: unseeded initializer"
     );
     // 1 000 seeded at #100, then #100's replay reward (a balance block is
-    // replay-bearing, FR36 (c), DEC-306) and #101's registration fee of 1.
+    // replay-bearing, FR36 (c), DEC-306) and #101's registration fee.
     assert_eq!(
         bc.node_info.balance_of(0),
-        1_101,
+        1_100 + TEST_REGISTRATION_FEE,
         "the fee reached the creator"
     );
 }
@@ -896,7 +921,13 @@ fn partially_applied_complex_transaction_is_inverted_exactly() {
     let (mut bc, mint) = utxo_genesis();
     let (replica, _) = utxo_genesis();
     // Node 9 does not exist: the second output fails its range check.
-    let cx = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 5)), Err((9, 5))]);
+    let cx = utxo_tx_vote(
+        1,
+        4,
+        &[(3, 0, 60 + CX_FEE)],
+        Some((0, 10)),
+        &[Err((1, 5)), Err((9, 5))],
+    );
     let block = complex_tx_block(4, mint.view().hash(), 0, 0, &[&cx]);
     assert_eq!(
         step_reason(&mut bc, &block),
@@ -1116,7 +1147,7 @@ fn failed_new_tail_read_is_a_local_failure() {
     }
     let b5 = real_on(
         &bc,
-        &tx_block(5, b4.view().hash(), 0, votes_for(5, 0, 1, 9)),
+        &tx_block(5, b4.view().hash(), 0, votes_for(5, 1, 1, 9)),
         0,
         1,
     );
@@ -1637,49 +1668,59 @@ fn input_signatures_are_verified_on_the_ready_extension() {
     let utxo = || utxo_genesis().0;
     let (_, mint) = utxo_genesis();
     let prev = mint.view().hash();
-    let refused = |cx: &moonblokz_chain_types::ComplexTransaction| {
+    let refused = |cx: &moonblokz_chain_types::ComplexTransaction, reason| {
         let block = complex_tx_block(4, prev, 0, 0, &[cx]);
-        assert_refused_at_intake(utxo, &block, ValidationReason::InputSignatureInvalid);
+        assert_refused_at_intake(utxo, &block, reason);
     };
+    let utxo_input = ValidationReason::UtxoSignatureInvalid;
+    let balance_input = ValidationReason::InputSignatureInvalid;
 
     // A UTXO input signed by a key other than the output's address.
-    refused(&utxo_tx_signed(
-        0,
-        4,
-        &[(3, 0, 60)],
-        None,
-        &[Err((1, 60))],
-        &other_key(),
-    ));
+    refused(
+        &utxo_tx_signed(
+            0,
+            4,
+            &[(3, 0, 60 + CX_FEE)],
+            None,
+            &[Err((1, 60))],
+            &other_key(),
+        ),
+        utxo_input,
+    );
     // A balance input signed by a key other than node #0's.
-    refused(&utxo_tx_signed(
-        0,
-        4,
-        &[],
-        Some((0, 10)),
-        &[Err((1, 10))],
-        &other_key(),
-    ));
+    refused(
+        &utxo_tx_signed(
+            1,
+            4,
+            &[],
+            Some((0, 10 + CX_FEE)),
+            &[Err((1, 10))],
+            &other_key(),
+        ),
+        balance_input,
+    );
 
     // Valid signatures moved onto a transaction whose `vote` differs: every
-    // input commits to the vote, so every one fails.
-    let signed = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 70))]);
-    let mut lifted = utxo_tx_vote(1, 4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 70))]);
+    // input commits to the vote, so every one fails — before the vote target
+    // is checked (DEC-350), so a vote for a node that does not exist (#2)
+    // still shows the signature failure.
+    let signed = utxo_tx_vote(1, 4, &[(3, 0, 60 + CX_FEE)], Some((0, 10)), &[Err((1, 70))]);
+    let mut lifted = utxo_tx_vote(2, 4, &[(3, 0, 60 + CX_FEE)], Some((0, 10)), &[Err((1, 70))]);
     for (i, signature) in input_signatures(&signed).iter().enumerate() {
         lifted
             .set_input_signature(i as u8, signature.as_slice().try_into().expect("size"))
             .ok()
             .expect("input");
     }
-    refused(&lifted);
+    refused(&lifted, utxo_input); // the UTXO input comes first
 
     // A zeroed signature.
-    let mut zeroed = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+    let mut zeroed = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Err((1, 60))]);
     zeroed
         .set_input_signature(0, &[0u8; SIGNATURE_SIZE])
         .ok()
         .expect("input");
-    refused(&zeroed);
+    refused(&zeroed, utxo_input);
 
     // The correctly signed transaction is accepted.
     let mut bc = utxo_genesis().0;
@@ -1699,7 +1740,7 @@ fn input_signatures_are_verified_on_the_ready_extension() {
 fn a_failed_input_signature_leaves_nothing_applied() {
     let (mut bc, mint) = utxo_genesis();
     let (replica, _) = utxo_genesis();
-    let mut cx = utxo_tx(4, &[(3, 0, 60)], Some((0, 10)), &[Err((1, 70))]);
+    let mut cx = utxo_tx_vote(1, 4, &[(3, 0, 60 + CX_FEE)], Some((0, 10)), &[Err((1, 70))]);
     let mut buf = [0u8; moonblokz_chain_types::MAX_TRANSACTION_SIZE];
     let len = TransactionView::from_bytes(cx.as_bytes())
         .and_then(|v| v.input_signing_preimage(&mut buf).map(|p| p.len()))
@@ -1754,7 +1795,7 @@ fn accepted_signatures_skip_input_verification_only() {
 fn the_bit_six_skip_still_resolves_and_spends() {
     let (mut bc, mint) = utxo_genesis();
     let mi = bc.active_chain_head_idx;
-    let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Err((1, 60))]);
+    let tx = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Err((1, 60))]);
     let spend = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
     assert_eq!(
         receive(&mut bc, &spend),

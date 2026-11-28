@@ -320,6 +320,7 @@ fn tier1_refuses_a_malformed_proof_or_repeated_members() {
             &bc.node_zero_public_key,
             MAX_BLOCK_SIZE as u32,
             TestChain::UTXO_BITFIELD_WIDTH,
+            None,
             &bc.crypto,
         )
     };
@@ -1137,7 +1138,9 @@ fn as_deviation(block: &Block, first_voted: u32, recorded: u32, key: u8) -> Bloc
 /// and a validator accepts that approval.
 #[test]
 fn a_penalty_only_fact_block_in_deviation_form_is_an_ordinary_deviation() {
-    const K: u32 = 4;
+    // A node that is not the top at #13 (node #4 is, on the support chain
+    // whose registrations vote for node #1, DEC-190).
+    const K: u32 = 5;
     let (mut g, mut l, [_, _, _, _, a4, a5]) = support_chain(K);
     let y = resign(
         &tx_block(5, a4.view().hash(), 0, votes_for(5, 2, 1, 9_999)),
@@ -1250,7 +1253,7 @@ fn a_node_that_entered_the_window_above_p_is_not_in_the_round() {
     assert_eq!(l.vote_engine.top_creator(), Some(5), "precondition");
     let a7 = real_on(
         &l,
-        &tx_block(7, a6.view().hash(), 0, votes_for(7, 0, 1, 7_100)),
+        &tx_block(7, a6.view().hash(), 0, votes_to(7, 0, 1, 7_100)),
         5,
         key_of(5),
     );

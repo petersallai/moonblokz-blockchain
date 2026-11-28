@@ -387,7 +387,7 @@ fn no_support_after_the_head_advanced_past_the_horizon() {
             pl.build_evidence_block(pl.active_chain_head_idx, 0)
                 .expect("complete")
         } else {
-            let template = tx_block(seq, prev_hash, 0, votes_for(seq, 0, 1, 500 + seq as u64));
+            let template = tx_block(seq, prev_hash, 0, votes_to(seq, 0, 1, 500 + seq as u64));
             real_on(&g, &template, 4, key_of(4))
         };
         for node in [&mut g, &mut pl] {

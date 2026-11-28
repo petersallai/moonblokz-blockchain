@@ -35,6 +35,7 @@ use moonblokz_crypto::{
     MULTI_SIGNATURE_SIZE, MultiSignature, MultiSignatureTrait, PUBLIC_KEY_SIZE, PublicKey,
     PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
 };
+use moonblokz_mempool::{AddResult, Mempool};
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
@@ -72,6 +73,7 @@ mod acquisition;
 mod admission;
 mod calls;
 mod chain_config;
+mod duplicate;
 mod evidence;
 mod fact;
 mod forward;
@@ -82,6 +84,7 @@ mod restart;
 mod step;
 mod support;
 mod switch;
+mod transaction_intake;
 mod window;
 
 use evidence::{deviation_sum, is_late, late_room, run_after, run_before, run_rules, slot_rule};
@@ -213,6 +216,10 @@ pub(crate) enum ProcessingError {
 pub(crate) enum UtxoSpendError {
     /// The input names no spendable output (exact evidence).
     Invalid(ValidationReason),
+    /// The referenced output exists but is spent on this ancestry: its
+    /// address, so the caller verifies the input's signature before it
+    /// declares the input unavailable (DEC-353, Story 7.3).
+    Spent([u8; PUBLIC_KEY_SIZE]),
     /// The referenced block could not be read back, no longer parses, or lacks
     /// an output its available-UTXO bit says exists (storage and RAM disagree).
     StorageRead,
@@ -241,10 +248,15 @@ pub(crate) enum ValidationReason {
     VoteHeaderMismatch,
     /// A node-transfer / registration transaction signature is invalid.
     TransactionSignatureInvalid,
-    /// A complex-transaction input signature does not verify over the DEC-196
-    /// preimage against its own key: a UTXO input's referenced output address,
-    /// a balance input's `initializer` key (Story 7.1, I-21).
+    /// A balance input's signature does not verify over the DEC-196 preimage
+    /// against its `initializer` key (Story 7.1, I-21).
     InputSignatureInvalid,
+    /// A UTXO input's signature does not verify over the DEC-196 preimage
+    /// against the referenced output's address (Story 7.1, I-21). Distinct
+    /// from [`Self::InputSignatureInvalid`] because the address is the
+    /// referenced block's content, which a switch can replace while that block
+    /// lies above the switch bound (FR58, Story 7.3 RD4.3).
+    UtxoSignatureInvalid,
     /// A debit (transfer amount+fee, registration price+fee, balance input)
     /// exceeds the initializer's derived balance (negative-balance outcome).
     InsufficientBalance,
@@ -364,6 +376,25 @@ pub(crate) enum ValidationReason {
     /// FR6 / FR9 Tier 2 (DEC-217): a non-genesis block's `mined_amount` is not
     /// the `mining_reward` resolved at its pre-state (Story 7.2).
     MinedAmountMismatch,
+    /// DEC-174 (I-45): a transfer, registration (DEC-356) or balance-input
+    /// anchor below `max(0, s − W)`, the window tail of the block's parent,
+    /// with the held `W` (Story 7.3).
+    AnchorBelowWindow,
+    /// FR56 (DEC-181, DEC-311): a non-exempt transaction's fee outside
+    /// `[tx_fee_per_byte_min · size, tx_fee_per_byte_max · size]` resolved at
+    /// the block's pre-state, or any fee under an inverted range (Story 7.3).
+    FeeOutOfPolicy,
+    /// DEC-312: a registration's carried price differs from
+    /// `registration_price` at the block's pre-state (Story 7.3).
+    RegistrationPriceMismatch,
+    /// DEC-190 (I-13): node #0 initiates with `vote == 0` while another node is
+    /// registered in the transaction's pre-state (Story 7.3).
+    NodeZeroSelfVote,
+    /// FR6 (I-22, DEC-349, DEC-354): a transfer or a balance-only complex
+    /// transaction whose uniqueness key another transaction of the same block,
+    /// or of a block on its ancestry above its anchor (and within the window),
+    /// already carries (Story 7.3).
+    DuplicateTransaction,
 }
 
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass
@@ -538,6 +569,13 @@ struct BlockDerivation {
     /// DEC-346: the slot of block `s − L` when it is an approval evidence
     /// block whose late-node hold ends with this block; the commit reads it.
     hold_exit: Option<u32>,
+    /// The registered-node count at the block's pre-state, `None` where the
+    /// chain-info source declines: what the fee policy and the registration
+    /// price resolve against for every transaction of the block (DEC-312).
+    chain_info_count: Option<u64>,
+    /// The `block_sequence` of the UTXO input a failure names (amount,
+    /// signature, resolution): what intake's outcome reads (RD1, RD4.3).
+    failed_utxo_ref: u32,
 }
 
 /// The FR3 candidate chain-config preload verdict — see
@@ -590,6 +628,8 @@ pub struct Blockchain<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 > {
     // Adjacent-component handles (immutable construction inputs).
     crypto: Crypto,
@@ -724,6 +764,11 @@ pub struct Blockchain<
     // no verdict; the root re-enters collecting at the end of its call, never
     // from inside the step or a switch. 1 B.
     reentry_due: bool,
+    // FR30 / FR31 (Story 7.3, DEC-351): the mempool, owned here and changed
+    // only by this crate — intake's add (FR31), FR32's reconciliation (Story
+    // 7.4); built in place with the node's `b"mempool"` sub-seed (DEC-090,
+    // DEC-201). Its capacities are build generics (AR9, DEC-088).
+    mempool: Mempool<MEMPOOL_COMPACT_BYTES, MEMPOOL_MAX_ENTRIES>,
     // No completeness horizon (Story 6.14 D6, DEC-211, withdrawing DEC-167):
     // a balance entry is a snapshot of its node at its position, so the undo
     // of a seed is identity on the values, and every state below it follows
@@ -740,6 +785,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -750,6 +797,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// The available-UTXO bitfield width in bits, `AVAILABLE_UTXO_BYTES · 8`:

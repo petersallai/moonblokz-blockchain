@@ -12,7 +12,7 @@ fn votes_after(g: &SupportChain, prev: &Block, creator: u32, targets: &[u32], sa
     let targets = targets.to_vec();
     let template = tx_block(seq, prev.view().hash(), 0, move |b| {
         for (i, &target) in targets.iter().enumerate() {
-            votes_for(seq, target, 1, salt + 1000 * i as u64)(b);
+            votes_to(seq, target, 1, salt + 1000 * i as u64)(b);
         }
     });
     real_on(g, &template, creator, key_of(creator))

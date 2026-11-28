@@ -11,6 +11,8 @@ pub(super) type TestChain = Blockchain<
     TEST_MAX_BLOCKS,
     4,
     TEST_UTXO_BYTES,
+    TEST_MEMPOOL_BYTES,
+    TEST_MEMPOOL_ENTRIES,
 >;
 
 pub(super) fn new_test_chain() -> TestChain {
@@ -30,7 +32,16 @@ pub(super) fn node_transfer_block(seq: u32, vote: u32, anchor: u32, initializer:
     // The block-creator signature is not a Tier 1 gate in Epic 4
     // (opportunistic / ready-state), so any signer works for these tests.
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let nt = NodeTransfer::new_signed(vote, anchor, initializer, 9, 100, 1, 0, &signer);
+    let nt = NodeTransfer::new_signed(
+        vote,
+        anchor,
+        initializer,
+        9,
+        100,
+        TEST_TRANSFER_FEE,
+        0,
+        &signer,
+    );
     let header = BlockHeader {
         version: 1,
         sequence: seq,
@@ -106,7 +117,7 @@ pub(super) fn block_zero_from(
 pub(super) fn genesis_zero_transactions(amount: u64) -> (Crypto, Registration, NodeTransfer) {
     let anchor = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
     let anchor_pk = *anchor.public_key().serialize();
-    let registration = Registration::new_signed(0, 0, 0, 0, 0, &anchor_pk, &anchor);
+    let registration = Registration::new_signed(0, 0, 0, 0, 0, 0, &anchor_pk, &anchor);
     let transfer = NodeTransfer::new_signed(0, 0, 0, 0, amount, 0, 0, &anchor);
     (anchor, registration, transfer)
 }
@@ -116,7 +127,16 @@ pub(super) fn genesis_zero_transactions(amount: u64) -> (Crypto, Registration, N
 /// makes an orphan (Stored head); this helper links a child to its parent.
 pub(super) fn linked_transfer_block(seq: u32, prev: [u8; 32]) -> Block {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let nt = NodeTransfer::new_signed(3, seq.saturating_sub(1), 7, 9, 100, 1, 0, &signer);
+    let nt = NodeTransfer::new_signed(
+        3,
+        seq.saturating_sub(1),
+        7,
+        9,
+        100,
+        TEST_TRANSFER_FEE,
+        0,
+        &signer,
+    );
     let header = BlockHeader {
         version: 1,
         sequence: seq,
@@ -141,7 +161,16 @@ pub(super) fn linked_transfer_block(seq: u32, prev: [u8; 32]) -> Block {
 /// `(sequence, previous_hash)` get distinct hashes — for the tie-break test.
 pub(super) fn salted_linked_block(seq: u32, prev: [u8; 32], vote: u32) -> Block {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let nt = NodeTransfer::new_signed(vote, seq.saturating_sub(1), 7, 9, 100, 1, 0, &signer);
+    let nt = NodeTransfer::new_signed(
+        vote,
+        seq.saturating_sub(1),
+        7,
+        9,
+        100,
+        TEST_TRANSFER_FEE,
+        0,
+        &signer,
+    );
     let header = BlockHeader {
         version: 1,
         sequence: seq,
@@ -173,7 +202,18 @@ pub(super) const W6: u32 = 6;
 /// segment fits the test harness's block storage. Same shape as
 /// `new_test_chain` otherwise (local_node_id 5, join/Collecting), but on
 /// [`W6Storage`].
-pub(super) type W6Chain = Blockchain<Crypto, W6Storage, TestConfig, 16, 6, 16, 4, TEST_UTXO_BYTES>;
+pub(super) type W6Chain = Blockchain<
+    Crypto,
+    W6Storage,
+    TestConfig,
+    16,
+    6,
+    16,
+    4,
+    TEST_UTXO_BYTES,
+    TEST_MEMPOOL_BYTES,
+    TEST_MEMPOOL_ENTRIES,
+>;
 
 /// The W6 harness's storage: fourteen block slots. A window-anchored join
 /// holds `W + H = 9` blocks; the others are kept for forks and extensions
@@ -253,10 +293,11 @@ pub(super) fn registration_block(
     let zero = [0u8; SIGNATURE_SIZE];
     let unsigned = Registration::new(
         0,
+        seq.saturating_sub(1),
         initializer,
         new_node_id,
-        50,
-        1,
+        TEST_REGISTRATION_PRICE,
+        TEST_REGISTRATION_FEE,
         &new_pk,
         &new_key_sig,
         &zero,
@@ -265,10 +306,11 @@ pub(super) fn registration_block(
     tx_sig.copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..SIGNATURE_SIZE]);
     let reg = Registration::new(
         0,
+        seq.saturating_sub(1),
         initializer,
         new_node_id,
-        50,
-        1,
+        TEST_REGISTRATION_PRICE,
+        TEST_REGISTRATION_FEE,
         &new_pk,
         &new_key_sig,
         &tx_sig,
@@ -461,12 +503,17 @@ pub(super) fn rewarded_config_builder(reward: u32) -> ChainConfigPayloadBuilder 
 /// the chain's `mining_reward` (FR6, DEC-217), so a credit is observable only
 /// on a chain that declares one.
 pub(super) fn rewarded_test_chain(reward: u32) -> TestChain {
+    test_chain_on(&mut rewarded_config_builder(reward))
+}
+
+/// [`new_test_chain`] durably locked on `builder`'s content.
+pub(super) fn test_chain_on(builder: &mut ChainConfigPayloadBuilder) -> TestChain {
     let (crypto, storage, _) = test_backends();
     let mut chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
     chain_config
-        .load_durable(rewarded_config_builder(reward).build_signed(&crypto))
+        .load_durable(builder.build_signed(&crypto))
         .ok()
-        .expect("a rewarded override set is accepted content");
+        .expect("the override set is accepted content");
     let node_zero = *crypto.public_key().serialize();
     let mut bc_slot = core::mem::MaybeUninit::<TestChain>::uninit();
     TestChain::init(&mut bc_slot, crypto, storage, chain_config, 5, node_zero, 0);
@@ -482,11 +529,35 @@ pub(super) fn admit_rewarded_anchor(
     prev: [u8; 32],
     reward: u32,
 ) -> [u8; 32] {
-    let cfg = chain_config_block_mined(seq, prev, &mut rewarded_config_builder(reward), reward);
+    admit_anchor_on(bc, seq, prev, &mut rewarded_config_builder(reward), reward)
+}
+
+/// [`admit_chain_config_anchor`] for a [`test_chain_on`] `builder`: the anchor
+/// carries that content, its `mined_amount` the chain's `mining_reward`.
+pub(super) fn admit_anchor_on(
+    bc: &mut TestChain,
+    seq: u32,
+    prev: [u8; 32],
+    builder: &mut ChainConfigPayloadBuilder,
+    mined: u32,
+) -> [u8; 32] {
+    let cfg = chain_config_block_mined(seq, prev, builder, mined);
     let hash = cfg.view().hash();
     bc.tier1_admit(&cfg.view(), &hash, 0)
         .expect("chain-config anchor admitted");
     hash
+}
+
+/// The test window with no fee ceiling (`tx_fee_per_byte_max = u64::MAX`),
+/// for the fee-total overflow: under the default ceiling a fee that could
+/// overflow it is out of policy first (FR56).
+pub(super) fn uncapped_fee_config_builder() -> ChainConfigPayloadBuilder {
+    let mut builder = window_config_builder(TEST_W);
+    builder
+        .add_literal(parameter::TX_FEE_PER_BYTE_MAX, &u64::MAX.to_le_bytes())
+        .ok()
+        .expect("an eight-byte literal is well-formed");
+    builder
 }
 
 pub(super) fn admit_chain_config_anchor(bc: &mut TestChain, seq: u32, prev: [u8; 32]) -> [u8; 32] {
@@ -624,12 +695,13 @@ pub(super) fn w6_horizon_block() -> Block {
 }
 
 /// A clean (Story 6.7 D8) block at `seq` on `prev`: one node transfer of
-/// nothing, fee 0, by node #0 to itself, voting for its creator. Valid
-/// wherever node #0 is seeded, so it extends a Ready W6 head at any
-/// position, a clean slot included.
-pub(super) fn w6_clean_block(seq: u32, prev: [u8; 32]) -> Block {
+/// nothing, at the minimum fee, by node #0 to itself, voting for `vote` —
+/// 0 while node #0 is the only node, another existing node once there are
+/// more (DEC-190). Valid wherever node #0 is seeded, so it extends a Ready
+/// W6 head at any position, a clean slot included.
+pub(super) fn w6_clean_block(seq: u32, prev: [u8; 32], vote: u32) -> Block {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let nt = NodeTransfer::new_signed(0, seq - 1, 0, 0, 0, 0, 0, &signer);
+    let nt = NodeTransfer::new_signed(vote, seq - 1, 0, 0, 0, TEST_TRANSFER_FEE, 0, &signer);
     tx_block(seq, prev, 0, |b| {
         b.add_node_transfer(&nt).ok().expect("add transfer");
     })
@@ -796,14 +868,19 @@ pub(super) fn admit(bc: &mut TestChain, block: &Block) -> u32 {
 }
 
 /// The UTXO harness: a chain-config anchor at 99, then a balance block at
-/// 100 seeding node 1 with 100 and nodes 2 and 3 (the creator) with 0.
+/// 100 seeding node 1 with [`NODE_ONE_FUNDS`] (its mints and the fees of
+/// the spends that need one) and nodes 2 and 3 (the creator) with 0.
 pub(super) fn utxo_test_chain() -> (TestChain, [u8; 32]) {
     let mut bc = new_test_chain();
     let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
     let seed = balance_block(
         100,
         cfg_hash,
-        &[(1, 100, 0, 0x31), (2, 0, 0, 0x32), (3, 0, 0, 0x33)],
+        &[
+            (1, NODE_ONE_FUNDS, 0, 0x31),
+            (2, 0, 0, 0x32),
+            (3, 0, 0, 0x33),
+        ],
         3,
     );
     admit(&mut bc, &seed);
@@ -876,8 +953,18 @@ impl<const N: usize> StorageTrait for FailingReadStorage<N> {
 
 /// Every chain of this section shares `TestChain`'s capacities; only the
 /// storage differs (the fault-injecting one of AC6).
-pub(super) type Chain16<S> =
-    Blockchain<Crypto, S, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>;
+pub(super) type Chain16<S> = Blockchain<
+    Crypto,
+    S,
+    TestConfig,
+    16,
+    16,
+    TEST_MAX_BLOCKS,
+    4,
+    TEST_UTXO_BYTES,
+    TEST_MEMPOOL_BYTES,
+    TEST_MEMPOOL_ENTRIES,
+>;
 
 /// The FR54 currency of every genesis node in this section.
 pub(super) const CURRENCY: u64 = 1_000_000_000;
@@ -929,8 +1016,37 @@ pub(super) fn receive<S: StorageTrait>(bc: &mut Chain16<S>, block: &Block) -> Re
 }
 
 /// A registration of `new_node_id` by `initializer`, its key from
-/// `pk_byte` (the cross-key construction of [`registration_block`]).
-pub(super) fn registration_tx(initializer: u32, new_node_id: u32, pk_byte: u8) -> Registration {
+/// `pk_byte` (the cross-key construction of [`registration_block`]), anchored
+/// at `anchor` (DEC-356: in a block `s`, `max(0, s − W) ≤ anchor < s`). It
+/// votes for node #1 when node #0 registers id 2 or above — node #1 then
+/// exists in its pre-state, so node #0 may no longer vote 0 (DEC-190) — and
+/// for node #0 otherwise.
+pub(super) fn registration_tx(
+    anchor: u32,
+    initializer: u32,
+    new_node_id: u32,
+    pk_byte: u8,
+) -> Registration {
+    let vote = u32::from(initializer == 0 && new_node_id >= 2);
+    registration_tx_priced(
+        anchor,
+        initializer,
+        new_node_id,
+        pk_byte,
+        TEST_REGISTRATION_PRICE,
+        vote,
+    )
+}
+
+/// [`registration_tx`] carrying `price` and voting for `vote`.
+pub(super) fn registration_tx_priced(
+    anchor: u32,
+    initializer: u32,
+    new_node_id: u32,
+    pk_byte: u8,
+    price: u64,
+    vote: u32,
+) -> Registration {
     let init_signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("init key");
     let new_signer = Crypto::new([pk_byte; PRIVATE_KEY_SIZE])
         .ok()
@@ -940,11 +1056,12 @@ pub(super) fn registration_tx(initializer: u32, new_node_id: u32, pk_byte: u8) -
     new_key_sig.copy_from_slice(&new_signer.prove_possession().serialize()[..SIGNATURE_SIZE]);
     let zero = [0u8; SIGNATURE_SIZE];
     let unsigned = Registration::new(
-        0,
+        vote,
+        anchor,
         initializer,
         new_node_id,
-        50,
-        1,
+        price,
+        TEST_REGISTRATION_FEE,
         &new_pk,
         &new_key_sig,
         &zero,
@@ -952,11 +1069,12 @@ pub(super) fn registration_tx(initializer: u32, new_node_id: u32, pk_byte: u8) -
     let mut tx_sig = [0u8; SIGNATURE_SIZE];
     tx_sig.copy_from_slice(&init_signer.sign(unsigned.as_bytes()).serialize()[..SIGNATURE_SIZE]);
     Registration::new(
-        0,
+        vote,
+        anchor,
         initializer,
         new_node_id,
-        50,
-        1,
+        price,
+        TEST_REGISTRATION_FEE,
         &new_pk,
         &new_key_sig,
         &tx_sig,
@@ -989,10 +1107,50 @@ pub(super) fn tx_block(
     builder.build_signed(&signer).ok().expect("build signed")
 }
 
-/// A node #0 → `receiver` transfer of `amount` (fee 1, vote 0).
+/// A node #0 → `receiver` transfer of `amount` (the minimum fee), voting for
+/// its receiver — node #0 votes 0 only to itself (DEC-190: only while alone).
 pub(super) fn transfer_tx(seq: u32, receiver: u32, amount: u64) -> NodeTransfer {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    NodeTransfer::new_signed(0, seq - 1, 0, receiver, amount, 1, 0, &signer)
+    NodeTransfer::new_signed(
+        receiver,
+        seq - 1,
+        0,
+        receiver,
+        amount,
+        TEST_TRANSFER_FEE,
+        0,
+        &signer,
+    )
+}
+
+/// [`transfer_tx`] voting for `vote` — for a node-#0 self-transfer once
+/// another node exists (DEC-190).
+pub(super) fn transfer_tx_vote(seq: u32, receiver: u32, amount: u64, vote: u32) -> NodeTransfer {
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    NodeTransfer::new_signed(
+        vote,
+        seq - 1,
+        0,
+        receiver,
+        amount,
+        TEST_TRANSFER_FEE,
+        0,
+        &signer,
+    )
+}
+
+/// [`transfer`] voting for `vote`.
+pub(super) fn transfer_vote(
+    seq: u32,
+    prev: [u8; 32],
+    receiver: u32,
+    amount: u64,
+    vote: u32,
+) -> Block {
+    let nt = transfer_tx_vote(seq, receiver, amount, vote);
+    tx_block(seq, prev, 0, |b| {
+        b.add_node_transfer(&nt).ok().expect("add transfer");
+    })
 }
 
 pub(super) fn transfer(seq: u32, prev: [u8; 32], receiver: u32, amount: u64) -> Block {
@@ -1003,7 +1161,7 @@ pub(super) fn transfer(seq: u32, prev: [u8; 32], receiver: u32, amount: u64) -> 
 }
 
 pub(super) fn register(seq: u32, prev: [u8; 32], new_node_id: u32, pk_byte: u8) -> Block {
-    let reg = registration_tx(0, new_node_id, pk_byte);
+    let reg = registration_tx(seq - 1, 0, new_node_id, pk_byte);
     tx_block(seq, prev, 0, |b| {
         b.add_registration(&reg).ok().expect("add registration");
     })
@@ -1119,8 +1277,15 @@ pub(super) fn faulty_utxo_genesis() -> (Chain16<FaultyStorage>, Block) {
     );
     // Its vote credits node #1 once, so a block of node #1 above it is
     // worth `I(1000)` (Story 6.3: the side-branch fixtures need an active
-    // branch their small free values do not outrank).
-    let mint_tx = utxo_tx_vote(1, 3, &[], Some((0, 100)), &[Ok(60), Ok(40)]);
+    // branch their small free values do not outrank). It also funds node #1,
+    // so node #1 can cast the votes for node #0 (DEC-190).
+    let mint_tx = utxo_tx_vote(
+        1,
+        3,
+        &[],
+        Some((0, 100 + NODE_ONE_FUNDS + 3 * CX_FEE)),
+        &[Ok(60 + CX_FEE), Ok(40 + CX_FEE), Err((1, NODE_ONE_FUNDS))],
+    );
     let mint = complex_tx_block(3, reg.view().hash(), 0, 0, &[&mint_tx]);
     assert_eq!(
         receive(&mut bc, &mint),
@@ -1212,9 +1377,11 @@ pub(super) fn resign(block: &Block, creator: u32, consumed_votes: u32, key: u8) 
 }
 
 /// A node #0 self-transfer of `amount` at `seq`, worth `value` — a free
-/// header value, so for side blocks only (see [`revalue`]).
+/// header value, so for side blocks only (see [`revalue`]). It votes for
+/// node #1, which every chain these side blocks join has registered (node
+/// #0 may not vote for itself then, DEC-190).
 pub(super) fn valued(seq: u32, prev: [u8; 32], value: u32, amount: u64) -> Block {
-    revalue(&transfer(seq, prev, 0, amount), value)
+    revalue(&transfer_vote(seq, prev, 0, amount, 1), value)
 }
 
 /// Node #1's key byte wherever these fixtures register it.
@@ -1241,15 +1408,51 @@ pub(super) fn votes_for(
     n: u32,
     salt: u64,
 ) -> impl FnOnce(&mut BlockBuilder) {
+    votes_by(seq, 0, target, n, salt)
+}
+
+/// `n` self-transfers by `initializer` (signed with its fixture key) at
+/// `seq` whose `vote` names `target`, their amounts from `salt` (distinct
+/// transactions). The initializer pays the minimum fee for each.
+pub(super) fn votes_by(
+    seq: u32,
+    initializer: u32,
+    target: u32,
+    n: u32,
+    salt: u64,
+) -> impl FnOnce(&mut BlockBuilder) {
     move |b| {
-        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let signer = Crypto::new([key_of(initializer); PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test key");
         for i in 0..n {
-            let nt =
-                NodeTransfer::new_signed(target, seq - 1, 0, 0, salt + u64::from(i), 1, 0, &signer);
+            let nt = NodeTransfer::new_signed(
+                target,
+                seq - 1,
+                initializer,
+                initializer,
+                salt + u64::from(i),
+                TEST_TRANSFER_FEE,
+                0,
+                &signer,
+            );
             b.add_node_transfer(&nt).ok().expect("add vote");
         }
     }
 }
+
+/// `n` votes for `target` at `seq`: node #0's, or node #1's for node #0
+/// (node #0 may not vote for itself once node #1 exists, DEC-190) — on a
+/// chain that funded node #1.
+pub(super) fn votes_to(seq: u32, target: u32, n: u32, salt: u64) -> impl FnOnce(&mut BlockBuilder) {
+    let initializer = u32::from(target == 0);
+    votes_by(seq, initializer, target, n, salt)
+}
+
+/// What the two-creator fixtures fund node #1 with where they register it,
+/// so it can initiate the votes for node #0 (DEC-190: node #0 may not vote
+/// for itself once node #1 exists).
+pub(super) const NODE_ONE_FUNDS: u64 = 1_000_000;
 
 /// An active-chain block by node `creator` (#0 or #1) carrying its real
 /// FR21 value on a chain whose creators alternate between #0 and #1, each
@@ -1272,16 +1475,31 @@ pub(super) fn alt(
     register: bool,
 ) -> Block {
     let other = 1 - creator;
+    // A vote for `x` is cast by the other node of the two: node #0 may not
+    // vote for itself once node #1 exists (DEC-190), and a vote for the
+    // creator is wiped by its reset, so the votes keep their old effect.
+    // The registering block (always node #0's) funds node #1 for that when it
+    // votes for node #1 anyway (one credit per block, DEC-176); with no
+    // vote out, its neutral vote precedes the registration, while node #0
+    // is still alone, and node #1 stays unfunded.
     let template = tx_block(seq, prev, 0, |b| {
         if register {
-            b.add_registration(&registration_tx(0, 1, NODE_ONE_KEY))
+            assert_eq!(creator, 0, "node #0 registers node #1");
+            if out == 0 {
+                votes_for(seq, 0, 1, salt)(b);
+            }
+            b.add_registration(&registration_tx(seq - 1, 0, 1, NODE_ONE_KEY))
                 .ok()
                 .expect("add registration");
-        }
-        if out == 0 {
-            votes_for(seq, creator, 1, salt)(b);
+            if out > 0 {
+                let funding = transfer_tx(seq, 1, NODE_ONE_FUNDS);
+                b.add_node_transfer(&funding).ok().expect("add funding");
+                votes_for(seq, 1, out, salt)(b);
+            }
+        } else if out == 0 {
+            votes_by(seq, other, creator, 1, salt)(b);
         } else {
-            votes_for(seq, other, out, salt)(b);
+            votes_by(seq, creator, other, out, salt)(b);
         }
     });
     let key = if creator == 0 { 1 } else { NODE_ONE_KEY };
@@ -1304,8 +1522,10 @@ pub(super) fn real_on<
     const B: usize,
     const H: usize,
     const U: usize,
+    const MB: usize,
+    const ME: usize,
 >(
-    state: &Blockchain<C, S, G, N, L, B, H, U>,
+    state: &Blockchain<C, S, G, N, L, B, H, U, MB, ME>,
     block: &Block,
     creator: u32,
     key: u8,
@@ -1325,8 +1545,10 @@ pub(super) fn brute_value<
     const B: usize,
     const H: usize,
     const U: usize,
+    const MB: usize,
+    const ME: usize,
 >(
-    bc: &Blockchain<C, S, G, N, L, B, H, U>,
+    bc: &Blockchain<C, S, G, N, L, B, H, U, MB, ME>,
     head: u32,
 ) -> u64 {
     let tail = bc
@@ -1360,8 +1582,10 @@ pub(super) fn slot<
     const B: usize,
     const H: usize,
     const U: usize,
+    const MB: usize,
+    const ME: usize,
 >(
-    bc: &Blockchain<C, S, G, N, L, B, H, U>,
+    bc: &Blockchain<C, S, G, N, L, B, H, U, MB, ME>,
     block: &Block,
 ) -> u32 {
     let view = block.view();
@@ -1441,15 +1665,24 @@ pub(super) fn utxo_side_fixture() -> (Chain16<FaultyStorage>, Block, Block) {
     // Node #1's, credited once by the mint: worth `I(1000)` = 1100 (I-09),
     // above the free values the side blocks of these Tier 2 tests carry,
     // so none of them is switched to (Story 6.3).
-    let b4 = real_on(&bc, &transfer(4, mint.view().hash(), 0, 7), 1, NODE_ONE_KEY);
+    // Its transaction, node #1's, votes for node #0 (node #0 may not vote
+    // for itself, DEC-190).
+    let b4 = real_on(
+        &bc,
+        &tx_block(4, mint.view().hash(), 0, votes_by(4, 1, 0, 1, 7)),
+        1,
+        NODE_ONE_KEY,
+    );
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
     (bc, mint, b4)
 }
 
 /// A side block at `seq` on `prev` spending `(3, index)` with the declared
-/// `amount` into one UTXO output.
+/// `amount + CX_FEE` into one UTXO output of `amount` — the side mint's
+/// outputs are 60 and 40 plus [`CX_FEE`], so `amount` 60 / 40 is the right
+/// declaration and the spend pays the fixtures' complex fee.
 pub(super) fn side_spend(seq: u32, prev: [u8; 32], index: u16, amount: u64) -> Block {
-    let tx = utxo_tx(seq, &[(3, index, amount)], None, &[Ok(amount)]);
+    let tx = utxo_tx(seq, &[(3, index, amount + CX_FEE)], None, &[Ok(amount)]);
     complex_tx_block(seq, prev, 0, 0, &[&tx])
 }
 
@@ -1708,12 +1941,18 @@ pub(super) fn support_chain_with<S: StorageTrait>(
     }
     assert!(l.is_ready(), "precondition: the local node is Ready");
 
+    // Node #0 registers nodes #1..=#5 and funds node #1, which casts the
+    // votes for node #0 (node #0 may not vote for itself, DEC-190); the
+    // registrations of #2..=#5 already vote for node #1, so the funding adds
+    // no credit (one per block, DEC-176).
+    let funding = transfer_tx(2, 1, NODE_ONE_FUNDS);
     let regs = tx_block(2, b1.view().hash(), 0, |b| {
         for n in 1..=5 {
-            b.add_registration(&registration_tx(0, n, key_of(n)))
+            b.add_registration(&registration_tx(1, 0, n, key_of(n)))
                 .ok()
                 .expect("add registration");
         }
+        b.add_node_transfer(&funding).ok().expect("add funding");
     });
     let a2 = real_on(&g, &regs, 0, 1);
     let next = |g: &mut SupportChain, l: &mut Chain16<S>, prev: &Block, plan: (u32, u32, u32)| {
@@ -1749,14 +1988,14 @@ pub(super) fn support_chain(local: u32) -> (SupportChain, SupportChain, [Block; 
 /// transaction from `salt`.
 pub(super) fn deviation_after(g: &SupportChain, prev: &Block, creator: u32, salt: u64) -> Block {
     let seq = prev.view().sequence() + 1;
-    let template = tx_block(seq, prev.view().hash(), 0, votes_for(seq, 0, 1, salt));
+    let template = tx_block(seq, prev.view().hash(), 0, votes_to(seq, creator, 1, salt));
     deviation_on(g, &template, creator)
 }
 
 /// A normal-form block by `creator` on `prev` (the active head of `g`).
 pub(super) fn normal_after(g: &SupportChain, prev: &Block, creator: u32, salt: u64) -> Block {
     let seq = prev.view().sequence() + 1;
-    let template = tx_block(seq, prev.view().hash(), 0, votes_for(seq, 0, 1, salt));
+    let template = tx_block(seq, prev.view().hash(), 0, votes_to(seq, creator, 1, salt));
     real_on(g, &template, creator, key_of(creator))
 }
 
@@ -1782,8 +2021,10 @@ pub(super) fn assert_active_set_matches<
     const B: usize,
     const H: usize,
     const U: usize,
+    const MB: usize,
+    const ME: usize,
 >(
-    bc: &Blockchain<C, S, G, N, L, B, H, U>,
+    bc: &Blockchain<C, S, G, N, L, B, H, U, MB, ME>,
     what: &str,
 ) {
     assert!(bc.active_set.is_valid(), "{what}: the active set is built");
@@ -2047,7 +2288,15 @@ pub(super) fn valued_by(
     creator: u32,
     key: u8,
 ) -> Block {
-    resign(&transfer(seq, prev, 0, amount), creator, value, key)
+    // The vote names the creator, whose reset wipes it (node #0 may not vote
+    // for itself once another node exists, DEC-190).
+    let vote = if creator == 0 { 1 } else { creator };
+    resign(
+        &transfer_vote(seq, prev, 0, amount, vote),
+        creator,
+        value,
+        key,
+    )
 }
 
 /// A genesis node on `W = w` over a [`FailingReadStorage`], unarmed.

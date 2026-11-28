@@ -12,6 +12,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -22,6 +24,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     // -----------------------------------------------------------------------
@@ -420,6 +424,19 @@ impl<
             .map(|config| config.active_chain_length())
     }
 
+    /// The window `W` that Tier 1 may **enforce** against an arriving block:
+    /// the chain's value once the configuration is durably locked, `None`
+    /// before that (FR9; the [`Self::enforceable_block_size_limit`] pattern).
+    /// DEC-174's anchor lower bound is chain-config-derived, so a tentative `W`
+    /// must not refuse a block at intake; the per-block step checks it with
+    /// the held `W` in every phase (Story 7.3 AC4).
+    pub(super) fn enforceable_active_chain_length(&self) -> Option<u32> {
+        self.chain_config
+            .durable_content()
+            .and_then(|_| self.chain_config.active_configuration())
+            .map(|config| config.active_chain_length())
+    }
+
     /// FR58's verification horizon `H` (DEC-160) the held configuration —
     /// tentative or durable — declares, or `None` while the node holds none.
     /// Read where it is needed and never cached (FR56); acceptance holds it
@@ -586,11 +603,16 @@ impl<
     /// position of a window-anchored pass and at side-block Tier 2, where every
     /// read declines (DEC-340).
     pub(super) fn projection_chain_info(&self, served: bool) -> ProjectionChainInfo {
-        ProjectionChainInfo {
-            registered_node_count: served
-                .then(|| u64::from(self.node_info.max_known_node_id()) + 1),
-            declined: core::cell::Cell::new(false),
-        }
+        ProjectionChainInfo::at(self.registered_count(served))
+    }
+
+    /// The registered-node count a chain-info source serves, `None` where it
+    /// declines: node ids are contiguous, so the watermark plus one. The
+    /// per-block step takes it once, before the block's own registrations move
+    /// the watermark, so every check of the block reads its pre-state (Story
+    /// 7.3, DEC-312).
+    pub(super) fn registered_count(&self, served: bool) -> Option<u64> {
+        served.then(|| u64::from(self.node_info.max_known_node_id()) + 1)
     }
 }
 
@@ -610,6 +632,16 @@ pub(super) struct ProjectionChainInfo {
 }
 
 impl ProjectionChainInfo {
+    /// A fresh source serving `registered_node_count` (declining where it is
+    /// `None`): one per check, so a decline is recorded only for the check
+    /// that read it.
+    pub(super) fn at(registered_node_count: Option<u64>) -> Self {
+        Self {
+            registered_node_count,
+            declined: core::cell::Cell::new(false),
+        }
+    }
+
     /// Whether any read through this source declined since it was built.
     pub(super) fn declined(&self) -> bool {
         self.declined.get()

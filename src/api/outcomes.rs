@@ -146,18 +146,30 @@ pub enum RestartRejectReason {
     AlreadyInitialized,
 }
 
-/// Not-ready result of the FR14/FR10 transaction-intake entry point
-/// [`Blockchain::receive_transaction`] while the node is not `Ready`.
-///
-/// Story 5.1 builds only the not-ready gate (FR1: transaction intake is
-/// Ready-state-only). The ready-state classification set (`AcceptedToMempool`,
-/// `AlreadyConfirmed`, `DuplicateInMempool`, `Deferred`, `Rejected`) is added by
-/// **Epic 7** when it builds the body (FR14).
+/// The FR14 / FR10 classification of a transaction submitted to
+/// [`Blockchain::receive_transaction`]: exactly one per call, derived from the
+/// active chain at the head and independent of transport origin. A status
+/// only (FR10's minimal response).
 #[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Eq)]
 pub enum ReceiveTransactionOutcome {
     /// FR1 — the module is not in `Ready`; no classification is performed.
     NotReady,
+    /// Valid for the next block, its signatures verified, and admitted to the
+    /// mempool (FR31).
+    AcceptedToMempool,
+    /// A transaction with the same uniqueness key is on the active chain inside
+    /// the window, or the registration's key is registered (DEC-352).
+    AlreadyConfirmed,
+    /// A mempool entry, Deferred ones included, has the same uniqueness key.
+    DuplicateInMempool,
+    /// Parseable, but missing context a later chain state can supply (an
+    /// unknown node, a balance short of the debit, a later slot or anchor, a
+    /// spent UTXO input); held in the mempool under its Deferred marker (FR31).
+    Deferred,
+    /// Invalid in a way no later chain state cures, or refused by the
+    /// mempool's FR33 eviction draw (FR31's capacity outcome, DEC-351).
+    Rejected,
 }
 
 /// Not-ready result of the FR55 local transaction-creation surface

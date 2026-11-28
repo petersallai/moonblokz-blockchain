@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// The PRNG sub-seed label of the mempool's FR33 eviction stream (DEC-090,
+/// DEC-201): replayable per node, apart from every other stream.
+const MEMPOOL_SEED_LABEL: &[u8] = b"mempool";
+
 impl<
     Crypto: CryptoTrait,
     Storage: StorageTrait,
@@ -12,6 +16,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -22,6 +28,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// This build's capacities, stated for the configuration module's §6
@@ -215,6 +223,11 @@ impl<
             ApprovalAccumulator::init(field_slot(&raw mut (*p).approval));
             (&raw mut (*p).active_open_run).write(NO_OPEN_RUN);
             (&raw mut (*p).reentry_due).write(false);
+            Mempool::init(
+                field_slot(&raw mut (*p).mempool),
+                Prng::new(prng_seed).derive_subseed(MEMPOOL_SEED_LABEL),
+                local_node_id,
+            );
         }
         // SAFETY: every field of `Self` was written above.
         unsafe { slot.assume_init_mut() }
@@ -264,6 +277,18 @@ impl<
             approval: ApprovalAccumulator::new(),
             active_open_run: NO_OPEN_RUN,
             reentry_due: false,
+            mempool: {
+                // The crate's by-value constructors are its own tests'; its
+                // one public constructor builds in place.
+                let mut slot = core::mem::MaybeUninit::uninit();
+                Mempool::init(
+                    &mut slot,
+                    Prng::new(prng_seed).derive_subseed(MEMPOOL_SEED_LABEL),
+                    local_node_id,
+                );
+                // SAFETY: `init` returned, so the slot is initialized.
+                unsafe { slot.assume_init() }
+            },
         }
     }
 
@@ -677,6 +702,7 @@ pub(super) fn genesis_block_zero<C: CryptoTrait>(
 ) {
     let registration = Registration::new_signed(
         0, // vote
+        0, // anchor_sequence (DEC-356; block #0's is 0)
         0, // initializer (node #0)
         0, // new_node_id (node #0)
         0, // registration_price

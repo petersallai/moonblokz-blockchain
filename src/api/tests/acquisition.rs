@@ -12,7 +12,16 @@ fn chained_node_transfer_block(
     initializer: u32,
 ) -> Block {
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let nt = NodeTransfer::new_signed(vote, anchor, initializer, 9, 100, 1, 0, &signer);
+    let nt = NodeTransfer::new_signed(
+        vote,
+        anchor,
+        initializer,
+        9,
+        100,
+        TEST_TRANSFER_FEE,
+        0,
+        &signer,
+    );
     let header = BlockHeader {
         version: 1,
         sequence: seq,
@@ -508,7 +517,7 @@ fn fr3_derives_registration_and_watermark() {
     // block in scope, so the segment is anchored by one. Inert with
     // respect to everything below — see `chain_config_anchor_block`.
     let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-    let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0x31)], 1);
+    let anchor = balance_block(100, cfg_hash, &[(1, 1_000, 0, 0x31)], 1);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
     // FR6 registration monotonicity: `new_node_id` must be the pre-block
@@ -532,8 +541,8 @@ fn fr3_derives_registration_and_watermark() {
     assert_eq!(bc.node_info.max_known_node_id(), 2, "watermark advanced");
     assert_eq!(
         bc.node_info.balance_of(1),
-        49,
-        "initializer debited registration_price(50) + fee(1)"
+        1_000 - TEST_REGISTRATION_PRICE - TEST_REGISTRATION_FEE,
+        "initializer debited registration_price + fee"
     );
 }
 
@@ -551,14 +560,18 @@ fn fr3_derives_node_transfer_between_seeded_nodes() {
         .expect("anchor admitted");
     // vote 0 — the permanent node-#0 vote-target exception (FR37/FR54), so the
     // FR6 vote-target check passes without seeding a dedicated target node.
-    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
+    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let ti = bc
         .tier1_admit(&tx.view(), &tx.view().hash(), 0)
         .expect("transfer admitted");
 
     bc.run_processing_pass(ti).expect("pass succeeds");
 
-    assert_eq!(bc.node_info.balance_of(1), 399, "500 - (100 + 1)");
+    assert_eq!(
+        bc.node_info.balance_of(1),
+        500 - (100 + u64::from(TEST_TRANSFER_FEE)),
+        "500 - (100 + fee)"
+    );
     assert_eq!(bc.node_info.balance_of(2), 400, "300 + 100");
 }
 
@@ -630,8 +643,8 @@ fn fr3_backward_mark_follows_selected_branch_only() {
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
     let ah = anchor.view().hash();
-    let left = transfer_block(101, ah, 1, 2, 100, 0, 0); // 1 → 2 (vote node #0)
-    let right = transfer_block(101, ah, 1, 3, 200, 0, 0); // 1 → 3 (sibling; vote node #0)
+    let left = transfer_block(101, ah, 1, 2, 100, TEST_TRANSFER_FEE, 0); // 1 → 2 (vote node #0)
+    let right = transfer_block(101, ah, 1, 3, 200, TEST_TRANSFER_FEE, 0); // 1 → 3 (sibling; vote node #0)
     let li = bc
         .tier1_admit(&left.view(), &left.view().hash(), 0)
         .expect("left admitted");
@@ -643,7 +656,11 @@ fn fr3_backward_mark_follows_selected_branch_only() {
 
     assert_eq!(bc.node_info.balance_of(2), 100, "left branch applied");
     assert_eq!(bc.node_info.balance_of(3), 0, "sibling NOT applied");
-    assert_eq!(bc.node_info.balance_of(1), 900, "only left's 100 debited");
+    assert_eq!(
+        bc.node_info.balance_of(1),
+        1000 - 100 - u64::from(TEST_TRANSFER_FEE),
+        "only left's 100 and fee debited"
+    );
 }
 
 /// AC5 — the pass is not resumable: re-running it on the same candidate
@@ -658,7 +675,7 @@ fn fr3_not_resumable_clean_reentry() {
     let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31)], 1);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
-    let tx = transfer_block(101, anchor.view().hash(), 1, 1, 0, 3, 0);
+    let tx = transfer_block(101, anchor.view().hash(), 1, 1, 0, TEST_TRANSFER_FEE, 0);
     let ti = bc
         .tier1_admit(&tx.view(), &tx.view().hash(), 0)
         .expect("tx admitted");
@@ -695,7 +712,7 @@ fn fr3_projection_is_clock_independent_and_reproducible() {
         let _ai = bc
             .tier1_admit(&anchor.view(), &anchor.view().hash(), now_base)
             .expect("anchor admitted");
-        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
+        let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
         let ti = bc
             .tier1_admit(&tx.view(), &tx.view().hash(), now_base + 5_000)
             .expect("tx admitted");
@@ -838,17 +855,17 @@ fn fr5_deletes_offender_subtree_and_spares_sibling() {
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
     // Offending branch: genesis ← b1 ← b2.
-    let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+    let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let bi1 = bc
         .tier1_admit(&b1.view(), &b1.view().hash(), 0)
         .expect("b1 admitted");
-    let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+    let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let bi2 = bc
         .tier1_admit(&b2.view(), &b2.view().hash(), 0)
         .expect("b2 admitted");
     // Sibling branch forking at the genesis (a different amount → a distinct
     // hash, so it is a genuine second child, not an FR11 duplicate).
-    let c1 = transfer_block(1, genesis.view().hash(), 1, 2, 200, 1, 0);
+    let c1 = transfer_block(1, genesis.view().hash(), 1, 2, 200, TEST_TRANSFER_FEE, 0);
     let ci1 = bc
         .tier1_admit(&c1.view(), &c1.view().hash(), 0)
         .expect("c1 admitted");
@@ -899,11 +916,11 @@ fn fr5_non_invalid_error_deletes_only_the_candidate_head() {
         let genesis = genesis_zero_block(1_000);
         bc.tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
             .expect("genesis admitted");
-        let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+        let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
         let bi1 = bc
             .tier1_admit(&b1.view(), &b1.view().hash(), 0)
             .expect("b1 admitted");
-        let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+        let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
         let bi2 = bc
             .tier1_admit(&b2.view(), &b2.view().hash(), 0)
             .expect("b2 admitted");
@@ -955,7 +972,7 @@ fn fr5_degenerate_target_still_rolls_back_and_reverts() {
     let anchor = balance_block(100, cfg_hash, &[(1, 500, 10, 0x31), (2, 300, 20, 0x32)], 5);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
-    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
+    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     bc.tier1_admit(&tx.view(), &tx.view().hash(), 0)
         .expect("tx admitted");
     let reg = registration_block(102, tx.view().hash(), 1, 3, 0x43);
@@ -1014,7 +1031,7 @@ fn fr5_working_set_is_clean_after_recovery() {
     let ai = bc
         .tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
-    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 0);
+    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let ti = bc
         .tier1_admit(&tx.view(), &tx.view().hash(), 0)
         .expect("tx admitted");
@@ -1077,7 +1094,7 @@ fn fr5_clears_active_head_when_its_block_is_deleted() {
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
-    let child = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+    let child = transfer_block(1, genesis.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let ci = bc
         .tier1_admit(&child.view(), &child.view().hash(), 0)
         .expect("child admitted");
@@ -1122,11 +1139,11 @@ fn fr5_restores_active_chain_marking_and_keeps_the_genesis_bootstrap() {
     let gi = bc
         .tier1_admit(&genesis.view(), &genesis.view().hash(), 0)
         .expect("genesis admitted");
-    let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, 1, 0);
+    let b1 = transfer_block(1, genesis.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let bi1 = bc
         .tier1_admit(&b1.view(), &b1.view().hash(), 0)
         .expect("b1 admitted");
-    let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, 1, 0);
+    let b2 = transfer_block(2, b1.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let bi2 = bc
         .tier1_admit(&b2.view(), &b2.view().hash(), 0)
         .expect("b2 admitted");
@@ -1283,7 +1300,7 @@ fn credit_block(
         initializer,
         receiver,
         amount,
-        0,
+        TEST_TRANSFER_FEE,
         0,
         &signer,
     );
@@ -1357,8 +1374,8 @@ fn fr3_creator_credit_applied_to_seeded_creator() {
 
     assert_eq!(
         bc.node_info.balance_of(3),
-        600,
-        "seeded creator credited mined_amount (100 seed + 500 mined)"
+        600 + u64::from(TEST_TRANSFER_FEE),
+        "seeded creator credited mined_amount and the fee (100 seed + 500 mined + fee)"
     );
 }
 
@@ -1418,7 +1435,7 @@ fn fr6_rejects_unknown_vote_target() {
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
     // Vote target 9 is beyond max_known_node_id (8) → not a possible node.
-    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 9);
+    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 9);
     let ti = bc
         .tier1_admit(&tx.view(), &tx.view().hash(), 0)
         .expect("tx admitted");
@@ -1448,8 +1465,9 @@ fn fr6_rejects_out_of_range_referenced_node() {
     let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 5);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
-    // Output side: receiver 99 is beyond the watermark.
-    let out = transfer_block(101, anchor.view().hash(), 1, 99, 100, 1, 0);
+    // Output side: receiver 9 is beyond the watermark (and below the node
+    // cap: an id at or above it is `NodeCountExceeded`, Story 7.3 RD3).
+    let out = transfer_block(101, anchor.view().hash(), 1, 9, 100, TEST_TRANSFER_FEE, 0);
     let oi = bc
         .tier1_admit(&out.view(), &out.view().hash(), 0)
         .expect("out admitted");
@@ -1461,10 +1479,10 @@ fn fr6_rejects_out_of_range_referenced_node() {
         }),
         "a transfer TO a node beyond the watermark is rejected (output side)"
     );
-    // Input side: an (unseeded) initializer 88 is beyond the watermark — normally
+    // Input side: an (unseeded) initializer 8 is beyond the watermark — normally
     // an unseeded initializer is trusted on a window-anchored candidate, but its
     // existence is still range-bounded.
-    let inp = transfer_block(101, anchor.view().hash(), 88, 2, 100, 1, 0);
+    let inp = transfer_block(101, anchor.view().hash(), 8, 2, 100, TEST_TRANSFER_FEE, 0);
     let ii = bc
         .tier1_admit(&inp.view(), &inp.view().hash(), 0)
         .expect("inp admitted");
@@ -1498,7 +1516,7 @@ fn fr6_vote_target_in_range_but_not_individually_seeded_is_accepted() {
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
     // Node 1 (seeded) votes for node 5: 5 ∉ seeded-set but 5 ≤ watermark(10).
-    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 5);
+    let tx = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 5);
     let ti = bc
         .tier1_admit(&tx.view(), &tx.view().hash(), 0)
         .expect("tx admitted");
@@ -1508,7 +1526,7 @@ fn fr6_vote_target_in_range_but_not_individually_seeded_is_accepted() {
         "a vote for an in-range node is accepted even if not individually seeded"
     );
     // Boundary: a vote for node 11 (> watermark 10) is still exact-evidence invalid.
-    let tx2 = transfer_block(101, anchor.view().hash(), 1, 2, 100, 1, 11);
+    let tx2 = transfer_block(101, anchor.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 11);
     let ti2 = bc
         .tier1_admit(&tx2.view(), &tx2.view().hash(), 0)
         .expect("tx2 admitted");
@@ -1584,7 +1602,7 @@ fn fr6_rejects_wrong_block_creator_signature() {
     let wrong = Crypto::new([9u8; PRIVATE_KEY_SIZE])
         .ok()
         .expect("wrong test key");
-    let nt = NodeTransfer::new_signed(0, 1, 0, 9, 100, 1, 0, &wrong);
+    let nt = NodeTransfer::new_signed(0, 1, 0, 9, 100, TEST_TRANSFER_FEE, 0, &wrong);
     let header = BlockHeader {
         version: 1,
         sequence: 2,
@@ -1736,7 +1754,7 @@ fn fr6_rejects_unseeded_actor_on_genesis_anchored_candidate() {
     bc.tier1_admit(&cfg.view(), &cfg.view().hash(), 0)
         .expect("chain-config block admitted");
     // Block #2: a transfer whose initializer (node 1) never registered.
-    let child = transfer_block(2, cfg.view().hash(), 1, 2, 100, 1, 0);
+    let child = transfer_block(2, cfg.view().hash(), 1, 2, 100, TEST_TRANSFER_FEE, 0);
     let ci = bc
         .tier1_admit(&child.view(), &child.view().hash(), 0)
         .expect("child admitted");
@@ -1774,7 +1792,7 @@ fn a_sequence_one_transaction_block_gets_the_ordinary_fr36_credit() {
     let mut bc = rewarded_test_chain(5);
     let genesis = genesis_zero_block(1_000);
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let nt = NodeTransfer::new_signed(0, 0, 0, 0, 0, 0, 0, &signer);
+    let nt = NodeTransfer::new_signed(0, 0, 0, 0, 0, TEST_TRANSFER_FEE, 0, &signer);
     let header = BlockHeader {
         version: 1,
         sequence: 1,
@@ -1859,6 +1877,7 @@ fn block_zero_transaction_signatures_are_verified() {
         .try_into()
         .expect("signature size");
     let bad_registration = Registration::new(
+        0,
         0,
         0,
         0,

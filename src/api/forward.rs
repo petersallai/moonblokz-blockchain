@@ -26,6 +26,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -36,11 +38,14 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// FR9 Tier 2 of a side block in Ready (Story 6.1 D6): the UTXO-input
     /// structural completion of every complex transaction, along the block's
-    /// own ancestry from `parent_idx`. A reference within `W` (`≥ s − W`) resolves to its
+    /// own ancestry from `parent_idx`. A reference within the window
+    /// (`≥ s − W + 1`, DEC-196) resolves to its
     /// block — in the window or the verification horizon — whose bytes must
     /// hold the output with the declared amount; one below the retained root
     /// is trusted pre-window history, as in the FR3 pass (DEC-129, DEC-131),
@@ -49,10 +54,10 @@ impl<
     /// active chain, so whether the output is unspent on this branch is Tier 3.
     ///
     /// The other FR9 Tier 2 items join here and in the shared head step
-    /// together: `mined_amount` (7.2, below), fee and price rules (7.3), the
-    /// approval threshold (6.7), the structural `snake_chain` checks (9.2 /
-    /// 9.3 / 9.5 / 6.6). Registration-key uniqueness is Tier 3 on a side
-    /// branch (D6).
+    /// together: `mined_amount` (7.2, below), the FR56 fee policy and the
+    /// registration price (7.3, below), the approval threshold (6.7), the
+    /// structural `snake_chain` checks (9.2 / 9.3 / 9.5 / 6.6).
+    /// Registration-key uniqueness is Tier 3 on a side branch (D6).
     pub(super) fn tier2_check(
         &self,
         view: &BlockView<'_>,
@@ -86,6 +91,19 @@ impl<
         let Some(txs) = view.transactions() else {
             return Ok(());
         };
+        // FR56 / DEC-312 (Story 7.3): the fee policy and a registration's
+        // price, judged like `mined_amount` — a value bound to chain-info
+        // declines here and is judged at the switch replay (DEC-305).
+        for tx in txs.iter() {
+            if self.fee_out_of_policy(&tx, None) {
+                return Err(invalid(ValidationReason::FeeOutOfPolicy));
+            }
+            if let Some(reg) = tx.as_registration()
+                && self.registration_price_mismatch(reg.registration_price(), None)
+            {
+                return Err(invalid(ValidationReason::RegistrationPriceMismatch));
+            }
+        }
         for tx in txs.iter() {
             let Some(cx) = tx.as_complex() else {
                 continue;

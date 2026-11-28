@@ -1,6 +1,7 @@
 //! The FR6 per-block step: derive and commit a block, transaction apply and
 //! inverse, signature and UTXO checks (Stories 5.3, 6.0, 6.8).
 
+use super::chain_config::ProjectionChainInfo;
 use super::*;
 
 /// What one vote-engine step run by [`Blockchain::run_vote_step`] came to.
@@ -104,6 +105,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -114,6 +117,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// The FR6 per-block step (Story 6.0 AC1): validates one block against the
@@ -235,7 +240,14 @@ impl<
             .hold_exit_slot(idx, seq, projection.anchor)
             .map_err(|()| ProcessingError::StorageRead)?;
 
+        // The block's parent: the ancestry UTXO references resolve along.
+        let parent = self
+            .blocks
+            .get(idx)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
         let mut derivation = BlockDerivation {
+            chain_info_count: self.registered_count(projection.complete),
+            failed_utxo_ref: 0,
             total_fees: 0,
             replay_reward: replay_reward(&self.chain_config, view),
             utxo_outputs: 0,
@@ -327,9 +339,25 @@ impl<
                 let txs = view
                     .transactions()
                     .ok_or(invalid(ValidationReason::MalformedPayload))?;
+                // FR6 window duplicate check (I-22, DEC-349), before any
+                // signature work: a window-anchored pass trusts the history
+                // below its segment start (DEC-129).
+                if seq != 0 {
+                    let below = if projection.complete {
+                        0
+                    } else {
+                        projection.anchor
+                    };
+                    if self
+                        .block_carries_duplicate(view, parent, below)
+                        .map_err(|()| ProcessingError::StorageRead)?
+                    {
+                        return Err(invalid(ValidationReason::DuplicateTransaction));
+                    }
+                }
                 for tx in txs.iter() {
                     if let Err(e) =
-                        self.apply_transaction(&tx, idx, seq, projection, &mut derivation)
+                        self.apply_transaction(&tx, idx, parent, seq, projection, &mut derivation)
                     {
                         self.invert_transactions(view, idx, applied);
                         return Err(e);
@@ -504,6 +532,77 @@ impl<
         !source.declined() && view.mined_amount() != reward
     }
 
+    /// FR56 (DEC-181, DEC-311): whether `tx` violates the fee policy resolved
+    /// at the block's pre-state — `count` is its registered-node count, `None`
+    /// where the source declines (as [`Self::mined_amount_mismatch`]); a
+    /// resolution that read a declined value is no violation — the check is
+    /// skipped (DEC-305, DEC-340). A zero-input carry-forward is exempt
+    /// (FR51); block #0 is the caller's.
+    pub(super) fn fee_out_of_policy(&self, tx: &TransactionView<'_>, count: Option<u64>) -> bool {
+        if tx.as_complex().is_some_and(|cx| cx.input_count() == 0) {
+            return false;
+        }
+        let Some(configuration) = self.chain_config.active_configuration() else {
+            return false;
+        };
+        let source = ProjectionChainInfo::at(count);
+        let configuration = configuration.with_chain_info(&source);
+        let (min, max) = (
+            configuration.tx_fee_per_byte_min(),
+            configuration.tx_fee_per_byte_max(),
+        );
+        !source.declined() && fee_violates(transaction_fee(tx, false), tx.len() as u64, min, max)
+    }
+
+    /// DEC-312: whether a registration's carried `price` differs from
+    /// `registration_price` at the block's pre-state (`count` as in
+    /// [`Self::fee_out_of_policy`]); skipped where the read declined.
+    pub(super) fn registration_price_mismatch(&self, price: u64, count: Option<u64>) -> bool {
+        let Some(configuration) = self.chain_config.active_configuration() else {
+            return false;
+        };
+        let source = ProjectionChainInfo::at(count);
+        let expected = configuration.with_chain_info(&source).registration_price();
+        !source.declined() && price != expected
+    }
+
+    /// DEC-174 (I-45): whether `anchor` lies below `max(0, s − W)`, the window
+    /// tail of a block `s`'s parent, with the held `W` — the per-block step's
+    /// half of the bound, in every phase (Tier 1 judges it once `W` is
+    /// locked). Without a configuration there is no window to judge.
+    pub(super) fn anchor_below_window(&self, anchor: u32, seq: u32) -> bool {
+        seq != 0
+            && self
+                .active_chain_length()
+                .is_some_and(|w| anchor < seq.saturating_sub(w))
+    }
+
+    /// DEC-190 (I-13): whether node #0 initiates `tx` — a transfer or
+    /// registration initializer, or any complex balance-input initializer —
+    /// with `vote == 0` while another node is registered in the pre-state.
+    /// Applied only where the watermark is authoritative (a complete
+    /// projection, or past the first balance block of a window-anchored one),
+    /// the `RegistrationWatermark` gate's condition: before it a window-anchored
+    /// pass cannot tell. Tier 1 keeps the structural exception.
+    fn node_zero_self_votes(&self, tx: &TransactionView<'_>, projection: &Projection) -> bool {
+        if tx.vote() != 0
+            || !(projection.complete || projection.saw_balance_block)
+            || self.node_info.max_known_node_id() == 0
+        {
+            return false;
+        }
+        if let Some(nt) = tx.as_node_transfer() {
+            nt.initializer() == 0
+        } else if let Some(reg) = tx.as_registration() {
+            reg.initializer() == 0
+        } else if let Some(cx) = tx.as_complex() {
+            cx.inputs()
+                .any(|input| input.as_balance().is_some_and(|bi| bi.initializer() == 0))
+        } else {
+            false
+        }
+    }
+
     /// DEC-178 / DEC-339: the creator of block `s − H` when the step-4
     /// liveness credit of the block at `idx` with sequence `s` is due (held
     /// from `s = H` on; the genesis blocks are derived before their slots
@@ -637,12 +736,28 @@ impl<
         }
     }
 
-    /// Checks one transaction and applies its effects, atomically: on `Err`
-    /// nothing of this transaction remains applied.
-    fn apply_transaction(
+    /// Applies one transaction of the block at `idx` (whose parent is
+    /// `parent`): its FR6 checks, then its invertible effects. A failure leaves
+    /// no effect of this transaction behind (a complex transaction inverts its
+    /// own applied prefix). FR14 intake runs it for a block at `h + 1` with
+    /// `idx = NONE_REF`, `parent` = the head, and inverts it afterwards (Story
+    /// 7.3, DEC-350).
+    ///
+    /// The check order serves intake's reason → outcome table (DEC-350,
+    /// DEC-353, DEC-355) and is consensus-neutral — every check must pass
+    /// either way: first the rules no later chain state cures — the FR56 fee
+    /// policy (the block's pre-state, DEC-312), the DEC-190 self-vote
+    /// restriction (the transaction's pre-state watermark), then the DEC-174
+    /// anchor bound; then the checks that fail only for a missing key (an
+    /// unseeded or unknown initializer); then the signature; then the checks a
+    /// later chain state can cure (receiver range, vote target, watermark,
+    /// balance), with a registration's price after its watermark (DEC-355); a
+    /// registration's key uniqueness last.
+    pub(super) fn apply_transaction(
         &mut self,
         tx: &TransactionView<'_>,
         idx: u32,
+        parent: u32,
         seq: u32,
         projection: &Projection,
         derivation: &mut BlockDerivation,
@@ -654,34 +769,50 @@ impl<
             reason,
         };
         let vote = tx.vote();
+        // The rules decidable from the transaction and the configuration.
+        if !is_genesis_zero {
+            if self.fee_out_of_policy(tx, derivation.chain_info_count) {
+                return Err(invalid(ValidationReason::FeeOutOfPolicy));
+            }
+            if self.node_zero_self_votes(tx, projection) {
+                return Err(invalid(ValidationReason::NodeZeroSelfVote));
+            }
+        }
         if let Some(nt) = tx.as_node_transfer() {
             let init = nt.initializer();
             let receiver = nt.receiver();
+            if self.anchor_below_window(nt.anchor_sequence(), seq) {
+                return Err(invalid(ValidationReason::AnchorBelowWindow));
+            }
             // [A] Complete projection: an unseeded initializer transacts
             // before it exists (D3). Non-complete: trusted pre-window history.
             if complete && !is_genesis_zero && !self.node_info.is_seeded(init) {
                 return Err(invalid(ValidationReason::UnseededActor));
             }
-            // FR6 node-existence bound: the initializer (input) and the
-            // receiver (output) must name nodes that can exist
-            // (`id <= max_known_node_id`) — checkable even when unseeded.
+            // FR6 node-existence bound on the initializer (input) — checkable
+            // even when unseeded.
             if projection.roster_bounded && !is_genesis_zero {
                 self.check_node_id_in_range(init).map_err(&invalid)?;
-                self.check_node_id_in_range(receiver).map_err(&invalid)?;
             }
             // State-dependent FR6 checks apply once the initializer is
             // derivable. The intrinsic invariants (no-self-vote,
             // anchor-before-block) are owned by the Tier-1 gate. Block #0's
             // self-transfer is signature-checked too (DEC-271): its
-            // registration has just seeded node #0 with the anchor key.
-            if self.node_info.is_seeded(init) {
-                if !is_genesis_zero {
-                    self.check_vote_target(vote).map_err(&invalid)?;
-                }
-                if !self.signatures_accepted(idx) && !self.verify_tx_signature(tx.as_bytes(), init)
-                {
-                    return Err(invalid(ValidationReason::TransactionSignatureInvalid));
-                }
+            // registration has just seeded node #0 with the anchor key. The
+            // signature precedes every check a later state can cure (DEC-350).
+            let seeded = self.node_info.is_seeded(init);
+            if seeded
+                && !self.signatures_accepted(idx)
+                && !self.verify_tx_signature(tx.as_bytes(), init)
+            {
+                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+            }
+            // The receiver (output) must name a node that can exist.
+            if projection.roster_bounded && !is_genesis_zero {
+                self.check_node_id_in_range(receiver).map_err(&invalid)?;
+            }
+            if seeded && !is_genesis_zero {
+                self.check_vote_target(vote).map_err(&invalid)?;
             }
             let fee = transaction_fee(tx, false);
             let debit = nt
@@ -689,7 +820,7 @@ impl<
                 .checked_add(fee)
                 .ok_or(invalid(ValidationReason::ValueOverflow))?;
             // FR54(d): the genesis self-transfer *creates* currency — no debit.
-            let debits = !is_genesis_zero && self.node_info.is_seeded(init);
+            let debits = !is_genesis_zero && seeded;
             let credits = self.node_info.is_seeded(receiver);
             if debits && self.node_info.balance_of(init) < debit {
                 return Err(invalid(ValidationReason::InsufficientBalance));
@@ -719,6 +850,9 @@ impl<
         } else if let Some(reg) = tx.as_registration() {
             let node_id = reg.new_node_id();
             let init = reg.initializer();
+            if self.anchor_below_window(reg.anchor_sequence(), seq) {
+                return Err(invalid(ValidationReason::AnchorBelowWindow));
+            }
             // [A] Complete projection: the registering initializer must be an
             // existing (seeded) node (block #0's node-#0 self-registration is
             // the FR54 bootstrap exception).
@@ -741,6 +875,16 @@ impl<
             if !is_genesis_zero && node_id >= self.max_node_count() {
                 return Err(invalid(ValidationReason::NodeCountExceeded));
             }
+            // The initializer's signature, once its key is derivable — or, for
+            // block #0's registration, node #0's key, the trust anchor, before
+            // that registration seeds it (DEC-271) — before every check a later
+            // state can cure (DEC-350).
+            if (debits || is_genesis_zero)
+                && !self.signatures_accepted(idx)
+                && !self.verify_tx_signature(tx.as_bytes(), init)
+            {
+                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
+            }
             if !is_genesis_zero {
                 // FR6 registration monotonicity: `new_node_id == running
                 // watermark + 1`, authoritative once the watermark is
@@ -752,18 +896,18 @@ impl<
                         return Err(invalid(ValidationReason::RegistrationWatermark));
                     }
                 }
+                // DEC-312: the carried price equals `registration_price` at the
+                // pre-state, after the watermark (DEC-355): a registration for
+                // a later slot fails the watermark, never its future price.
+                if self.registration_price_mismatch(
+                    reg.registration_price(),
+                    derivation.chain_info_count,
+                ) {
+                    return Err(invalid(ValidationReason::RegistrationPriceMismatch));
+                }
                 if debits {
                     self.check_vote_target(vote).map_err(&invalid)?;
                 }
-            }
-            // The initializer's signature, once its key is derivable — or, for
-            // block #0's registration, node #0's key, the trust anchor, before
-            // that registration seeds it (DEC-271).
-            if (debits || is_genesis_zero)
-                && !self.signatures_accepted(idx)
-                && !self.verify_tx_signature(tx.as_bytes(), init)
-            {
-                return Err(invalid(ValidationReason::TransactionSignatureInvalid));
             }
             if debits && self.node_info.balance_of(init) < debit {
                 return Err(invalid(ValidationReason::InsufficientBalance));
@@ -798,9 +942,10 @@ impl<
         } else if let Some(cx) = tx.as_complex() {
             // How many inputs and outputs applied, for the partial inversion.
             let mut applied = (0usize, 0usize);
-            let result = self.apply_complex(tx, idx, seq, projection, derivation, &mut applied);
+            let result =
+                self.apply_complex(tx, idx, parent, seq, projection, derivation, &mut applied);
             if result.is_err() {
-                self.invert_complex(&cx, idx, applied.0, applied.1, is_genesis_zero);
+                self.invert_complex(&cx, parent, applied.0, applied.1, is_genesis_zero);
             }
             result?;
         } else {
@@ -814,10 +959,12 @@ impl<
     /// order — a later input of the same initializer sees the earlier debit —
     /// and `applied` counts how many inputs and outputs applied, for the
     /// caller's partial inversion.
+    #[allow(clippy::too_many_arguments)]
     fn apply_complex(
         &mut self,
         tx: &TransactionView<'_>,
         idx: u32,
+        parent: u32,
         seq: u32,
         projection: &Projection,
         derivation: &mut BlockDerivation,
@@ -836,6 +983,90 @@ impl<
         // both sums against `u64` and `Σ inputs ≥ Σ outputs` (DEC-011).
         let mut in_sum: u64 = 0;
         let mut out_sum: u64 = 0;
+        // Pass 1, no effects: every input signature whose key is known, before
+        // any check a later state can cure (DEC-350) — so a forged later input
+        // is never hidden behind an earlier input's curable failure. A UTXO
+        // input resolves here (its one read: amount, address); one that
+        // cannot yet be judged — spent on this ancestry, an output the block
+        // does not hold, a block above `seq` (intake only, Tier 1 refuses it
+        // in a block) — is remembered and reported after every signature.
+        let mut deferred: Option<(ValidationReason, u32)> = None;
+        for input in cx.inputs() {
+            if let Some(bi) = input.as_balance() {
+                let binit = bi.initializer();
+                if self.anchor_below_window(bi.anchor_sequence(), seq) {
+                    return Err(invalid(ValidationReason::AnchorBelowWindow));
+                }
+                // DEC-196: the input signs the transaction with the
+                // initializer's key, verified before the debit (DEC-332);
+                // skipped where this node accepted the block's signatures
+                // (DEC-334). An unseeded initializer has no key to verify
+                // against: pass 2 judges it.
+                if !is_genesis_zero
+                    && self.node_info.is_seeded(binit)
+                    && !self.signatures_accepted(idx)
+                    && !self.verify_balance_input(tx, bi.signature(), binit)
+                {
+                    return Err(invalid(ValidationReason::InputSignatureInvalid));
+                }
+            } else if let Some(ui) = input.as_utxo() {
+                // [H] ADR-016: resolve along this block's own ancestry and
+                // verify the input's signature against the output's address
+                // (DEC-332). A non-complete candidate trusts a reference below
+                // its anchor (DEC-129) — declared amount and signature
+                // included (DEC-333). An output that exists but is spent on
+                // this ancestry is verified before it is declared unavailable
+                // (DEC-353).
+                let reference = ui.block_sequence();
+                let fail = |derivation: &mut BlockDerivation, reason| {
+                    derivation.failed_utxo_ref = reference;
+                    invalid(reason)
+                };
+                let address = match self.resolve_utxo(
+                    parent,
+                    seq,
+                    reference,
+                    ui.output_index(),
+                    ui.amount(),
+                    !projection.complete,
+                ) {
+                    Ok(Some((_, address))) => Some(address),
+                    Ok(None) => None,
+                    Err(UtxoSpendError::Spent(address)) => {
+                        deferred.get_or_insert((ValidationReason::UtxoUnavailable, reference));
+                        Some(address)
+                    }
+                    Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable)) => {
+                        deferred.get_or_insert((ValidationReason::UtxoUnavailable, reference));
+                        None
+                    }
+                    Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable))
+                        if reference >= seq =>
+                    {
+                        deferred.get_or_insert((ValidationReason::UtxoUnresolvable, reference));
+                        None
+                    }
+                    Err(UtxoSpendError::Invalid(reason)) => return Err(fail(derivation, reason)),
+                    Err(UtxoSpendError::StorageRead) => return Err(ProcessingError::StorageRead),
+                    Err(UtxoSpendError::MissingBlock) => return Err(ProcessingError::MissingBlock),
+                };
+                if let Some(address) = address
+                    && !self.signatures_accepted(idx)
+                    && !self.verify_input_signature(tx, ui.signature(), &address)
+                {
+                    return Err(fail(derivation, ValidationReason::UtxoSignatureInvalid));
+                }
+            }
+        }
+        if let Some((reason, reference)) = deferred {
+            derivation.failed_utxo_ref = reference;
+            return Err(invalid(reason));
+        }
+        // Pass 2, in order: the checks a later state can cure, then each
+        // input's effect — a later input of the same initializer sees the
+        // earlier debit. Pass 1 resolved every UTXO input to an available
+        // output (Tier 1 keeps them distinct), so a spend re-finds its block
+        // by the RAM ancestor walk alone.
         for input in cx.inputs() {
             if let Some(bi) = input.as_balance() {
                 let binit = bi.initializer();
@@ -845,55 +1076,19 @@ impl<
                 if projection.roster_bounded && !is_genesis_zero {
                     self.check_node_id_in_range(binit).map_err(&invalid)?;
                 }
+                // An unseeded initializer in an incomplete pass is trusted
+                // with the rest of its effects.
                 if !is_genesis_zero && self.node_info.is_seeded(binit) {
                     self.check_vote_target(vote).map_err(&invalid)?;
                     if self.node_info.balance_of(binit) < bi.amount() {
                         return Err(invalid(ValidationReason::InsufficientBalance));
                     }
-                    // DEC-196: the input signs the transaction with the
-                    // initializer's key, verified before the debit (DEC-332);
-                    // skipped where this node accepted the block's signatures
-                    // (DEC-334). An unseeded initializer in an incomplete pass
-                    // is trusted with the rest of its effects.
-                    if !self.signatures_accepted(idx)
-                        && !self.verify_balance_input(tx, bi.signature(), binit)
-                    {
-                        return Err(invalid(ValidationReason::InputSignatureInvalid));
-                    }
                     self.node_info.debit(binit, bi.amount());
                 }
                 in_sum = in_sum.saturating_add(bi.amount());
             } else if let Some(ui) = input.as_utxo() {
-                // [H] ADR-016: resolve along this block's own ancestry, verify
-                // the input's signature against the output's address, then
-                // spend (DEC-332): a failed verification leaves the bit set.
-                // A non-complete candidate trusts a reference below its anchor
-                // (DEC-129) — declared amount and signature included (DEC-333).
-                let parent = self
-                    .blocks
-                    .get(idx)
-                    .ok_or(ProcessingError::MissingBlock)?
-                    .parent_ref();
-                let resolved = self
-                    .resolve_utxo(
-                        parent,
-                        seq,
-                        ui.block_sequence(),
-                        ui.output_index(),
-                        ui.amount(),
-                        !projection.complete,
-                    )
-                    .map_err(|e| match e {
-                        UtxoSpendError::Invalid(reason) => invalid(reason),
-                        UtxoSpendError::StorageRead => ProcessingError::StorageRead,
-                        UtxoSpendError::MissingBlock => ProcessingError::MissingBlock,
-                    })?;
-                if let Some((ref_idx, address)) = resolved {
-                    if !self.signatures_accepted(idx)
-                        && !self.verify_input_signature(tx, ui.signature(), &address)
-                    {
-                        return Err(invalid(ValidationReason::InputSignatureInvalid));
-                    }
+                if let Ok(Some(ref_idx)) = self.locate_utxo_source(parent, seq, ui.block_sequence())
+                {
                     self.blocks
                         .set_utxo_available(ref_idx, ui.output_index() as usize, false);
                 }
@@ -956,35 +1151,51 @@ impl<
             return;
         };
         let is_genesis_zero = view.sequence() == 0;
+        let parent = self
+            .blocks
+            .get(idx)
+            .map_or(NONE_REF, |entry| entry.parent_ref());
         let count = count.min(txs.iter().count());
         for k in (0..count).rev() {
-            let Some(tx) = txs.iter().nth(k) else {
-                continue;
-            };
-            if let Some(nt) = tx.as_node_transfer() {
-                if self.node_info.is_seeded(nt.receiver()) {
-                    self.node_info.debit(nt.receiver(), nt.amount());
-                }
-                if !is_genesis_zero && self.node_info.is_seeded(nt.initializer()) {
-                    let debit = nt.amount().wrapping_add(nt.fee() as u64);
-                    self.node_info.credit(nt.initializer(), debit);
-                }
-            } else if let Some(reg) = tx.as_registration() {
-                // Stride-1 on a bounded roster: the slot was empty and the
-                // watermark one below the new id (D1 precondition 2).
-                let node_id = reg.new_node_id();
-                self.node_info.clear_node(node_id);
-                if !is_genesis_zero {
-                    self.node_info
-                        .set_max_known_node_id(node_id.saturating_sub(1));
-                }
-                if !is_genesis_zero && self.node_info.is_seeded(reg.initializer()) {
-                    let debit = reg.registration_price().wrapping_add(reg.fee());
-                    self.node_info.credit(reg.initializer(), debit);
-                }
-            } else if let Some(cx) = tx.as_complex() {
-                self.invert_complex(&cx, idx, usize::MAX, usize::MAX, is_genesis_zero);
+            if let Some(tx) = txs.iter().nth(k) {
+                self.invert_transaction(&tx, parent, is_genesis_zero);
             }
+        }
+    }
+
+    /// The exact inverse of one applied transaction of a block whose parent is
+    /// `parent`, from its bytes and the state right after it applied: the
+    /// block undo's per-transaction step, and the undo of FR14 intake's
+    /// dry-run (Story 7.3, DEC-350).
+    pub(super) fn invert_transaction(
+        &mut self,
+        tx: &TransactionView<'_>,
+        parent: u32,
+        is_genesis_zero: bool,
+    ) {
+        if let Some(nt) = tx.as_node_transfer() {
+            if self.node_info.is_seeded(nt.receiver()) {
+                self.node_info.debit(nt.receiver(), nt.amount());
+            }
+            if !is_genesis_zero && self.node_info.is_seeded(nt.initializer()) {
+                let debit = nt.amount().wrapping_add(nt.fee() as u64);
+                self.node_info.credit(nt.initializer(), debit);
+            }
+        } else if let Some(reg) = tx.as_registration() {
+            // Stride-1 on a bounded roster: the slot was empty and the
+            // watermark one below the new id (D1 precondition 2).
+            let node_id = reg.new_node_id();
+            self.node_info.clear_node(node_id);
+            if !is_genesis_zero {
+                self.node_info
+                    .set_max_known_node_id(node_id.saturating_sub(1));
+            }
+            if !is_genesis_zero && self.node_info.is_seeded(reg.initializer()) {
+                let debit = reg.registration_price().wrapping_add(reg.fee());
+                self.node_info.credit(reg.initializer(), debit);
+            }
+        } else if let Some(cx) = tx.as_complex() {
+            self.invert_complex(&cx, parent, usize::MAX, usize::MAX, is_genesis_zero);
         }
     }
 
@@ -996,7 +1207,7 @@ impl<
     fn invert_complex(
         &mut self,
         cx: &ComplexTransactionView<'_>,
-        idx: u32,
+        parent: u32,
         inputs: usize,
         outputs: usize,
         is_genesis_zero: bool,
@@ -1008,10 +1219,6 @@ impl<
                 self.node_info.debit(bo.receiver(), bo.amount());
             }
         }
-        let parent = self
-            .blocks
-            .get(idx)
-            .map_or(NONE_REF, |entry| entry.parent_ref());
         for input in cx.inputs().take(inputs) {
             if let Some(bi) = input.as_balance() {
                 if !is_genesis_zero && self.node_info.is_seeded(bi.initializer()) {
@@ -1045,9 +1252,15 @@ impl<
     /// balance block, when the watermark is still 0 — is the same ordering
     /// assumption the FR6 registration-monotonicity check already relies on (it too
     /// reads `max_known_node_id`), so this introduces no new dependency.
+    ///
+    /// An id at or above the chain's `max_node_count` can never exist (the
+    /// configuration is locked for the chain's life, DEC-228):
+    /// `NodeCountExceeded`, judged only on the failure path (Story 7.3 RD3).
     fn check_vote_target(&self, vote: u32) -> Result<(), ValidationReason> {
         if vote == 0 || vote <= self.node_info.max_known_node_id() {
             Ok(())
+        } else if vote >= self.max_node_count() {
+            Err(ValidationReason::NodeCountExceeded)
         } else {
             Err(ValidationReason::VoteTargetUnknown)
         }
@@ -1062,9 +1275,13 @@ impl<
     /// range-checkable. Callers gate it on the watermark being authoritative
     /// (`roster_bounded`): a window-anchored candidate with no balance block in the
     /// segment has no reliable bound and trusts the reference (AC4).
+    /// An id at or above `max_node_count` is `NodeCountExceeded`, as for the
+    /// vote target.
     fn check_node_id_in_range(&self, node_id: u32) -> Result<(), ValidationReason> {
         if node_id <= self.node_info.max_known_node_id() {
             Ok(())
+        } else if node_id >= self.max_node_count() {
+            Err(ValidationReason::NodeCountExceeded)
         } else {
             Err(ValidationReason::NodeIdOutOfRange)
         }
@@ -1231,9 +1448,9 @@ impl<
     /// without spending it:
     /// 1. causality: `block_sequence` must be below `consuming_seq` (Tier 1
     ///    owns this check; here it is a guard);
-    /// 2. distance: `consuming_seq - block_sequence` must not exceed the
-    ///    window `W` (FR14 freshness: the output was at or above `S_tail` when
-    ///    the consuming block was made);
+    /// 2. distance: `consuming_seq - block_sequence` must be below the window
+    ///    `W` (DEC-196: the output lies above `S_tail` when the consuming
+    ///    block is made, so it stays spendable in it);
     /// 3. a RAM-only walk up `parent_ref` to the ancestor at `block_sequence`.
     ///    Only ancestors are visited, so a block on a side branch is never
     ///    found (FR39). Reaching `NONE_REF` first means the output lies below
@@ -1242,9 +1459,11 @@ impl<
     ///    with no bit to clear and the declared amount trusted (DEC-129);
     ///    otherwise (a genesis-anchored candidate, or the released tail in
     ///    Ready) it is `UtxoUnresolvable`;
-    /// 4. the available-UTXO bit, before any read: a bit that is not 1 (the
-    ///    output is spent, or lies beyond the block's outputs or the bitfield)
-    ///    is `UtxoUnavailable` (DEC-132);
+    /// 4. the available-UTXO bit: a bit that is not 1 (the output is spent,
+    ///    or lies beyond the block's outputs or the bitfield) is
+    ///    `UtxoUnavailable` (DEC-132) — `Spent(address)` when the block holds
+    ///    the output with the declared amount, so the caller verifies the input
+    ///    first (DEC-353; one read, on an input that is not includable);
     /// 5. exactly one storage read of the referenced block, for the amount and
     ///    the address. A failed read is a local fault (`StorageRead`), never
     ///    `Invalid`, and so is a set bit whose output the bytes do not hold
@@ -1273,7 +1492,18 @@ impl<
         };
         let bit = output_index as usize;
         if self.blocks.utxo_available(ref_idx, bit) != Some(true) {
-            return Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable));
+            // DEC-353: an output the block holds but this ancestry spent is
+            // read for its address, so the caller verifies the input before
+            // declaring it unavailable — one read, only on an input that is
+            // not includable anyway. An output the block does not hold names
+            // no key to verify against.
+            return Err(match self.utxo_output_of(ref_idx, output_index)? {
+                Some((address, amount)) if amount == declared_amount => {
+                    UtxoSpendError::Spent(address)
+                }
+                Some(_) => UtxoSpendError::Invalid(ValidationReason::UtxoAmountMismatch),
+                None => UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable),
+            });
         }
 
         // The bit said the output exists; bytes that lack it are the node's own
@@ -1308,7 +1538,7 @@ impl<
         // made it the candidate's own, tentative or durable (DEC-129).
         if self
             .active_chain_length()
-            .is_some_and(|w| consuming_seq - block_sequence > w)
+            .is_some_and(|w| consuming_seq - block_sequence >= w)
         {
             return Err(unresolvable);
         }
@@ -1332,6 +1562,21 @@ impl<
             .ok_or(UtxoSpendError::StorageRead)?;
         Ok(utxo_output_at(&view, output_index))
     }
+}
+
+/// The FR56 predicate (DEC-181, DEC-311): whether `fee` lies outside
+/// `[min · size, max · size]` over the integers, both bounds inclusive. Exact
+/// with `checked_mul`: an overflowing lower product means the fee is too low,
+/// an overflowing upper product means the upper bound holds. An inverted range
+/// (`min > max`) admits no fee — no swap, no clamp — by construction: for a
+/// size of at least one byte `min · size > max · size`, so no fee meets both
+/// bounds, and an overflowing `min · size` already fails.
+pub(super) fn fee_violates(fee: u64, size: u64, min: u64, max: u64) -> bool {
+    match min.checked_mul(size) {
+        Some(lower) if fee >= lower => {}
+        _ => return true,
+    }
+    matches!(max.checked_mul(size), Some(upper) if fee > upper)
 }
 
 /// FR36's genesis exception (FR54 (e)): block #0, and block #1 when it is the

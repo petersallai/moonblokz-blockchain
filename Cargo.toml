@@ -19,6 +19,7 @@ moonblokz-configuration = { path = "../moonblokz-configuration", default-feature
 moonblokz-storage = { path = "../moonblokz-storage", default-features = false }
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
 moonblokz-vote = { path = "../moonblokz-vote", default-features = false }
+moonblokz-mempool = { path = "../moonblokz-mempool", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
 
 # Test-only: turns on `moonblokz-vote`'s by-value `VoteEngine::new()` oracle
@@ -38,18 +39,21 @@ moonblokz-storage = { path = "../moonblokz-storage", default-features = false, f
 # storage backend stays enabled directly — it is orthogonal to this choice.
 default = ["schnorr", "block-size-2016"]
 block-size-2016 = [
+    "moonblokz-mempool/block-size-2016",
     "moonblokz-vote/block-size-2016",
     "moonblokz-configuration/block-size-2016",
     "moonblokz-chain-types/block-size-2016",
     "moonblokz-storage/block-size-2016",
 ]
 block-size-65536 = [
+    "moonblokz-mempool/block-size-65536",
     "moonblokz-vote/block-size-65536",
     "moonblokz-configuration/block-size-65536",
     "moonblokz-chain-types/block-size-65536",
     "moonblokz-storage/block-size-65536",
 ]
 schnorr = [
+    "moonblokz-mempool/schnorr",
     "moonblokz-vote/schnorr",
     "moonblokz-configuration/schnorr",
     "moonblokz-chain-types/schnorr",
@@ -57,6 +61,7 @@ schnorr = [
     "moonblokz-storage/schnorr",
 ]
 bls-min-sig = [
+    "moonblokz-mempool/bls-min-sig",
     "moonblokz-vote/bls-min-sig",
     "moonblokz-configuration/bls-min-sig",
     "moonblokz-chain-types/bls-min-sig",
@@ -64,6 +69,7 @@ bls-min-sig = [
     "moonblokz-storage/bls-min-sig",
 ]
 bls-min-pk = [
+    "moonblokz-mempool/bls-min-pk",
     "moonblokz-vote/bls-min-pk",
     "moonblokz-configuration/bls-min-pk",
     "moonblokz-chain-types/bls-min-pk",

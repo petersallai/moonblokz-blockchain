@@ -20,9 +20,31 @@ use super::*;
 fn init_sets_expected_defaults() {
     let (crypto, storage, chain_config) = construction_backends();
     let mut bc_slot = core::mem::MaybeUninit::<
-        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+        Blockchain<
+            _,
+            _,
+            _,
+            16,
+            16,
+            TEST_MAX_BLOCKS,
+            4,
+            TEST_UTXO_BYTES,
+            TEST_MEMPOOL_BYTES,
+            TEST_MEMPOOL_ENTRIES,
+        >,
     >::uninit();
-    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
+    let bc = Blockchain::<
+        _,
+        _,
+        _,
+        16,
+        16,
+        TEST_MAX_BLOCKS,
+        4,
+        TEST_UTXO_BYTES,
+        TEST_MEMPOOL_BYTES,
+        TEST_MEMPOOL_ENTRIES,
+    >::init(
         &mut bc_slot,
         crypto,
         storage,
@@ -56,6 +78,7 @@ fn init_sets_expected_defaults() {
         approval,
         active_open_run,
         reentry_due,
+        mempool,
     } = &*bc;
 
     assert_eq!(*local_node_id, 7);
@@ -95,6 +118,8 @@ fn init_sets_expected_defaults() {
     // Story 6.7: no open deviation run.
     assert_eq!(*active_open_run, NO_OPEN_RUN);
     assert!(!*reentry_due);
+    assert_eq!(mempool.entry_count(), 0, "the mempool starts empty (FR59)");
+    assert_eq!(mempool.byte_usage(), 0);
     assert_eq!(bc.local_node_id(), 7);
 }
 
@@ -110,9 +135,31 @@ fn init_sets_expected_defaults() {
 fn init_is_equivalent_to_new() {
     let (crypto, storage, chain_config) = construction_backends();
     let mut slot = core::mem::MaybeUninit::<
-        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+        Blockchain<
+            _,
+            _,
+            _,
+            16,
+            16,
+            TEST_MAX_BLOCKS,
+            4,
+            TEST_UTXO_BYTES,
+            TEST_MEMPOOL_BYTES,
+            TEST_MEMPOOL_ENTRIES,
+        >,
     >::uninit();
-    let built = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
+    let built = Blockchain::<
+        _,
+        _,
+        _,
+        16,
+        16,
+        TEST_MAX_BLOCKS,
+        4,
+        TEST_UTXO_BYTES,
+        TEST_MEMPOOL_BYTES,
+        TEST_MEMPOOL_ENTRIES,
+    >::init(
         &mut slot,
         crypto,
         storage,
@@ -122,7 +169,18 @@ fn init_is_equivalent_to_new() {
         0xDEAD_BEEF,
     );
     let (crypto, storage, chain_config) = construction_backends();
-    let spec = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::new(
+    let spec = Blockchain::<
+        _,
+        _,
+        _,
+        16,
+        16,
+        TEST_MAX_BLOCKS,
+        4,
+        TEST_UTXO_BYTES,
+        TEST_MEMPOOL_BYTES,
+        TEST_MEMPOOL_ENTRIES,
+    >::new(
         crypto,
         storage,
         chain_config,
@@ -155,6 +213,7 @@ fn init_is_equivalent_to_new() {
         approval,
         active_open_run,
         reentry_due,
+        mempool,
     } = &*built;
     let Blockchain {
         crypto: _,
@@ -180,6 +239,7 @@ fn init_is_equivalent_to_new() {
         approval: spec_approval,
         active_open_run: spec_active_open_run,
         reentry_due: spec_reentry_due,
+        mempool: spec_mempool,
     } = &spec;
 
     assert_eq!(local_node_id, spec_local_node_id);
@@ -205,6 +265,10 @@ fn init_is_equivalent_to_new() {
     assert!(approval == spec_approval);
     assert_eq!(active_open_run, spec_active_open_run);
     assert_eq!(reentry_due, spec_reentry_due);
+    // The mempool has no `PartialEq`; both sides are its own in-place `init`
+    // with the same sub-seed and node id, so its observable state compares.
+    assert_eq!(mempool.entry_count(), spec_mempool.entry_count());
+    assert_eq!(mempool.byte_usage(), spec_mempool.byte_usage());
 }
 
 /// AC1, AC4, AC5 — successful genesis bootstrap on `local_node_id == 0`
@@ -425,9 +489,31 @@ fn walking_skeleton_refuses_storage_save_failure() {
     let node_zero = *crypto.public_key().serialize();
 
     let mut bc_slot = core::mem::MaybeUninit::<
-        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+        Blockchain<
+            _,
+            _,
+            _,
+            16,
+            16,
+            TEST_MAX_BLOCKS,
+            4,
+            TEST_UTXO_BYTES,
+            TEST_MEMPOOL_BYTES,
+            TEST_MEMPOOL_ENTRIES,
+        >,
     >::uninit();
-    let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
+    let bc = Blockchain::<
+        _,
+        _,
+        _,
+        16,
+        16,
+        TEST_MAX_BLOCKS,
+        4,
+        TEST_UTXO_BYTES,
+        TEST_MEMPOOL_BYTES,
+        TEST_MEMPOOL_ENTRIES,
+    >::init(
         &mut bc_slot,
         crypto,
         BlockWriteFailsStorage,
@@ -638,6 +724,7 @@ fn process_genesis_block_zero_has_the_tier1_genesis_shape() {
                 &bc.node_zero_public_key,
                 bc.enforceable_block_size_limit(),
                 bc.enforceable_max_utxo_outputs(),
+                None,
                 &bc.crypto,
             ),
             Ok(())
