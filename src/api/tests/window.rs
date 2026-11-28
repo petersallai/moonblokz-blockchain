@@ -20,7 +20,7 @@ fn genesis_node_with_window(w: u32) -> TestChain {
 
 /// A node-#0 founder on the W6 configuration, Ready on its FR54 genesis
 /// ([`Blockchain::process_genesis`]), and the blocks #0 and #1 it wrote.
-fn w6_founder() -> (W6Chain, Block, Block) {
+pub(super) fn w6_founder() -> (W6Chain, Block, Block) {
     let (crypto, _, _) = test_backends();
     let node_zero = *crypto.public_key().serialize();
     let mut slot = core::mem::MaybeUninit::<W6Chain>::uninit();
@@ -45,7 +45,7 @@ fn w6_founder() -> (W6Chain, Block, Block) {
 
 /// The W6 segment's balance block at `seq`, repeating node #0's entry as
 /// `bc` holds it (the first, #102, seeds it with nothing).
-fn w6_balance_block(bc: Option<&W6Chain>, seq: u32, prev: [u8; 32]) -> Block {
+pub(super) fn w6_balance_block(bc: Option<&W6Chain>, seq: u32, prev: [u8; 32]) -> Block {
     let (balance, vote, max) = bc.map_or((0, 0, 9), |bc| {
         (
             bc.node_info.balance_of(0),

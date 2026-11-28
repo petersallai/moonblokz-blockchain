@@ -12,6 +12,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -22,6 +24,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// Read-only query — returns the local node id (FR67).
@@ -74,20 +78,25 @@ impl<
     // (`todo!()` forward-tag, reachable only by a genesis(Ready) node in tests).
 
     /// FR14/FR10 transaction intake (Ready-state-only). While not `Ready` the module
-    /// returns [`ReceiveTransactionOutcome::NotReady`] with `NextCall::Idle`
-    /// (FR1: FR14's classification inputs — anchor-sequence window, already-
-    /// confirmed detection, deferred evaluation — are defined against the active
-    /// chain, which does not exist while collecting). Ready-state classification
-    /// is **Epic 7** (FR14); Story 5.1 builds only the gate.
+    /// returns [`ReceiveTransactionOutcome::NotReady`] (FR1: FR14's classification
+    /// inputs — anchor-sequence window, already-confirmed detection, deferred
+    /// evaluation — are defined against the active chain, which does not exist
+    /// while collecting). In `Ready` it classifies the transaction against the
+    /// head and admits an Accepted or Deferred one to the mempool (Story 7.3,
+    /// [`Self::classify_and_admit`]). Every return carries the pending
+    /// parent-recovery deadline. Intake reads no clock: `now` is unused, so the
+    /// outcome depends only on the bytes and the state (FR14, FR63).
     pub fn receive_transaction(
         &mut self,
-        _tx: TransactionView<'_>,
+        tx: TransactionView<'_>,
         _now: u64,
     ) -> CallResult<ReceiveTransactionOutcome> {
-        if !self.is_ready() {
-            return (ReceiveTransactionOutcome::NotReady, NextCall::Idle);
-        }
-        todo!("FR14 ready-state transaction classification — Epic 7")
+        let outcome = if self.is_ready() {
+            self.classify_and_admit(tx)
+        } else {
+            ReceiveTransactionOutcome::NotReady
+        };
+        (outcome, self.next_parent_recovery_call())
     }
 
     /// FR55 local transaction-creation surface (Ready-state-only). While not `Ready`

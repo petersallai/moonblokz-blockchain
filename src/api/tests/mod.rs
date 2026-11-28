@@ -35,6 +35,7 @@ mod fact;
 mod fixtures;
 mod forward;
 mod genesis;
+mod intake;
 mod late_hold;
 mod proposer;
 mod restart;
@@ -123,6 +124,12 @@ const TEST_TRANSFER_FEE: u32 = NODE_TRANSFER_SIZE as u32;
 /// (FR56 at the default minimum of 1 per byte), and within the default
 /// maximum of 1 000 per byte.
 const CX_FEE: u64 = 1_000;
+
+/// The test chains' mempool: the smallest buffer the crate admits (one block,
+/// `COMPACT_BYTES ≥ MAX_BLOCK_SIZE`) and 16 entries — small, so a test may
+/// hold several chains on one thread.
+const TEST_MEMPOOL_BYTES: usize = MAX_BLOCK_SIZE;
+const TEST_MEMPOOL_ENTRIES: usize = 16;
 
 /// The available-UTXO bitfield bytes of every test chain: the production value
 /// (DEC-318), 32 outputs per block.
@@ -507,6 +514,8 @@ fn new_chain(
     TEST_MAX_BLOCKS,
     4,
     TEST_UTXO_BYTES,
+    TEST_MEMPOOL_BYTES,
+    TEST_MEMPOOL_ENTRIES,
 > {
     let node_zero = *crypto.public_key().serialize();
     let mut bc_slot = core::mem::MaybeUninit::uninit();

@@ -115,6 +115,8 @@ pub(crate) fn classify_block<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >(
     bc: &mut Blockchain<
         C,
@@ -125,6 +127,8 @@ pub(crate) fn classify_block<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >,
     block: &BlockView<'_>,
     window: Option<(u32, u32)>,
@@ -247,6 +251,8 @@ mod tests {
         TEST_MAX_BLOCKS,
         4,
         TEST_UTXO_BYTES,
+        TEST_MEMPOOL_BYTES,
+        TEST_MEMPOOL_ENTRIES,
     >;
 
     /// The verification horizon the configurations declare beside `W`
@@ -260,6 +266,8 @@ mod tests {
 
     /// The production bitfield bytes (DEC-318).
     const TEST_UTXO_BYTES: usize = 4;
+    const TEST_MEMPOOL_BYTES: usize = MAX_BLOCK_SIZE;
+    const TEST_MEMPOOL_ENTRIES: usize = 16;
 
     /// The node cap the configurations declare: `TestChain`'s `MAX_NODES`
     /// (DEC-228; the default 1000 would fail configuration §6 check 18).
@@ -635,9 +643,31 @@ mod tests {
         let node_zero = *c.public_key().serialize();
         let storage = MemoryBackend::<0>::new();
         let mut bc_slot = core::mem::MaybeUninit::<
-            Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+            Blockchain<
+                _,
+                _,
+                _,
+                16,
+                16,
+                TEST_MAX_BLOCKS,
+                4,
+                TEST_UTXO_BYTES,
+                TEST_MEMPOOL_BYTES,
+                TEST_MEMPOOL_ENTRIES,
+            >,
         >::uninit();
-        let bc = Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
+        let bc = Blockchain::<
+            _,
+            _,
+            _,
+            16,
+            16,
+            TEST_MAX_BLOCKS,
+            4,
+            TEST_UTXO_BYTES,
+            TEST_MEMPOOL_BYTES,
+            TEST_MEMPOOL_ENTRIES,
+        >::init(
             &mut bc_slot,
             c,
             storage,

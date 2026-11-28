@@ -185,6 +185,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -195,6 +197,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// Story 6.7 AC5 (FR6, FR9 Tier 3, FR12, FR27; DEC-172, DEC-184, DEC-216;

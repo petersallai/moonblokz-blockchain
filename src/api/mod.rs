@@ -35,6 +35,7 @@ use moonblokz_crypto::{
     MULTI_SIGNATURE_SIZE, MultiSignature, MultiSignatureTrait, PUBLIC_KEY_SIZE, PublicKey,
     PublicKeyTrait, SIGNATURE_SIZE, SignatureTrait,
 };
+use moonblokz_mempool::{AddResult, Mempool};
 use moonblokz_storage::{StorageError, StorageTrait};
 use moonblokz_vote::{VoteEngine, VoteEngineError};
 
@@ -83,6 +84,7 @@ mod restart;
 mod step;
 mod support;
 mod switch;
+mod transaction_intake;
 mod window;
 
 use evidence::{deviation_sum, is_late, late_room, run_after, run_before, run_rules, slot_rule};
@@ -614,6 +616,8 @@ pub struct Blockchain<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 > {
     // Adjacent-component handles (immutable construction inputs).
     crypto: Crypto,
@@ -748,6 +752,11 @@ pub struct Blockchain<
     // no verdict; the root re-enters collecting at the end of its call, never
     // from inside the step or a switch. 1 B.
     reentry_due: bool,
+    // FR30 / FR31 (Story 7.3, DEC-351): the mempool, owned here and changed
+    // only by this crate — intake's add (FR31), FR32's reconciliation (Story
+    // 7.4); built in place with the node's `b"mempool"` sub-seed (DEC-090,
+    // DEC-201). Its capacities are build generics (AR9, DEC-088).
+    mempool: Mempool<MEMPOOL_COMPACT_BYTES, MEMPOOL_MAX_ENTRIES>,
     // No completeness horizon (Story 6.14 D6, DEC-211, withdrawing DEC-167):
     // a balance entry is a snapshot of its node at its position, so the undo
     // of a seed is identity on the values, and every state below it follows
@@ -764,6 +773,8 @@ impl<
     const MAX_BLOCKS: usize,
     const MAX_BRANCH_COUNT: usize,
     const AVAILABLE_UTXO_BYTES: usize,
+    const MEMPOOL_COMPACT_BYTES: usize,
+    const MEMPOOL_MAX_ENTRIES: usize,
 >
     Blockchain<
         Crypto,
@@ -774,6 +785,8 @@ impl<
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >
 {
     /// The available-UTXO bitfield width in bits, `AVAILABLE_UTXO_BYTES · 8`:

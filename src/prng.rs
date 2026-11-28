@@ -55,7 +55,6 @@ impl Prng {
     /// Pure: depends only on `(self.seed, label)` and never observes or
     /// mutates `self.inner`. Two calls with the same label return identical
     /// sub-seeds for the lifetime of the `Prng` (AR11 stability guarantee).
-    #[allow(dead_code)] // consumed by mempool initialization and FR50 seed-source selection
     pub(crate) fn derive_subseed(&self, label: &[u8]) -> u64 {
         // FNV-1a 64-bit hash of the label, XOR'd with the cached seed.
         const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;

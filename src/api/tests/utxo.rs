@@ -480,8 +480,18 @@ fn utxo_value_overflow_is_invalid() {
     );
 }
 
-type FailingReadChain =
-    Blockchain<Crypto, FailingReadStorage, TestConfig, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>;
+type FailingReadChain = Blockchain<
+    Crypto,
+    FailingReadStorage,
+    TestConfig,
+    16,
+    16,
+    TEST_MAX_BLOCKS,
+    4,
+    TEST_UTXO_BYTES,
+    TEST_MEMPOOL_BYTES,
+    TEST_MEMPOOL_ENTRIES,
+>;
 
 /// The UTXO harness on a [`FailingReadChain`] whose reads all succeed
 /// until a test arms `failing_slot`: chain-config anchor 99, balance block
@@ -1015,9 +1025,31 @@ fn an_integrity_failure_on_the_dropping_block_is_local() {
     let chain_config = locked_chain_config(&crypto, TestChain::BUILD_LIMITS);
     let node_zero = *crypto.public_key().serialize();
     let mut slot = core::mem::MaybeUninit::<
-        Blockchain<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>,
+        Blockchain<
+            _,
+            _,
+            _,
+            16,
+            16,
+            TEST_MAX_BLOCKS,
+            4,
+            TEST_UTXO_BYTES,
+            TEST_MEMPOOL_BYTES,
+            TEST_MEMPOOL_ENTRIES,
+        >,
     >::uninit();
-    Blockchain::<_, _, _, 16, 16, TEST_MAX_BLOCKS, 4, TEST_UTXO_BYTES>::init(
+    Blockchain::<
+        _,
+        _,
+        _,
+        16,
+        16,
+        TEST_MAX_BLOCKS,
+        4,
+        TEST_UTXO_BYTES,
+        TEST_MEMPOOL_BYTES,
+        TEST_MEMPOOL_ENTRIES,
+    >::init(
         &mut slot,
         crypto,
         CorruptSlotsStorage,
