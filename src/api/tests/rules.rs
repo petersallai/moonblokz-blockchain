@@ -5,6 +5,7 @@
 use super::super::duplicate::{inclusion_floor, is_balance_only, same_key};
 use super::super::step::fee_violates;
 use super::crediting::{REWARD_PER_NODE_PROGRAM, genesis_with};
+use super::intake::transfer_by;
 use super::*;
 use crate::approval::test_seams::{DUPLICATE_SCAN_READS, counted};
 
@@ -416,8 +417,9 @@ fn the_duplicate_scan_reads_only_transaction_blocks_above_the_floor() {
     assert_eq!(receive(&mut bc, &b3), ReceiveBlockOutcome::AcceptedSilently);
     let prev = b3.view().hash();
     // Anchor 2: floor 3, only #3 (no read). Anchor 1: floor 2, #3 and #2
-    // (one read). Anchor 0: floor 1, #3, #2 and #1 (one read).
-    for (anchor, reads) in [(2, 0), (1, 1), (0, 1)] {
+    // (one read). Anchor 0: floor 0 — block #0 carries its self-transfer at
+    // anchor 0 (FR54) — #3, #2, #1 and #0 (two reads).
+    for (anchor, reads) in [(2, 0), (1, 1), (0, 2)] {
         let nt = transfer_with(anchor, 6, TEST_TRANSFER_FEE, 0, 9);
         let block = tx_block(4, prev, 0, |b| {
             b.add_node_transfer(&nt).ok().expect("transfer");
@@ -510,5 +512,514 @@ fn the_fr3_pass_deletes_a_repeated_transaction() {
     assert!(
         mesh.blocks.find(3, &dup3.view().hash()).is_none(),
         "deleted"
+    );
+}
+
+// --- Code review of Story 7.3 (P4, RD3) ----------------------------------------
+
+/// P4 (I-22): block #0 carries node #0's self-transfer at anchor 0 (FR54), so
+/// while `s − W ≤ 0` the scan reaches block #0 — a fee-bumped re-signing of it
+/// is a duplicate in a block and Already-confirmed at intake.
+#[test]
+fn the_genesis_self_transfer_is_in_the_scan() {
+    let (mut bc, b0, b1) = ready_genesis(16);
+    let genesis = b0.view();
+    let amount = genesis
+        .transactions()
+        .and_then(|txs| txs.iter().nth(1))
+        .and_then(|tx| tx.as_node_transfer().map(|nt| nt.amount()))
+        .expect("block #0's self-transfer");
+    let replay = transfer_with(0, amount, TEST_TRANSFER_FEE, 0, 0);
+    let block = tx_block(2, b1.view().hash(), 0, |b| {
+        b.add_node_transfer(&replay).ok().expect("transfer");
+    });
+    assert_eq!(
+        step_reason(&mut bc, &block),
+        Some(ValidationReason::DuplicateTransaction)
+    );
+    let (outcome, _) = bc.receive_transaction(view_of(replay.as_bytes()), 0);
+    assert_eq!(outcome, ReceiveTransactionOutcome::AlreadyConfirmed);
+}
+
+/// RD3: a receiver or a vote target at or above `max_node_count` (16 on the
+/// test chains) can never exist: `NodeCountExceeded`, not the curable
+/// `NodeIdOutOfRange` / `VoteTargetUnknown` one below it.
+#[test]
+fn an_id_at_the_node_cap_can_never_exist() {
+    let (mut bc, _, b1) = ready_genesis(16);
+    let prev = b1.view().hash();
+    let to = |receiver, vote| {
+        let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+        let nt = NodeTransfer::new_signed(vote, 1, 0, receiver, 5, TEST_TRANSFER_FEE, 0, &signer);
+        tx_block(2, prev, 0, |b| {
+            b.add_node_transfer(&nt).ok().expect("transfer");
+        })
+    };
+    for (receiver, vote, reason) in [
+        (15, 0, ValidationReason::NodeIdOutOfRange),
+        (16, 0, ValidationReason::NodeCountExceeded),
+        (0, 15, ValidationReason::VoteTargetUnknown),
+        (0, 16, ValidationReason::NodeCountExceeded),
+    ] {
+        assert_eq!(
+            step_reason(&mut bc, &to(receiver, vote)),
+            Some(reason),
+            "receiver {receiver}, vote {vote}"
+        );
+    }
+}
+
+// --- Code review of Story 7.3 (P8): the rules on every path -------------------
+
+/// `program` (a seven-byte parameter program) bound to `id` on the test
+/// window, the rest at the registry defaults.
+fn bound_builder(id: u8, program: &[u8]) -> ChainConfigPayloadBuilder {
+    let mut builder = window_config_builder(TEST_W);
+    builder
+        .add_bytecode(id, program)
+        .ok()
+        .expect("the program frames");
+    builder
+}
+
+/// FR9 Tier 2 of a side block (`tier2_check`, DEC-305) for the FR56 fee
+/// policy and the DEC-312 price: a sibling of the active #2 is judged before
+/// it is written. A literal bound is judged there — a fee below the literal
+/// minimum and a price one above the literal `registration_price` are exact
+/// evidence and nothing is stored. A chain-info-bound one
+/// (`tx_fee_per_byte_min` or `registration_price` = `10 · count`) declines
+/// and its check is skipped: the same violation, which the served pre-state
+/// refuses, is stored as a side block (the switch replay judges it).
+#[test]
+fn tier_two_judges_a_literal_fee_or_price_and_skips_a_chain_info_bound_one() {
+    let size = NODE_TRANSFER_SIZE as u32;
+    let cheap = |prev| self_transfer(2, prev, 6, TEST_TRANSFER_FEE - 1, 0);
+    let overpriced = |prev| {
+        let reg = registration_tx_priced(1, 0, 1, NODE_ONE_KEY, TEST_REGISTRATION_PRICE + 1, 0);
+        tx_block(2, prev, 0, |b| {
+            b.add_registration(&reg).ok().expect("add registration");
+        })
+    };
+
+    // Literal (the registry defaults): refused at Tier 2.
+    for (case, side, reason) in [
+        (
+            "fee",
+            cheap as fn([u8; 32]) -> Block,
+            ValidationReason::FeeOutOfPolicy,
+        ),
+        (
+            "price",
+            overpriced,
+            ValidationReason::RegistrationPriceMismatch,
+        ),
+    ] {
+        let (mut bc, _, b1) = ready_genesis(16);
+        let prev = b1.view().hash();
+        let side = side(prev);
+        assert_eq!(step_reason(&mut bc, &side), Some(reason), "{case}");
+        let active = self_transfer(2, prev, 5, TEST_TRANSFER_FEE, 0);
+        assert_eq!(
+            receive(&mut bc, &active),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            receive(&mut bc, &side),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            "literal {case}: refused at Tier 2"
+        );
+        assert_eq!(status_of(&bc, &side), None, "literal {case}: not stored");
+    }
+
+    // Chain-info-bound (`10 · count`, one node: 10): skipped at Tier 2.
+    for (case, id, side, active_fee, reason) in [
+        (
+            "fee",
+            parameter::TX_FEE_PER_BYTE_MIN,
+            (|prev| self_transfer(2, prev, 6, NODE_TRANSFER_SIZE as u32, 0))
+                as fn([u8; 32]) -> Block,
+            10 * size,
+            ValidationReason::FeeOutOfPolicy,
+        ),
+        (
+            "price",
+            parameter::REGISTRATION_PRICE,
+            overpriced,
+            TEST_TRANSFER_FEE,
+            ValidationReason::RegistrationPriceMismatch,
+        ),
+    ] {
+        let (mut bc, _, b1) = genesis_with(&bound_builder(id, &REWARD_PER_NODE_PROGRAM[..7]));
+        let prev = b1.view().hash();
+        let side = side(prev);
+        assert_eq!(
+            step_reason(&mut bc, &side),
+            Some(reason),
+            "{case}: the served pre-state refuses it"
+        );
+        let active = self_transfer(2, prev, 5, active_fee, 0);
+        assert_eq!(
+            receive(&mut bc, &active),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(
+            receive(&mut bc, &side),
+            ReceiveBlockOutcome::AcceptedSilently,
+            "chain-info {case}: Tier 2 declines"
+        );
+        assert_eq!(
+            status_of(&bc, &side),
+            Some(BlockStatus::Connected),
+            "chain-info {case}: stored beside the head"
+        );
+        assert_eq!(head_of(&bc), (2, active.view().hash()));
+    }
+}
+
+/// I-22 / DEC-129: the window duplicate scan stops at `below`, the segment
+/// start `a` of a window-anchored FR3 pass (`projection.anchor`) — a copy at
+/// `a` is a duplicate, one below it is trusted pre-window history.
+/// Ready, `W = 16`: #2 carries `t`; the candidate #4 repeats it.
+#[test]
+fn the_duplicate_scan_stops_at_the_segment_start() {
+    let (mut bc, _, b1) = ready_genesis(16);
+    let t = transfer_with(1, 5, TEST_TRANSFER_FEE, 0, 0);
+    let b2 = tx_block(2, b1.view().hash(), 0, |b| {
+        b.add_node_transfer(&t).ok().expect("transfer");
+    });
+    let b3 = self_transfer(3, b2.view().hash(), 6, TEST_TRANSFER_FEE, 0);
+    for block in [&b2, &b3] {
+        assert_eq!(
+            receive(&mut bc, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    let again = tx_block(4, b3.view().hash(), 0, |b| {
+        b.add_node_transfer(&t).ok().expect("transfer");
+    });
+    let parent = bc.active_chain_head_idx;
+    for (below, duplicate) in [(0, true), (2, true), (3, false)] {
+        assert_eq!(
+            bc.block_carries_duplicate(&again.view(), parent, below),
+            Ok(duplicate),
+            "a = {below}"
+        );
+    }
+}
+
+/// I-22 on a window-anchored FR3 pass (W6, `a = 97`): #101 repeats the
+/// transfer of the segment's first block #97 — the scan reaches `a`
+/// inclusive, so the pass refuses it. A joiner whose segment starts at
+/// `a = 98` never holds #97: the same #101 validates (trusted history).
+#[test]
+fn a_window_anchored_pass_scans_down_to_its_segment_start() {
+    let [b97, b98, b99] = w6_below();
+    let c100 = w6_config_anchor_block(100, b99.view().hash());
+    // #97's key (initializer 7 → 9, 100, anchor 96, comment 0), another vote.
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    let copy = NodeTransfer::new_signed(3, 96, 7, 9, 100, TEST_TRANSFER_FEE, 0, &signer);
+    let again = tx_block(101, c100.view().hash(), 0, |b| {
+        b.add_node_transfer(&copy).ok().expect("transfer");
+    });
+    let pass = |segment: &[&Block]| {
+        let mut bc = new_w6_chain();
+        for block in segment {
+            let view = block.view();
+            bc.tier1_admit(&view, &view.hash(), 0).expect("admitted");
+        }
+        let tip = bc.blocks.find(101, &again.view().hash()).expect("stored");
+        (bc.run_processing_pass(tip).map(|_| ()), tip)
+    };
+    let (verdict, tip) = pass(&[&b97, &b98, &b99, &c100, &again]);
+    assert_eq!(
+        verdict,
+        Err(ProcessingError::Invalid {
+            block_idx: tip,
+            reason: ValidationReason::DuplicateTransaction,
+        }),
+        "a = 97: the copy at a"
+    );
+    let (verdict, _) = pass(&[&b98, &b99, &c100, &again]);
+    assert_eq!(verdict, Ok(()), "a = 98: the copy lies below a");
+}
+
+/// A genesis node on `builder` with node #0's `a2` (registering node #1 and
+/// crediting it once) and its zero-valued tip `z3`: node #1's sibling of
+/// `z3` at its real value (`I(1000)`) outranks it, so the FR23 switch
+/// replays that sibling (Story 6.12 FR70: an honest fork).
+fn zero_tip_on(builder: &ChainConfigPayloadBuilder) -> (TestChain, Block) {
+    let (mut bc, _, b1) = genesis_with(builder);
+    let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
+    let z3 = alt(3, a2.view().hash(), 0, 0, 1, 8, false);
+    for block in [&a2, &z3] {
+        assert_eq!(
+            receive(&mut bc, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    (bc, a2)
+}
+
+/// Node #1's heavier sibling of `z3` on `a2`: three votes for node #0, then
+/// `extra`.
+fn heavier_with(a2: &Block, extra: impl FnOnce(&mut BlockBuilder)) -> Block {
+    let template = tx_block(3, a2.view().hash(), 0, |b| {
+        votes_by(3, 1, 0, 3, 40)(b);
+        extra(b);
+    });
+    resign(&template, 1, vote_snapshot(1000), NODE_ONE_KEY)
+}
+
+/// The Story 7.3 step rules refuse on the FR23 switch replay (Tier 3 of a
+/// side branch): a heavier sibling carrying node #0's self-vote (DEC-190), a
+/// transfer twice (I-22), or a fee above a chain-info-bound maximum (FR56 —
+/// skipped at Tier 2, judged at the replay's served pre-state, DEC-305) is
+/// deleted and the active chain stays; the same sibling with the fee at the
+/// bound wins the switch. `tx_fee_per_byte_max = 10 · count` (two nodes: 20
+/// per byte); every other fixture fee is the minimum.
+#[test]
+fn the_new_rules_refuse_on_a_switch_replay() {
+    let builder = bound_builder(
+        parameter::TX_FEE_PER_BYTE_MAX,
+        &REWARD_PER_NODE_PROGRAM[..7],
+    );
+    let size = NODE_TRANSFER_SIZE as u32;
+    let by_one = |fee: u32, comment: u64| transfer_by(1, NODE_ONE_KEY, 1, 7, 2, fee, 0, comment);
+    let self_vote = transfer_with(2, 5, TEST_TRANSFER_FEE, 0, 9);
+    let twice = by_one(TEST_TRANSFER_FEE, 1);
+    let pricey = by_one(21 * size, 2);
+    let at_bound = by_one(20 * size, 3);
+    type Extra<'a> = &'a dyn Fn(&mut BlockBuilder);
+    let cases: [(&str, Extra, Option<ValidationReason>); 4] = [
+        (
+            "node #0 voting for itself",
+            &|b| {
+                b.add_node_transfer(&self_vote).ok().expect("transfer");
+            },
+            Some(ValidationReason::NodeZeroSelfVote),
+        ),
+        (
+            "a transfer twice",
+            &|b| {
+                b.add_node_transfer(&twice).ok().expect("first");
+                b.add_node_transfer(&twice).ok().expect("second");
+            },
+            Some(ValidationReason::DuplicateTransaction),
+        ),
+        (
+            "a fee above the chain-info maximum",
+            &|b| {
+                b.add_node_transfer(&pricey).ok().expect("transfer");
+            },
+            Some(ValidationReason::FeeOutOfPolicy),
+        ),
+        (
+            "the fee at the chain-info maximum",
+            &|b| {
+                b.add_node_transfer(&at_bound).ok().expect("transfer");
+            },
+            None,
+        ),
+    ];
+    for (case, extra, reason) in cases {
+        let (mut bc, a2) = zero_tip_on(&builder);
+        let z3 = head_of(&bc);
+        let sibling = heavier_with(&a2, extra);
+        // The reason the replay meets: the sibling as the extension of `a2`.
+        let (mut probe, _, b1) = genesis_with(&builder);
+        assert_eq!(a2.view().previous_hash(), b1.view().hash().as_slice());
+        assert_eq!(
+            receive(&mut probe, &a2),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+        assert_eq!(step_reason(&mut probe, &sibling), reason, "{case}: on a2");
+        assert_eq!(
+            receive(&mut bc, &sibling),
+            ReceiveBlockOutcome::AcceptedSilently,
+            "{case}"
+        );
+        if reason.is_some() {
+            assert_eq!(head_of(&bc), z3, "{case}: the active chain stays");
+            assert_eq!(status_of(&bc, &sibling), None, "{case}: deleted");
+        } else {
+            assert_eq!(head_of(&bc), (3, sibling.view().hash()), "{case}: switched");
+        }
+    }
+}
+
+/// The Story 7.3 step rules on the FR3 pass: a mesh node joining a chain
+/// whose #3 breaks one of them — a fee below the minimum (FR56), a price one
+/// above `registration_price` (DEC-312), node #0 voting for itself once node
+/// #1 exists (DEC-190) — deletes #3 and goes Ready on the valid prefix, as
+/// the head extension refuses it (the duplicate:
+/// [`the_fr3_pass_deletes_a_repeated_transaction`]).
+#[test]
+fn the_fr3_pass_deletes_a_block_breaking_a_new_rule() {
+    let (_, b0, b1) = ready_genesis(16);
+    let b2 = register(2, b1.view().hash(), 1, NODE_ONE_KEY);
+    let prev = b2.view().hash();
+    let overpriced = registration_tx_priced(2, 0, 2, 0x32, TEST_REGISTRATION_PRICE + 1, 1);
+    for (case, bad3, reason) in [
+        (
+            "a fee below the minimum",
+            self_transfer(3, prev, 5, TEST_TRANSFER_FEE - 1, 1),
+            ValidationReason::FeeOutOfPolicy,
+        ),
+        (
+            "a price above registration_price",
+            tx_block(3, prev, 0, |b| {
+                b.add_registration(&overpriced).ok().expect("registration");
+            }),
+            ValidationReason::RegistrationPriceMismatch,
+        ),
+        (
+            "node #0 voting for itself",
+            self_transfer(3, prev, 5, TEST_TRANSFER_FEE, 0),
+            ValidationReason::NodeZeroSelfVote,
+        ),
+    ] {
+        let (mut g, _, _) = ready_genesis(16);
+        assert_eq!(receive(&mut g, &b2), ReceiveBlockOutcome::AcceptedSilently);
+        assert_eq!(step_reason(&mut g, &bad3), Some(reason), "{case}");
+        assert_eq!(
+            receive(&mut g, &bad3),
+            ReceiveBlockOutcome::Rejected(RejectReason::InvalidEvidence),
+            "{case}: the head extension refuses it"
+        );
+        let mut mesh = new_unconfigured_test_chain();
+        for block in [&bad3, &b2, &b1, &b0] {
+            assert_eq!(
+                receive(&mut mesh, block),
+                ReceiveBlockOutcome::AcceptedSilently,
+                "{case}"
+            );
+        }
+        assert!(mesh.is_ready(), "{case}");
+        assert_eq!(head_of(&mesh), (2, prev), "{case}: Ready on the prefix");
+        assert!(
+            mesh.blocks.find(3, &bad3.view().hash()).is_none(),
+            "{case}: deleted"
+        );
+    }
+}
+
+/// NFR5 with the Story 7.3 rules: a chain paying fees at both FR56 bounds
+/// (the minimum and `1 000 ·` size), registering nodes #1 and #2 at exactly
+/// `registration_price`, and node #1 voting for node #0 (DEC-190's
+/// alternative) — the FR3 pass of a mesh node fed the same blocks into the
+/// same slots ends in the state the genesis node's head extensions reached.
+#[test]
+fn the_fr3_pass_equals_the_head_extension_under_the_new_rules() {
+    let (mut g, b0, b1) = ready_genesis(16);
+    let size = NODE_TRANSFER_SIZE as u32;
+    let b2 = register(2, b1.view().hash(), 1, NODE_ONE_KEY);
+    let fund = NodeTransfer::new_signed(
+        1,
+        2,
+        0,
+        1,
+        NODE_ONE_FUNDS,
+        TEST_TRANSFER_FEE,
+        0,
+        &Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("key"),
+    );
+    let at_max = transfer_with(2, 5, 1_000 * size, 1, 1);
+    let b3 = tx_block(3, b2.view().hash(), 0, |b| {
+        b.add_node_transfer(&fund).ok().expect("funding");
+        b.add_node_transfer(&at_max).ok().expect("at the maximum");
+    });
+    let reg = registration_tx(3, 0, 2, 0x32);
+    let by_one = transfer_by(1, NODE_ONE_KEY, 0, 9, 3, TEST_TRANSFER_FEE, 0, 0);
+    let b4 = tx_block(4, b3.view().hash(), 0, |b| {
+        b.add_registration(&reg).ok().expect("registration");
+        b.add_node_transfer(&by_one).ok().expect("node #1's vote");
+    });
+    for block in [&b2, &b3, &b4] {
+        assert_eq!(
+            receive(&mut g, block),
+            ReceiveBlockOutcome::AcceptedSilently
+        );
+    }
+    assert_eq!(head_of(&g), (4, b4.view().hash()));
+    assert_eq!(g.node_info.max_known_node_id(), 2);
+
+    let mut mesh = new_unconfigured_test_chain();
+    for block in [&b0, &b1, &b2, &b3, &b4] {
+        let view = block.view();
+        mesh.tier1_admit(&view, &view.hash(), 0).expect("admitted");
+    }
+    mesh.drive_dominant_chain_acquisition();
+    assert!(mesh.is_ready());
+    // The one-way signature marks (DEC-157, Story 6.7 D2) are not derived
+    // state: the founder wrote #0 and #1 itself and never judged them, the
+    // pass did. Every other entry is compared as it stands.
+    for block in [&b0, &b1] {
+        let idx = slot(&g, block);
+        assert_eq!(verified(&g, block), Some(false), "the founder's own");
+        assert!(
+            mesh.blocks
+                .get(slot(&mesh, block))
+                .is_some_and(|e| e.is_signatures_accepted())
+        );
+        g.blocks.mark_signatures_accepted(idx);
+    }
+    super::forward::assert_same_state(&mesh, &g, "pass vs head extension");
+}
+
+/// FR9 / DEC-174 at Tier 1, end to end through `tier1_admit`: the anchor's
+/// lower bound `s − W` is enforced only once the configuration is durably
+/// locked (`enforceable_active_chain_length` is `Some(W)`); while it is
+/// tentative (`None`) an anchor below the window is not refused at Tier 1
+/// (the per-block step judges it with the held `W`).
+#[test]
+fn tier_one_bounds_an_anchor_by_the_window_only_once_locked() {
+    let s = 100;
+    let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
+    let block = |anchor| {
+        let nt = NodeTransfer::new_signed(3, anchor, 7, 9, 100, TEST_TRANSFER_FEE, 0, &signer);
+        tx_block(s, [0xCD; 32], 0, |b| {
+            b.add_node_transfer(&nt).ok().expect("transfer");
+        })
+    };
+    let below = block(s - TEST_W - 1);
+    let at_tail = block(s - TEST_W);
+
+    // Tentative: a stray chain-config block declares `W = 16`.
+    let mut bc = new_unconfigured_test_chain();
+    let stray = chain_config_block_from(500, [0xEE; 32], &mut window_config_builder(TEST_W));
+    bc.tier1_admit(&stray.view(), &stray.view().hash(), 0)
+        .expect("the stray is admitted");
+    assert!(bc.chain_config.tentative_content().is_some());
+    assert_eq!(bc.active_chain_length(), Some(TEST_W), "held");
+    assert_eq!(
+        bc.enforceable_active_chain_length(),
+        None,
+        "not enforceable"
+    );
+    assert!(
+        bc.tier1_admit(&below.view(), &below.view().hash(), 0)
+            .is_ok(),
+        "a tentative W must not refuse it"
+    );
+
+    // Locked on the same content: refused, nothing stored.
+    let (crypto, storage, _) = test_backends();
+    let mut chain_config = empty_chain_config(TestChain::BUILD_LIMITS);
+    chain_config
+        .load_durable(window_config_builder(TEST_W).build_signed(&crypto))
+        .ok()
+        .expect("legal content");
+    let mut bc = new_chain(crypto, storage, chain_config, 5, 0);
+    assert_eq!(bc.enforceable_active_chain_length(), Some(TEST_W));
+    let stored = bc.blocks.len();
+    assert_eq!(
+        bc.tier1_admit(&below.view(), &below.view().hash(), 0),
+        Err(AdmitError::Rejected(Tier1Failure::AnchorBelowWindow))
+    );
+    assert_eq!(bc.blocks.len(), stored, "not stored");
+    assert!(
+        bc.tier1_admit(&at_tail.view(), &at_tail.view().hash(), 0)
+            .is_ok(),
+        "an anchor at s − W is admitted"
     );
 }

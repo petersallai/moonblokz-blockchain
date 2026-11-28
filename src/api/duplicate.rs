@@ -2,9 +2,10 @@
 //! transaction uniqueness keys it and FR14 intake share (DEC-354).
 //!
 //! A transfer or a balance-only complex transaction is guarded by nothing but
-//! its key: an earlier inclusion lies above its highest anchor (Tier 1), hence
-//! inside the parent's window (DEC-174), so an exact scan of the ancestry down
-//! to that floor is complete. No state is kept: the cached payload type skips
+//! its key: an earlier inclusion lies above its highest anchor (Tier 1) — or
+//! is block #0's own self-transfer, at anchor 0 (FR54) — hence inside the
+//! parent's window (DEC-174), so an exact scan of the ancestry down to that
+//! floor is complete. No state is kept: the cached payload type skips
 //! the blocks that carry no transaction without a read, and each other block is
 //! read once per applied block, whatever its transaction count. A registration
 //! is guarded by key uniqueness, a UTXO-bearing transaction by the spent bit.
@@ -24,7 +25,10 @@ pub(super) fn is_balance_only(tx: &TransactionView<'_>) -> bool {
 }
 
 /// The lowest sequence a block including `tx` can have: one above its highest
-/// anchor or UTXO reference (Tier 1: each lies strictly below the block).
+/// anchor or UTXO reference (Tier 1: each lies strictly below the block) —
+/// and 0 when that reference is 0, where block #0 carries its genesis
+/// self-transfer at anchor 0 (FR54). Intake also judges a future-referenced
+/// transaction's Tier 1 at it (Story 7.3 RD1).
 pub(super) fn inclusion_floor(tx: &TransactionView<'_>) -> u32 {
     let highest = if let Some(nt) = tx.as_node_transfer() {
         nt.anchor_sequence()
@@ -44,12 +48,20 @@ pub(super) fn inclusion_floor(tx: &TransactionView<'_>) -> u32 {
     } else {
         0
     };
-    highest.saturating_add(1)
+    if highest == 0 {
+        0
+    } else {
+        highest.saturating_add(1)
+    }
 }
 
 /// FR14's uniqueness-key equality (DEC-354): a transfer by `(initializer,
 /// receiver, amount, anchor_sequence, comment)`; a registration by
-/// `new_public_key`; a balance-only complex transaction by its ordered balance
+/// `(new_public_key, initializer)` — the mempool's key (Story 7.3 RD2): a copy
+/// under another sponsor, unverifiable while that sponsor is unseeded, must
+/// not shut out the genuine registration; on the chain a registration is
+/// matched by its key alone (DEC-352, `key_is_registered`), and only the
+/// mempool search reaches this arm; a balance-only complex transaction by its ordered balance
 /// inputs' `(initializer, anchor_sequence, amount, comment)` — outputs, `vote`
 /// and signatures excluded, so a fee-bumped variant is a duplicate; any other
 /// complex transaction (UTXO-bearing, or zero-input) by its exact bytes.
@@ -62,7 +74,7 @@ pub(super) fn same_key(a: &TransactionView<'_>, b: &TransactionView<'_>) -> bool
             && x.comment() == y.comment();
     }
     if let (Some(x), Some(y)) = (a.as_registration(), b.as_registration()) {
-        return x.new_public_key() == y.new_public_key();
+        return x.new_public_key() == y.new_public_key() && x.initializer() == y.initializer();
     }
     let (Some(x), Some(y)) = (a.as_complex(), b.as_complex()) else {
         return false;
@@ -147,12 +159,16 @@ impl<
 
     /// The lowest sequence at which a valid transaction of a block `s` can
     /// have been included before: above `max(0, s − W)`, its earliest anchor
-    /// or UTXO reference (DEC-174, DEC-196). It bounds every scan to `W − 1`
-    /// blocks whatever a candidate's own references claim — one below the
+    /// or UTXO reference (DEC-174, DEC-196) — block #0 itself while that bound
+    /// is 0 (its self-transfer sits at anchor 0). It bounds every scan to the
+    /// window whatever a candidate's own references claim — one below the
     /// window is invalid anyway. Without a configuration there is no bound.
     pub(super) fn window_floor(&self, seq: u32) -> u32 {
         self.active_chain_length()
-            .map_or(0, |w| seq.saturating_sub(w).saturating_add(1))
+            .map_or(0, |w| match seq.saturating_sub(w) {
+                0 => 0,
+                tail => tail.saturating_add(1),
+            })
     }
 
     /// Whether a transaction block on the ancestry from `parent` down to

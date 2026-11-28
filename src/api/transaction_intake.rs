@@ -21,16 +21,31 @@ pub(super) fn exceeds_block_room(len: usize, block_size_limit: u32) -> bool {
     len > (block_size_limit as usize).saturating_sub(HEADER_SIZE + 2)
 }
 
+/// Where a step failure at intake stood: what [`outcome_of`] reads beyond
+/// the reason.
+struct FailureContext {
+    /// The pre-state watermark (a failing registration moves nothing).
+    max_known: u32,
+    /// The `block_sequence` of the UTXO input the failure names.
+    failed_utxo_ref: u32,
+    /// The judged block, `h + 1`.
+    s: u32,
+    /// The lowest sequence a switch can replace, `h − H + 1` (FR58's bound on
+    /// the divergence point; the head's own sequence plus one without `H`).
+    switchable_from: u32,
+}
+
 /// The FR14 outcome of a step failure at intake (DEC-350's table): `Deferred`
 /// where a later chain state can cure it — an unknown or unseeded node, a vote
 /// target not yet registered, a balance short of the debit, a registration for
-/// a later slot, a spent UTXO input — and `Rejected` for every other reason.
-/// A registered key is Already-confirmed (DEC-352). `max_known` is the
-/// pre-state watermark (a failing registration moves nothing).
+/// a later slot, a spent UTXO input, a UTXO reference at or above `h + 1`
+/// (RD1), and a UTXO input whose amount or address signature disagrees with a
+/// referenced block a switch can still replace (RD4.3) — and `Rejected` for
+/// every other reason. A registered key is Already-confirmed (DEC-352).
 fn outcome_of(
     reason: ValidationReason,
     tx: &TransactionView<'_>,
-    max_known: u32,
+    at: &FailureContext,
 ) -> ReceiveTransactionOutcome {
     use ReceiveTransactionOutcome as O;
     use ValidationReason as R;
@@ -41,9 +56,15 @@ fn outcome_of(
         | R::InsufficientBalance
         | R::UtxoUnavailable => O::Deferred,
         R::RegistrationWatermark => match tx.as_registration() {
-            Some(reg) if reg.new_node_id() > max_known.saturating_add(1) => O::Deferred,
+            Some(reg) if reg.new_node_id() > at.max_known.saturating_add(1) => O::Deferred,
             _ => O::Rejected,
         },
+        R::UtxoUnresolvable if at.failed_utxo_ref >= at.s => O::Deferred,
+        R::UtxoAmountMismatch | R::UtxoSignatureInvalid
+            if at.failed_utxo_ref >= at.switchable_from =>
+        {
+            O::Deferred
+        }
         R::DuplicatePublicKey => O::AlreadyConfirmed,
         _ => O::Rejected,
     }
@@ -110,30 +131,41 @@ impl<
             return O::Rejected; // FR53: no block can follow the ceiling.
         };
 
-        // 1. The transaction alone (AC3): DEC-223's size, the per-transaction
-        //    Tier 1 at `s`, and no carry-forward — a zero-input complex
-        //    transaction is the block creator's own (FR51), never submitted.
+        // 1. The transaction alone (AC3): DEC-223's size, no carry-forward —
+        //    a zero-input complex transaction is the block creator's own
+        //    (FR51), never submitted (RD4.1) — the `h + W` horizon, and the
+        //    per-transaction Tier 1.
         if exceeds_block_room(tx.len(), self.enforceable_block_size_limit())
             || tx.as_complex().is_some_and(|cx| cx.input_count() == 0)
         {
             return O::Rejected;
         }
+        // A reference above `h + W` is beyond this node's horizon: Rejected,
+        // FR14's second named exception beside FR31's (RD1 addendum) — it
+        // bounds an entry's life to about `2W` blocks.
+        let floor = inclusion_floor(tx);
+        if self
+            .active_chain_length()
+            .is_some_and(|w| floor.saturating_sub(1) > h.saturating_add(w))
+        {
+            return O::Rejected;
+        }
+        // A reference at or above `h + 1` waits for the chain, but is judged
+        // as fully as any (RD1): Tier 1 at its inclusion floor, then the
+        // mempool, the scan and the dry-run — so a Deferred entry is
+        // unverified only where its key is genuinely missing (DEC-350).
+        let future = floor > s;
         match tier1_transaction(
             tx,
-            s,
+            floor.max(s),
             self.enforceable_active_chain_length(),
             &self.node_zero_public_key,
             &self.crypto,
         ) {
             Ok(utxo_outputs) if utxo_outputs > u32::from(self.enforceable_max_utxo_outputs()) => {
-                return O::Rejected;
+                return O::Rejected; // no block can carry it (RD4.2)
             }
             Ok(_) => {}
-            // FR14 has no upper bound: an anchor or a UTXO block at or above
-            // `h + 1` waits for the chain.
-            Err(
-                Tier1Failure::AnchorSequenceNotBeforeBlock | Tier1Failure::UtxoInputNotBeforeBlock,
-            ) => return O::Deferred,
             Err(_) => return O::Rejected,
         }
 
@@ -167,6 +199,7 @@ impl<
             utxo_outputs: 0,
             liveness: None,
             hold_exit: None,
+            failed_utxo_ref: 0,
         };
         let projection = Projection::COMPLETE;
         let outcome =
@@ -175,11 +208,21 @@ impl<
                     self.invert_transaction(tx, head, false);
                     O::AcceptedToMempool
                 }
-                Err(ProcessingError::Invalid { reason, .. }) => outcome_of(reason, tx, max_known),
+                Err(ProcessingError::Invalid { reason, .. }) => {
+                    let at = FailureContext {
+                        max_known,
+                        failed_utxo_ref: derivation.failed_utxo_ref,
+                        s,
+                        switchable_from: self
+                            .verification_horizon()
+                            .map_or(s, |horizon| h.saturating_sub(horizon).saturating_add(1)),
+                    };
+                    outcome_of(reason, tx, &at)
+                }
                 // A failed read or an inconsistent ancestry is the node's own.
                 Err(_) => O::Deferred,
             };
-        if scan_fault && outcome == O::AcceptedToMempool {
+        if (scan_fault || future) && outcome == O::AcceptedToMempool {
             O::Deferred
         } else {
             outcome
@@ -206,15 +249,19 @@ impl<
             let Some(cx) = tx.as_complex() else {
                 return Ok(false);
             };
-            let every_utxo_spent = cx.inputs().filter_map(|input| input.as_utxo()).all(|ui| {
-                matches!(
-                    self.ancestor_at(head, ui.block_sequence()),
-                    Ok(Some(slot)) if self.blocks.utxo_available(slot, ui.output_index() as usize)
-                        != Some(true)
-                )
-            });
-            if !every_utxo_spent {
-                return Ok(false);
+            // One available (or unresolvable) input rules an equivalent out;
+            // a failed walk is a read fault, never "unspent".
+            for ui in cx.inputs().filter_map(|input| input.as_utxo()) {
+                let spent = match self.ancestor_at(head, ui.block_sequence()) {
+                    Ok(Some(slot)) => {
+                        self.blocks.utxo_available(slot, ui.output_index() as usize) != Some(true)
+                    }
+                    Ok(None) => false,
+                    Err(_) => return Err(()),
+                };
+                if !spent {
+                    return Ok(false);
+                }
             }
         }
         let floor = inclusion_floor(tx).max(self.window_floor(s));

@@ -248,10 +248,15 @@ pub(crate) enum ValidationReason {
     VoteHeaderMismatch,
     /// A node-transfer / registration transaction signature is invalid.
     TransactionSignatureInvalid,
-    /// A complex-transaction input signature does not verify over the DEC-196
-    /// preimage against its own key: a UTXO input's referenced output address,
-    /// a balance input's `initializer` key (Story 7.1, I-21).
+    /// A balance input's signature does not verify over the DEC-196 preimage
+    /// against its `initializer` key (Story 7.1, I-21).
     InputSignatureInvalid,
+    /// A UTXO input's signature does not verify over the DEC-196 preimage
+    /// against the referenced output's address (Story 7.1, I-21). Distinct
+    /// from [`Self::InputSignatureInvalid`] because the address is the
+    /// referenced block's content, which a switch can replace while that block
+    /// lies above the switch bound (FR58, Story 7.3 RD4.3).
+    UtxoSignatureInvalid,
     /// A debit (transfer amount+fee, registration price+fee, balance input)
     /// exceeds the initializer's derived balance (negative-balance outcome).
     InsufficientBalance,
@@ -568,6 +573,9 @@ struct BlockDerivation {
     /// chain-info source declines: what the fee policy and the registration
     /// price resolve against for every transaction of the block (DEC-312).
     chain_info_count: Option<u64>,
+    /// The `block_sequence` of the UTXO input a failure names (amount,
+    /// signature, resolution): what intake's outcome reads (RD1, RD4.3).
+    failed_utxo_ref: u32,
 }
 
 /// The FR3 candidate chain-config preload verdict — see

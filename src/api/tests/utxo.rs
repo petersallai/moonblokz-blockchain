@@ -415,22 +415,29 @@ fn utxo_double_spend_within_one_block_is_unavailable() {
     );
     let first = utxo_tx(102, &[(101, 0, 60 + CX_FEE)], None, &[Err((2, 60))]);
     let second = utxo_tx(102, &[(101, 0, 60 + CX_FEE)], None, &[Err((2, 60))]);
-    for txs in [&[&same_tx][..], &[&first, &second][..]] {
-        let (mut bc, h100) = utxo_test_chain();
-        let mint = utxo_mint_block(h100);
-        admit(&mut bc, &mint);
-        let spend = complex_tx_block(102, mint.view().hash(), 3, 0, txs);
-        let si = admit(&mut bc, &spend);
-        assert_eq!(
-            bc.run_processing_pass(si),
-            Err(ProcessingError::Invalid {
-                block_idx: si,
-                reason: ValidationReason::UtxoUnavailable,
-            }),
-            "{} transaction(s)",
-            txs.len()
-        );
-    }
+    // One transaction naming the output twice: Tier 1 evidence from the
+    // bytes (Story 7.3 RD3).
+    let (mut bc, h100) = utxo_test_chain();
+    let mint = utxo_mint_block(h100);
+    admit(&mut bc, &mint);
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&same_tx]);
+    assert_eq!(
+        bc.tier1_admit(&spend.view(), &spend.view().hash(), 0).err(),
+        Some(AdmitError::Rejected(Tier1Failure::DuplicateUtxoInput))
+    );
+    // Two transactions spending it: the second finds the bit cleared.
+    let (mut bc, h100) = utxo_test_chain();
+    let mint = utxo_mint_block(h100);
+    admit(&mut bc, &mint);
+    let spend = complex_tx_block(102, mint.view().hash(), 3, 0, &[&first, &second]);
+    let si = admit(&mut bc, &spend);
+    assert_eq!(
+        bc.run_processing_pass(si),
+        Err(ProcessingError::Invalid {
+            block_idx: si,
+            reason: ValidationReason::UtxoUnavailable,
+        })
+    );
 }
 
 /// AC6 — an input sum beyond `u64` is rejected at Tier 1 (DEC-011,
@@ -954,7 +961,7 @@ fn the_fr3_pass_verifies_input_signatures() {
         bc.run_processing_pass(si),
         Err(ProcessingError::Invalid {
             block_idx: si,
-            reason: ValidationReason::InputSignatureInvalid,
+            reason: ValidationReason::UtxoSignatureInvalid,
         }),
         "UTXO input"
     );
@@ -1117,7 +1124,7 @@ fn the_fr3_pass_refuses_lifted_and_zeroed_input_signatures() {
             bc.run_processing_pass(si),
             Err(ProcessingError::Invalid {
                 block_idx: si,
-                reason: ValidationReason::InputSignatureInvalid,
+                reason: ValidationReason::UtxoSignatureInvalid,
             }),
             "{what}"
         );

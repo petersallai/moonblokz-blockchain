@@ -44,7 +44,8 @@ impl<
 {
     /// FR9 Tier 2 of a side block in Ready (Story 6.1 D6): the UTXO-input
     /// structural completion of every complex transaction, along the block's
-    /// own ancestry from `parent_idx`. A reference within `W` (`≥ s − W`) resolves to its
+    /// own ancestry from `parent_idx`. A reference within the window
+    /// (`≥ s − W + 1`, DEC-196) resolves to its
     /// block — in the window or the verification horizon — whose bytes must
     /// hold the output with the declared amount; one below the retained root
     /// is trusted pre-window history, as in the FR3 pass (DEC-129, DEC-131),

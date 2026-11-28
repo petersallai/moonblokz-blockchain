@@ -247,6 +247,7 @@ impl<
             .map_or(NONE_REF, |entry| entry.parent_ref());
         let mut derivation = BlockDerivation {
             chain_info_count: self.registered_count(projection.complete),
+            failed_utxo_ref: 0,
             total_fees: 0,
             replay_reward: replay_reward(&self.chain_config, view),
             utxo_outputs: 0,
@@ -982,30 +983,102 @@ impl<
         // both sums against `u64` and `Σ inputs ≥ Σ outputs` (DEC-011).
         let mut in_sum: u64 = 0;
         let mut out_sum: u64 = 0;
+        // Pass 1, no effects: every input signature whose key is known, before
+        // any check a later state can cure (DEC-350) — so a forged later input
+        // is never hidden behind an earlier input's curable failure. A UTXO
+        // input resolves here (its one read: amount, address); one that
+        // cannot yet be judged — spent on this ancestry, an output the block
+        // does not hold, a block above `seq` (intake only, Tier 1 refuses it
+        // in a block) — is remembered and reported after every signature.
+        let mut deferred: Option<(ValidationReason, u32)> = None;
         for input in cx.inputs() {
             if let Some(bi) = input.as_balance() {
                 let binit = bi.initializer();
                 if self.anchor_below_window(bi.anchor_sequence(), seq) {
                     return Err(invalid(ValidationReason::AnchorBelowWindow));
                 }
+                // DEC-196: the input signs the transaction with the
+                // initializer's key, verified before the debit (DEC-332);
+                // skipped where this node accepted the block's signatures
+                // (DEC-334). An unseeded initializer has no key to verify
+                // against: pass 2 judges it.
+                if !is_genesis_zero
+                    && self.node_info.is_seeded(binit)
+                    && !self.signatures_accepted(idx)
+                    && !self.verify_balance_input(tx, bi.signature(), binit)
+                {
+                    return Err(invalid(ValidationReason::InputSignatureInvalid));
+                }
+            } else if let Some(ui) = input.as_utxo() {
+                // [H] ADR-016: resolve along this block's own ancestry and
+                // verify the input's signature against the output's address
+                // (DEC-332). A non-complete candidate trusts a reference below
+                // its anchor (DEC-129) — declared amount and signature
+                // included (DEC-333). An output that exists but is spent on
+                // this ancestry is verified before it is declared unavailable
+                // (DEC-353).
+                let reference = ui.block_sequence();
+                let fail = |derivation: &mut BlockDerivation, reason| {
+                    derivation.failed_utxo_ref = reference;
+                    invalid(reason)
+                };
+                let address = match self.resolve_utxo(
+                    parent,
+                    seq,
+                    reference,
+                    ui.output_index(),
+                    ui.amount(),
+                    !projection.complete,
+                ) {
+                    Ok(Some((_, address))) => Some(address),
+                    Ok(None) => None,
+                    Err(UtxoSpendError::Spent(address)) => {
+                        deferred.get_or_insert((ValidationReason::UtxoUnavailable, reference));
+                        Some(address)
+                    }
+                    Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnavailable)) => {
+                        deferred.get_or_insert((ValidationReason::UtxoUnavailable, reference));
+                        None
+                    }
+                    Err(UtxoSpendError::Invalid(ValidationReason::UtxoUnresolvable))
+                        if reference >= seq =>
+                    {
+                        deferred.get_or_insert((ValidationReason::UtxoUnresolvable, reference));
+                        None
+                    }
+                    Err(UtxoSpendError::Invalid(reason)) => return Err(fail(derivation, reason)),
+                    Err(UtxoSpendError::StorageRead) => return Err(ProcessingError::StorageRead),
+                    Err(UtxoSpendError::MissingBlock) => return Err(ProcessingError::MissingBlock),
+                };
+                if let Some(address) = address
+                    && !self.signatures_accepted(idx)
+                    && !self.verify_input_signature(tx, ui.signature(), &address)
+                {
+                    return Err(fail(derivation, ValidationReason::UtxoSignatureInvalid));
+                }
+            }
+        }
+        if let Some((reason, reference)) = deferred {
+            derivation.failed_utxo_ref = reference;
+            return Err(invalid(reason));
+        }
+        // Pass 2, in order: the checks a later state can cure, then each
+        // input's effect — a later input of the same initializer sees the
+        // earlier debit. Pass 1 resolved every UTXO input to an available
+        // output (Tier 1 keeps them distinct), so a spend re-finds its block
+        // by the RAM ancestor walk alone.
+        for input in cx.inputs() {
+            if let Some(bi) = input.as_balance() {
+                let binit = bi.initializer();
                 if projection.complete && !is_genesis_zero && !self.node_info.is_seeded(binit) {
                     return Err(invalid(ValidationReason::UnseededActor));
                 }
                 if projection.roster_bounded && !is_genesis_zero {
                     self.check_node_id_in_range(binit).map_err(&invalid)?;
                 }
+                // An unseeded initializer in an incomplete pass is trusted
+                // with the rest of its effects.
                 if !is_genesis_zero && self.node_info.is_seeded(binit) {
-                    // DEC-196: the input signs the transaction with the
-                    // initializer's key, verified before the debit (DEC-332)
-                    // and before every check a later state can cure (DEC-350);
-                    // skipped where this node accepted the block's signatures
-                    // (DEC-334). An unseeded initializer in an incomplete pass
-                    // is trusted with the rest of its effects.
-                    if !self.signatures_accepted(idx)
-                        && !self.verify_balance_input(tx, bi.signature(), binit)
-                    {
-                        return Err(invalid(ValidationReason::InputSignatureInvalid));
-                    }
                     self.check_vote_target(vote).map_err(&invalid)?;
                     if self.node_info.balance_of(binit) < bi.amount() {
                         return Err(invalid(ValidationReason::InsufficientBalance));
@@ -1014,40 +1087,8 @@ impl<
                 }
                 in_sum = in_sum.saturating_add(bi.amount());
             } else if let Some(ui) = input.as_utxo() {
-                // [H] ADR-016: resolve along this block's own ancestry, verify
-                // the input's signature against the output's address, then
-                // spend (DEC-332): a failed verification leaves the bit set.
-                // A non-complete candidate trusts a reference below its anchor
-                // (DEC-129) — declared amount and signature included (DEC-333).
-                // An output that exists but is spent on this ancestry is
-                // verified before it is declared unavailable (DEC-353).
-                let resolved = match self.resolve_utxo(
-                    parent,
-                    seq,
-                    ui.block_sequence(),
-                    ui.output_index(),
-                    ui.amount(),
-                    !projection.complete,
-                ) {
-                    Ok(resolved) => resolved,
-                    Err(UtxoSpendError::Spent(address)) => {
-                        if !self.signatures_accepted(idx)
-                            && !self.verify_input_signature(tx, ui.signature(), &address)
-                        {
-                            return Err(invalid(ValidationReason::InputSignatureInvalid));
-                        }
-                        return Err(invalid(ValidationReason::UtxoUnavailable));
-                    }
-                    Err(UtxoSpendError::Invalid(reason)) => return Err(invalid(reason)),
-                    Err(UtxoSpendError::StorageRead) => return Err(ProcessingError::StorageRead),
-                    Err(UtxoSpendError::MissingBlock) => return Err(ProcessingError::MissingBlock),
-                };
-                if let Some((ref_idx, address)) = resolved {
-                    if !self.signatures_accepted(idx)
-                        && !self.verify_input_signature(tx, ui.signature(), &address)
-                    {
-                        return Err(invalid(ValidationReason::InputSignatureInvalid));
-                    }
+                if let Ok(Some(ref_idx)) = self.locate_utxo_source(parent, seq, ui.block_sequence())
+                {
                     self.blocks
                         .set_utxo_available(ref_idx, ui.output_index() as usize, false);
                 }
@@ -1211,9 +1252,15 @@ impl<
     /// balance block, when the watermark is still 0 — is the same ordering
     /// assumption the FR6 registration-monotonicity check already relies on (it too
     /// reads `max_known_node_id`), so this introduces no new dependency.
+    ///
+    /// An id at or above the chain's `max_node_count` can never exist (the
+    /// configuration is locked for the chain's life, DEC-228):
+    /// `NodeCountExceeded`, judged only on the failure path (Story 7.3 RD3).
     fn check_vote_target(&self, vote: u32) -> Result<(), ValidationReason> {
         if vote == 0 || vote <= self.node_info.max_known_node_id() {
             Ok(())
+        } else if vote >= self.max_node_count() {
+            Err(ValidationReason::NodeCountExceeded)
         } else {
             Err(ValidationReason::VoteTargetUnknown)
         }
@@ -1228,9 +1275,13 @@ impl<
     /// range-checkable. Callers gate it on the watermark being authoritative
     /// (`roster_bounded`): a window-anchored candidate with no balance block in the
     /// segment has no reliable bound and trusts the reference (AC4).
+    /// An id at or above `max_node_count` is `NodeCountExceeded`, as for the
+    /// vote target.
     fn check_node_id_in_range(&self, node_id: u32) -> Result<(), ValidationReason> {
         if node_id <= self.node_info.max_known_node_id() {
             Ok(())
+        } else if node_id >= self.max_node_count() {
+            Err(ValidationReason::NodeCountExceeded)
         } else {
             Err(ValidationReason::NodeIdOutOfRange)
         }
@@ -1397,9 +1448,9 @@ impl<
     /// without spending it:
     /// 1. causality: `block_sequence` must be below `consuming_seq` (Tier 1
     ///    owns this check; here it is a guard);
-    /// 2. distance: `consuming_seq - block_sequence` must not exceed the
-    ///    window `W` (FR14 freshness: the output was at or above `S_tail` when
-    ///    the consuming block was made);
+    /// 2. distance: `consuming_seq - block_sequence` must be below the window
+    ///    `W` (DEC-196: the output lies above `S_tail` when the consuming
+    ///    block is made, so it stays spendable in it);
     /// 3. a RAM-only walk up `parent_ref` to the ancestor at `block_sequence`.
     ///    Only ancestors are visited, so a block on a side branch is never
     ///    found (FR39). Reaching `NONE_REF` first means the output lies below

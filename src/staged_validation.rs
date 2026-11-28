@@ -160,6 +160,10 @@ pub(crate) enum Tier1Failure {
     /// A complex transaction with inputs whose declared input amounts (balance
     /// and UTXO) sum to less than its output amounts.
     InputsLessThanOutputs,
+    /// A complex transaction with two UTXO inputs naming the same output
+    /// `(block_sequence, output_index)`: the second can never spend it, on any
+    /// chain (Story 7.3 code review, RD3).
+    DuplicateUtxoInput,
     /// A transaction block whose UTXO outputs, summed over all its complex
     /// transactions, exceed the enforceable `max_block_utxo_output` (I-07,
     /// DEC-132): the locked value, or the available-UTXO bitfield width before
@@ -534,7 +538,7 @@ fn tier1_complex_tx(
     let mut input_seen = 0u32;
     let mut declared_input_sum: u128 = 0;
 
-    for input in cx.inputs() {
+    for (i, input) in cx.inputs().enumerate() {
         input_seen += 1;
         if let Some(bal) = input.as_balance() {
             check_anchor(bal.anchor_sequence(), block_sequence, w)?;
@@ -545,6 +549,18 @@ fn tier1_complex_tx(
             // processing-pass resolver only guards it.
             if block_sequence <= utxo.block_sequence() {
                 return Err(Tier1Failure::UtxoInputNotBeforeBlock);
+            }
+            // Distinct outputs: decidable from the bytes, so Tier 1's.
+            if cx
+                .inputs()
+                .take(i)
+                .filter_map(|e| e.as_utxo())
+                .any(|earlier| {
+                    earlier.block_sequence() == utxo.block_sequence()
+                        && earlier.output_index() == utxo.output_index()
+                })
+            {
+                return Err(Tier1Failure::DuplicateUtxoInput);
             }
             // The declared amount (DEC-131); the FR6 pass checks it against
             // the referenced output.

@@ -9,7 +9,11 @@ use super::*;
 /// AC2 / AC10.4: the derived state of two nodes is identical — `node_info`,
 /// the vote engine, the whole block table (statuses, chain flags,
 /// available-UTXO bits), `chain_heads`, the head and the tail.
-fn assert_same_state<S: StorageTrait, T: StorageTrait>(a: &Chain16<S>, b: &Chain16<T>, what: &str) {
+pub(super) fn assert_same_state<S: StorageTrait, T: StorageTrait>(
+    a: &Chain16<S>,
+    b: &Chain16<T>,
+    what: &str,
+) {
     assert!(a.node_info == b.node_info, "{what}: node_info");
     assert!(a.vote_engine == b.vote_engine, "{what}: votes");
     assert!(a.blocks == b.blocks, "{what}: block table");
@@ -1664,29 +1668,37 @@ fn input_signatures_are_verified_on_the_ready_extension() {
     let utxo = || utxo_genesis().0;
     let (_, mint) = utxo_genesis();
     let prev = mint.view().hash();
-    let refused = |cx: &moonblokz_chain_types::ComplexTransaction| {
+    let refused = |cx: &moonblokz_chain_types::ComplexTransaction, reason| {
         let block = complex_tx_block(4, prev, 0, 0, &[cx]);
-        assert_refused_at_intake(utxo, &block, ValidationReason::InputSignatureInvalid);
+        assert_refused_at_intake(utxo, &block, reason);
     };
+    let utxo_input = ValidationReason::UtxoSignatureInvalid;
+    let balance_input = ValidationReason::InputSignatureInvalid;
 
     // A UTXO input signed by a key other than the output's address.
-    refused(&utxo_tx_signed(
-        0,
-        4,
-        &[(3, 0, 60 + CX_FEE)],
-        None,
-        &[Err((1, 60))],
-        &other_key(),
-    ));
+    refused(
+        &utxo_tx_signed(
+            0,
+            4,
+            &[(3, 0, 60 + CX_FEE)],
+            None,
+            &[Err((1, 60))],
+            &other_key(),
+        ),
+        utxo_input,
+    );
     // A balance input signed by a key other than node #0's.
-    refused(&utxo_tx_signed(
-        1,
-        4,
-        &[],
-        Some((0, 10 + CX_FEE)),
-        &[Err((1, 10))],
-        &other_key(),
-    ));
+    refused(
+        &utxo_tx_signed(
+            1,
+            4,
+            &[],
+            Some((0, 10 + CX_FEE)),
+            &[Err((1, 10))],
+            &other_key(),
+        ),
+        balance_input,
+    );
 
     // Valid signatures moved onto a transaction whose `vote` differs: every
     // input commits to the vote, so every one fails — before the vote target
@@ -1700,7 +1712,7 @@ fn input_signatures_are_verified_on_the_ready_extension() {
             .ok()
             .expect("input");
     }
-    refused(&lifted);
+    refused(&lifted, utxo_input); // the UTXO input comes first
 
     // A zeroed signature.
     let mut zeroed = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Err((1, 60))]);
@@ -1708,7 +1720,7 @@ fn input_signatures_are_verified_on_the_ready_extension() {
         .set_input_signature(0, &[0u8; SIGNATURE_SIZE])
         .ok()
         .expect("input");
-    refused(&zeroed);
+    refused(&zeroed, utxo_input);
 
     // The correctly signed transaction is accepted.
     let mut bc = utxo_genesis().0;

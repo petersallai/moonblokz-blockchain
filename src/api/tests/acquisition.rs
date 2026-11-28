@@ -1465,8 +1465,9 @@ fn fr6_rejects_out_of_range_referenced_node() {
     let anchor = balance_block(100, cfg_hash, &[(1, 500, 0, 0x31)], 5);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
-    // Output side: receiver 99 is beyond the watermark.
-    let out = transfer_block(101, anchor.view().hash(), 1, 99, 100, TEST_TRANSFER_FEE, 0);
+    // Output side: receiver 9 is beyond the watermark (and below the node
+    // cap: an id at or above it is `NodeCountExceeded`, Story 7.3 RD3).
+    let out = transfer_block(101, anchor.view().hash(), 1, 9, 100, TEST_TRANSFER_FEE, 0);
     let oi = bc
         .tier1_admit(&out.view(), &out.view().hash(), 0)
         .expect("out admitted");
@@ -1478,10 +1479,10 @@ fn fr6_rejects_out_of_range_referenced_node() {
         }),
         "a transfer TO a node beyond the watermark is rejected (output side)"
     );
-    // Input side: an (unseeded) initializer 88 is beyond the watermark — normally
+    // Input side: an (unseeded) initializer 8 is beyond the watermark — normally
     // an unseeded initializer is trusted on a window-anchored candidate, but its
     // existence is still range-bounded.
-    let inp = transfer_block(101, anchor.view().hash(), 88, 2, 100, TEST_TRANSFER_FEE, 0);
+    let inp = transfer_block(101, anchor.view().hash(), 8, 2, 100, TEST_TRANSFER_FEE, 0);
     let ii = bc
         .tier1_admit(&inp.view(), &inp.view().hash(), 0)
         .expect("inp admitted");
