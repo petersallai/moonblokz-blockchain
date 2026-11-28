@@ -146,18 +146,22 @@ impl<
             return O::DuplicateInMempool;
         }
 
-        // 3. Already on the active chain (DEC-349, DEC-352, DEC-353).
-        match self.already_confirmed(tx, head) {
+        // 3. Already on the active chain (DEC-349, DEC-352, DEC-353). A
+        //    failed read is the node's own fault, never a verdict: the
+        //    transaction may be on the chain, so it is at most Deferred — after
+        //    the dry-run has verified its signatures (DEC-350).
+        let scan_fault = match self.already_confirmed(tx, head, s) {
             Ok(true) => return O::AlreadyConfirmed,
-            Ok(false) => {}
-            Err(()) => return O::Deferred, // a local read fault, never a verdict
-        }
+            Ok(false) => false,
+            Err(()) => true,
+        };
 
         // 4. The dry-run of the shared step for `h + 1` on the head's
         //    post-state: served chain-info (`h + 1`'s pre-state, R1), every
         //    signature verified, then undone exactly.
         let max_known = self.node_info.max_known_node_id();
         let mut derivation = BlockDerivation {
+            chain_info_count: self.registered_count(true),
             total_fees: 0,
             replay_reward: 0,
             utxo_outputs: 0,
@@ -165,24 +169,36 @@ impl<
             hold_exit: None,
         };
         let projection = Projection::COMPLETE;
-        match self.apply_transaction(tx, NONE_REF, head, s, &projection, &mut derivation) {
-            Ok(()) => {
-                self.invert_transaction(tx, head, false);
-                O::AcceptedToMempool
-            }
-            Err(ProcessingError::Invalid { reason, .. }) => outcome_of(reason, tx, max_known),
-            // A failed read or an inconsistent ancestry is the node's own.
-            Err(_) => O::Deferred,
+        let outcome =
+            match self.apply_transaction(tx, NONE_REF, head, s, &projection, &mut derivation) {
+                Ok(()) => {
+                    self.invert_transaction(tx, head, false);
+                    O::AcceptedToMempool
+                }
+                Err(ProcessingError::Invalid { reason, .. }) => outcome_of(reason, tx, max_known),
+                // A failed read or an inconsistent ancestry is the node's own.
+                Err(_) => O::Deferred,
+            };
+        if scan_fault && outcome == O::AcceptedToMempool {
+            O::Deferred
+        } else {
+            outcome
         }
     }
 
     /// Whether a transaction with `tx`'s uniqueness key is on the active chain
-    /// above its inclusion floor (DEC-349): a registration by its registered
-    /// key (DEC-352); a balance-only one by the window scan; a UTXO-bearing
-    /// one only when every UTXO input's available bit is 0 — an equivalent on
-    /// the chain spent them all, so one set bit rules it out with no read
+    /// (ending at `head`) above its inclusion floor and the window's of the
+    /// next block `s` (DEC-349): a registration by its registered key
+    /// (DEC-352); a balance-only one by the window scan; a UTXO-bearing one
+    /// only when every UTXO input's available bit is 0 — an equivalent on the
+    /// chain spent them all, so one set bit rules it out with no read
     /// (DEC-353). `Err` on a failed read.
-    fn already_confirmed(&self, tx: &TransactionView<'_>, head: u32) -> Result<bool, ()> {
+    pub(super) fn already_confirmed(
+        &self,
+        tx: &TransactionView<'_>,
+        head: u32,
+        s: u32,
+    ) -> Result<bool, ()> {
         if let Some(reg) = tx.as_registration() {
             return Ok(self.node_info.key_is_registered(reg.new_public_key()));
         }
@@ -201,8 +217,7 @@ impl<
                 return Ok(false);
             }
         }
-        self.ancestry_carries(head, inclusion_floor(tx), &mut |included| {
-            same_key(included, tx)
-        })
+        let floor = inclusion_floor(tx).max(self.window_floor(s));
+        self.ancestry_carries(head, floor, &mut |included| same_key(included, tx))
     }
 }

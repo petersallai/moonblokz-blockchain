@@ -603,11 +603,16 @@ impl<
     /// position of a window-anchored pass and at side-block Tier 2, where every
     /// read declines (DEC-340).
     pub(super) fn projection_chain_info(&self, served: bool) -> ProjectionChainInfo {
-        ProjectionChainInfo {
-            registered_node_count: served
-                .then(|| u64::from(self.node_info.max_known_node_id()) + 1),
-            declined: core::cell::Cell::new(false),
-        }
+        ProjectionChainInfo::at(self.registered_count(served))
+    }
+
+    /// The registered-node count a chain-info source serves, `None` where it
+    /// declines: node ids are contiguous, so the watermark plus one. The
+    /// per-block step takes it once, before the block's own registrations move
+    /// the watermark, so every check of the block reads its pre-state (Story
+    /// 7.3, DEC-312).
+    pub(super) fn registered_count(&self, served: bool) -> Option<u64> {
+        served.then(|| u64::from(self.node_info.max_known_node_id()) + 1)
     }
 }
 
@@ -627,6 +632,16 @@ pub(super) struct ProjectionChainInfo {
 }
 
 impl ProjectionChainInfo {
+    /// A fresh source serving `registered_node_count` (declining where it is
+    /// `None`): one per check, so a decline is recorded only for the check
+    /// that read it.
+    pub(super) fn at(registered_node_count: Option<u64>) -> Self {
+        Self {
+            registered_node_count,
+            declined: core::cell::Cell::new(false),
+        }
+    }
+
     /// Whether any read through this source declined since it was built.
     pub(super) fn declined(&self) -> bool {
         self.declined.get()

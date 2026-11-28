@@ -376,8 +376,8 @@ pub(crate) enum ValidationReason {
     /// with the held `W` (Story 7.3).
     AnchorBelowWindow,
     /// FR56 (DEC-181, DEC-311): a non-exempt transaction's fee outside
-    /// `[tx_fee_per_byte_min · size, tx_fee_per_byte_max · size]`, or any fee
-    /// under an inverted range (Story 7.3).
+    /// `[tx_fee_per_byte_min · size, tx_fee_per_byte_max · size]` resolved at
+    /// the block's pre-state, or any fee under an inverted range (Story 7.3).
     FeeOutOfPolicy,
     /// DEC-312: a registration's carried price differs from
     /// `registration_price` at the block's pre-state (Story 7.3).
@@ -387,8 +387,8 @@ pub(crate) enum ValidationReason {
     NodeZeroSelfVote,
     /// FR6 (I-22, DEC-349, DEC-354): a transfer or a balance-only complex
     /// transaction whose uniqueness key another transaction of the same block,
-    /// or of a block on its ancestry above its anchor, already carries
-    /// (Story 7.3).
+    /// or of a block on its ancestry above its anchor (and within the window),
+    /// already carries (Story 7.3).
     DuplicateTransaction,
 }
 
@@ -564,6 +564,10 @@ struct BlockDerivation {
     /// DEC-346: the slot of block `s − L` when it is an approval evidence
     /// block whose late-node hold ends with this block; the commit reads it.
     hold_exit: Option<u32>,
+    /// The registered-node count at the block's pre-state, `None` where the
+    /// chain-info source declines: what the fee policy and the registration
+    /// price resolve against for every transaction of the block (DEC-312).
+    chain_info_count: Option<u64>,
 }
 
 /// The FR3 candidate chain-config preload verdict — see

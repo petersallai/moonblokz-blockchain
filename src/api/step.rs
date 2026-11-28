@@ -1,6 +1,7 @@
 //! The FR6 per-block step: derive and commit a block, transaction apply and
 //! inverse, signature and UTXO checks (Stories 5.3, 6.0, 6.8).
 
+use super::chain_config::ProjectionChainInfo;
 use super::*;
 
 /// What one vote-engine step run by [`Blockchain::run_vote_step`] came to.
@@ -245,6 +246,7 @@ impl<
             .get(idx)
             .map_or(NONE_REF, |entry| entry.parent_ref());
         let mut derivation = BlockDerivation {
+            chain_info_count: self.registered_count(projection.complete),
             total_fees: 0,
             replay_reward: replay_reward(&self.chain_config, view),
             utxo_outputs: 0,
@@ -530,18 +532,19 @@ impl<
     }
 
     /// FR56 (DEC-181, DEC-311): whether `tx` violates the fee policy resolved
-    /// at the pre-state, under the source `served` selects (as
-    /// [`Self::mined_amount_mismatch`]); a resolution that read a declined
-    /// value is no violation — the check is skipped (DEC-305, DEC-340). A
-    /// zero-input carry-forward is exempt (FR51); block #0 is the caller's.
-    pub(super) fn fee_out_of_policy(&self, tx: &TransactionView<'_>, served: bool) -> bool {
+    /// at the block's pre-state — `count` is its registered-node count, `None`
+    /// where the source declines (as [`Self::mined_amount_mismatch`]); a
+    /// resolution that read a declined value is no violation — the check is
+    /// skipped (DEC-305, DEC-340). A zero-input carry-forward is exempt
+    /// (FR51); block #0 is the caller's.
+    pub(super) fn fee_out_of_policy(&self, tx: &TransactionView<'_>, count: Option<u64>) -> bool {
         if tx.as_complex().is_some_and(|cx| cx.input_count() == 0) {
             return false;
         }
         let Some(configuration) = self.chain_config.active_configuration() else {
             return false;
         };
-        let source = self.projection_chain_info(served);
+        let source = ProjectionChainInfo::at(count);
         let configuration = configuration.with_chain_info(&source);
         let (min, max) = (
             configuration.tx_fee_per_byte_min(),
@@ -551,13 +554,13 @@ impl<
     }
 
     /// DEC-312: whether a registration's carried `price` differs from
-    /// `registration_price` at the pre-state (`served` as in
-    /// [`Self::mined_amount_mismatch`]); skipped where the read declined.
-    pub(super) fn registration_price_mismatch(&self, price: u64, served: bool) -> bool {
+    /// `registration_price` at the block's pre-state (`count` as in
+    /// [`Self::fee_out_of_policy`]); skipped where the read declined.
+    pub(super) fn registration_price_mismatch(&self, price: u64, count: Option<u64>) -> bool {
         let Some(configuration) = self.chain_config.active_configuration() else {
             return false;
         };
-        let source = self.projection_chain_info(served);
+        let source = ProjectionChainInfo::at(count);
         let expected = configuration.with_chain_info(&source).registration_price();
         !source.declined() && price != expected
     }
@@ -741,13 +744,14 @@ impl<
     ///
     /// The check order serves intake's reason → outcome table (DEC-350,
     /// DEC-353, DEC-355) and is consensus-neutral — every check must pass
-    /// either way: the rules decidable from the transaction and the
-    /// configuration first (the DEC-174 anchor bound, the FR56 fee policy, the
-    /// DEC-190 self-vote restriction); then the checks that fail only for a
-    /// missing key (an unseeded or unknown initializer); then the signature;
-    /// then the checks a later chain state can cure (receiver range, vote
-    /// target, watermark, balance), with a registration's price after its
-    /// watermark (DEC-355); a registration's key uniqueness last.
+    /// either way: first the rules no later chain state cures — the FR56 fee
+    /// policy (the block's pre-state, DEC-312), the DEC-190 self-vote
+    /// restriction (the transaction's pre-state watermark), then the DEC-174
+    /// anchor bound; then the checks that fail only for a missing key (an
+    /// unseeded or unknown initializer); then the signature; then the checks a
+    /// later chain state can cure (receiver range, vote target, watermark,
+    /// balance), with a registration's price after its watermark (DEC-355); a
+    /// registration's key uniqueness last.
     pub(super) fn apply_transaction(
         &mut self,
         tx: &TransactionView<'_>,
@@ -766,7 +770,7 @@ impl<
         let vote = tx.vote();
         // The rules decidable from the transaction and the configuration.
         if !is_genesis_zero {
-            if self.fee_out_of_policy(tx, complete) {
+            if self.fee_out_of_policy(tx, derivation.chain_info_count) {
                 return Err(invalid(ValidationReason::FeeOutOfPolicy));
             }
             if self.node_zero_self_votes(tx, projection) {
@@ -894,7 +898,10 @@ impl<
                 // DEC-312: the carried price equals `registration_price` at the
                 // pre-state, after the watermark (DEC-355): a registration for
                 // a later slot fails the watermark, never its future price.
-                if self.registration_price_mismatch(reg.registration_price(), complete) {
+                if self.registration_price_mismatch(
+                    reg.registration_price(),
+                    derivation.chain_info_count,
+                ) {
                     return Err(invalid(ValidationReason::RegistrationPriceMismatch));
                 }
                 if debits {

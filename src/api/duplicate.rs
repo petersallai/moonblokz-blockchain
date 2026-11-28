@@ -138,10 +138,21 @@ impl<
         if floor == u32::MAX {
             return Ok(false);
         }
-        self.ancestry_carries(parent, floor.max(below), &mut |included| {
+        let floor = floor.max(below).max(self.window_floor(view.sequence()));
+        self.ancestry_carries(parent, floor, &mut |included| {
             txs.iter()
                 .any(|tx| is_balance_only(&tx) && same_key(&tx, included))
         })
+    }
+
+    /// The lowest sequence at which a valid transaction of a block `s` can
+    /// have been included before: above `max(0, s − W)`, its earliest anchor
+    /// or UTXO reference (DEC-174, DEC-196). It bounds every scan to `W − 1`
+    /// blocks whatever a candidate's own references claim — one below the
+    /// window is invalid anyway. Without a configuration there is no bound.
+    pub(super) fn window_floor(&self, seq: u32) -> u32 {
+        self.active_chain_length()
+            .map_or(0, |w| seq.saturating_sub(w).saturating_add(1))
     }
 
     /// Whether a transaction block on the ancestry from `parent` down to

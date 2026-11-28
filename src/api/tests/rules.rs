@@ -108,8 +108,11 @@ fn an_inverted_range_admits_no_fee_and_a_declined_read_skips_it() {
     }
     let nt = transfer_with(1, 5, size, 0, 0);
     let tx = view_of(nt.as_bytes());
-    assert!(bc.fee_out_of_policy(&tx, true), "served: inverted");
-    assert!(!bc.fee_out_of_policy(&tx, false), "declined: skipped");
+    assert!(
+        bc.fee_out_of_policy(&tx, bc.registered_count(true)),
+        "served: inverted"
+    );
+    assert!(!bc.fee_out_of_policy(&tx, None), "declined: skipped");
 }
 
 /// DEC-312: a registration's carried price equals `registration_price` (the
@@ -128,6 +131,60 @@ fn a_registration_carries_exactly_the_registration_price() {
             b.add_registration(&reg).ok().expect("add registration");
         });
         assert_eq!(step_reason(&mut bc, &block), reason, "price {price}");
+    }
+}
+
+/// DEC-312: every registration of a block is priced at the block's pre-state.
+/// With `registration_price = 10 · count`, two registrations on a one-node
+/// pre-state both carry 10, though the first moves the count to 2 — 20 for
+/// the second is a mismatch.
+#[test]
+fn every_registration_of_a_block_is_priced_at_its_pre_state() {
+    let mut builder = window_config_builder(TEST_W);
+    builder
+        .add_bytecode(parameter::REGISTRATION_PRICE, &REWARD_PER_NODE_PROGRAM[..7])
+        .ok()
+        .expect("the program frames");
+    let (mut bc, _, b1) = genesis_with(&builder);
+    let prev = b1.view().hash();
+    let first = registration_tx_priced(1, 0, 1, NODE_ONE_KEY, 10, 0);
+    for (price, reason) in [
+        (10, None),
+        (20, Some(ValidationReason::RegistrationPriceMismatch)),
+    ] {
+        let second = registration_tx_priced(1, 0, 2, 0x32, price, 1);
+        let block = tx_block(2, prev, 0, |b| {
+            b.add_registration(&first).ok().expect("first");
+            b.add_registration(&second).ok().expect("second");
+        });
+        assert_eq!(step_reason(&mut bc, &block), reason, "second at {price}");
+    }
+}
+
+/// DEC-312 for the FR56 fee policy: with `tx_fee_per_byte_max = 10 · count`,
+/// a transfer after a registration in the same block is held to the
+/// one-node pre-state's 10 per byte, not to the 20 the registration makes it.
+#[test]
+fn every_fee_of_a_block_is_judged_at_its_pre_state() {
+    let mut builder = window_config_builder(TEST_W);
+    builder
+        .add_bytecode(
+            parameter::TX_FEE_PER_BYTE_MAX,
+            &REWARD_PER_NODE_PROGRAM[..7],
+        )
+        .ok()
+        .expect("the program frames");
+    let (mut bc, _, b1) = genesis_with(&builder);
+    let prev = b1.view().hash();
+    let reg = registration_tx(1, 0, 1, NODE_ONE_KEY);
+    let size = NODE_TRANSFER_SIZE as u32;
+    for (per_byte, reason) in [(10, None), (15, Some(ValidationReason::FeeOutOfPolicy))] {
+        let nt = transfer_with(1, 5, per_byte * size, 1, 0);
+        let block = tx_block(2, prev, 0, |b| {
+            b.add_registration(&reg).ok().expect("registration");
+            b.add_node_transfer(&nt).ok().expect("transfer");
+        });
+        assert_eq!(step_reason(&mut bc, &block), reason, "{per_byte} per byte");
     }
 }
 
@@ -373,6 +430,53 @@ fn the_duplicate_scan_reads_only_transaction_blocks_above_the_floor() {
             "anchor {anchor}"
         );
     }
+}
+
+/// DEC-349: the scan never reaches below the window. A block `s` reads at
+/// most its ancestors down to `s − W + 1`, however low a candidate's anchor
+/// claims — an anchor below `s − W` is invalid anyway, judged after the scan.
+#[test]
+fn the_duplicate_scan_stops_at_the_window() {
+    let (mut bc, _, b1) = ready_genesis_w6();
+    let mut prev = b1.view().hash();
+    // The replays the tail drops need, each in the block that drops its
+    // source (FR49, FR50): node #0's balance at #6 (dropping #0), the chain
+    // configuration at #7 (dropping #1); clean blocks otherwise (Story 6.7
+    // D8: #5 and #8 must be).
+    for seq in 2..=8 {
+        let block = match seq {
+            6 => snapshot_block(&bc, seq, prev),
+            7 => w6_config_anchor_block(seq, prev),
+            _ => w6_clean_block(seq, prev, 0),
+        };
+        assert_eq!(
+            receive(&mut bc, &block),
+            ReceiveBlockOutcome::AcceptedSilently,
+            "#{seq}"
+        );
+        prev = block.view().hash();
+    }
+    let nt = transfer_with(0, 6, TEST_TRANSFER_FEE, 0, 9);
+    let block = tx_block(9, prev, 0, |b| {
+        b.add_node_transfer(&nt).ok().expect("transfer");
+    });
+    let before = counted(&DUPLICATE_SCAN_READS);
+    assert_eq!(
+        step_reason(&mut bc, &block),
+        Some(ValidationReason::AnchorBelowWindow)
+    );
+    // #8, #5, #4 — #7 and #6 carry no transaction — down to `s − W + 1 = 4`;
+    // not #3, #2 (the anchor's own floor is #1).
+    assert_eq!(counted(&DUPLICATE_SCAN_READS) - before, 3, "the step");
+    // Intake's scan for the next block #9 (Tier 1 would refuse this anchor
+    // first; a UTXO reference below the window reaches the scan) — the same.
+    let before = counted(&DUPLICATE_SCAN_READS);
+    let head = bc.active_chain_head_idx;
+    assert_eq!(
+        bc.already_confirmed(&view_of(nt.as_bytes()), head, 9),
+        Ok(false)
+    );
+    assert_eq!(counted(&DUPLICATE_SCAN_READS) - before, 3, "intake");
 }
 
 /// I-22 on the FR3 pass: a mesh node joining a chain whose #3 repeats #2's

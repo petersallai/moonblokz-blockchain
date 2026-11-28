@@ -94,11 +94,11 @@ impl<
         // price, judged like `mined_amount` — a value bound to chain-info
         // declines here and is judged at the switch replay (DEC-305).
         for tx in txs.iter() {
-            if self.fee_out_of_policy(&tx, false) {
+            if self.fee_out_of_policy(&tx, None) {
                 return Err(invalid(ValidationReason::FeeOutOfPolicy));
             }
             if let Some(reg) = tx.as_registration()
-                && self.registration_price_mismatch(reg.registration_price(), false)
+                && self.registration_price_mismatch(reg.registration_price(), None)
             {
                 return Err(invalid(ValidationReason::RegistrationPriceMismatch));
             }

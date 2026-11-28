@@ -166,6 +166,27 @@ fn a_spent_utxo_input_is_deferred_after_its_signature() {
     assert_eq!(submit(&mut bc, missing.as_bytes()), O::Deferred);
 }
 
+/// A read fault in the already-confirmed scan is the node's own, never a
+/// verdict (DEC-349): a valid transfer is at most Deferred — it may be on the
+/// chain — and a forged one is still Rejected, as the dry-run verifies its
+/// signature whatever the scan came to (DEC-350).
+#[test]
+fn a_scan_read_fault_defers_only_what_the_dry_run_accepts() {
+    let (mut bc, _) = faulty_utxo_genesis();
+    bc.storage.failing_read_slot = bc.active_chain_head_idx;
+    let forged = transfer_by(0, 2, 0, 5, 2, TEST_TRANSFER_FEE, 1, 0);
+    let valid = zero_transfer(2, 1, 0);
+    assert_eq!(submit(&mut bc, forged.as_bytes()), O::Rejected);
+    assert_eq!(submit(&mut bc, valid.as_bytes()), O::Deferred);
+    assert_eq!(bc.mempool.entry_count(), 1, "only the valid one held");
+    bc.storage.failing_read_slot = NONE_REF;
+    assert_eq!(
+        submit(&mut bc, valid.as_bytes()),
+        O::DuplicateInMempool,
+        "readable again"
+    );
+}
+
 /// DEC-353: an equivalent on the chain spent every UTXO input, so one set bit
 /// rules it out — the scan does not run (no read); with every bit 0 it does.
 #[test]

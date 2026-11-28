@@ -709,13 +709,13 @@ fn is_genesis_zero_shape(block: &BlockView) -> bool {
     registration_holds && transfer_holds
 }
 
-/// FR6 no-self-vote (exact semantics): a transaction's `initializer` must not
-/// equal its `vote`, with two exceptions. (1) Block #0 is fully waived (FR54
-/// exception (i)). (2) The permanent node-#0 self-vote exception (a structural
-/// constant of MoonBlokz semantics, chain-wide — *not* bootstrap-only): when
-/// `initializer == 0`, `vote == 0` never violates. This guarantees node #0
-/// always has a valid vote choice, preventing the early-chain bootstrap
-/// deadlock.
+/// FR6 no-self-vote, its structural (Tier 1) half: a transaction's
+/// `initializer` must not equal its `vote`, with two exceptions. (1) Block #0
+/// is fully waived (FR54 exception (i)). (2) Node #0 voting for itself
+/// (`initializer == 0`, `vote == 0`) passes here: it is valid only while node
+/// #0 is the only registered node (DEC-190, I-13), which depends on the
+/// pre-state, so the per-block step judges it (Story 7.3) — the exception that
+/// keeps the first block after genesis buildable.
 fn check_no_self_vote(
     initializer: u32,
     vote: u32,
