@@ -64,7 +64,7 @@ fn w6_extension(bc: &W6Chain, seq: u32, prev: [u8; 32]) -> Block {
     match (seq - 100) % 6 {
         0 => w6_config_anchor_block(seq, prev),
         2 => w6_balance_block(Some(bc), seq, prev),
-        _ => w6_clean_block(seq, prev),
+        _ => w6_clean_block(seq, prev, 1),
     }
 }
 
@@ -93,7 +93,7 @@ fn w6_ready_on_segment(last: u32) -> (W6Chain, [[u8; 32]; 8]) {
         let blk = match seq {
             102 => w6_balance_block(None, seq, prev),
             106 => w6_config_anchor_block(seq, prev),
-            107 => w6_clean_block(seq, prev),
+            107 => w6_clean_block(seq, prev, 1),
             _ => linked_transfer_block(seq, prev),
         };
         hashes[(seq - 100) as usize] = blk.view().hash();
@@ -227,7 +227,7 @@ fn snake_ready_entry_on_a_longer_genesis_segment_releases_the_excess() {
     for seq in 2..=9 {
         let blk = match seq {
             6 => w6_balance_block(Some(&founder), seq, prev),
-            _ if seq % 3 == 2 => w6_clean_block(seq, prev),
+            _ if seq % 3 == 2 => w6_clean_block(seq, prev, 0),
             _ => w6_config_anchor_block(seq, prev),
         };
         assert_eq!(
@@ -760,7 +760,7 @@ fn fr3_pass_evaluates_the_binding_inside_the_segment() {
     for seq in 2..=6 {
         let blk = match seq {
             6 => w6_balance_block(Some(&founder), seq, prev),
-            _ if seq % 3 == 2 => w6_clean_block(seq, prev),
+            _ if seq % 3 == 2 => w6_clean_block(seq, prev, 0),
             _ => w6_config_anchor_block(seq, prev),
         };
         assert_eq!(
@@ -770,7 +770,7 @@ fn fr3_pass_evaluates_the_binding_inside_the_segment() {
         prev = blk.view().hash();
         chain.push(blk);
     }
-    let skip = w6_clean_block(7, prev);
+    let skip = w6_clean_block(7, prev, 0);
     let replay = w6_config_anchor_block(7, prev);
     let mut bc = new_w6_chain();
     let refs: std::vec::Vec<&Block> = chain.iter().chain([&skip, &replay]).collect();
@@ -856,9 +856,15 @@ fn fr3_pass_seeds_a_window_anchored_vote_at_a_plus_h() {
         0,
         votes_for(101, 3, 1, 40),
     );
-    // The vote seed: the entry repeats #3's balance (credited #101's fee)
+    // The vote seed: the entry repeats #3's balance (credited #101's fee,
+    // the minimum)
     // and states a vote the pass never derived.
-    let seed = balance_block(102, early.view().hash(), &[(3, 1, 1000, 0x33)], 3);
+    let seed = balance_block(
+        102,
+        early.view().hash(),
+        &[(3, TEST_TRANSFER_FEE as u64, 1000, 0x33)],
+        3,
+    );
     let tip = tx_block(103, seed.view().hash(), 0, votes_for(103, 3, 1, 41));
     let late = headed(
         103,
@@ -1145,7 +1151,10 @@ fn assert_same_nodes(a: &W6Chain, b: &W6Chain) {
 fn a_switch_undoes_seed_points_as_identity() {
     let prefix = vote_seed_prefix(4);
     let b101 = &prefix[7];
-    let entries = [(3, 1, 1000, 0x33), (4, 70, 500, 0x34)];
+    let entries = [
+        (3, TEST_TRANSFER_FEE as u64, 1000, 0x33),
+        (4, 1_000, 500, 0x34),
+    ];
     let seed = balance_block(102, b101.view().hash(), &entries, 4);
     let joiner = || {
         let mut bc = new_w6_chain();
@@ -1190,7 +1199,7 @@ fn a_switch_undoes_seed_points_as_identity() {
     }
     assert!(direct.is_ready());
     // #103 replays the chain-config block #97 it drops; #104 is a clean
-    // slot (Story 6.7 D8): node #4, seeded by #102 with 70, transfers
+    // slot (Story 6.7 D8): node #4, seeded by #102 with 1 000, transfers
     // nothing to itself; #105 is any block.
     let f103 = real_on(
         &direct,
@@ -1200,7 +1209,7 @@ fn a_switch_undoes_seed_points_as_identity() {
     );
     extend_active_head(&mut direct, &f103, 0);
     let signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("test key");
-    let idle = NodeTransfer::new_signed(0, 103, 4, 4, 0, 0, 0, &signer);
+    let idle = NodeTransfer::new_signed(0, 103, 4, 4, 0, TEST_TRANSFER_FEE, 0, &signer);
     let f104 = real_on(
         &direct,
         &tx_block(104, f103.view().hash(), 0, |b| {
@@ -1366,12 +1375,14 @@ fn a_young_chain_reclaims_a_fragment_below_its_tail() {
 /// `a = 94`, so node #3's vote is seeded at its first entry at or after
 /// `a + H = 97`.
 fn vote_seed_prefix(max_node_id: u32) -> [Block; 8] {
-    let p94 = tx_block(94, [0xAB; 32], 0, votes_for(94, 0, 1, 50));
-    let p95 = tx_block(95, p94.view().hash(), 0, votes_for(95, 0, 1, 51));
+    // Node #0's votes name node #1, which the floor's watermark makes known:
+    // node #0 may not vote for itself (DEC-190).
+    let p94 = tx_block(94, [0xAB; 32], 0, votes_for(94, 1, 1, 50));
+    let p95 = tx_block(95, p94.view().hash(), 0, votes_for(95, 1, 1, 51));
     let floor = balance_block(96, p95.view().hash(), &[(3, 0, 0, 0x33)], max_node_id);
     let cfg = w6_config_anchor_block(97, floor.view().hash());
-    let p98 = tx_block(98, cfg.view().hash(), 0, votes_for(98, 0, 1, 52));
-    let p99 = tx_block(99, p98.view().hash(), 0, votes_for(99, 0, 1, 53));
+    let p98 = tx_block(98, cfg.view().hash(), 0, votes_for(98, 1, 1, 52));
+    let p99 = tx_block(99, p98.view().hash(), 0, votes_for(99, 1, 1, 53));
     let early = headed(
         100,
         p99.view().hash(),
@@ -1392,8 +1403,18 @@ fn vote_seed_prefix(max_node_id: u32) -> [Block; 8] {
 fn switch_across_a_vote_seed(now: u64) -> (W6Chain, [u8; 32]) {
     let prefix = vote_seed_prefix(3);
     let b101 = &prefix[7];
-    let seed = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
-    let replay = balance_block(102, b101.view().hash(), &[(3, 1, 1000, 0x33)], 3);
+    let seed = balance_block(
+        102,
+        b101.view().hash(),
+        &[(3, TEST_TRANSFER_FEE as u64, 1000, 0x33)],
+        3,
+    );
+    let replay = balance_block(
+        102,
+        b101.view().hash(),
+        &[(3, TEST_TRANSFER_FEE as u64, 1000, 0x33)],
+        3,
+    );
     let f102 = resign(&replay, 3, vote_snapshot(1000), 1);
     let mut bc = new_w6_chain();
     for blk in prefix.iter().chain([&seed, &f102]) {
@@ -1451,19 +1472,19 @@ fn a_tail_whose_outputs_are_all_at_most_the_fee_drops_without_a_carry_forward() 
         for seq in 2..=8 {
             let blk = match seq {
                 3 => {
-                    let paid = outputs.iter().map(|o| o.as_ref().map_or(0, |a| *a)).sum();
-                    let tx = utxo_tx(3, &[], Some((0, paid)), outputs);
+                    let paid: u64 = outputs.iter().map(|o| o.as_ref().map_or(0, |a| *a)).sum();
+                    let tx = utxo_tx(3, &[], Some((0, paid + CX_FEE)), outputs);
                     complex_tx_block(3, prev, 0, 0, &[&tx])
                 }
                 6 => w6_balance_block(Some(&founder), seq, prev),
                 7 => w6_config_anchor_block(seq, prev),
-                _ => w6_clean_block(seq, prev),
+                _ => w6_clean_block(seq, prev, 0),
             };
             extend_active_head(&mut founder, &blk, 0);
             prev = blk.view().hash();
             chain.push(blk);
         }
-        let plain = w6_clean_block(9, prev);
+        let plain = w6_clean_block(9, prev, 0);
 
         // Ready: the head extension's FR48 gate.
         let (outcome, _) = founder.receive_block(plain.view(), 0);

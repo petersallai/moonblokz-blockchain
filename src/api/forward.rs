@@ -49,10 +49,10 @@ impl<
     /// active chain, so whether the output is unspent on this branch is Tier 3.
     ///
     /// The other FR9 Tier 2 items join here and in the shared head step
-    /// together: `mined_amount` (7.2, below), fee and price rules (7.3), the
-    /// approval threshold (6.7), the structural `snake_chain` checks (9.2 /
-    /// 9.3 / 9.5 / 6.6). Registration-key uniqueness is Tier 3 on a side
-    /// branch (D6).
+    /// together: `mined_amount` (7.2, below), the FR56 fee policy and the
+    /// registration price (7.3, below), the approval threshold (6.7), the
+    /// structural `snake_chain` checks (9.2 / 9.3 / 9.5 / 6.6).
+    /// Registration-key uniqueness is Tier 3 on a side branch (D6).
     pub(super) fn tier2_check(
         &self,
         view: &BlockView<'_>,
@@ -86,6 +86,19 @@ impl<
         let Some(txs) = view.transactions() else {
             return Ok(());
         };
+        // FR56 / DEC-312 (Story 7.3): the fee policy and a registration's
+        // price, judged like `mined_amount` — a value bound to chain-info
+        // declines here and is judged at the switch replay (DEC-305).
+        for tx in txs.iter() {
+            if self.fee_out_of_policy(&tx, false) {
+                return Err(invalid(ValidationReason::FeeOutOfPolicy));
+            }
+            if let Some(reg) = tx.as_registration()
+                && self.registration_price_mismatch(reg.registration_price(), false)
+            {
+                return Err(invalid(ValidationReason::RegistrationPriceMismatch));
+            }
+        }
         for tx in txs.iter() {
             let Some(cx) = tx.as_complex() else {
                 continue;

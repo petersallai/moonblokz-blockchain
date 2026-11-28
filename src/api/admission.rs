@@ -94,6 +94,7 @@ impl<
             &self.node_zero_public_key,
             block_size_limit,
             self.enforceable_max_utxo_outputs(),
+            self.enforceable_active_chain_length(),
             &self.crypto,
         )
         .map_err(AdmitError::Rejected)?;

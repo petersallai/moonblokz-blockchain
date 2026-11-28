@@ -75,7 +75,7 @@ fn chain_info_reaches_the_scheduler_in_ready() {
 fn chain_info_reads_the_derived_watermark() {
     let mut bc = new_test_chain();
     let cfg_hash = admit_chain_config_anchor(&mut bc, 99, [0xAB; 32]);
-    let anchor = balance_block(100, cfg_hash, &[(1, 100, 0, 0x31)], 1);
+    let anchor = balance_block(100, cfg_hash, &[(1, 1_000, 0, 0x31)], 1);
     bc.tier1_admit(&anchor.view(), &anchor.view().hash(), 0)
         .expect("anchor admitted");
     let reg = registration_block(101, anchor.view().hash(), 1, 2, 0x45);

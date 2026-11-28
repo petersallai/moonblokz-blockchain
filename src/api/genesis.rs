@@ -677,6 +677,7 @@ pub(super) fn genesis_block_zero<C: CryptoTrait>(
 ) {
     let registration = Registration::new_signed(
         0, // vote
+        0, // anchor_sequence (DEC-356; block #0's is 0)
         0, // initializer (node #0)
         0, // new_node_id (node #0)
         0, // registration_price

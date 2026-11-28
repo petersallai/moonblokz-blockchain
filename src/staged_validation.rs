@@ -33,7 +33,8 @@
 
 use moonblokz_chain_types::{
     ApprovalView, BlockView, ComplexTransactionView, PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE,
-    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, PAYLOAD_TYPE_TWIN_FACT, TwinFactView,
+    PAYLOAD_TYPE_CHAIN_CONFIG, PAYLOAD_TYPE_TRANSACTION, PAYLOAD_TYPE_TWIN_FACT, TransactionView,
+    TwinFactView,
 };
 use moonblokz_crypto::{
     CryptoTrait, PUBLIC_KEY_SIZE, PublicKey, PublicKeyTrait, Signature, SignatureTrait,
@@ -124,9 +125,13 @@ pub(crate) enum Tier1Failure {
     /// FR6: a `payload_type=1` block contains both ≥1 registration (`type=2`)
     /// and ≥1 complex (`type=3`) transaction.
     RegistrationComplexMutualExclusion,
-    /// `block.sequence ≤ anchor_sequence` for a node-transfer or a complex-tx
-    /// balance input (FR9 Tier 1 intake monotonicity).
+    /// `block.sequence ≤ anchor_sequence` for a node-transfer, a registration
+    /// (DEC-356) or a complex-tx balance input (FR9 Tier 1 intake
+    /// monotonicity).
     AnchorSequenceNotBeforeBlock,
+    /// An anchor below the window tail of the block's parent,
+    /// `anchor < max(0, s − W)`, once `W` is durably locked (DEC-174, I-45).
+    AnchorBelowWindow,
     /// A complex transaction's output amounts, or its declared input amounts
     /// (balance and UTXO), sum beyond `u64::MAX`.
     AmountOverflow,
@@ -275,7 +280,8 @@ fn verify_possession_bytes<C: CryptoTrait>(
 
 /// Runs the full FR9 Tier 1 gating-check set over `block`, evaluable from the
 /// block bytes alone plus the durable-locked chain-config (`block_size_limit`,
-/// `max_utxo_outputs`; each falls back to a structural bound before the lock).
+/// `max_utxo_outputs`; each falls back to a structural bound before the lock;
+/// `w`, the window for DEC-174's anchor lower bound, is `None` before it).
 /// Returns `Ok(())` when no exact evidence of invalidity exists (the block is
 /// admissible at `Stored`), or the first exact-evidence [`Tier1Failure`].
 ///
@@ -286,6 +292,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
     block_size_limit: u32,
     max_utxo_outputs: u16,
+    w: Option<u32>,
     crypto: &C,
 ) -> Result<(), Tier1Failure> {
     // Header-level checks (payload-independent).
@@ -324,13 +331,7 @@ pub(crate) fn tier1_gate<C: CryptoTrait>(
 
     match block.payload_type() {
         PAYLOAD_TYPE_TRANSACTION => {
-            tier1_transaction_block(
-                block,
-                node_zero_public_key,
-                max_utxo_outputs,
-                crypto,
-                is_genesis_block_zero,
-            )?;
+            tier1_transaction_block(block, node_zero_public_key, max_utxo_outputs, w, crypto)?;
         }
         PAYLOAD_TYPE_BALANCE => tier1_balance_block(block, node_zero_public_key)?,
         PAYLOAD_TYPE_CHAIN_CONFIG => tier1_chain_config_block(block, node_zero_public_key, crypto)?,
@@ -405,8 +406,8 @@ fn tier1_transaction_block<C: CryptoTrait>(
     block: &BlockView,
     node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
     max_utxo_outputs: u16,
+    w: Option<u32>,
     crypto: &C,
-    is_genesis_block_zero: bool,
 ) -> Result<(), Tier1Failure> {
     let payload = block.transactions().ok_or(Tier1Failure::MalformedPayload)?;
     let declared = payload.count() as usize;
@@ -419,42 +420,9 @@ fn tier1_transaction_block<C: CryptoTrait>(
 
     for tx in payload.iter() {
         seen += 1;
-        let vote = tx.vote();
-
-        if let Some(nt) = tx.as_node_transfer() {
-            if !is_genesis_block_zero && block_sequence <= nt.anchor_sequence() {
-                return Err(Tier1Failure::AnchorSequenceNotBeforeBlock);
-            }
-            check_no_self_vote(nt.initializer(), vote, is_genesis_block_zero)?;
-        } else if let Some(reg) = tx.as_registration() {
-            has_registration = true;
-            // DEC-269: node #0 is registered only by block #0 (FR54 (h), and
-            // FR6's `watermark + 1` makes id 0 unreachable afterwards).
-            if reg.new_node_id() == NODE_ZERO_ID && !is_genesis_block_zero {
-                return Err(Tier1Failure::GenesisShape);
-            }
-            check_no_self_vote(reg.initializer(), vote, is_genesis_block_zero)?;
-            // FR69 (i): node-#0 registration must carry the trust-anchor key.
-            if reg.new_node_id() == NODE_ZERO_ID
-                && reg.new_public_key() != &node_zero_public_key[..]
-            {
-                return Err(Tier1Failure::NodeZeroRegistrationKeyMismatch);
-            }
-            // new_key_signature is the new key's proof of possession (DEC-248):
-            // a signature over its own public key in the proof domain. An ordinary
-            // signature over the key bytes does not pass (the Schnorr domain is
-            // the message prefix `MoonBlokz/pop`, BLS has its own DST).
-            if !verify_possession_bytes(crypto, reg.new_public_key(), reg.new_key_signature()) {
-                return Err(Tier1Failure::InvalidNewKeySignature);
-            }
-        } else if let Some(cx) = tx.as_complex() {
-            has_complex = true;
-            utxo_outputs += tier1_complex_tx(&cx, vote, is_genesis_block_zero, block_sequence)?;
-        } else {
-            // Unknown transaction discriminator: the iterator yielded a view
-            // whose type is none of {node-transfer, registration, complex}.
-            return Err(Tier1Failure::MalformedPayload);
-        }
+        has_registration |= tx.as_registration().is_some();
+        has_complex |= tx.as_complex().is_some();
+        utxo_outputs += tier1_transaction(&tx, block_sequence, w, node_zero_public_key, crypto)?;
     }
 
     // Payload coherence: the transaction iterator stops silently on a
@@ -479,6 +447,73 @@ fn tier1_transaction_block<C: CryptoTrait>(
     Ok(())
 }
 
+/// FR9 Tier 1 over one transaction in a block of sequence `block_sequence`
+/// (Story 7.3 AC3): the one per-transaction rule set that the block gate and
+/// FR14 intake share — intake calls it with `block_sequence = h + 1`. Returns
+/// the transaction's UTXO-output count for the block-wide cap. `w` is the
+/// enforceable window (`None` before the durable lock).
+pub(crate) fn tier1_transaction<C: CryptoTrait>(
+    tx: &TransactionView,
+    block_sequence: u32,
+    w: Option<u32>,
+    node_zero_public_key: &[u8; PUBLIC_KEY_SIZE],
+    crypto: &C,
+) -> Result<u32, Tier1Failure> {
+    let is_genesis_block_zero = block_sequence == 0;
+    let vote = tx.vote();
+    if let Some(nt) = tx.as_node_transfer() {
+        check_anchor(nt.anchor_sequence(), block_sequence, w)?;
+        check_no_self_vote(nt.initializer(), vote, is_genesis_block_zero)?;
+        Ok(0)
+    } else if let Some(reg) = tx.as_registration() {
+        // DEC-356: a registration carries the transfer's window anchor.
+        check_anchor(reg.anchor_sequence(), block_sequence, w)?;
+        // DEC-269: node #0 is registered only by block #0 (FR54 (h), and
+        // FR6's `watermark + 1` makes id 0 unreachable afterwards).
+        if reg.new_node_id() == NODE_ZERO_ID && !is_genesis_block_zero {
+            return Err(Tier1Failure::GenesisShape);
+        }
+        check_no_self_vote(reg.initializer(), vote, is_genesis_block_zero)?;
+        // FR69 (i): node-#0 registration must carry the trust-anchor key.
+        if reg.new_node_id() == NODE_ZERO_ID && reg.new_public_key() != &node_zero_public_key[..] {
+            return Err(Tier1Failure::NodeZeroRegistrationKeyMismatch);
+        }
+        // new_key_signature is the new key's proof of possession (DEC-248):
+        // a signature over its own public key in the proof domain. An ordinary
+        // signature over the key bytes does not pass (the Schnorr domain is
+        // the message prefix `MoonBlokz/pop`, BLS has its own DST).
+        if !verify_possession_bytes(crypto, reg.new_public_key(), reg.new_key_signature()) {
+            return Err(Tier1Failure::InvalidNewKeySignature);
+        }
+        Ok(0)
+    } else if let Some(cx) = tx.as_complex() {
+        tier1_complex_tx(&cx, vote, block_sequence, w)
+    } else {
+        // Unknown transaction discriminator: the iterator yielded a view
+        // whose type is none of {node-transfer, registration, complex}.
+        Err(Tier1Failure::MalformedPayload)
+    }
+}
+
+/// The window anchor of a transfer, a registration (DEC-356) or a balance
+/// input in a block of sequence `block_sequence`: strictly below the block
+/// (FR9 Tier 1 intake monotonicity) and, once the window `W` is enforceable,
+/// at or above the window tail of the block's parent, `max(0, s − W)`
+/// (DEC-174, I-45), so the FR6 duplicate check over the window is complete.
+/// Block #0 is exempt (FR54 (c)).
+fn check_anchor(anchor: u32, block_sequence: u32, w: Option<u32>) -> Result<(), Tier1Failure> {
+    if block_sequence == 0 {
+        return Ok(());
+    }
+    if block_sequence <= anchor {
+        return Err(Tier1Failure::AnchorSequenceNotBeforeBlock);
+    }
+    if w.is_some_and(|w| anchor < block_sequence.saturating_sub(w)) {
+        return Err(Tier1Failure::AnchorBelowWindow);
+    }
+    Ok(())
+}
+
 /// DEC-308 (I-55): a complex transaction needs at least one output — the one
 /// predicate Tier 1 and Story 7.3's FR14 intake share. Exact once the output
 /// count is coherent with the bytes, which `TransactionView::from_bytes` and
@@ -492,18 +527,17 @@ pub(crate) fn complex_has_output(cx: &ComplexTransactionView) -> bool {
 fn tier1_complex_tx(
     cx: &ComplexTransactionView,
     vote: u32,
-    is_genesis_block_zero: bool,
     block_sequence: u32,
+    w: Option<u32>,
 ) -> Result<u32, Tier1Failure> {
+    let is_genesis_block_zero = block_sequence == 0;
     let mut input_seen = 0u32;
     let mut declared_input_sum: u128 = 0;
 
     for input in cx.inputs() {
         input_seen += 1;
         if let Some(bal) = input.as_balance() {
-            if !is_genesis_block_zero && block_sequence <= bal.anchor_sequence() {
-                return Err(Tier1Failure::AnchorSequenceNotBeforeBlock);
-            }
+            check_anchor(bal.anchor_sequence(), block_sequence, w)?;
             check_no_self_vote(bal.initializer(), vote, is_genesis_block_zero)?;
             declared_input_sum = declared_input_sum.saturating_add(bal.amount() as u128);
         } else if let Some(utxo) = input.as_utxo() {
@@ -634,7 +668,7 @@ pub(crate) fn tier1_chain_config_block<C: CryptoTrait>(
 /// FR54's fixed block #0 description (DEC-269), from the block bytes alone:
 /// all-zeros `previous_hash`, creator 0, zero `mined_amount` and vote-header
 /// fields, a transaction payload of exactly the node #0 registration (vote,
-/// initializer, `new_node_id`, price and fee 0) then the node #0 self-transfer
+/// anchor (DEC-356), initializer, `new_node_id`, price and fee 0) then the node #0 self-transfer
 /// (vote, anchor, initializer, receiver, fee and comment 0, any amount). The
 /// registration's key is the trust anchor and its proof of possession holds —
 /// both checked by [`tier1_transaction_block`] (FR69 (i), DEC-248). This is the
@@ -658,7 +692,8 @@ fn is_genesis_zero_shape(block: &BlockView) -> bool {
     };
     let registration_holds = first.vote() == NODE_ZERO_ID
         && first.as_registration().is_some_and(|reg| {
-            reg.initializer() == NODE_ZERO_ID
+            reg.anchor_sequence() == 0
+                && reg.initializer() == NODE_ZERO_ID
                 && reg.new_node_id() == NODE_ZERO_ID
                 && reg.registration_price() == 0
                 && reg.fee() == 0
@@ -788,7 +823,14 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
+            tier1_gate(
+                &block,
+                &pubkey_bytes(&c),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                None,
+                &c
+            ),
             Err(Tier1Failure::UnsupportedVersion)
         );
     }
@@ -799,7 +841,14 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
+            tier1_gate(
+                &block,
+                &pubkey_bytes(&c),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                None,
+                &c
+            ),
             Err(Tier1Failure::UnknownPayloadType)
         );
     }
@@ -811,7 +860,14 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
+            tier1_gate(
+                &block,
+                &pubkey_bytes(&c),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                None,
+                &c
+            ),
             Err(Tier1Failure::SequenceCeiling)
         );
     }
@@ -828,6 +884,7 @@ mod tests {
                 &pubkey_bytes(&c),
                 100, /* < 122 */
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::BlockTooLarge)
@@ -888,7 +945,14 @@ mod tests {
     fn tier1_of(bytes: &[u8]) -> Result<(), Tier1Failure> {
         let block = BlockView::from_bytes(bytes).ok().expect("parses");
         let c = crypto(1);
-        tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c)
+        tier1_gate(
+            &block,
+            &pubkey_bytes(&c),
+            NORMAL_LIMIT,
+            UTXO_LIMIT,
+            None,
+            &c,
+        )
     }
 
     #[test]
@@ -992,7 +1056,7 @@ mod tests {
             .ok()
             .expect("parses");
         assert_eq!(
-            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
+            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, None, &c),
             Ok(())
         );
     }
@@ -1013,6 +1077,7 @@ mod tests {
                 &pubkey_bytes(&node_zero),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &node_zero
             ),
             Err(Tier1Failure::ChainConfigContentSignatureInvalid)
@@ -1037,7 +1102,7 @@ mod tests {
         bytes[HEADER_SIZE] = 1;
         let view = BlockView::from_bytes(&bytes).ok().expect("parses");
         assert_eq!(
-            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
+            tier1_gate(&view, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, None, &c),
             Err(Tier1Failure::MalformedPayload)
         );
     }
@@ -1051,7 +1116,14 @@ mod tests {
         let block = BlockView::from_bytes(&bytes).ok().expect("parses");
         let c = crypto(1);
         assert_eq!(
-            tier1_gate(&block, &pubkey_bytes(&c), NORMAL_LIMIT, UTXO_LIMIT, &c),
+            tier1_gate(
+                &block,
+                &pubkey_bytes(&c),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                None,
+                &c
+            ),
             Err(Tier1Failure::MalformedPayload)
         );
     }
@@ -1075,6 +1147,7 @@ mod tests {
                     &pubkey_bytes(&node_zero),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &node_zero
                 ),
                 Err(Tier1Failure::ChainConfigContentSignatureInvalid),
@@ -1101,7 +1174,8 @@ mod tests {
             (chain_config_block(5, &EMPTY_CONFIG_CONTENT, &a), pk_a),
         ];
         for (block, anchor) in &cases {
-            let gate = |view: &BlockView| tier1_gate(view, anchor, NORMAL_LIMIT, UTXO_LIMIT, &a);
+            let gate =
+                |view: &BlockView| tier1_gate(view, anchor, NORMAL_LIMIT, UTXO_LIMIT, None, &a);
             assert_eq!(gate(&block.view()), Ok(()), "the passing fixture");
             let n = block.len();
             let mut bytes = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
@@ -1113,7 +1187,7 @@ mod tests {
         let bytes = raw_block(1, 5, PAYLOAD_TYPE_APPROVAL);
         let empty = BlockView::from_bytes(&bytes).ok().expect("parses");
         assert_eq!(
-            tier1_gate(&empty, &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&empty, &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Err(Tier1Failure::MalformedPayload)
         );
     }
@@ -1133,6 +1207,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Ok(())
@@ -1150,6 +1225,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::SelfVote)
@@ -1167,6 +1243,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Ok(())
@@ -1186,6 +1263,7 @@ mod tests {
                 &pubkey_bytes(&c),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Ok(())
@@ -1199,6 +1277,7 @@ mod tests {
                 &pubkey_bytes(&c),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::GenesisShape)
@@ -1218,6 +1297,7 @@ mod tests {
         ExtraTransfer,
         Swapped,
         RegInitializer,
+        RegAnchor,
         RegNodeId,
         RegVote,
         RegPrice,
@@ -1239,6 +1319,7 @@ mod tests {
         let pick = |hit: bool, value: u32| if hit { value } else { 0 };
         let reg = Registration::new_signed(
             pick(matches!(m, M::RegVote), 3),
+            pick(matches!(m, M::RegAnchor), 1),
             pick(matches!(m, M::RegInitializer), 1),
             pick(matches!(m, M::RegNodeId), 1),
             u64::from(pick(matches!(m, M::RegPrice), 5)),
@@ -1303,6 +1384,7 @@ mod tests {
                     &pubkey_bytes(&c),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &c
                 ),
                 Ok(()),
@@ -1326,6 +1408,7 @@ mod tests {
             M::ExtraTransfer,
             M::Swapped,
             M::RegInitializer,
+            M::RegAnchor,
             M::RegNodeId,
             M::RegVote,
             M::RegPrice,
@@ -1344,6 +1427,7 @@ mod tests {
                     &pubkey_bytes(&c),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &c
                 ),
                 Err(Tier1Failure::GenesisShape),
@@ -1364,6 +1448,7 @@ mod tests {
                 &pubkey_bytes(&c),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::GenesisShape)
@@ -1379,12 +1464,12 @@ mod tests {
         let pk_a = pubkey_bytes(&a);
         let block = registration_block(5, 0, &pk_a, &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Err(Tier1Failure::GenesisShape)
         );
         let block = registration_block(5, 1, &pk_a, &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Ok(())
         );
     }
@@ -1400,7 +1485,63 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
+            ),
+            Err(Tier1Failure::AnchorSequenceNotBeforeBlock)
+        );
+    }
+
+    /// Story 7.3 AC4 / AC16 (DEC-174, DEC-356): once `W` is enforceable, a
+    /// transfer, a registration and a balance input are each anchored at or
+    /// above `max(0, s − W)`. At `s = 20`, `W = 8` the bound is 12: 12 passes,
+    /// 11 is refused; before the lock (`w = None`) there is no lower bound;
+    /// below `W` the bound is 0.
+    #[test]
+    fn tier1_anchor_lower_bound_is_the_parents_window_tail() {
+        let c = crypto(1);
+        let pk = pubkey_bytes(&crypto(2));
+        let new_key = crypto(9);
+        let gate =
+            |block: &Block, w| tier1_gate(&block.view(), &pk, NORMAL_LIMIT, UTXO_LIMIT, w, &c);
+        let blocks_at = |seq: u32, anchor: u32| {
+            [
+                node_transfer_block(seq, 3, anchor, 7, &c),
+                registration_block_anchored(seq, anchor, 9, &pubkey_bytes(&new_key), &new_key),
+                complex_block(seq, 3, &c, |cx| {
+                    cx.add_balance_input(anchor, 8, 50, 0, &DUMMY_SIG)
+                        .ok()
+                        .unwrap();
+                    cx.add_balance_output(9, 40).ok().unwrap();
+                }),
+            ]
+        };
+        for block in blocks_at(20, 12) {
+            assert_eq!(gate(&block, Some(8)), Ok(()));
+        }
+        for block in blocks_at(20, 11) {
+            assert_eq!(gate(&block, Some(8)), Err(Tier1Failure::AnchorBelowWindow));
+            assert_eq!(gate(&block, None), Ok(()), "no lower bound before the lock");
+        }
+        for block in blocks_at(5, 0) {
+            assert_eq!(gate(&block, Some(8)), Ok(()), "below W the bound is 0");
+        }
+    }
+
+    /// DEC-356: a registration's anchor lies strictly below its block, as a
+    /// transfer's does.
+    #[test]
+    fn tier1_rejects_a_registration_anchored_at_its_block() {
+        let new_key = crypto(9);
+        let block = registration_block_anchored(5, 5, 9, &pubkey_bytes(&new_key), &new_key);
+        assert_eq!(
+            tier1_gate(
+                &block.view(),
+                &pubkey_bytes(&crypto(2)),
+                NORMAL_LIMIT,
+                UTXO_LIMIT,
+                None,
+                &new_key
             ),
             Err(Tier1Failure::AnchorSequenceNotBeforeBlock)
         );
@@ -1414,6 +1555,7 @@ mod tests {
         let c = crypto(1);
         let reg = Registration::new_signed(
             5, /*vote*/
+            4, /*anchor*/
             5, /*initializer*/
             6,
             0,
@@ -1433,6 +1575,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::SelfVote)
@@ -1445,8 +1588,19 @@ mod tests {
         new_pk: &[u8; PUBLIC_KEY_SIZE],
         signer: &Crypto,
     ) -> Block {
+        registration_block_anchored(seq, seq.saturating_sub(1), new_node_id, new_pk, signer)
+    }
+
+    fn registration_block_anchored(
+        seq: u32,
+        anchor: u32,
+        new_node_id: u32,
+        new_pk: &[u8; PUBLIC_KEY_SIZE],
+        signer: &Crypto,
+    ) -> Block {
         let reg = Registration::new_signed(
             3, /*vote*/
+            anchor,
             5, /*initializer*/
             new_node_id,
             0,
@@ -1469,7 +1623,7 @@ mod tests {
         // A registration of node 6 with a key whose proof of possession holds.
         let block = registration_block(5, 6, &pk_a, &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Ok(())
         );
     }
@@ -1488,6 +1642,7 @@ mod tests {
                 &pubkey_bytes(&b),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &a
             ),
             Err(Tier1Failure::NodeZeroRegistrationKeyMismatch)
@@ -1508,6 +1663,7 @@ mod tests {
                 &pubkey_bytes(&crypto(3)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &a
             ),
             Err(Tier1Failure::InvalidNewKeySignature)
@@ -1523,10 +1679,10 @@ mod tests {
         let mut ordinary = [0u8; SIGNATURE_SIZE];
         ordinary.copy_from_slice(&a.sign(&pk_a).serialize()[..SIGNATURE_SIZE]);
         let zero = [0u8; SIGNATURE_SIZE];
-        let unsigned = Registration::new(3, 5, 9, 0, 0, &pk_a, &ordinary, &zero);
+        let unsigned = Registration::new(3, 4, 5, 9, 0, 0, &pk_a, &ordinary, &zero);
         let mut tx_sig = [0u8; SIGNATURE_SIZE];
         tx_sig.copy_from_slice(&a.sign(unsigned.as_bytes()).serialize()[..SIGNATURE_SIZE]);
-        let reg = Registration::new(3, 5, 9, 0, 0, &pk_a, &ordinary, &tx_sig);
+        let reg = Registration::new(3, 4, 5, 9, 0, 0, &pk_a, &ordinary, &tx_sig);
         let mut builder = BlockBuilder::new().header(header(5, PAYLOAD_TYPE_TRANSACTION));
         builder
             .add_registration(&reg)
@@ -1534,7 +1690,7 @@ mod tests {
             .expect("add registration");
         let block = builder.build_signed(&a).ok().expect("build signed");
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Err(Tier1Failure::InvalidNewKeySignature)
         );
     }
@@ -1543,7 +1699,7 @@ mod tests {
     fn tier1_rejects_registration_complex_mutual_exclusion() {
         let a = crypto(1);
         let pk_a = pubkey_bytes(&a);
-        let reg = Registration::new_signed(3, 5, 9, 0, 0, &pk_a, &a);
+        let reg = Registration::new_signed(3, 4, 5, 9, 0, 0, &pk_a, &a);
         let mut cx = ComplexTransaction::new(3 /*vote*/);
         cx.add_balance_input(4 /*anchor*/, 8 /*initializer*/, 50, 0, &DUMMY_SIG)
             .ok()
@@ -1557,7 +1713,7 @@ mod tests {
             .expect("add complex");
         let block = builder.build_signed(&a).ok().expect("build");
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Err(Tier1Failure::RegistrationComplexMutualExclusion)
         );
     }
@@ -1596,9 +1752,12 @@ mod tests {
         builder.add_complex_transaction(&cx).ok().unwrap();
         let block = builder.build_signed(&c).ok().unwrap();
         let pk = pubkey_bytes(&crypto(2));
-        assert_eq!(tier1_gate(&block.view(), &pk, NORMAL_LIMIT, 4, &c), Ok(()));
         assert_eq!(
-            tier1_gate(&block.view(), &pk, NORMAL_LIMIT, 3, &c),
+            tier1_gate(&block.view(), &pk, NORMAL_LIMIT, 4, None, &c),
+            Ok(())
+        );
+        assert_eq!(
+            tier1_gate(&block.view(), &pk, NORMAL_LIMIT, 3, None, &c),
             Err(Tier1Failure::TooManyUtxoOutputs)
         );
     }
@@ -1617,6 +1776,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::InputsLessThanOutputs)
@@ -1639,6 +1799,7 @@ mod tests {
                     &pubkey_bytes(&crypto(2)),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &c
                 ),
                 expected,
@@ -1673,6 +1834,7 @@ mod tests {
                     &pubkey_bytes(&crypto(2)),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &c
                 ),
                 Err(Tier1Failure::AmountOverflow)
@@ -1698,6 +1860,7 @@ mod tests {
                     &pubkey_bytes(&crypto(2)),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &c
                 ),
                 Err(Tier1Failure::ComplexWithoutOutput)
@@ -1715,6 +1878,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::AmountOverflow)
@@ -1730,6 +1894,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Ok(())
@@ -1754,6 +1919,7 @@ mod tests {
                     &pubkey_bytes(&crypto(2)),
                     NORMAL_LIMIT,
                     UTXO_LIMIT,
+                    None,
                     &c
                 ),
                 Err(Tier1Failure::UtxoInputNotBeforeBlock),
@@ -1776,6 +1942,7 @@ mod tests {
                 &pubkey_bytes(&crypto(2)),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &c
             ),
             Err(Tier1Failure::SelfVote)
@@ -1802,7 +1969,7 @@ mod tests {
         let pk_a = pubkey_bytes(&a);
         let block = balance_block(5, 0, &pk_a, &a);
         assert_eq!(
-            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, &a),
+            tier1_gate(&block.view(), &pk_a, NORMAL_LIMIT, UTXO_LIMIT, None, &a),
             Ok(())
         );
     }
@@ -1819,6 +1986,7 @@ mod tests {
                 &pubkey_bytes(&b),
                 NORMAL_LIMIT,
                 UTXO_LIMIT,
+                None,
                 &a
             ),
             Err(Tier1Failure::NodeZeroBalanceKeyMismatch)

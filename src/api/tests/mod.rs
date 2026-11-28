@@ -4,7 +4,7 @@
 //! the shared chain constructors among them, live in `fixtures.rs`.
 
 use super::*;
-use moonblokz_chain_types::{ChainConfigPayloadBuilder, MAX_BLOCK_SIZE};
+use moonblokz_chain_types::{ChainConfigPayloadBuilder, MAX_BLOCK_SIZE, NODE_TRANSFER_SIZE};
 use moonblokz_configuration::{ChainConfiguration, NoopConfigChangeSink, parameter};
 use moonblokz_crypto::{
     AggregatedSignature, Crypto, CryptoError, MultiSignature, PRIVATE_KEY_SIZE, PublicKey,
@@ -108,6 +108,21 @@ const TEST_MAX_NODES: u32 = 16;
 /// one competing branch of depth `H` (configuration §6 check 16). The test
 /// backend stores eight blocks, so the size only has to pass the check.
 const TEST_MAX_BLOCKS: usize = TEST_W as usize + 2 * TEST_H as usize;
+/// The fixtures' registration price: the registry default of ID 24 (no test
+/// configuration declares it), which the per-block step checks for equality
+/// (DEC-312).
+const TEST_REGISTRATION_PRICE: u64 = 100;
+/// The fixtures' registration fee: the FR56 minimum at the registry default
+/// `tx_fee_per_byte_min = 1` (DEC-181), one per byte.
+const TEST_REGISTRATION_FEE: u64 = REGISTRATION_SIZE as u64;
+/// The fixtures' node-transfer fee: the FR56 minimum at the registry default.
+const TEST_TRANSFER_FEE: u32 = NODE_TRANSFER_SIZE as u32;
+/// The fee the fixtures' complex transactions pay (`Σ in − Σ out`): at least
+/// the size of every complex transaction the tests build, on every scheme
+/// (FR56 at the default minimum of 1 per byte), and within the default
+/// maximum of 1 000 per byte.
+const CX_FEE: u64 = 1_000;
+
 /// The available-UTXO bitfield bytes of every test chain: the production value
 /// (DEC-318), 32 outputs per block.
 const TEST_UTXO_BYTES: usize = 4;

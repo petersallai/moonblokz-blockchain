@@ -766,8 +766,9 @@ mod tests {
     fn classify_collecting_suppresses_window() {
         let mut bc = new_test_chain();
         // A high sequence that WOULD be out-of-window under any small window is
-        // admitted in collecting state (window == None).
-        let block = node_transfer_block(9_999, 3, 4, 7);
+        // admitted in collecting state (window == None). Its anchor sits in
+        // its own window (DEC-174 at the locked test `W`).
+        let block = node_transfer_block(9_999, 3, 9_998, 7);
         let outcome = classify_block(&mut bc, &block.view(), None, 0).0;
         assert_eq!(outcome, ReceiveBlockOutcome::AcceptedSilently);
         assert_eq!(bc.block_tree_len(), 1);

@@ -38,7 +38,7 @@ fn genesis_with(builder: &ChainConfigPayloadBuilder) -> (TestChain, Block, Block
 
 fn registration_with_reward(seq: u32, prev: [u8; 32], node: u32, mined: u32) -> Block {
     tx_block(seq, prev, mined, |b| {
-        b.add_registration(&registration_tx(0, node, key_of(node)))
+        b.add_registration(&registration_tx(seq - 1, 0, node, key_of(node)))
             .ok()
             .expect("add registration");
     })
@@ -108,7 +108,8 @@ fn a_wrong_mined_amount_is_deleted_by_the_fr3_pass() {
 
 /// A node-transfer block by node #0 with `mined`.
 fn transfer_with_mined(seq: u32, prev: [u8; 32], mined: u32) -> Block {
-    let nt = transfer_tx(seq, 0, 1);
+    // Node #1 exists from #2: node #0 votes for it (DEC-190).
+    let nt = transfer_tx_vote(seq, 0, 1, 1);
     tx_block(seq, prev, mined, |b| {
         b.add_node_transfer(&nt).ok().expect("add transfer");
     })
@@ -427,7 +428,7 @@ fn a_chain_info_custodian_fee_binds_the_tail_classification() {
         (&[Ok(60), Ok(40)][..], TailObligation::Utxo),
     ] {
         let (mut bc, _, b1) = genesis_with(&builder);
-        let tx = utxo_tx(2, &[], Some((0, 100)), outputs);
+        let tx = utxo_tx(2, &[], Some((0, 100 + CX_FEE)), outputs);
         let mint = complex_tx_block(2, b1.view().hash(), 0, 0, &[&tx]);
         assert_eq!(
             receive(&mut bc, &mint),

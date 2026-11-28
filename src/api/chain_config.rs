@@ -420,6 +420,19 @@ impl<
             .map(|config| config.active_chain_length())
     }
 
+    /// The window `W` that Tier 1 may **enforce** against an arriving block:
+    /// the chain's value once the configuration is durably locked, `None`
+    /// before that (FR9; the [`Self::enforceable_block_size_limit`] pattern).
+    /// DEC-174's anchor lower bound is chain-config-derived, so a tentative `W`
+    /// must not refuse a block at intake; the per-block step checks it with
+    /// the held `W` in every phase (Story 7.3 AC4).
+    pub(super) fn enforceable_active_chain_length(&self) -> Option<u32> {
+        self.chain_config
+            .durable_content()
+            .and_then(|_| self.chain_config.active_configuration())
+            .map(|config| config.active_chain_length())
+    }
+
     /// FR58's verification horizon `H` (DEC-160) the held configuration —
     /// tentative or durable — declares, or `None` while the node holds none.
     /// Read where it is needed and never cached (FR56); acceptance holds it

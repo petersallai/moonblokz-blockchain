@@ -72,6 +72,7 @@ mod acquisition;
 mod admission;
 mod calls;
 mod chain_config;
+mod duplicate;
 mod evidence;
 mod fact;
 mod forward;
@@ -213,6 +214,10 @@ pub(crate) enum ProcessingError {
 pub(crate) enum UtxoSpendError {
     /// The input names no spendable output (exact evidence).
     Invalid(ValidationReason),
+    /// The referenced output exists but is spent on this ancestry: its
+    /// address, so the caller verifies the input's signature before it
+    /// declares the input unavailable (DEC-353, Story 7.3).
+    Spent([u8; PUBLIC_KEY_SIZE]),
     /// The referenced block could not be read back, no longer parses, or lacks
     /// an output its available-UTXO bit says exists (storage and RAM disagree).
     StorageRead,
@@ -364,6 +369,25 @@ pub(crate) enum ValidationReason {
     /// FR6 / FR9 Tier 2 (DEC-217): a non-genesis block's `mined_amount` is not
     /// the `mining_reward` resolved at its pre-state (Story 7.2).
     MinedAmountMismatch,
+    /// DEC-174 (I-45): a transfer, registration (DEC-356) or balance-input
+    /// anchor below `max(0, s − W)`, the window tail of the block's parent,
+    /// with the held `W` (Story 7.3).
+    AnchorBelowWindow,
+    /// FR56 (DEC-181, DEC-311): a non-exempt transaction's fee outside
+    /// `[tx_fee_per_byte_min · size, tx_fee_per_byte_max · size]`, or any fee
+    /// under an inverted range (Story 7.3).
+    FeeOutOfPolicy,
+    /// DEC-312: a registration's carried price differs from
+    /// `registration_price` at the block's pre-state (Story 7.3).
+    RegistrationPriceMismatch,
+    /// DEC-190 (I-13): node #0 initiates with `vote == 0` while another node is
+    /// registered in the transaction's pre-state (Story 7.3).
+    NodeZeroSelfVote,
+    /// FR6 (I-22, DEC-349, DEC-354): a transfer or a balance-only complex
+    /// transaction whose uniqueness key another transaction of the same block,
+    /// or of a block on its ancestry above its anchor, already carries
+    /// (Story 7.3).
+    DuplicateTransaction,
 }
 
 /// The projection context of the per-block step (Story 6.0 D3). The FR3 pass

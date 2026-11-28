@@ -415,7 +415,7 @@ fn fr22_compares_after_the_continuation() {
     let (mut bc, mint) = faulty_utxo_genesis();
     let b4 = alt(4, mint.view().hash(), 0, 0, 5, 7, false);
     assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
-    let tx = utxo_tx(5, &[(3, 1, 40)], None, &[Err((1, 40))]);
+    let tx = utxo_tx(5, &[(3, 1, 40 + CX_FEE)], None, &[Err((1, 40))]);
     // Node #1: credited once by the mint and once by `b4`'s five votes (the
     // per-target cap, DEC-176).
     let c5 = resign(
@@ -471,17 +471,35 @@ fn i09_vote_headers_are_verified_at_ready_intake() {
             votes_for(3, 1, 1, 40),
         ),
         // A normal block with a wrong value.
-        headed(3, prev, 1, NODE_ONE_KEY, 2000, 1, 0, votes_for(3, 0, 1, 41)),
+        headed(
+            3,
+            prev,
+            1,
+            NODE_ONE_KEY,
+            2000,
+            1,
+            0,
+            votes_by(3, 1, 0, 1, 41),
+        ),
         // The normal form with a deviation field (Tier 1 form).
-        headed(3, prev, 1, NODE_ONE_KEY, 1100, 1, 5, votes_for(3, 0, 1, 42)),
+        headed(
+            3,
+            prev,
+            1,
+            NODE_ONE_KEY,
+            1100,
+            1,
+            5,
+            votes_by(3, 1, 0, 1, 42),
+        ),
         // A deviation naming a node that is not the top.
-        headed(3, prev, 0, 1, 0, 5, 10, votes_for(3, 0, 1, 43)),
+        headed(3, prev, 0, 1, 0, 5, 10, votes_by(3, 1, 0, 1, 43)),
         // A deviation with a wrong snapshot of the top (its pre-interest value).
-        headed(3, prev, 0, 1, 0, 1, 1000, votes_for(3, 0, 1, 44)),
+        headed(3, prev, 0, 1, 0, 1, 1000, votes_by(3, 1, 0, 1, 44)),
         // A deviation counting its own credit (AR-005).
-        headed(3, prev, 0, 1, 1000, 1, 1100, votes_for(3, 0, 1, 45)),
+        headed(3, prev, 0, 1, 1000, 1, 1100, votes_by(3, 1, 0, 1, 45)),
         // A deviation above the top's snapshot (Tier 1 form).
-        headed(3, prev, 0, 1, 4000, 1, 1100, votes_for(3, 0, 1, 46)),
+        headed(3, prev, 0, 1, 4000, 1, 1100, votes_by(3, 1, 0, 1, 46)),
     ];
     for (i, bad) in refused.iter().enumerate() {
         let free = bc.blocks.next_free_index();
@@ -497,7 +515,7 @@ fn i09_vote_headers_are_verified_at_ready_intake() {
         );
     }
     let d3 = headed(3, prev, 0, 1, 0, 1, 1100, |b| {
-        votes_for(3, 0, 1, 47)(b);
+        votes_by(3, 1, 0, 1, 47)(b);
         votes_for(3, 1, 1, 48)(b);
     });
     assert_eq!(receive(&mut bc, &d3), ReceiveBlockOutcome::AcceptedSilently);
@@ -515,13 +533,22 @@ fn i09_mismatch_in_the_fr3_pass_is_deleted() {
     let prev = a2.view().hash();
     let bad = [
         // A wrong normal value.
-        headed(3, prev, 1, NODE_ONE_KEY, 2000, 1, 0, votes_for(3, 0, 1, 50)),
+        headed(
+            3,
+            prev,
+            1,
+            NODE_ONE_KEY,
+            2000,
+            1,
+            0,
+            votes_by(3, 1, 0, 1, 50),
+        ),
         // A deviation naming a node that is not the top.
-        headed(3, prev, 0, 1, 0, 2, 10, votes_for(3, 0, 1, 51)),
+        headed(3, prev, 0, 1, 0, 2, 10, votes_by(3, 1, 0, 1, 51)),
         // A deviation with a wrong snapshot of the top (its pre-interest value).
-        headed(3, prev, 0, 1, 0, 1, 1000, votes_for(3, 0, 1, 52)),
+        headed(3, prev, 0, 1, 0, 1, 1000, votes_by(3, 1, 0, 1, 52)),
         // A deviation counting its own credit (AR-005).
-        headed(3, prev, 0, 1, 1000, 1, 1100, votes_for(3, 0, 1, 53)),
+        headed(3, prev, 0, 1, 1000, 1, 1100, votes_by(3, 1, 0, 1, 53)),
     ];
     for (i, bad3) in bad.iter().enumerate() {
         let mut mesh = new_unconfigured_test_chain();
@@ -712,7 +739,13 @@ fn fr28_two_stage_scoring_end_to_end() {
             votes_for(3, 1, 1, 60 + i as u64),
         )
     });
-    let ns: [Block; 8] = core::array::from_fn(|i| alt(3, prev, 0, 0, 0, 71 + i as u64, false));
+    // Node #0's blocks vote for node #1 (node #1 is unfunded here, and node
+    // #0 may not vote for itself, DEC-190): the credit lands after `n`'s own
+    // value, its creator's pre-state snapshot, so the tie stands.
+    let ns: [Block; 8] = core::array::from_fn(|i| {
+        let template = tx_block(3, prev, 0, votes_for(3, 1, 1, 71 + i as u64));
+        resign(&template, 0, vote_snapshot(0), 1)
+    });
     for n_lower in [true, false] {
         let (mut bc, a2) = setup(0);
         assert_eq!(a2.view().hash(), prev);
@@ -1061,8 +1094,10 @@ fn honest_depth_two(a2: &Block, salt: u64) -> (Block, Block) {
 /// sequence. Returns `b3` and `b5`.
 fn full_w6_genesis_with_node_one() -> (Chain16<W6Storage>, Block, Block) {
     let (mut bc, _, b3) = w6_node_one_prefix();
-    let b4 = transfer(4, b3.view().hash(), 0, 9);
-    let b5 = transfer(5, b4.view().hash(), 0, 10);
+    // Node #0's transfers vote for node #1, which `b3` registered (node #0
+    // may not vote for itself then, DEC-190).
+    let b4 = transfer_vote(4, b3.view().hash(), 0, 9, 1);
+    let b5 = transfer_vote(5, b4.view().hash(), 0, 10, 1);
     for block in [&b4, &b5] {
         assert_eq!(
             receive(&mut bc, block),
@@ -1078,7 +1113,14 @@ fn full_w6_genesis_with_node_one() -> (Chain16<W6Storage>, Block, Block) {
 fn w6_node_one_prefix() -> (Chain16<W6Storage>, Block, Block) {
     let (mut bc, _, b1) = ready_genesis_w6();
     let b2 = transfer(2, b1.view().hash(), 0, 7);
-    let b3 = register(3, b2.view().hash(), 1, NODE_ONE_KEY);
+    // `b3` registers node #1 and funds it, so node #1 can cast the votes for
+    // node #0 (node #0 may not vote for itself once node #1 exists, DEC-190).
+    let reg = registration_tx(2, 0, 1, NODE_ONE_KEY);
+    let funding = transfer_tx(3, 1, NODE_ONE_FUNDS);
+    let b3 = tx_block(3, b2.view().hash(), 0, |b| {
+        b.add_registration(&reg).ok().expect("add registration");
+        b.add_node_transfer(&funding).ok().expect("add funding");
+    });
     for block in [&b2, &b3] {
         assert_eq!(
             receive(&mut bc, block),
@@ -1265,7 +1307,7 @@ fn fr23_undo_inverts_every_block_kind() {
     // A complex block spending a UTXO into two outputs.
     let (bc, mint) = faulty_utxo_genesis();
     let (replica, _) = faulty_utxo_genesis();
-    let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(30), Ok(30)]);
+    let tx = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Ok(30), Ok(30)]);
     check(
         bc,
         &replica,
@@ -1275,7 +1317,7 @@ fn fr23_undo_inverts_every_block_kind() {
     // A complex block paying its creator a fee (60 in, 50 out).
     let (bc, mint) = faulty_utxo_genesis();
     let (replica, _) = faulty_utxo_genesis();
-    let tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(50)]);
+    let tx = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Ok(50)]);
     check(
         bc,
         &replica,
@@ -1312,7 +1354,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
     // created the mint). Node #1's blocks at #4 are honest forks of it
     // (Story 6.12, FR70).
     let spend = |outputs: &[Result<u64, (u32, u64)>]| {
-        let tx = utxo_tx(4, &[(3, 0, 60)], None, outputs);
+        let tx = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, outputs);
         move |mint: &Block| complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx])
     };
     let (mut bc, mint) = faulty_utxo_genesis();
@@ -1365,7 +1407,7 @@ fn fr23_replay_resolves_utxo_against_the_new_chain() {
         vote_snapshot(0),
         1,
     );
-    let tx = utxo_tx(5, &[(4, 0, 60)], None, &[Ok(60)]);
+    let tx = utxo_tx(5, &[(4, 0, 60 + CX_FEE)], None, &[Ok(60)]);
     let x5 = resign(
         &complex_tx_block(5, x4.view().hash(), 0, 0, &[&tx]),
         1,
@@ -1436,7 +1478,7 @@ fn fr23_seed_sources_are_restored_by_the_backward_scan() {
     // A larger sibling of `s3` (worth 0 as well) wins: node #1's, an
     // honest fork beside node #0's `s3` (Story 6.12, FR70).
     let n3 = resign(
-        &tx_block(3, r2.view().hash(), 0, votes_for(3, 0, 3, 80)),
+        &tx_block(3, r2.view().hash(), 0, votes_for(3, 1, 3, 80)),
         1,
         vote_snapshot(0),
         NODE_ONE_KEY,
@@ -1472,7 +1514,7 @@ fn fr23_replay_checks_key_uniqueness_on_the_new_branch() {
     let (replica, _, _, _) = zero_tip_chain();
     let dup = resign(
         &tx_block(3, a2.view().hash(), 0, |b| {
-            b.add_registration(&registration_tx(0, 2, NODE_ONE_KEY))
+            b.add_registration(&registration_tx(2, 0, 2, NODE_ONE_KEY))
                 .ok()
                 .expect("add registration");
         }),
@@ -1498,10 +1540,10 @@ fn fr23_replay_checks_key_uniqueness_on_the_new_branch() {
     let a2 = alt(2, b1.view().hash(), 0, 0, 1, 7, true);
     let registering = |salt: u64| {
         move |b: &mut BlockBuilder| {
-            b.add_registration(&registration_tx(0, 2, key_of(2)))
+            b.add_registration(&registration_tx(2, 0, 2, key_of(2)))
                 .ok()
                 .expect("add registration");
-            votes_for(3, 0, 1, salt)(b);
+            votes_by(3, 1, 0, 1, salt)(b);
         }
     };
     let k3 = resign(
@@ -1630,14 +1672,19 @@ fn fr23_local_failures_keep_the_candidate() {
 
     // Forward replay: `n4` spends from the mint, which cannot be read.
     let (mut bc, mint) = faulty_utxo_genesis();
-    let o4 = real_on(&bc, &transfer(4, mint.view().hash(), 0, 7), 1, NODE_ONE_KEY);
+    let o4 = real_on(
+        &bc,
+        &tx_block(4, mint.view().hash(), 0, votes_by(4, 1, 0, 1, 7)),
+        1,
+        NODE_ONE_KEY,
+    );
     assert_eq!(receive(&mut bc, &o4), ReceiveBlockOutcome::AcceptedSilently);
-    let tx = utxo_tx_vote(1, 4, &[(3, 0, 60)], None, &[Ok(60)]);
+    let tx = utxo_tx_vote(1, 4, &[(3, 0, 60 + CX_FEE)], None, &[Ok(60)]);
     let n4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&tx]);
     assert_eq!(receive(&mut bc, &n4), ReceiveBlockOutcome::AcceptedSilently);
     assert_eq!(status_of(&bc, &n4), Some(BlockStatus::Connected));
     let n5 = resign(
-        &transfer(5, n4.view().hash(), 0, 9),
+        &tx_block(5, n4.view().hash(), 0, votes_by(5, 1, 0, 1, 9)),
         1,
         vote_snapshot(vote_snapshot(1000) + 1000),
         NODE_ONE_KEY,
@@ -1651,7 +1698,7 @@ fn fr23_local_failures_keep_the_candidate() {
     bc.storage.failing_read_slot = NONE_REF;
     // `n5`'s transfer credited node #0 once.
     let n6 = resign(
-        &transfer(6, n5.view().hash(), 0, 10),
+        &tx_block(6, n5.view().hash(), 0, votes_by(6, 1, 0, 1, 10)),
         0,
         vote_snapshot(1000),
         1,
@@ -1774,10 +1821,10 @@ fn fr23_tail_advances_wait_for_the_commit() {
     // slots.
     let branch = |last_is_replay: bool| {
         let (mut fresh, _, b3) = w6_node_one_prefix();
-        let n4 = resign(
-            &transfer(4, b3.view().hash(), 0, 54),
+        let n4 = real_on(
+            &fresh,
+            &tx_block(4, b3.view().hash(), 0, votes_by(4, 1, 0, 1, 54)),
             1,
-            vote_snapshot(0),
             NODE_ONE_KEY,
         );
         assert_eq!(
@@ -1785,7 +1832,12 @@ fn fr23_tail_advances_wait_for_the_commit() {
             ReceiveBlockOutcome::AcceptedSilently
         );
         // `n4`'s transfer credits node #0 once.
-        let n5 = real_on(&fresh, &transfer(5, n4.view().hash(), 0, 55), 0, 1);
+        let n5 = real_on(
+            &fresh,
+            &tx_block(5, n4.view().hash(), 0, votes_by(5, 1, 0, 1, 55)),
+            0,
+            1,
+        );
         assert_eq!(
             receive(&mut fresh, &n5),
             ReceiveBlockOutcome::AcceptedSilently
@@ -1794,10 +1846,10 @@ fn fr23_tail_advances_wait_for_the_commit() {
         let n7 = if last_is_replay {
             w6_config_anchor_block(7, n6.view().hash())
         } else {
-            tx_block(7, n6.view().hash(), 0, votes_for(7, 0, 3, 52))
+            tx_block(7, n6.view().hash(), 0, votes_by(7, 1, 0, 3, 52))
         };
-        let n8 = tx_block(8, n7.view().hash(), 0, votes_for(8, 0, 3, 53));
-        let n9 = tx_block(9, n8.view().hash(), 0, votes_for(9, 0, 3, 57));
+        let n8 = tx_block(8, n7.view().hash(), 0, votes_by(8, 1, 0, 3, 53));
+        let n9 = tx_block(9, n8.view().hash(), 0, votes_by(9, 1, 0, 3, 57));
         [n4, n5, n6, n7, n8, n9]
     };
     for last_is_replay in [false, true] {
@@ -1925,7 +1977,7 @@ fn fr23_signature_prepass() {
     let (replica, _, _, _) = two_creator_chain();
     let k3 = resign(
         &tx_block(3, a2.view().hash(), 0, |b| {
-            b.add_registration(&registration_tx(0, 2, key_of(2)))
+            b.add_registration(&registration_tx(2, 0, 2, key_of(2)))
                 .ok()
                 .expect("add registration");
         }),
@@ -2069,15 +2121,20 @@ fn fr23_switch_survives_a_restart() {
 fn a_side_blocks_input_signature_is_verified_at_the_switch_replay() {
     // A foreign-key UTXO input, then (review patch) a foreign-key balance input.
     let foreign = Crypto::new([2u8; PRIVATE_KEY_SIZE]).ok().expect("key");
-    for (inputs, balance) in [(&[(3, 0, 60)][..], None), (&[][..], Some((0, 60)))] {
+    for (inputs, balance) in [
+        (&[(3, 0, 60 + CX_FEE)][..], None),
+        (&[][..], Some((0, 60 + CX_FEE))),
+    ] {
         let (mut bc, mint) = faulty_utxo_genesis();
         let (mut replica, _) = faulty_utxo_genesis();
-        let o4_tx = utxo_tx(4, &[(3, 0, 60)], None, &[Ok(60)]);
+        let o4_tx = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Ok(60)]);
         let o4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&o4_tx]);
         for node in [&mut bc, &mut replica] {
             assert_eq!(receive(node, &o4), ReceiveBlockOutcome::AcceptedSilently);
         }
-        let n4_tx = utxo_tx_signed(0, 4, inputs, balance, &[Ok(30), Ok(30)], &foreign);
+        // It votes for node #1: node #0's balance input may not vote for
+        // node #0 once node #1 exists (DEC-190).
+        let n4_tx = utxo_tx_signed(1, 4, inputs, balance, &[Ok(30), Ok(30)], &foreign);
         let n4 = resign(
             &complex_tx_block(4, mint.view().hash(), 0, 0, &[&n4_tx]),
             1,

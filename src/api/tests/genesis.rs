@@ -638,6 +638,7 @@ fn process_genesis_block_zero_has_the_tier1_genesis_shape() {
                 &bc.node_zero_public_key,
                 bc.enforceable_block_size_limit(),
                 bc.enforceable_max_utxo_outputs(),
+                None,
                 &bc.crypto,
             ),
             Ok(())

@@ -846,6 +846,9 @@ pub(crate) mod test_seams {
         /// Block-creator signature verifications on this test thread (Story
         /// 6.10: a block #0 refused by the single-genesis guard costs none).
         pub(crate) static BLOCK_SIGNATURE_VERIFICATIONS: Cell<u32> = const { Cell::new(0) };
+        /// Block reads of the FR6 window duplicate scan on this test thread
+        /// (Story 7.3 AC8: a non-transaction block costs none).
+        pub(crate) static DUPLICATE_SCAN_READS: Cell<u32> = const { Cell::new(0) };
     }
 
     /// The evidence payload room under this thread's cap.
