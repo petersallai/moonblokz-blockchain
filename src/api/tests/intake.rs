@@ -287,12 +287,44 @@ fn what_no_later_chain_cures_is_rejected() {
         .ok()
         .expect("input");
     let overspend = utxo_tx_vote(1, 4, &[], Some((0, 5)), &[Err((1, 6))]);
+    // The registration and the balance-input arms of the signature-first
+    // order (DEC-350): forged, voting for a node that does not exist (#7).
+    let honest = registration_tx_priced(3, 0, 2, 0x32, TEST_REGISTRATION_PRICE, 7);
+    let honest = TransactionView::from_bytes(honest.as_bytes()).expect("tx");
+    let honest = honest.as_registration().expect("registration");
+    let forged_registration = Registration::new(
+        7,
+        3,
+        0,
+        2,
+        TEST_REGISTRATION_PRICE,
+        TEST_REGISTRATION_FEE,
+        honest.new_public_key().try_into().expect("key"),
+        honest.new_key_signature().try_into().expect("proof"),
+        &[0x55; SIGNATURE_SIZE],
+    );
+    let forged_input = utxo_tx_signed(
+        7,
+        4,
+        &[],
+        Some((0, 5 + CX_FEE)),
+        &[Err((1, 5))],
+        &other_key(),
+    );
     let carry_forward = utxo_tx(4, &[], None, &[Ok(5)]);
     for (case, bytes) in [
         ("a forged signature", forged.as_bytes()),
         (
             "forged, to an unknown target",
             forged_unknown_target.as_bytes(),
+        ),
+        (
+            "a forged registration, to an unknown target",
+            forged_registration.as_bytes(),
+        ),
+        (
+            "a forged balance input, to an unknown target",
+            forged_input.as_bytes(),
         ),
         ("node #0 voting for itself", self_vote.as_bytes()),
         ("a fee below the minimum", cheap.as_bytes()),
