@@ -562,7 +562,7 @@ impl<
     /// tail of a block `s`'s parent, with the held `W` — the per-block step's
     /// half of the bound, in every phase (Tier 1 judges it once `W` is
     /// locked). Without a configuration there is no window to judge.
-    fn anchor_below_window(&self, anchor: u32, seq: u32) -> bool {
+    pub(super) fn anchor_below_window(&self, anchor: u32, seq: u32) -> bool {
         seq != 0
             && self
                 .active_chain_length()

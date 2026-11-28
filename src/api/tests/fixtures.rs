@@ -1005,6 +1005,25 @@ pub(super) fn registration_tx(
     pk_byte: u8,
 ) -> Registration {
     let vote = u32::from(initializer == 0 && new_node_id >= 2);
+    registration_tx_priced(
+        anchor,
+        initializer,
+        new_node_id,
+        pk_byte,
+        TEST_REGISTRATION_PRICE,
+        vote,
+    )
+}
+
+/// [`registration_tx`] carrying `price` and voting for `vote`.
+pub(super) fn registration_tx_priced(
+    anchor: u32,
+    initializer: u32,
+    new_node_id: u32,
+    pk_byte: u8,
+    price: u64,
+    vote: u32,
+) -> Registration {
     let init_signer = Crypto::new([1u8; PRIVATE_KEY_SIZE]).ok().expect("init key");
     let new_signer = Crypto::new([pk_byte; PRIVATE_KEY_SIZE])
         .ok()
@@ -1018,7 +1037,7 @@ pub(super) fn registration_tx(
         anchor,
         initializer,
         new_node_id,
-        TEST_REGISTRATION_PRICE,
+        price,
         TEST_REGISTRATION_FEE,
         &new_pk,
         &new_key_sig,
@@ -1031,7 +1050,7 @@ pub(super) fn registration_tx(
         anchor,
         initializer,
         new_node_id,
-        TEST_REGISTRATION_PRICE,
+        price,
         TEST_REGISTRATION_FEE,
         &new_pk,
         &new_key_sig,

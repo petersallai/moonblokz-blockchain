@@ -38,6 +38,7 @@ mod genesis;
 mod late_hold;
 mod proposer;
 mod restart;
+mod rules;
 mod support;
 mod switch;
 mod twin;

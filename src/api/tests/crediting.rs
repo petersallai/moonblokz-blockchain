@@ -6,7 +6,7 @@ use super::fixtures::*;
 use super::*;
 
 /// `mining_reward = 10 · GETCHAININFO 1` (the registered-node count).
-const REWARD_PER_NODE_PROGRAM: [u8; 8] = [
+pub(super) const REWARD_PER_NODE_PROGRAM: [u8; 8] = [
     0x71,
     chain_info::REGISTERED_NODE_COUNT,
     0,
@@ -26,7 +26,7 @@ fn node_count_reward_builder() -> ChainConfigPayloadBuilder {
     builder
 }
 
-fn genesis_with(builder: &ChainConfigPayloadBuilder) -> (TestChain, Block, Block) {
+pub(super) fn genesis_with(builder: &ChainConfigPayloadBuilder) -> (TestChain, Block, Block) {
     let (crypto, storage, chain_config) = test_backends();
     let mut bc = new_chain(crypto, storage, chain_config, 0, 0);
     let genesis = bc
