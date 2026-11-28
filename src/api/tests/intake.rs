@@ -166,6 +166,32 @@ fn a_spent_utxo_input_is_deferred_after_its_signature() {
     assert_eq!(submit(&mut bc, missing.as_bytes()), O::Deferred);
 }
 
+/// DEC-353: an equivalent on the chain spent every UTXO input, so one set bit
+/// rules it out — the scan does not run (no read); with every bit 0 it does.
+#[test]
+fn the_utxo_equivalence_scan_runs_only_when_every_input_is_spent() {
+    use crate::approval::test_seams::{DUPLICATE_SCAN_READS, counted};
+    let (mut bc, mint) = faulty_utxo_genesis();
+    let spend = utxo_tx(4, &[(3, 0, 60 + CX_FEE)], None, &[Err((1, 60))]);
+    let b4 = complex_tx_block(4, mint.view().hash(), 0, 0, &[&spend]);
+    assert_eq!(receive(&mut bc, &b4), ReceiveBlockOutcome::AcceptedSilently);
+    let one_unspent = utxo_tx(
+        5,
+        &[(3, 0, 60 + CX_FEE), (3, 1, 40 + CX_FEE)],
+        None,
+        &[Err((1, 100))],
+    );
+    let before = counted(&DUPLICATE_SCAN_READS);
+    assert_eq!(submit(&mut bc, one_unspent.as_bytes()), O::Deferred);
+    assert_eq!(counted(&DUPLICATE_SCAN_READS), before, "a set bit: no scan");
+    let all_spent = utxo_tx(5, &[(3, 0, 60 + CX_FEE)], None, &[Ok(60)]);
+    assert_eq!(submit(&mut bc, all_spent.as_bytes()), O::Deferred);
+    assert!(
+        counted(&DUPLICATE_SCAN_READS) > before,
+        "every bit 0: scanned"
+    );
+}
+
 // --- AC9 step 2: Duplicate-in-mempool -------------------------------------------
 
 /// The key search covers every entry, Deferred ones included, by DEC-354's

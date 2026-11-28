@@ -1510,11 +1510,10 @@ impl<
 /// `[min · size, max · size]` over the integers, both bounds inclusive. Exact
 /// with `checked_mul`: an overflowing lower product means the fee is too low,
 /// an overflowing upper product means the upper bound holds. An inverted range
-/// (`min > max`) admits no fee — no swap, no clamp.
+/// (`min > max`) admits no fee — no swap, no clamp — by construction: for a
+/// size of at least one byte `min · size > max · size`, so no fee meets both
+/// bounds, and an overflowing `min · size` already fails.
 pub(super) fn fee_violates(fee: u64, size: u64, min: u64, max: u64) -> bool {
-    if min > max {
-        return true;
-    }
     match min.checked_mul(size) {
         Some(lower) if fee >= lower => {}
         _ => return true,
